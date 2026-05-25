@@ -30,7 +30,6 @@ With [green]filter[/green], you can select specific instances, e.g., [green]--in
 """
 
 import getpass
-import json
 import logging
 import random
 import sys
@@ -381,33 +380,20 @@ class RunBatch:
         if self._redo_existing:
             return False
 
-        # Check if there's an existing trajectory for this instance
-        log_path = self.output_dir / instance.problem_statement.id / (instance.problem_statement.id + ".traj")
-        if not log_path.exists():
+        # Skip only when a patch already exists for this instance.
+        # If there is no patch, we redo the instance even if a trajectory exists.
+        patch_path = self.output_dir / instance.problem_statement.id / (instance.problem_statement.id + ".patch")
+        if not patch_path.exists():
             return False
 
-        content = log_path.read_text()
+        content = patch_path.read_text()
         if not content.strip():
-            self.logger.warning("Found empty trajectory: %s. Removing.", log_path)
-            log_path.unlink()
+            self.logger.warning("Found empty patch: %s. Removing.", patch_path)
+            patch_path.unlink()
             return False
 
-        try:
-            data = json.loads(content)
-            # If the trajectory has no exit status, it's incomplete and we will redo it
-            exit_status = data["info"].get("exit_status", None)
-            if exit_status == "early_exit" or exit_status is None:
-                self.logger.warning(f"Found existing trajectory with no exit status: {log_path}. Removing.")
-                log_path.unlink()
-                return False
-        except Exception as e:
-            self.logger.error(f"Failed to check existing trajectory: {log_path}: {e}. Removing.")
-            # If we can't check the trajectory, we will redo it
-            log_path.unlink()
-            return False
-        # otherwise, we will skip it
-        self.logger.info(f"⏭️ Skipping existing trajectory: {log_path}")
-        return exit_status
+        self.logger.info(f"⏭️ Skipping existing instance with patch: {patch_path}")
+        return "patch_exists"
 
     def _add_instance_log_file_handlers(self, instance_id: str, multi_worker: bool = False) -> None:
         filename_template = f"{instance_id}.{{level}}.log"

@@ -109,6 +109,10 @@ class SWEEnv:
     def start(self) -> None:
         """Start the environment and reset it to a clean state."""
         self._init_deployment()
+        # Disable readline tab completion so that literal tab characters in
+        # commands (e.g. Go source in str_replace_editor) are not intercepted
+        # by bash as completion requests.
+        self.communicate("bind 'set disable-completion on'", check="warn")
         self.reset()
         for command in self._post_startup_commands:
             self.communicate(command, check="raise", timeout=self.post_startup_command_timeout)
@@ -155,7 +159,7 @@ class SWEEnv:
             self.communicate(
                 input="[ -d /app ] && cd / && mv /app /testbed",
                 check="ignore",
-                timeout=120,
+                timeout=600,
             )
             startup_commands = [
                 f"cd /{self.repo.repo_name}",
