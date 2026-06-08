@@ -30,8 +30,10 @@ With [green]filter[/green], you can select specific instances, e.g., [green]--in
 """
 
 import getpass
+import json
 import logging
 import random
+import shutil
 import sys
 import time
 import traceback
@@ -134,6 +136,13 @@ class _BreakLoop(Exception):
 
 
 class RunBatch:
+    _DONE_EXIT_STATUS_TO_SKIP_REASON = {
+        "submitted": "submitted",
+        "skipped (submitted)": "submitted",
+        "submitted (exit_cost)": "submitted (exit_cost)",
+        "skipped (submitted (exit_cost))": "submitted (exit_cost)",
+    }
+
     def __init__(
         self,
         instances: list[BatchInstance],
@@ -291,19 +300,18 @@ class RunBatch:
     def run_instance(self, instance: BatchInstance) -> None:
         self.logger.info("Running on instance %s", instance.problem_statement.id)
         register_thread_name(instance.problem_statement.id)
-        self._add_instance_log_file_handlers(instance.problem_statement.id, multi_worker=self._num_workers > 1)
-        # Let's add some randomness to avoid any potential race conditions or thundering herd
-        if self._progress_manager.n_completed < self._num_workers:
-            time.sleep(random.random() * self._random_delay_multiplier * (self._num_workers - 1))
-
         self._progress_manager.on_instance_start(instance.problem_statement.id)
 
         if previous_exit_status := self.should_skip(instance):
             self._progress_manager.on_instance_end(
                 instance.problem_statement.id, exit_status=f"skipped ({previous_exit_status})"
             )
-            self._remove_instance_log_file_handlers(instance.problem_statement.id)
             return
+
+        self._add_instance_log_file_handlers(instance.problem_statement.id, multi_worker=self._num_workers > 1)
+        # Let's add some randomness to avoid any potential race conditions or thundering herd
+        if self._progress_manager.n_completed < self._num_workers:
+            time.sleep(random.random() * self._random_delay_multiplier * (self._num_workers - 1))
 
         # Either catch and silence exception, or raise _BreakLoop to stop the loop
         # over the instances
@@ -373,27 +381,59 @@ class RunBatch:
         self._chooks.on_instance_completed(result=result)
         return result
 
+    def _clean_instance_output_dir(self, instance: BatchInstance) -> None:
+        output_dir = self.output_dir / instance.problem_statement.id
+        if not output_dir.exists():
+            return
+        self.logger.info("Cleaning existing instance output directory before redo: %s", output_dir)
+        if output_dir.is_dir():
+            shutil.rmtree(output_dir)
+        else:
+            output_dir.unlink()
+
     def should_skip(self, instance: BatchInstance) -> bool | str:
         """Check if we should skip this instance.
         Returns previous exit status if the instance should be skipped.
+
+        Existing instance output is only kept for completed submissions. All other
+        existing instance directories are removed so the instance can be redone
+        from a clean output directory.
         """
         if self._redo_existing:
+            RunBatch._clean_instance_output_dir(self, instance)
             return False
 
-        # Skip only when a patch already exists for this instance.
-        # If there is no patch, we redo the instance even if a trajectory exists.
-        patch_path = self.output_dir / instance.problem_statement.id / (instance.problem_statement.id + ".patch")
-        if not patch_path.exists():
+        output_dir = self.output_dir / instance.problem_statement.id
+        if not output_dir.exists():
             return False
 
-        content = patch_path.read_text()
+        log_path = output_dir / (instance.problem_statement.id + ".traj")
+        if not log_path.exists():
+            self.logger.warning("Found existing output directory without trajectory: %s", output_dir)
+            RunBatch._clean_instance_output_dir(self, instance)
+            return False
+
+        content = log_path.read_text()
         if not content.strip():
-            self.logger.warning("Found empty patch: %s. Removing.", patch_path)
-            patch_path.unlink()
+            self.logger.warning("Found empty trajectory: %s", log_path)
+            RunBatch._clean_instance_output_dir(self, instance)
             return False
 
-        self.logger.info(f"⏭️ Skipping existing instance with patch: {patch_path}")
-        return "patch_exists"
+        try:
+            data = json.loads(content)
+            exit_status = data.get("info", {}).get("exit_status", None)
+        except Exception as e:
+            self.logger.error("Failed to check existing trajectory: %s: %s", log_path, e)
+            RunBatch._clean_instance_output_dir(self, instance)
+            return False
+
+        if isinstance(exit_status, str) and exit_status in RunBatch._DONE_EXIT_STATUS_TO_SKIP_REASON:
+            self.logger.info("⏭️ Skipping existing completed trajectory: %s", log_path)
+            return RunBatch._DONE_EXIT_STATUS_TO_SKIP_REASON[exit_status]
+
+        self.logger.info("Redoing instance with existing exit status %r: %s", exit_status, log_path)
+        RunBatch._clean_instance_output_dir(self, instance)
+        return False
 
     def _add_instance_log_file_handlers(self, instance_id: str, multi_worker: bool = False) -> None:
         filename_template = f"{instance_id}.{{level}}.log"

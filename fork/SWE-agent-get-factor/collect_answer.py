@@ -1,15 +1,15 @@
 import json
 
-ds_dir = "dataset/pro_go_50.jsonl"
+ds_dir = "dataset/pro_pyt_50.jsonl"
 
 target_dir = {
-    "reproduction": "trajectories/v-kenanli/ablation_rep_cl__claude-sonnet-4-6__t-0.00__p-1.00__c-0.00___swe_bench_dataset/pro_go_50.jsonl_dev/preds.json",
-    "location": "trajectories/v-kenanli/ablation_loc_cl__claude-sonnet-4-6__t-0.00__p-1.00__c-0.00___swe_bench_dataset/pro_go_50.jsonl_dev/preds.json",
-    "context": "trajectories/v-kenanli/ablation_con_cl__claude-sonnet-4-6__t-0.00__p-1.00__c-0.00___swe_bench_dataset/pro_go_50.jsonl_dev/preds.json",
-    "api": "trajectories/v-kenanli/ablation_api_cl__claude-sonnet-4-6__t-0.00__p-1.00__c-0.00___swe_bench_dataset/pro_go_50.jsonl_dev/preds.json"
+    "reproduction": "trajectories/v-kenanli/ablation_rep_5__gpt-5-20250807__t-0.00__p-1.00__c-0.00___swe_bench_dataset/pro_pyt_50.jsonl_dev/preds.json",
+    "location":     "trajectories/v-kenanli/ablation_loc_5__gpt-5-20250807__t-0.00__p-1.00__c-0.00___swe_bench_dataset/pro_pyt_50.jsonl_dev/preds.json",
+    "context":      "trajectories/v-kenanli/ablation_con_5__gpt-5-20250807__t-0.00__p-1.00__c-0.00___swe_bench_dataset/pro_pyt_50.jsonl_dev/preds.json",
+    "api":          "trajectories/v-kenanli/ablation_api_5__gpt-5-20250807__t-0.00__p-1.00__c-0.00___swe_bench_dataset/pro_pyt_50.jsonl_dev/preds.json"
 }
 
-out_dir = "dataset/forward_pro_go_cl46.jsonl"
+out_dir = "dataset/forward_pro_pyt_gpt5.jsonl"
 
 target = {}
 
@@ -56,23 +56,23 @@ for idx in range(len(ds)):
     instance["f2p_cmd"] = "python reproduction.py" if lang == "python" else "go test -run TestReproduce -v"
     instance["FAIL_TO_PASS"] = "reproduction.py" if lang == "python" else "TestReproduce"
 
-    context_raw = target["context"][instance_id]["model_patch"]
-    if len(context_raw.strip()) < 5:
-        print(instance_id, "empty context")
-    try:
-        instance["error_context"] = json.loads(context_raw)
-    except:
-        print(instance_id, "context json decode error")
-        instance["error_context"] = {"context stack": context_raw}
+    #context_raw = target["context"][instance_id]["model_patch"]
+    #if len(context_raw.strip()) < 5:
+    #    print(instance_id, "empty context")
+    #try:
+    #    instance["error_context"] = json.loads(context_raw)
+    #except:
+    #    print(instance_id, "context json decode error")
+    #    instance["error_context"] = {"context stack": context_raw}
 
-    api_raw = target["api"][instance_id]["model_patch"]
-    if len(api_raw.strip()) < 5:
-        print(instance_id, "empty api")
-    try:
-        instance["api"] = json.loads(api_raw)
-    except:
-        print(instance_id, "api json decode error")
-        instance["api"] = {"api utils": api_raw}
+    #api_raw = target["api"][instance_id]["model_patch"]
+    #if len(api_raw.strip()) < 5:
+    #    print(instance_id, "empty api")
+    #try:
+    #    instance["api"] = json.loads(api_raw)
+    #except:
+    #    print(instance_id, "api json decode error")
+    #    instance["api"] = {"api utils": api_raw}
     
     ds[idx] = instance
 

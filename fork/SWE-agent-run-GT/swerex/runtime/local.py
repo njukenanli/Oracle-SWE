@@ -151,6 +151,7 @@ class BashSession(Session):
             f"export PS1='{self._ps1}'",
             "export PS2=''",
             "export PS0=''",
+            "bind 'set disable-completion on'",
         ]
 
     async def start(self) -> CreateBashSessionResponse:
