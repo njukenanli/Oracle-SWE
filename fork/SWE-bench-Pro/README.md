@@ -49,5 +49,5 @@ python swe_bench_pro_eval.py \
 
 
 ```bash
-nohup python swe_bench_pro_eval.py  --raw_sample_path=/home/v-kenanli/workspace/ablation/data/pro/pyt/original_pro.jsonl --patch_path=/home/v-kenanli/workspace/ablation/fork/SWE-agent/trajectories/v-kenanli/ablation_rep_api__gpt-5-20250807__t-0.00__p-1.00__c-0.00___swe_bench_/home/v-kenanli/workspace/ablation/data/pro/pyt/subset/api.jsonl_dev/preds.json  --output_dir=logs/eval/pyt-rep-api --scripts_dir=run_scripts    --num_workers=10    --dockerhub_username=jefzda > log-pyt-rep-api.out 2>&1 &
+nohup python swe_bench_pro_eval.py  --raw_sample_path=/home/v-kenanli/workspace/ablation/data/pro/pyt/original_pro.jsonl --patch_path=/home/v-kenanli/workspace/ablation/fork/SWE-agent/trajectories/v-kenanli/ablation_rep_api__gpt-5-20250807__t-0.00__p-1.00__c-0.00___swe_bench_/home/v-kenanli/workspace/ablation/data/pro/pyt/subset/api.jsonl_dev/preds.json  --output_dir=logs/eval/pyt-rep-api --scripts_dir=run_scripts    --num_workers=10   --use_local_docker  --dockerhub_username=jefzda > log-pyt-rep-api.out 2>&1 &
 ```
