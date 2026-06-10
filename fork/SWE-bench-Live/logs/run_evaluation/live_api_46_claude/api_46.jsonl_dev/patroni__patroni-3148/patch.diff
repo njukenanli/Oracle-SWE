@@ -1,0 +1,232 @@
+diff --git a/features/steps/slots.py b/features/steps/slots.py
+index 84d7e350..2416811b 100644
+--- a/features/steps/slots.py
++++ b/features/steps/slots.py
+@@ -104,3 +104,19 @@ def dcs_key_contains(context, name, subkey, key):
+ def dcs_key_does_not_contain(context, name, subkey, key):
+     response = json.loads(context.dcs_ctl.query(name))
+     assert key not in response or subkey not in response[key], f"{name} key in DCS has {subkey} in {key}"
++
++
++@step('physical replication slot named {slot_name} on {pg_name:w} has no xmin value after {time_limit:d} seconds')
++def physical_slot_has_no_xmin(context, slot_name, pg_name, time_limit):
++    time_limit *= context.timeout_multiplier
++    max_time = time.time() + int(time_limit)
++    query = f"SELECT xmin FROM pg_catalog.pg_replication_slots WHERE slot_type = 'physical' AND slot_name = '{slot_name}'"
++    while time.time() < max_time:
++        try:
++            row = context.pctl.query(pg_name, query).fetchone()
++            if bool(row) and row[0] is None:
++                return
++        except Exception:
++            pass
++        time.sleep(1)
++    assert False, f"Physical slot {slot_name} on {pg_name} still has xmin value after {time_limit} seconds"
+diff --git a/patroni/dcs/__init__.py b/patroni/dcs/__init__.py
+index 1185367c..5a9214cc 100644
+--- a/patroni/dcs/__init__.py
++++ b/patroni/dcs/__init__.py
+@@ -1158,6 +1158,30 @@ class Cluster(NamedTuple('Cluster',
+             # only manage slots for replicas that replicate from this one, except for the leader among them
+             members = [m for m in members if m.replicatefrom == name and m.name != self.leader_name]
+ 
++        # Helper function to determine if a slot is expected to be active
++        def expected_active(m: Member) -> bool:
++            """Check whether provided *member* should replicate from the current node when it is running as a leader.
++
++            :param member: a :class:`Member` object.
++
++            :returns: ``True`` if provided member should replicate from the current node, ``False`` otherwise.
++            """
++            if role in ('primary', 'standby_leader'):
++                # On the leader, slots for members that replicate from it are expected to be active
++                return m.replicatefrom is None or m.replicatefrom == name or not self.has_member(m.replicatefrom)
++            else:
++                """Check whether provided *member* should replicate from the current node when it is running as a replica.
++
++            ..note::
++                We only consider members with ``replicatefrom`` tag that matches our name and always exclude the leader.
++
++            :param member: a :class:`Member` object.
++
++            :returns: ``True`` if provided member should replicate from the current node, ``False`` otherwise.
++            """
++                # On a replica, only cascading replicas are expected to be active
++                return m.replicatefrom == name and m.name != self.leader_name
++
+         slots: Dict[str, int] = self.slots
+         ret: Dict[str, Dict[str, Any]] = {}
+         for member in members:
+@@ -1169,7 +1193,7 @@ class Cluster(NamedTuple('Cluster',
+                 # reported by the member to advance replication slot LSN.
+                 # `max` is only a fallback so we take the LSN from the slot when there is no feedback from the member.
+                 lsn = max(member.lsn or 0, lsn)
+-            ret[slot_name] = {'type': 'physical', 'lsn': lsn}
++            ret[slot_name] = {'type': 'physical', 'lsn': lsn, 'expected_active': expected_active(member)}
+         slot_name = slot_name_from_member_name(name)
+         ret.update({slot: {'type': 'physical'} for slot in self.status.retain_slots
+                     if slot not in ret and slot != slot_name})
+diff --git a/patroni/postgresql/__init__.py b/patroni/postgresql/__init__.py
+index c66a8967..937d58fc 100644
+--- a/patroni/postgresql/__init__.py
++++ b/patroni/postgresql/__init__.py
+@@ -228,7 +228,7 @@ class Postgresql(object):
+         if self._major_version >= 90600:
+             extra = ("pg_catalog.current_setting('restore_command')" if self._major_version >= 120000 else "NULL") +\
+                 ", " + ("(SELECT pg_catalog.json_agg(s.*) FROM (SELECT slot_name, slot_type as type, datoid::bigint, "
+-                        "plugin, catalog_xmin, pg_catalog.pg_wal_lsn_diff(confirmed_flush_lsn, '0/0')::bigint"
++                        "plugin, xmin, catalog_xmin, pg_catalog.pg_wal_lsn_diff(confirmed_flush_lsn, '0/0')::bigint"
+                         " AS confirmed_flush_lsn, pg_catalog.pg_wal_lsn_diff(restart_lsn, '0/0')::bigint"
+                         " AS restart_lsn FROM pg_catalog.pg_get_replication_slots()) AS s)"
+                         if self._should_query_slots and self.can_advance_slots else "NULL") + extra
+diff --git a/patroni/postgresql/slots.py b/patroni/postgresql/slots.py
+index 9e5216fb..5d0f1dfd 100644
+--- a/patroni/postgresql/slots.py
++++ b/patroni/postgresql/slots.py
+@@ -246,6 +246,7 @@ class SlotsHandler:
+                         ret[name] = value['confirmed_flush_lsn']
+                         self._copy_items(value, self._replication_slots[name])
+                     else:
++                        self._copy_items(value, self._replication_slots[name], ('restart_lsn', 'xmin'))
+                         self._replication_slots[name]['restart_lsn'] = ret[name] = value['restart_lsn']
+                 else:
+                     self._schedule_load_slots = True
+@@ -273,15 +274,15 @@ class SlotsHandler:
+             extra = f", catalog_xmin, {pg_wal_lsn_diff}(confirmed_flush_lsn, '0/0')::bigint" \
+                 if self._postgresql.major_version >= 100000 else ""
+             skip_temp_slots = ' WHERE NOT temporary' if self._postgresql.major_version >= 100000 else ''
+-            for r in self._query(f"SELECT slot_name, slot_type, {pg_wal_lsn_diff}(restart_lsn, '0/0')::bigint, plugin,"
++            for r in self._query(f"SELECT slot_name, slot_type, xmin, {pg_wal_lsn_diff}(restart_lsn, '0/0')::bigint, plugin,"
+                                  f" database, datoid{extra} FROM pg_catalog.pg_replication_slots{skip_temp_slots}"):
+                 value = {'type': r[1]}
+                 if r[1] == 'logical':
+-                    value.update(plugin=r[3], database=r[4], datoid=r[5])
++                    value.update(plugin=r[4], database=r[5], datoid=r[6])
+                     if self._postgresql.major_version >= 100000:
+-                        value.update(catalog_xmin=r[6], confirmed_flush_lsn=r[7])
++                        value.update(catalog_xmin=r[7], confirmed_flush_lsn=r[8])
+                 else:
+-                    value['restart_lsn'] = r[2]
++                    value.update(xmin=r[2], restart_lsn=r[3])
+                 replication_slots[r[0]] = value
+             self._replication_slots = replication_slots
+             self._schedule_load_slots = False
+@@ -385,7 +386,26 @@ class SlotsHandler:
+                     logger.exception("Failed to create physical replication slot '%s'", name)
+                 self._schedule_load_slots = True
+             elif self._postgresql.can_advance_slots and self._replication_slots[name]['type'] == 'physical':
+-                value['restart_lsn'] = self._replication_slots[name]['restart_lsn']
++                self._copy_items(self._replication_slots[name], value, ('restart_lsn', 'xmin'))
++                # Check if the slot has an xmin value and is not expected to be active
++                # This happens on replicas after a switchover, where inactive slots retain stale xmin values
++                # that can block autovacuum on the new primary
++                if not value.get('expected_active') and value.get('xmin') is not None:
++                    logger.warning('Dropping physical replication slot %s because of its xmin value %s',
++                                   name, value['xmin'])
++                    try:
++                        self.drop_replication_slot(name)
++                        # Remove from cache so it will be recreated
++                        self._replication_slots.pop(name)
++                        # Recreate the slot
++                        self._query(f"SELECT pg_catalog.pg_create_physical_replication_slot(%s{immediately_reserve})",
++                                    name)
++                        self._schedule_load_slots = True
++                        continue  # Skip advancing this slot since we just recreated it
++                    except Exception:
++                        logger.warning("Unable to drop replication slot '%s', slot is active", name)
++                        # If we can't drop the slot, continue with normal processing
++                    
+                 lsn = value.get('lsn')
+                 if lsn and lsn > value['restart_lsn']:  # The slot has feedback in DCS and needs to be advanced
+                     try:
+diff --git a/tests/__init__.py b/tests/__init__.py
+index c3bfc8d1..e7e18b09 100644
+--- a/tests/__init__.py
++++ b/tests/__init__.py
+@@ -129,9 +129,9 @@ class MockCursor(object):
+         elif sql.startswith('SELECT slot_name, slot_type, datname, plugin, catalog_xmin'):
+             self.results = [('ls', 'logical', 'a', 'b', 100, 500, b'123456')]
+         elif sql.startswith('SELECT slot_name'):
+-            self.results = [('blabla', 'physical', 12345),
+-                            ('foobar', 'physical', 12345),
+-                            ('ls', 'logical', 499, 'b', 'a', 5, 100, 500)]
++            self.results = [('blabla', 'physical', None, 12345),
++                            ('foobar', 'physical', None, 12345),
++                            ('ls', 'logical', None, 499, 'b', 'a', 5, 100, 500)]
+         elif sql.startswith('WITH slots AS (SELECT slot_name, active'):
+             self.results = [(False, True)] if self.rowcount == 1 else []
+         elif sql.startswith('SELECT CASE WHEN pg_catalog.pg_is_in_recovery()'):
+diff --git a/tests/test_slots.py b/tests/test_slots.py
+index 2ff2c4d5..76436766 100644
+--- a/tests/test_slots.py
++++ b/tests/test_slots.py
+@@ -94,7 +94,7 @@ class TestSlotsHandler(BaseTestPostgresql):
+         self.p.set_role('replica')
+         with patch.object(Postgresql, '_query') as mock_query, \
+                 patch.object(Postgresql, 'is_primary', Mock(return_value=False)):
+-            mock_query.return_value = [('ls', 'logical', 104, 'b', 'a', 5, 12345, 105)]
++            mock_query.return_value = [('ls', 'logical', None, 104, 'b', 'a', 5, 12345, 105)]
+             ret = self.s.sync_replication_slots(cluster, self.tags)
+         self.assertEqual(ret, [])
+ 
+@@ -110,16 +110,16 @@ class TestSlotsHandler(BaseTestPostgresql):
+             self.p.reset_cluster_info_state(None)
+             mock_query.return_value = [(
+                 1, 0, 0, 0, 0, 0, 0, 0, 0, None, None,
+-                [{"slot_name": "ls", "type": "logical", "datoid": 5, "plugin": "b",
++                [{"slot_name": "ls", "type": "logical", "datoid": 5, "plugin": "b", "xmin": None,
+                   "confirmed_flush_lsn": 12345, "catalog_xmin": 105, "restart_lsn": 12344},
+-                 {"slot_name": "blabla", "type": "physical", "datoid": None, "plugin": None,
++                 {"slot_name": "blabla", "type": "physical", "datoid": None, "plugin": None, "xmin": None,
+                   "confirmed_flush_lsn": None, "catalog_xmin": 105, "restart_lsn": 12344}])]
+             self.assertEqual(self.p.slots(), {'ls': 12345, 'blabla': 12344, 'postgresql0': 0})
+ 
+             self.p.reset_cluster_info_state(None)
+             mock_query.return_value = [(
+                 1, 0, 0, 0, 0, 0, 0, 0, 0, None, None,
+-                [{"slot_name": "ls", "type": "logical", "datoid": 6, "plugin": "b",
++                [{"slot_name": "ls", "type": "logical", "datoid": 6, "plugin": "b", "xmin": None,
+                   "confirmed_flush_lsn": 12345, "catalog_xmin": 105}])]
+             self.assertEqual(self.p.slots(), {'postgresql0': 0})
+ 
+@@ -151,7 +151,8 @@ class TestSlotsHandler(BaseTestPostgresql):
+             {'foo': {'type': 'logical', 'database': 'a', 'plugin': 'b'}, 'bar': {'type': 'physical'}})
+         self.assertEqual(
+             cluster._get_members_slots(self.p.name, 'primary', False, True),
+-            {'test_3': {'type': 'physical', 'lsn': 98}, 'test_4': {'type': 'physical', 'lsn': 98}})
++            {'test_3': {'type': 'physical', 'lsn': 98, 'expected_active': False}, 
++             'test_4': {'type': 'physical', 'lsn': 98, 'expected_active': True}})
+ 
+         # nostream node must not have slot on primary
+         self.p.name = nostream_node.name
+@@ -166,9 +167,9 @@ class TestSlotsHandler(BaseTestPostgresql):
+         # check cascade member-slot existence on nostream node
+         self.assertEqual(
+             cluster._get_members_slots(nostream_node.name, 'replica', False, True),
+-            {'leader': {'type': 'physical', 'lsn': 99},
+-             'test_3': {'type': 'physical', 'lsn': 98},
+-             'test_4': {'type': 'physical', 'lsn': 98}})
++            {'leader': {'type': 'physical', 'lsn': 99, 'expected_active': False},
++             'test_3': {'type': 'physical', 'lsn': 98, 'expected_active': True},
++             'test_4': {'type': 'physical', 'lsn': 98, 'expected_active': False}})
+ 
+         # cascade also does not entitled to have logical slot on itself ...
+         self.p.name = cascade_node.name
+@@ -222,7 +223,7 @@ class TestSlotsHandler(BaseTestPostgresql):
+         self.cluster.status.slots['ls'] = 12346
+         with patch.object(SlotsHandler, 'check_logical_slots_readiness', Mock(return_value=False)):
+             self.assertEqual(self.s.sync_replication_slots(self.cluster, self.tags), [])
+-        with patch.object(SlotsHandler, '_query', Mock(return_value=[('ls', 'logical', 499, 'b', 'a', 5, 100, 500)])), \
++        with patch.object(SlotsHandler, '_query', Mock(return_value=[('ls', 'logical', None, 499, 'b', 'a', 5, 100, 500)])), \
+                 patch.object(MockCursor, 'execute', Mock(side_effect=psycopg.OperationalError)), \
+                 patch.object(SlotsAdvanceThread, 'schedule', Mock(return_value=(True, ['ls']))), \
+                 patch.object(psycopg.OperationalError, 'diag') as mock_diag:
+@@ -300,7 +301,7 @@ class TestSlotsHandler(BaseTestPostgresql):
+                           [self.me, self.other, self.leadermem], None, SyncState.empty(), None, None)
+         global_config.update(cluster)
+         self.s.sync_replication_slots(cluster, self.tags)
+-        with patch.object(SlotsHandler, '_query', Mock(side_effect=[[('blabla', 'physical', 12345, None, None, None,
++        with patch.object(SlotsHandler, '_query', Mock(side_effect=[[('blabla', 'physical', None, 12345, None, None, None,
+                                                                       None, None)], Exception])) as mock_query, \
+                 patch('patroni.postgresql.slots.logger.error') as mock_error:
+             self.s.sync_replication_slots(cluster, self.tags)

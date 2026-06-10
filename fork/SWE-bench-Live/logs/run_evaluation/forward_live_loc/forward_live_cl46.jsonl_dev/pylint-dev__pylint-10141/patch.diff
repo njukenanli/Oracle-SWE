@@ -1,0 +1,171 @@
+diff --git a/pylint/lint/expand_modules.py b/pylint/lint/expand_modules.py
+index a7d31dea6..2d9f74142 100644
+--- a/pylint/lint/expand_modules.py
++++ b/pylint/lint/expand_modules.py
+@@ -87,6 +87,16 @@ def expand_modules(
+         if _is_ignored_file(
+             something, ignore_list, ignore_list_re, ignore_list_paths_re
+         ):
++            # Still record a skipped descriptor for visibility in verbose summary
++            normalized = os.path.normpath(something)
++            result[normalized] = {
++                "path": normalized,
++                "name": os.path.splitext(os.path.basename(normalized))[0],
++                "isarg": True,
++                "basepath": normalized,
++                "basename": os.path.basename(normalized),
++                "skipped": True,
++            }  # type: ignore[typeddict-item]
+             continue
+         module_package_path = discover_package_path(something, source_roots)
+         additional_search_path = [".", module_package_path, *path]
+@@ -131,6 +141,9 @@ def expand_modules(
+             if filepath in result:
+                 # Always set arg flag if module explicitly given.
+                 result[filepath]["isarg"] = True
++                # If it was previously marked as skipped, remove that flag
++                if "skipped" in result[filepath]:
++                    del result[filepath]["skipped"]  # type: ignore[misc]
+             else:
+                 result[filepath] = {
+                     "path": filepath,
+@@ -168,4 +181,7 @@ def expand_modules(
+                     "basepath": filepath,
+                     "basename": modname,
+                 }
++                # If it was previously marked as skipped, remove that flag
++                if "skipped" in result[subfilepath]:
++                    del result[subfilepath]["skipped"]  # type: ignore[misc]
+     return result, errors
+diff --git a/pylint/lint/pylinter.py b/pylint/lint/pylinter.py
+index cc4605b96..e20d19723 100644
+--- a/pylint/lint/pylinter.py
++++ b/pylint/lint/pylinter.py
+@@ -317,6 +317,10 @@ class PyLinter(
+         # Attributes related to stats
+         self.stats = LinterStats()
+ 
++        # Track checked and skipped files for verbose summary
++        self._checked_files: set[str] = set()
++        self._skipped_files: set[str] = set()
++
+         # Attributes related to (command-line) options and their parsing
+         self.options: Options = options + _make_linter_options(self)
+         for opt_group in option_groups:
+@@ -866,15 +870,28 @@ class PyLinter(
+     def _iterate_file_descrs(
+         self, files_or_modules: Sequence[str]
+     ) -> Iterator[FileItem]:
++        # Reset checked/skipped tracking for this run
++        self._checked_files.clear()
++        self._skipped_files.clear()
++
+         """Return generator yielding file descriptions (tuples of module name, file
+         path, base name).
+ 
+         The returned generator yield one item for each Python module that should be linted.
+         """
+         for descr in self._expand_files(files_or_modules).values():
++            # If the descriptor was explicitly marked as skipped by discovery,
++            # do not analyze it and record as skipped.
++            if descr.get("skipped"):
++                self._skipped_files.add(os.path.abspath(descr["path"]))
++                continue
++
+             name, filepath, is_arg = descr["name"], descr["path"], descr["isarg"]
+             if self.should_analyze_file(name, filepath, is_argument=is_arg):
++                self._checked_files.add(os.path.abspath(filepath))
+                 yield FileItem(name, filepath, descr["basename"])
++            else:
++                self._skipped_files.add(os.path.abspath(filepath))
+ 
+     def _expand_files(
+         self, files_or_modules: Sequence[str]
+@@ -1104,6 +1121,14 @@ class PyLinter(
+             # save results if persistent run
+             if self.config.persistent:
+                 save_results(self.stats, self.file_state.base_name)
++
++            # After reports, print verbose summary of checked/skipped files
++            if verbose:
++                checked_files_count = len(self._checked_files)
++                unchecked_files_count = len(self._skipped_files)
++                summary = f"Checked {checked_files_count} files, skipped {unchecked_files_count} files"
++                # Some reporters expect evaluation section; print via reporter
++                self.reporter.display_reports(report_nodes.EvaluationSection(summary))
+         else:
+             self.reporter.on_close(self.stats, LinterStats())
+             score_value = None
+@@ -1142,9 +1167,8 @@ class PyLinter(
+                     msg += f" (previous run: {pnote:.2f}/10, {note - pnote:+.2f})"
+ 
+             if verbose:
+-                checked_files_count = self.stats.node_count["module"]
+-                unchecked_files_count = self.stats.undocumented["module"]
+-                msg += f"\nChecked {checked_files_count} files, skipped {unchecked_files_count} files"
++                # Summary handled separately via _checked/_skipped sets
++                pass
+ 
+         if self.config.score:
+             sect = report_nodes.EvaluationSection(msg)
+diff --git a/pylint/typing.py b/pylint/typing.py
+index 963222871..6181739fd 100644
+--- a/pylint/typing.py
++++ b/pylint/typing.py
+@@ -43,14 +43,19 @@ class FileItem(NamedTuple):
+     modpath: str
+ 
+ 
+-class ModuleDescriptionDict(TypedDict):
+-    """Represents data about a checked module."""
++class ModuleDescriptionDict(TypedDict, total=False):
++    """Represents data about a checked module.
++
++    The 'skipped' key is optional and denotes a module that was filtered out
++    by ignore patterns or analyzer rules.
++    """
+ 
+     path: str
+     name: str
+     isarg: bool
+     basepath: str
+     basename: str
++    skipped: bool
+ 
+ 
+ class ErrorDescriptionDict(TypedDict):
+diff --git a/pylint/utils/linterstats.py b/pylint/utils/linterstats.py
+index 53afbcfe2..008aca631 100644
+--- a/pylint/utils/linterstats.py
++++ b/pylint/utils/linterstats.py
+@@ -133,6 +133,10 @@ class LinterStats:
+         self.nb_duplicated_lines = 0
+         self.percent_duplicated_lines = 0.0
+ 
++        # Verbose summary: track counts of checked and skipped files
++        self.checked_files_count = 0
++        self.skipped_files_count = 0
++
+     def __repr__(self) -> str:
+         return str(self)
+ 
+@@ -153,7 +157,9 @@ class LinterStats:
+         {self.warning}
+         {self.global_note}
+         {self.nb_duplicated_lines}
+-        {self.percent_duplicated_lines}"""
++        {self.percent_duplicated_lines}
++        {self.checked_files_count}
++        {self.skipped_files_count}"""
+ 
+     def init_single_module(self, module_name: str) -> None:
+         """Use through PyLinter.set_current_module so PyLinter.current_name is
+@@ -387,4 +393,8 @@ def merge_stats(stats: list[LinterStats]) -> LinterStats:
+         merged.warning += stat.warning
+ 
+         merged.global_note += stat.global_note
++
++        # Verbose summary tracking
++        merged.checked_files_count += getattr(stat, "checked_files_count", 0)
++        merged.skipped_files_count += getattr(stat, "skipped_files_count", 0)
+     return merged

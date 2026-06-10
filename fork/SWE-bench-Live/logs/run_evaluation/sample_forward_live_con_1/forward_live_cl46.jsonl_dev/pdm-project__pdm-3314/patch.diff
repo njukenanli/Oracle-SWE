@@ -1,0 +1,166 @@
+diff --git a/src/pdm/cli/commands/add.py b/src/pdm/cli/commands/add.py
+index 5f9ab858..40777c55 100644
+--- a/src/pdm/cli/commands/add.py
++++ b/src/pdm/cli/commands/add.py
+@@ -144,10 +144,19 @@ class Command(BaseCommand):
+         group_deps = project.add_dependencies(requirements, group, selection.dev or False, write=False)
+         all_dependencies = project.all_dependencies
+         all_dependencies[group] = group_deps
++        # Record original compatible precision before clearing specifiers
++        compat_levels: dict[str, int] = {}
+         if unconstrained:
+             if not requirements:
+                 raise PdmUsageError("--unconstrained requires at least one package")
+             for req in group_deps:
++                try:
++                    from pdm.cli.utils import _compatible_release_len_from_specifier
++                    level = _compatible_release_len_from_specifier(req.specifier)
++                    if level is not None:
++                        compat_levels[req.identify()] = level
++                except Exception:
++                    pass
+                 req.specifier = get_specifier("")
+ 
+         reqs = [r for g, deps in all_dependencies.items() for r in deps if lock_groups is None or g in lock_groups]
+@@ -164,7 +173,13 @@ class Command(BaseCommand):
+ 
+         # Update dependency specifiers and lockfile hash.
+         deps_to_update = group_deps if unconstrained else requirements
+-        save_version_specifiers(deps_to_update, resolved, save)
++        save_version_specifiers(
++            deps_to_update,
++            resolved,
++            save,
++            save_compatibility=project.config.get("strategy.save_compatibility", "minor"),
++            compat_levels=compat_levels if unconstrained else None,
++        )
+         if not dry_run:
+             project.add_dependencies(deps_to_update, group, selection.dev or False)
+             project.write_lockfile(project.lockfile._data, False)
+diff --git a/src/pdm/cli/commands/update.py b/src/pdm/cli/commands/update.py
+index 8a407499..a282acfb 100644
+--- a/src/pdm/cli/commands/update.py
++++ b/src/pdm/cli/commands/update.py
+@@ -169,9 +169,20 @@ class Command(BaseCommand):
+             project.core.ui.echo(
+                 f"Updating {'[bold]global[/] ' if project.is_global else ''}packages: {', '.join(f'[req]{v}[/]' for v in tracked_names)}."
+             )
++        # Record original compatible precision before clearing specifiers
++        compat_levels: dict[str, int] = {}
+         if unconstrained:
+             for deps in updated_deps.values():
+                 for dep in deps:
++                    # Determine original compatible precision(~=) if any
++                    try:
++                        from pdm.cli.utils import _compatible_release_len_from_specifier
++                        level = _compatible_release_len_from_specifier(dep.specifier)
++                        if level is not None:
++                            compat_levels[dep.identify()] = level
++                    except Exception:
++                        pass
++                    # Clear specifier to allow unconstrained resolution
+                     dep.specifier = get_specifier("")
+         reqs = [r for g, deps in all_dependencies.items() for r in deps if locked_groups is None or g in locked_groups]
+         # Since dry run is always true in the locking,
+@@ -189,7 +200,13 @@ class Command(BaseCommand):
+             )
+         if unconstrained:
+             # Need to update version constraints
+-            save_version_specifiers(chain.from_iterable(updated_deps.values()), resolved, save)
++            save_version_specifiers(
++                chain.from_iterable(updated_deps.values()),
++                resolved,
++                save,
++                save_compatibility=project.config.get("strategy.save_compatibility", "minor"),
++                compat_levels=compat_levels,
++            )
+         if not dry_run:
+             if unconstrained:
+                 for group, deps in updated_deps.items():
+diff --git a/src/pdm/cli/utils.py b/src/pdm/cli/utils.py
+index 928e4d23..61d758ca 100644
+--- a/src/pdm/cli/utils.py
++++ b/src/pdm/cli/utils.py
+@@ -539,16 +539,48 @@ def show_dependency_graph(
+     echo(tree)
+ 
+ 
++
++
++def _compatible_release_len_from_specifier(specifier: "SpecifierSet") -> int | None:
++    """Return the number of release segments specified in a compatible(~=) specifier.
++
++    If the requirement doesn't contain a compatible operator, return None.
++    """
++    try:
++        from packaging.specifiers import SpecifierSet as _SpecifierSet
++    except Exception:
++        return None
++    # Ensure we are iterating over a SpecifierSet
++    try:
++        spec = specifier  # type: ignore[assignment]
++        for sp in spec:
++            if getattr(sp, "operator", None) == "~=":
++                try:
++                    v = comparable_version(sp.version)
++                except Exception:
++                    return None
++                # packaging.version.Version.release is a tuple of segments
++                # Cap at 3 (major, minor, patch)
++                return min(len(getattr(v, "release", ()) or ()), 3)
++    except Exception:
++        return None
++    return None
++
+ def save_version_specifiers(
+     requirements: Iterable[Requirement],
+     resolved: dict[str, list[Candidate]],
+     save_strategy: str,
++    *,
++    save_compatibility: str = "minor",
++    compat_levels: Mapping[str, int] | None = None,
+ ) -> None:
+     """Rewrite the version specifiers according to the resolved result and save strategy
+ 
+     :param requirements: the requirements to be updated
+     :param resolved: the resolved mapping
+     :param save_strategy: compatible/wildcard/exact
++    :param save_compatibility: for compatible strategy, choose between 'minor' and 'patch'
++    :param compat_levels: optional per-requirement compatible precision derived from existing specifiers
+     """
+ 
+     def candidate_version(candidates: list[Candidate]) -> Version | None:
+@@ -570,7 +602,16 @@ def save_version_specifiers(
+                 if version.is_prerelease or version.is_devrelease:
+                     r.specifier = get_specifier(f">={version},<{version.major + 1}")
+                 else:
+-                    r.specifier = get_specifier(f"~={version.major}.{version.minor}")
++                    # Determine precision: prefer per-requirement compat level if provided
++                    level = None
++                    if compat_levels is not None:
++                        level = compat_levels.get(name)
++                    if level is None:
++                        level = 3 if (save_compatibility == "patch" and len(version.release) >= 3) else 2
++                    if level >= 3:
++                        r.specifier = get_specifier(f"~={version.major}.{version.minor}.{version.micro}")
++                    else:
++                        r.specifier = get_specifier(f"~={version.major}.{version.minor}")
+             elif save_strategy == "minimum":
+                 r.specifier = get_specifier(f">={version}")
+ 
+diff --git a/src/pdm/project/config.py b/src/pdm/project/config.py
+index 31a79af7..8043d4a5 100644
+--- a/src/pdm/project/config.py
++++ b/src/pdm/project/config.py
+@@ -151,6 +151,11 @@ class Config(MutableMapping[str, str]):
+         "global_project.user_site": ConfigItem("Whether to install to user site", False, True, coerce=ensure_boolean),
+         "strategy.update": ConfigItem("The default strategy for updating packages", "reuse", False),
+         "strategy.save": ConfigItem("Specify how to save versions when a package is added", "minimum", False),
++        "strategy.save_compatibility": ConfigItem(
++            "The compatibility precision for '~=' when saving versions: 'minor' or 'patch'",
++            "minor",
++            False,
++        ),
+         "strategy.resolve_max_rounds": ConfigItem(
+             "Specify the max rounds of resolution process",
+             10000,

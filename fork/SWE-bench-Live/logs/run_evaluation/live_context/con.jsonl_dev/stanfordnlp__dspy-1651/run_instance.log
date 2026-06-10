@@ -1,0 +1,313 @@
+2026-01-01 21:28:59,945 - INFO - Creating container for stanfordnlp__dspy-1651...
+2026-01-01 21:29:00,023 - INFO - Container for stanfordnlp__dspy-1651 created: 7bbfd28195644eb3b875aa483a88be97c133e60a3ae1355035a06f0c4337b9d4
+2026-01-01 21:29:00,561 - INFO - Container for stanfordnlp__dspy-1651 started: 7bbfd28195644eb3b875aa483a88be97c133e60a3ae1355035a06f0c4337b9d4
+2026-01-01 21:29:00,562 - INFO - Intermediate patch for stanfordnlp__dspy-1651 written to logs/run_evaluation/live_context/con.jsonl_dev/stanfordnlp__dspy-1651/patch.diff, now applying to container...
+2026-01-01 21:29:00,738 - INFO - >>>>> Applied Patch:
+Checking patch dspy/clients/lm.py...
+Checking patch dspy/functional/functional.py...
+Applied patch dspy/clients/lm.py cleanly.
+Applied patch dspy/functional/functional.py cleanly.
+
+2026-01-01 21:29:02,849 - INFO - Git diff before:
+diff --git a/dspy/clients/lm.py b/dspy/clients/lm.py
+index f2949372..f793cb0c 100644
+--- a/dspy/clients/lm.py
++++ b/dspy/clients/lm.py
+@@ -14,16 +14,40 @@ from dspy.clients.lm_finetune_utils import (
+     execute_finetune_job,
+ )
+ 
+-import litellm
+-from litellm.caching import Cache
+-
++# NOTE: Avoid importing heavy third-party modules (like litellm) at import time to
++# prevent side-effects during test collection/import. We'll lazy-load and configure
++# them when actually needed.
+ 
+ DISK_CACHE_DIR = os.environ.get("DSPY_CACHEDIR") or os.path.join(Path.home(), ".dspy_cache")
+-litellm.cache = Cache(disk_cache_dir=DISK_CACHE_DIR, type="disk")
+-litellm.telemetry = False
+ 
+-if "LITELLM_LOCAL_MODEL_COST_MAP" not in os.environ:
+-    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
++
++def _get_litellm():
++    """Lazily import and configure litellm and its cache.
++
++    Returns the litellm module, configured for disk caching and with telemetry disabled.
++    """
++    # Local import to avoid import-time side effects during test discovery
++    import litellm  # type: ignore
++    try:
++        from litellm.caching import Cache  # type: ignore
++    except Exception:  # pragma: no cover - very defensive, caching API may change
++        Cache = None  # type: ignore
++
++    # Configure caching and telemetry once
++    try:
++        if Cache is not None and getattr(litellm, "cache", None) is None:
++            litellm.cache = Cache(disk_cache_dir=DISK_CACHE_DIR, type="disk")  # type: ignore[attr-defined]
++        # Always disable telemetry in DSPy
++        litellm.telemetry = False  # type: ignore[attr-defined]
++    except Exception:
++        # If anything goes wrong configuring cache/telemetry, proceed without failing import
++        pass
++
++    # Ensure local model cost map is set to avoid network calls
++    if "LITELLM_LOCAL_MODEL_COST_MAP" not in os.environ:
++        os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
++
++    return litellm
+ 
+ 
+ class LM:
+@@ -155,6 +179,8 @@ def cached_litellm_completion(request):
+ 
+ 
+ def litellm_completion(request, cache={"no-cache": True, "no-store": True}):
++    # Lazily import litellm and configure
++    litellm = _get_litellm()
+     kwargs = ujson.loads(request)
+     return litellm.completion(cache=cache, **kwargs)
+ 
+@@ -165,6 +191,8 @@ def cached_litellm_text_completion(request):
+ 
+ 
+ def litellm_text_completion(request, cache={"no-cache": True, "no-store": True}):
++    # Lazily import litellm and configure
++    litellm = _get_litellm()
+     kwargs = ujson.loads(request)
+ 
+     # Extract the provider and model from the model string.
+diff --git a/dspy/functional/functional.py b/dspy/functional/functional.py
+index a45e302c..19c43484 100644
+--- a/dspy/functional/functional.py
++++ b/dspy/functional/functional.py
+@@ -199,11 +199,26 @@ class TypedPredictor(dspy.Module):
+         ).advice
+ 
+     def _prepare_signature(self) -> dspy.Signature:
+-        """Add formats and parsers to the signature fields, based on the type annotations of the fields."""
+-        signature = self.signature
+-        for name, field in self.signature.fields.items():
+-            is_output = field.json_schema_extra["__dspy_field_type"] == "output"
+-            type_ = field.annotation
++        """Add formats and parsers to the signature fields, based on the type annotations of the fields.
++
++        If an underlying dspy.Predict has an optimized signature (e.g., from MIPROv2),
++        we start from that signature so optimized instructions/prefixes are preserved.
++        We then layer the TypedPredictor type annotations and formatting/parsing rules
++        on top of that base.
++        """
++        # Prefer the inner predictor's signature if available (e.g., after optimization/load)
++        base_signature = getattr(self, "predictor", None)
++        base_signature = getattr(base_signature, "signature", None) or self.signature
++
++        signature = base_signature
++        # Iterate over the typed signature's fields to derive types/parsers, but apply them to the base.
++        for name, typed_field in self.signature.fields.items():
++            # If the base signature doesn't have this field (e.g., mismatch), fall back to typed signature entirely.
++            if name not in signature.fields:
++                signature = self.signature
++                typed_field = self.signature.fields[name]
++            is_output = typed_field.json_schema_extra["__dspy_field_type"] == "output"
++            type_ = typed_field.annotation
+             if is_output:
+                 if type_ is bool:
+ 
+@@ -215,18 +230,20 @@ class TypedPredictor(dspy.Module):
+ 
+                     signature = signature.with_updated_fields(
+                         name,
+-                        desc=field.json_schema_extra.get("desc", "")
++                        desc=typed_field.json_schema_extra.get("desc", "")
+                         + (" (Respond with true or false)" if type_ != str else ""),
+                         format=lambda x: x if isinstance(x, str) else str(x),
+                         parser=parse,
++                        type_=type_,
+                     )
+                 elif type_ in (str, int, float):
+                     signature = signature.with_updated_fields(
+                         name,
+-                        desc=field.json_schema_extra.get("desc", "")
++                        desc=typed_field.json_schema_extra.get("desc", "")
+                         + (f" (Respond with a single {type_.__name__} value)" if type_ != str else ""),
+                         format=lambda x: x if isinstance(x, str) else str(x),
+                         parser=type_,
++                        type_=type_,
+                     )
+                 else:
+                     # Anything else we wrap in a pydantic object
+@@ -248,7 +265,7 @@ class TypedPredictor(dspy.Module):
+                         schema = "```json\n" + schema + "\n```"
+                     signature = signature.with_updated_fields(
+                         name,
+-                        desc=field.json_schema_extra.get("desc", "")
++                        desc=typed_field.json_schema_extra.get("desc", "")
+                         + (". Respond with a single JSON object. JSON Schema: " + schema),
+                         format=lambda x, to_json=to_json: (x if isinstance(x, str) else to_json(x)),
+                         parser=lambda x, from_json=from_json: from_json(_unwrap_json(x, from_json)),
+@@ -275,7 +292,7 @@ class TypedPredictor(dspy.Module):
+                     is_json = True
+                 if self.wrap_json and is_json:
+                     format_ = lambda x, inner=format_: x if isinstance(x, str) else "```json\n" + inner(x) + "\n```\n"
+-                signature = signature.with_updated_fields(name, format=format_)
++                signature = signature.with_updated_fields(name, format=format_, type_=type_)
+ 
+         return signature
+2026-01-01 21:29:02,849 - INFO - Eval script for stanfordnlp__dspy-1651 written to logs/run_evaluation/live_context/con.jsonl_dev/stanfordnlp__dspy-1651/eval.sh; copying to container...
+2026-01-01 21:29:23,052 - INFO - Test runtime: 20.09 seconds
+2026-01-01 21:29:23,055 - INFO - Test output for stanfordnlp__dspy-1651 written to logs/run_evaluation/live_context/con.jsonl_dev/stanfordnlp__dspy-1651/test_output.txt
+2026-01-01 21:29:23,152 - INFO - Git diff after:
+diff --git a/dspy/clients/lm.py b/dspy/clients/lm.py
+index f2949372..f793cb0c 100644
+--- a/dspy/clients/lm.py
++++ b/dspy/clients/lm.py
+@@ -14,16 +14,40 @@ from dspy.clients.lm_finetune_utils import (
+     execute_finetune_job,
+ )
+ 
+-import litellm
+-from litellm.caching import Cache
+-
++# NOTE: Avoid importing heavy third-party modules (like litellm) at import time to
++# prevent side-effects during test collection/import. We'll lazy-load and configure
++# them when actually needed.
+ 
+ DISK_CACHE_DIR = os.environ.get("DSPY_CACHEDIR") or os.path.join(Path.home(), ".dspy_cache")
+-litellm.cache = Cache(disk_cache_dir=DISK_CACHE_DIR, type="disk")
+-litellm.telemetry = False
+ 
+-if "LITELLM_LOCAL_MODEL_COST_MAP" not in os.environ:
+-    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
++
++def _get_litellm():
++    """Lazily import and configure litellm and its cache.
++
++    Returns the litellm module, configured for disk caching and with telemetry disabled.
++    """
++    # Local import to avoid import-time side effects during test discovery
++    import litellm  # type: ignore
++    try:
++        from litellm.caching import Cache  # type: ignore
++    except Exception:  # pragma: no cover - very defensive, caching API may change
++        Cache = None  # type: ignore
++
++    # Configure caching and telemetry once
++    try:
++        if Cache is not None and getattr(litellm, "cache", None) is None:
++            litellm.cache = Cache(disk_cache_dir=DISK_CACHE_DIR, type="disk")  # type: ignore[attr-defined]
++        # Always disable telemetry in DSPy
++        litellm.telemetry = False  # type: ignore[attr-defined]
++    except Exception:
++        # If anything goes wrong configuring cache/telemetry, proceed without failing import
++        pass
++
++    # Ensure local model cost map is set to avoid network calls
++    if "LITELLM_LOCAL_MODEL_COST_MAP" not in os.environ:
++        os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
++
++    return litellm
+ 
+ 
+ class LM:
+@@ -155,6 +179,8 @@ def cached_litellm_completion(request):
+ 
+ 
+ def litellm_completion(request, cache={"no-cache": True, "no-store": True}):
++    # Lazily import litellm and configure
++    litellm = _get_litellm()
+     kwargs = ujson.loads(request)
+     return litellm.completion(cache=cache, **kwargs)
+ 
+@@ -165,6 +191,8 @@ def cached_litellm_text_completion(request):
+ 
+ 
+ def litellm_text_completion(request, cache={"no-cache": True, "no-store": True}):
++    # Lazily import litellm and configure
++    litellm = _get_litellm()
+     kwargs = ujson.loads(request)
+ 
+     # Extract the provider and model from the model string.
+diff --git a/dspy/functional/functional.py b/dspy/functional/functional.py
+index a45e302c..19c43484 100644
+--- a/dspy/functional/functional.py
++++ b/dspy/functional/functional.py
+@@ -199,11 +199,26 @@ class TypedPredictor(dspy.Module):
+         ).advice
+ 
+     def _prepare_signature(self) -> dspy.Signature:
+-        """Add formats and parsers to the signature fields, based on the type annotations of the fields."""
+-        signature = self.signature
+-        for name, field in self.signature.fields.items():
+-            is_output = field.json_schema_extra["__dspy_field_type"] == "output"
+-            type_ = field.annotation
++        """Add formats and parsers to the signature fields, based on the type annotations of the fields.
++
++        If an underlying dspy.Predict has an optimized signature (e.g., from MIPROv2),
++        we start from that signature so optimized instructions/prefixes are preserved.
++        We then layer the TypedPredictor type annotations and formatting/parsing rules
++        on top of that base.
++        """
++        # Prefer the inner predictor's signature if available (e.g., after optimization/load)
++        base_signature = getattr(self, "predictor", None)
++        base_signature = getattr(base_signature, "signature", None) or self.signature
++
++        signature = base_signature
++        # Iterate over the typed signature's fields to derive types/parsers, but apply them to the base.
++        for name, typed_field in self.signature.fields.items():
++            # If the base signature doesn't have this field (e.g., mismatch), fall back to typed signature entirely.
++            if name not in signature.fields:
++                signature = self.signature
++                typed_field = self.signature.fields[name]
++            is_output = typed_field.json_schema_extra["__dspy_field_type"] == "output"
++            type_ = typed_field.annotation
+             if is_output:
+                 if type_ is bool:
+ 
+@@ -215,18 +230,20 @@ class TypedPredictor(dspy.Module):
+ 
+                     signature = signature.with_updated_fields(
+                         name,
+-                        desc=field.json_schema_extra.get("desc", "")
++                        desc=typed_field.json_schema_extra.get("desc", "")
+                         + (" (Respond with true or false)" if type_ != str else ""),
+                         format=lambda x: x if isinstance(x, str) else str(x),
+                         parser=parse,
++                        type_=type_,
+                     )
+                 elif type_ in (str, int, float):
+                     signature = signature.with_updated_fields(
+                         name,
+-                        desc=field.json_schema_extra.get("desc", "")
++                        desc=typed_field.json_schema_extra.get("desc", "")
+                         + (f" (Respond with a single {type_.__name__} value)" if type_ != str else ""),
+                         format=lambda x: x if isinstance(x, str) else str(x),
+                         parser=type_,
++                        type_=type_,
+                     )
+                 else:
+                     # Anything else we wrap in a pydantic object
+@@ -248,7 +265,7 @@ class TypedPredictor(dspy.Module):
+                         schema = "```json\n" + schema + "\n```"
+                     signature = signature.with_updated_fields(
+                         name,
+-                        desc=field.json_schema_extra.get("desc", "")
++                        desc=typed_field.json_schema_extra.get("desc", "")
+                         + (". Respond with a single JSON object. JSON Schema: " + schema),
+                         format=lambda x, to_json=to_json: (x if isinstance(x, str) else to_json(x)),
+                         parser=lambda x, from_json=from_json: from_json(_unwrap_json(x, from_json)),
+@@ -275,7 +292,7 @@ class TypedPredictor(dspy.Module):
+                     is_json = True
+                 if self.wrap_json and is_json:
+                     format_ = lambda x, inner=format_: x if isinstance(x, str) else "```json\n" + inner(x) + "\n```\n"
+-                signature = signature.with_updated_fields(name, format=format_)
++                signature = signature.with_updated_fields(name, format=format_, type_=type_)
+ 
+         return signature
+2026-01-01 21:29:23,152 - INFO - Grading answer for stanfordnlp__dspy-1651...
+2026-01-01 21:29:23,223 - INFO - report: {'stanfordnlp__dspy-1651': {'patch_is_None': False, 'patch_exists': True, 'patch_successfully_applied': True, 'resolved': False, 'tests_status': {'FAIL_TO_PASS': {'success': [], 'failure': ['tests/functional/test_functional.py::test_save_type_predictor']}, 'PASS_TO_PASS': {'success': ['tests/datasets/test_dataset.py::TestCSVDataset::test_input_keys', 'tests/dsp_LM/evaluate/test_evaluate.py::test_evaluate_call', 'tests/dsp_LM/evaluate/test_evaluate.py::test_multithread_evaluate_call', 'tests/dsp_LM/evaluate/test_evaluate.py::test_multi_thread_evaluate_call_cancelled', 'tests/dsp_LM/evaluate/test_evaluate.py::test_evaluate_call_bad', 'tests/dsp_LM/functional/test_functional.py::test_simple', 'tests/dsp_LM/functional/test_functional.py::test_list_output', 'tests/dsp_LM/functional/test_functional.py::test_simple_type', 'tests/dsp_LM/functional/test_functional.py::test_simple_type_input', 'tests/dsp_LM/functional/test_functional.py::test_simple_class', 'tests/dsp_LM/functional/test_functional.py::test_simple_oop', 'tests/dsp_LM/functional/test_functional.py::test_bootstrap_effectiveness', 'tests/dsp_LM/functional/test_functional.py::test_regex', 'tests/dsp_LM/functional/test_functional.py::test_custom_model_validate_json', 'tests/dsp_LM/functional/test_functional.py::test_raises', 'tests/dsp_LM/functional/test_functional.py::test_multi_errors', 'tests/dsp_LM/functional/test_functional.py::test_field_validator', 'tests/dsp_LM/functional/test_functional.py::test_annotated_field', 'tests/dsp_LM/functional/test_functional.py::test_multiple_outputs', 'tests/dsp_LM/functional/test_functional.py::test_multiple_outputs_int', 'tests/dsp_LM/functional/test_functional.py::test_multiple_outputs_int_cot', 'tests/dsp_LM/functional/test_functional.py::test_parse_type_string', 'tests/dsp_LM/functional/test_functional.py::test_literal', 'tests/dsp_LM/functional/test_functional.py::test_literal_missmatch', 'tests/dsp_LM/functional/test_functional.py::test_literal_int', 'tests/dsp_LM/functional/test_functional.py::test_literal_int_missmatch', 'tests/dsp_LM/functional/test_functional.py::test_fields_on_base_signature', 'tests/dsp_LM/functional/test_functional.py::test_synthetic_data_gen', 'tests/dsp_LM/functional/test_functional.py::test_list_input2', 'tests/dsp_LM/functional/test_functional.py::test_custom_reasoning_field', 'tests/dsp_LM/functional/test_functional.py::test_generic_signature', 'tests/dsp_LM/functional/test_functional.py::test_lm_as_validator', 'tests/dsp_LM/functional/test_functional.py::test_annotated_validator', 'tests/dsp_LM/functional/test_functional.py::test_annotated_validator_functional', 'tests/dsp_LM/functional/test_functional.py::test_demos', 'tests/dsp_LM/functional/test_functional.py::test_conlist', 'tests/dsp_LM/functional/test_functional.py::test_conlist2', 'tests/dsp_LM/functional/test_functional.py::test_model_validator', 'tests/dsp_LM/functional/test_signature_opt_typed.py::test_opt', 'tests/dsp_LM/functional/test_signature_opt_typed.py::test_opt_composed', 'tests/dsp_LM/predict/test_chain_of_thought.py::test_initialization_with_string_signature', 'tests/dsp_LM/predict/test_chain_of_thought_with_hint.py::test_cot_with_no_hint', 'tests/dsp_LM/predict/test_chain_of_thought_with_hint.py::test_cot_with_hint', 'tests/dsp_LM/predict/test_multi_chain_comparison.py::test_basic_example', 'tests/dsp_LM/predict/test_predict.py::test_call_method', 'tests/dsp_LM/predict/test_predict.py::test_forward_method', 'tests/dsp_LM/predict/test_predict.py::test_forward_method2', 'tests/dsp_LM/predict/test_predict.py::test_config_management', 'tests/dsp_LM/predict/test_predict.py::test_multi_output', 'tests/dsp_LM/predict/test_predict.py::test_multi_output2', 'tests/dsp_LM/predict/test_predict.py::test_output_only', 'tests/dsp_LM/predict/test_program_of_thought.py::test_pot_code_generation', 'tests/dsp_LM/predict/test_program_of_thought.py::test_pot_code_generation_with_error', 'tests/dsp_LM/predict/test_react.py::test_example_no_tools', 'tests/dsp_LM/predict/test_react.py::test_example_search', 'tests/dsp_LM/predict/test_react.py::test_custom_tools', 'tests/dsp_LM/predict/test_retry.py::test_retry_simple', 'tests/dsp_LM/predict/test_retry.py::test_retry_forward_with_feedback', 'tests/dsp_LM/predict/test_retry.py::test_retry_forward_with_typed_predictor', 'tests/dsp_LM/primitives/test_program.py::test_forward', 'tests/dsp_LM/signatures/test_signature.py::test_multiline_instructions', 'tests/dsp_LM/teleprompt/test_bootstrap.py::test_compile_with_predict_instances', 'tests/dsp_LM/teleprompt/test_bootstrap.py::test_bootstrap_effectiveness', 'tests/dsp_LM/teleprompt/test_bootstrap.py::test_error_handling_during_bootstrap', 'tests/dsp_LM/teleprompt/test_bootstrap.py::test_validation_set_usage', 'tests/dsp_LM/teleprompt/test_copro_optimizer.py::test_signature_optimizer_initialization', 'tests/dsp_LM/teleprompt/test_copro_optimizer.py::test_signature_optimizer_optimization_process', 'tests/dsp_LM/teleprompt/test_copro_optimizer.py::test_signature_optimizer_statistics_tracking', 'tests/dsp_LM/teleprompt/test_copro_optimizer.py::test_optimization_and_output_verification', 'tests/dsp_LM/teleprompt/test_copro_optimizer.py::test_statistics_tracking_during_optimization', 'tests/dsp_LM/teleprompt/test_mipro_optimizer.py::test_bayesian_signature_optimizer_initialization', 'tests/dsp_LM/teleprompt/test_mipro_optimizer.py::test_signature_optimizer_optimization_process', 'tests/dsp_LM/teleprompt/test_mipro_optimizer.py::test_signature_optimizer_bad_lm', 'tests/dsp_LM/teleprompt/test_mipro_optimizer.py::test_optimization_and_output_verification', 'tests/dsp_LM/teleprompt/test_random_search.py::test_basic_workflow', 'tests/evaluate/test_evaluate.py::test_evaluate_initialization', 'tests/evaluate/test_evaluate.py::test_evaluate_call', 'tests/evaluate/test_evaluate.py::test_multithread_evaluate_call', 'tests/evaluate/test_evaluate.py::test_multi_thread_evaluate_call_cancelled', 'tests/evaluate/test_evaluate.py::test_evaluate_call_bad', 'tests/evaluate/test_evaluate.py::test_evaluate_display_table[True-True]', 'tests/evaluate/test_evaluate.py::test_evaluate_display_table[True-False]', 'tests/evaluate/test_evaluate.py::test_evaluate_display_table[True-1]', 'tests/evaluate/test_evaluate.py::test_evaluate_display_table[False-True]', 'tests/evaluate/test_evaluate.py::test_evaluate_display_table[False-False]', 'tests/evaluate/test_evaluate.py::test_evaluate_display_table[False-1]', 'tests/evaluate/test_metrics.py::test_answer_exact_match_string', 'tests/evaluate/test_metrics.py::test_answer_exact_match_list', 'tests/evaluate/test_metrics.py::test_answer_exact_match_no_match', 'tests/functional/test_functional.py::test_simple', 'tests/functional/test_functional.py::test_list_output', 'tests/functional/test_functional.py::test_simple_type', 'tests/functional/test_functional.py::test_simple_type_input', 'tests/functional/test_functional.py::test_simple_class', 'tests/functional/test_functional.py::test_simple_oop', 'tests/functional/test_functional.py::test_equivalent_signatures', 'tests/functional/test_functional.py::test_named_params', 'tests/functional/test_functional.py::test_bootstrap_effectiveness', 'tests/functional/test_functional.py::test_regex', 'tests/functional/test_functional.py::test_custom_model_validate_json', 'tests/functional/test_functional.py::test_raises', 'tests/functional/test_functional.py::test_multi_errors', 'tests/functional/test_functional.py::test_field_validator', 'tests/functional/test_functional.py::test_annotated_field', 'tests/functional/test_functional.py::test_multiple_outputs', 'tests/functional/test_functional.py::test_multiple_outputs_int', 'tests/functional/test_functional.py::test_multiple_outputs_int_cot', 'tests/functional/test_functional.py::test_parse_type_string', 'tests/functional/test_functional.py::test_literal', 'tests/functional/test_functional.py::test_literal_missmatch', 'tests/functional/test_functional.py::test_literal_int', 'tests/functional/test_functional.py::test_literal_int_missmatch', 'tests/functional/test_functional.py::test_fields_on_base_signature', 'tests/functional/test_functional.py::test_synthetic_data_gen', 'tests/functional/test_functional.py::test_list_input2', 'tests/functional/test_functional.py::test_custom_reasoning_field', 'tests/functional/test_functional.py::test_generic_signature', 'tests/functional/test_functional.py::test_field_validator_in_signature', 'tests/functional/test_functional.py::test_lm_as_validator', 'tests/functional/test_functional.py::test_annotated_validator', 'tests/functional/test_functional.py::test_annotated_validator_functional', 'tests/functional/test_functional.py::test_demos', 'tests/functional/test_functional.py::test_demos_missing_input_in_demo', 'tests/functional/test_functional.py::test_conlist', 'tests/functional/test_functional.py::test_conlist2', 'tests/functional/test_functional.py::test_model_validator', 'tests/functional/test_signature_opt_typed.py::test_opt', 'tests/functional/test_signature_opt_typed.py::test_opt_composed', 'tests/functional/test_signature_typed.py::test_basic_types[str-foo-foo]', 'tests/functional/test_signature_typed.py::test_basic_types[int-42-42]', 'tests/functional/test_signature_typed.py::test_basic_types[float-42.42-42.42]', 'tests/functional/test_signature_typed.py::test_boolean', 'tests/functional/test_signature_typed.py::test_sequences[list-["foo",', 'tests/functional/test_signature_typed.py::test_sequences[tuple-[42,', 'tests/functional/test_signature_typed.py::test_unions[test_type0-"foobar"-foobar]', 'tests/functional/test_signature_typed.py::test_unions[test_type1-null-None]', 'tests/functional/test_signature_typed.py::test_unions[test_type2-3.14-3.14]', 'tests/functional/test_signature_typed.py::test_unions[test_type3-true-True]', 'tests/functional/test_signature_typed.py::test_pydantic', 'tests/functional/test_signature_typed.py::test_optional_pydantic', 'tests/functional/test_signature_typed.py::test_nested_pydantic', 'tests/functional/test_signature_typed.py::test_dataclass', 'tests/modules/test_hf_model.py::test_load_gated_model', 'tests/modules/test_hf_model.py::test_load_ungated_model', 'tests/predict/test_aggregation.py::test_majority_with_prediction', 'tests/predict/test_aggregation.py::test_majority_with_completions', 'tests/predict/test_aggregation.py::test_majority_with_list', 'tests/predict/test_aggregation.py::test_majority_with_normalize', 'tests/predict/test_aggregation.py::test_majority_with_field', 'tests/predict/test_aggregation.py::test_majority_with_no_majority', 'tests/predict/test_chain_of_thought.py::test_initialization_with_string_signature', 'tests/predict/test_chain_of_thought_with_hint.py::test_cot_with_no_hint', 'tests/predict/test_chain_of_thought_with_hint.py::test_cot_with_hint', 'tests/predict/test_knn.py::test_knn_initialization', 'tests/predict/test_knn.py::test_knn_query', 'tests/predict/test_knn.py::test_knn_query_specificity', 'tests/predict/test_multi_chain_comparison.py::test_basic_example', 'tests/predict/test_predict.py::test_initialization_with_string_signature', 'tests/predict/test_predict.py::test_reset_method', 'tests/predict/test_predict.py::test_lm_after_dump_and_load_state', 'tests/predict/test_predict.py::test_call_method', 'tests/predict/test_predict.py::test_instructions_after_dump_and_load_state', 'tests/predict/test_predict.py::test_demos_after_dump_and_load_state', 'tests/predict/test_predict.py::test_typed_demos_after_dump_and_load_state', 'tests/predict/test_predict.py::test_signature_fields_after_dump_and_load_state', 'tests/predict/test_predict.py::test_forward_method', 'tests/predict/test_predict.py::test_forward_method2', 'tests/predict/test_predict.py::test_config_management', 'tests/predict/test_predict.py::test_multi_output', 'tests/predict/test_predict.py::test_multi_output2', 'tests/predict/test_predict.py::test_named_predictors', 'tests/predict/test_predict.py::test_output_only', 'tests/predict/test_program_of_thought.py::test_pot_code_generation', 'tests/predict/test_program_of_thought.py::test_pot_code_generation_with_error', 'tests/predict/test_react.py::test_example_no_tools', 'tests/predict/test_react.py::test_example_search', 'tests/predict/test_react.py::test_custom_tools', 'tests/predict/test_react.py::test_signature_instructions', 'tests/predict/test_retry.py::test_retry_simple', 'tests/predict/test_retry.py::test_retry_forward_with_feedback', 'tests/predict/test_retry.py::test_retry_forward_with_typed_predictor', 'tests/primitives/test_example.py::test_example_initialization', 'tests/primitives/test_example.py::test_example_initialization_from_base', 'tests/primitives/test_example.py::test_example_initialization_from_dict', 'tests/primitives/test_example.py::test_example_set_get_item', 'tests/primitives/test_example.py::test_example_attribute_access', 'tests/primitives/test_example.py::test_example_deletion', 'tests/primitives/test_example.py::test_example_len', 'tests/primitives/test_example.py::test_example_repr_str', 'tests/primitives/test_example.py::test_example_eq', 'tests/primitives/test_example.py::test_example_hash', 'tests/primitives/test_example.py::test_example_keys_values_items', 'tests/primitives/test_example.py::test_example_get', 'tests/primitives/test_example.py::test_example_with_inputs', 'tests/primitives/test_example.py::test_example_inputs_labels', 'tests/primitives/test_example.py::test_example_copy_without', 'tests/primitives/test_example.py::test_example_to_dict', 'tests/primitives/test_module.py::test_deepcopy_basic', 'tests/primitives/test_module.py::test_deepcopy_with_uncopyable_modules', 'tests/primitives/test_module.py::test_deepcopy_with_nested_modules', 'tests/primitives/test_program.py::test_module_initialization', 'tests/primitives/test_program.py::test_named_predictors', 'tests/primitives/test_program.py::test_predictors', 'tests/primitives/test_program.py::test_forward', 'tests/primitives/test_program.py::test_nested_named_predictors', 'tests/primitives/test_program.py::test_empty_module', 'tests/primitives/test_program.py::test_single_level', 'tests/primitives/test_program.py::test_multiple_levels', 'tests/primitives/test_program.py::test_multiple_sub_modules', 'tests/primitives/test_program.py::test_non_base_module_attributes', 'tests/primitives/test_program.py::test_complex_module_traversal', 'tests/primitives/test_program.py::test_complex_module_set_attribute_by_name', 'tests/primitives/test_program.py::test_named_parameters_duplicate_references', 'tests/primitives/test_python_interpreter.py::test_execute_simple_code', 'tests/primitives/test_python_interpreter.py::test_action_space_limitation', 'tests/primitives/test_python_interpreter.py::test_import_whitelist', 'tests/primitives/test_python_interpreter.py::test_fuzzy_variable_matching', 'tests/primitives/test_python_interpreter.py::test_text_prompt_keyword_extraction', 'tests/primitives/test_python_interpreter.py::test_text_prompt_formatting', 'tests/primitives/test_python_interpreter.py::test_code_prompt_execution', 'tests/signatures/test_signature.py::test_field_types_and_custom_attributes', 'tests/signatures/test_signature.py::test_no_input_output', 'tests/signatures/test_signature.py::test_no_input_output2', 'tests/signatures/test_signature.py::test_all_fields_have_prefix', 'tests/signatures/test_signature.py::test_signature_parsing', 'tests/signatures/test_signature.py::test_with_signature', 'tests/signatures/test_signature.py::test_with_updated_field', 'tests/signatures/test_signature.py::test_empty_signature', 'tests/signatures/test_signature.py::test_instructions_signature', 'tests/signatures/test_signature.py::test_signature_instructions', 'tests/signatures/test_signature.py::test_signature_instructions_none', 'tests/signatures/test_signature.py::test_signature_from_dict', 'tests/signatures/test_signature.py::test_signature_equality', 'tests/signatures/test_signature.py::test_signature_inequality', 'tests/signatures/test_signature.py::test_equality_format', 'tests/signatures/test_signature.py::test_signature_reverse', 'tests/signatures/test_signature.py::test_insert_field_at_various_positions', 'tests/signatures/test_signature.py::test_infer_prefix', 'tests/signatures/test_signature.py::test_insantiating', 'tests/signatures/test_signature.py::test_insantiating2', 'tests/signatures/test_signature.py::test_multiline_instructions', 'tests/signatures/test_signature.py::test_replaced_by_replace_context_manager', 'tests/signatures/test_signature.py::test_multiple_replaced_by_update_signatures', 'tests/signatures/test_signature.py::test_dump_and_load_state', 'tests/teleprompt/test_bootstrap.py::test_bootstrap_initialization', 'tests/teleprompt/test_bootstrap.py::test_compile_with_predict_instances', 'tests/teleprompt/test_bootstrap.py::test_bootstrap_effectiveness', 'tests/teleprompt/test_bootstrap.py::test_error_handling_during_bootstrap', 'tests/teleprompt/test_bootstrap.py::test_validation_set_usage', 'tests/teleprompt/test_copro_optimizer.py::test_signature_optimizer_initialization', 'tests/teleprompt/test_copro_optimizer.py::test_signature_optimizer_optimization_process', 'tests/teleprompt/test_copro_optimizer.py::test_signature_optimizer_statistics_tracking', 'tests/teleprompt/test_copro_optimizer.py::test_optimization_and_output_verification', 'tests/teleprompt/test_copro_optimizer.py::test_statistics_tracking_during_optimization', 'tests/teleprompt/test_ensemble.py::test_ensemble_without_reduction', 'tests/teleprompt/test_ensemble.py::test_ensemble_with_reduction', 'tests/teleprompt/test_ensemble.py::test_ensemble_with_size_limitation', 'tests/teleprompt/test_ensemble.py::test_ensemble_deterministic_behavior', 'tests/teleprompt/test_knn_fewshot.py::test_knn_few_shot_initialization', 'tests/teleprompt/test_random_search.py::test_basic_workflow'], 'failure': []}, 'FAIL_TO_FAIL': {'success': [], 'failure': []}, 'PASS_TO_FAIL': {'success': [], 'failure': []}}}}
+Result for stanfordnlp__dspy-1651: resolved: False
+2026-01-01 21:29:23,223 - INFO - Attempting to stop container sweb.eval.stanfordnlp__dspy-1651.live_context...
+2026-01-01 21:29:38,553 - INFO - Attempting to remove container sweb.eval.stanfordnlp__dspy-1651.live_context...
+2026-01-01 21:29:38,575 - INFO - Container sweb.eval.stanfordnlp__dspy-1651.live_context removed.

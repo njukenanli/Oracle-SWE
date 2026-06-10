@@ -1,0 +1,279 @@
+2026-01-01 21:42:23,215 - INFO - Creating container for jupyterlab__jupyter-ai-1022...
+2026-01-01 21:42:23,237 - INFO - Container for jupyterlab__jupyter-ai-1022 created: fed484ec30aebf871a1d05fd41dbd618f885b25a03aed868572dfbdd7954ba04
+2026-01-01 21:42:23,553 - INFO - Container for jupyterlab__jupyter-ai-1022 started: fed484ec30aebf871a1d05fd41dbd618f885b25a03aed868572dfbdd7954ba04
+2026-01-01 21:42:23,556 - INFO - Intermediate patch for jupyterlab__jupyter-ai-1022 written to logs/run_evaluation/live_context/con.jsonl_dev/jupyterlab__jupyter-ai-1022/patch.diff, now applying to container...
+2026-01-01 21:42:23,739 - INFO - >>>>> Applied Patch:
+Checking patch packages/jupyter-ai/jupyter_ai/chat_handlers/base.py...
+Checking patch packages/jupyter-ai/jupyter_ai/chat_handlers/default.py...
+Checking patch packages/jupyter-ai/jupyter_ai/extension.py...
+Checking patch packages/jupyter-ai/jupyter_ai/handlers.py...
+Checking patch packages/jupyter-ai/jupyter_ai/models.py...
+Applied patch packages/jupyter-ai/jupyter_ai/chat_handlers/base.py cleanly.
+Applied patch packages/jupyter-ai/jupyter_ai/chat_handlers/default.py cleanly.
+Applied patch packages/jupyter-ai/jupyter_ai/extension.py cleanly.
+Applied patch packages/jupyter-ai/jupyter_ai/handlers.py cleanly.
+Applied patch packages/jupyter-ai/jupyter_ai/models.py cleanly.
+
+2026-01-01 21:42:23,909 - INFO - Git diff before:
+diff --git a/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py b/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py
+index fb2559c..2e4abc7 100644
+--- a/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py
++++ b/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py
+@@ -14,6 +14,7 @@ from typing import (
+     Type,
+     Union,
+     cast,
++    Callable,
+ )
+ from uuid import uuid4
+ 
+@@ -140,6 +141,7 @@ class BaseChatHandler:
+         help_message_template: str,
+         chat_handlers: Dict[str, "BaseChatHandler"],
+         context_providers: Dict[str, "BaseCommandContextProvider"],
++        message_interrupted: Optional[Callable[["HumanChatMessage"], bool]] = None,
+     ):
+         self.log = log
+         self.config_manager = config_manager
+@@ -147,6 +149,9 @@ class BaseChatHandler:
+         self.model_parameters = model_parameters
+         self._chat_history = chat_history
+         self.llm_chat_memory = llm_chat_memory
++        self.message_interrupted: Callable[["HumanChatMessage"], bool] = (
++            message_interrupted or (lambda msg: False)
++        )
+         self.parser = argparse.ArgumentParser(
+             add_help=False, description=self.help, formatter_class=MarkdownHelpFormatter
+         )
+diff --git a/packages/jupyter-ai/jupyter_ai/chat_handlers/default.py b/packages/jupyter-ai/jupyter_ai/chat_handlers/default.py
+index 607dc92..dc710ee 100644
+--- a/packages/jupyter-ai/jupyter_ai/chat_handlers/default.py
++++ b/packages/jupyter-ai/jupyter_ai/chat_handlers/default.py
+@@ -137,6 +137,18 @@ class DefaultChatHandler(BaseChatHandler):
+                     "callbacks": [metadata_handler],
+                 },
+             ):
++                # allow interruption before processing the chunk
++                if self.message_interrupted(message):
++                    # close pending if still open
++                    if not received_first_chunk:
++                        self.close_pending(pending_message)
++                    # send a final stream completion without extra content
++                    if received_first_chunk:
++                        self._send_stream_chunk(
++                            stream_id, "", complete=True, metadata=metadata_handler.jai_metadata
++                        )
++                    return
++
+                 if not received_first_chunk:
+                     # when receiving the first chunk, close the pending message and
+                     # start the stream.
+diff --git a/packages/jupyter-ai/jupyter_ai/extension.py b/packages/jupyter-ai/jupyter_ai/extension.py
+index 7d93e2c..a1f8935 100644
+--- a/packages/jupyter-ai/jupyter_ai/extension.py
++++ b/packages/jupyter-ai/jupyter_ai/extension.py
+@@ -321,6 +321,12 @@ class AiExtension(ExtensionApp):
+     async def _get_dask_client(self):
+         return DaskClient(processes=False, asynchronous=True)
+ 
++    def _message_interrupted(self, human_msg):
++        # Frontend can set a flag on the message via server-side state; currently
++        # we only check a transient attribute placed by the websocket handler.
++        # If the human message has attribute `interrupted` set to True, we stop.
++        return bool(getattr(human_msg, "interrupted", False))
++
+     async def stop_extension(self):
+         """
+         Public method called by Jupyter Server when the server is stopping.
+@@ -363,6 +369,7 @@ class AiExtension(ExtensionApp):
+             "help_message_template": self.help_message_template,
+             "chat_handlers": chat_handlers,
+             "context_providers": self.settings["jai_context_providers"],
++            "message_interrupted": self._message_interrupted,
+         }
+         default_chat_handler = DefaultChatHandler(**chat_handler_kwargs)
+         clear_chat_handler = ClearChatHandler(**chat_handler_kwargs)
+@@ -381,6 +388,13 @@ class AiExtension(ExtensionApp):
+         chat_handlers["default"] = default_chat_handler
+         chat_handlers["/ask"] = ask_chat_handler
+         chat_handlers["/clear"] = clear_chat_handler
++        # optional stop command to let users stop generation via a slash command
++        try:
++            from .chat_handlers.stop import StopChatHandler
++
++            chat_handlers["/stop"] = StopChatHandler(**chat_handler_kwargs)
++        except Exception:
++            pass
+         chat_handlers["/generate"] = generate_chat_handler
+         chat_handlers["/learn"] = learn_chat_handler
+         chat_handlers["/export"] = export_chat_handler
+diff --git a/packages/jupyter-ai/jupyter_ai/handlers.py b/packages/jupyter-ai/jupyter_ai/handlers.py
+index d915279..bd1e272 100644
+--- a/packages/jupyter-ai/jupyter_ai/handlers.py
++++ b/packages/jupyter-ai/jupyter_ai/handlers.py
+@@ -279,6 +279,14 @@ class RootChatHandler(JupyterHandler, websocket.WebSocketHandler):
+             message = json.loads(message)
+             if message.get("type") == "clear":
+                 request = ClearRequest(**message)
++            elif message.get("type") == "stop-generating":
++                # set a transient attribute on the last human message to interrupt streaming
++                # this is a best-effort client-side stop; providers may not support cancel.
++                for msg in reversed(self.chat_history):
++                    if isinstance(msg, HumanChatMessage):
++                        setattr(msg, "interrupted", True)
++                        break
++                return
+             else:
+                 request = ChatRequest(**message)
+         except ValidationError as e:
+diff --git a/packages/jupyter-ai/jupyter_ai/models.py b/packages/jupyter-ai/jupyter_ai/models.py
+index 9bd59ca..60700e6 100644
+--- a/packages/jupyter-ai/jupyter_ai/models.py
++++ b/packages/jupyter-ai/jupyter_ai/models.py
+@@ -135,6 +135,10 @@ class HumanChatMessage(BaseModel):
+     """The selection included with the prompt, if any."""
+     client: ChatClient
+ 
++class StopGenerationRequest(BaseModel):
++    type: Literal["stop-generating"] = "stop-generating"
++
++
+ 
+ class ClearMessage(BaseModel):
+     type: Literal["clear"] = "clear"
+2026-01-01 21:42:23,910 - INFO - Eval script for jupyterlab__jupyter-ai-1022 written to logs/run_evaluation/live_context/con.jsonl_dev/jupyterlab__jupyter-ai-1022/eval.sh; copying to container...
+2026-01-01 21:42:31,317 - INFO - Test runtime: 7.31 seconds
+2026-01-01 21:42:31,318 - INFO - Test output for jupyterlab__jupyter-ai-1022 written to logs/run_evaluation/live_context/con.jsonl_dev/jupyterlab__jupyter-ai-1022/test_output.txt
+2026-01-01 21:42:31,409 - INFO - Git diff after:
+diff --git a/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py b/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py
+index fb2559c..2e4abc7 100644
+--- a/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py
++++ b/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py
+@@ -14,6 +14,7 @@ from typing import (
+     Type,
+     Union,
+     cast,
++    Callable,
+ )
+ from uuid import uuid4
+ 
+@@ -140,6 +141,7 @@ class BaseChatHandler:
+         help_message_template: str,
+         chat_handlers: Dict[str, "BaseChatHandler"],
+         context_providers: Dict[str, "BaseCommandContextProvider"],
++        message_interrupted: Optional[Callable[["HumanChatMessage"], bool]] = None,
+     ):
+         self.log = log
+         self.config_manager = config_manager
+@@ -147,6 +149,9 @@ class BaseChatHandler:
+         self.model_parameters = model_parameters
+         self._chat_history = chat_history
+         self.llm_chat_memory = llm_chat_memory
++        self.message_interrupted: Callable[["HumanChatMessage"], bool] = (
++            message_interrupted or (lambda msg: False)
++        )
+         self.parser = argparse.ArgumentParser(
+             add_help=False, description=self.help, formatter_class=MarkdownHelpFormatter
+         )
+diff --git a/packages/jupyter-ai/jupyter_ai/chat_handlers/default.py b/packages/jupyter-ai/jupyter_ai/chat_handlers/default.py
+index 607dc92..dc710ee 100644
+--- a/packages/jupyter-ai/jupyter_ai/chat_handlers/default.py
++++ b/packages/jupyter-ai/jupyter_ai/chat_handlers/default.py
+@@ -137,6 +137,18 @@ class DefaultChatHandler(BaseChatHandler):
+                     "callbacks": [metadata_handler],
+                 },
+             ):
++                # allow interruption before processing the chunk
++                if self.message_interrupted(message):
++                    # close pending if still open
++                    if not received_first_chunk:
++                        self.close_pending(pending_message)
++                    # send a final stream completion without extra content
++                    if received_first_chunk:
++                        self._send_stream_chunk(
++                            stream_id, "", complete=True, metadata=metadata_handler.jai_metadata
++                        )
++                    return
++
+                 if not received_first_chunk:
+                     # when receiving the first chunk, close the pending message and
+                     # start the stream.
+diff --git a/packages/jupyter-ai/jupyter_ai/extension.py b/packages/jupyter-ai/jupyter_ai/extension.py
+index 7d93e2c..a1f8935 100644
+--- a/packages/jupyter-ai/jupyter_ai/extension.py
++++ b/packages/jupyter-ai/jupyter_ai/extension.py
+@@ -321,6 +321,12 @@ class AiExtension(ExtensionApp):
+     async def _get_dask_client(self):
+         return DaskClient(processes=False, asynchronous=True)
+ 
++    def _message_interrupted(self, human_msg):
++        # Frontend can set a flag on the message via server-side state; currently
++        # we only check a transient attribute placed by the websocket handler.
++        # If the human message has attribute `interrupted` set to True, we stop.
++        return bool(getattr(human_msg, "interrupted", False))
++
+     async def stop_extension(self):
+         """
+         Public method called by Jupyter Server when the server is stopping.
+@@ -363,6 +369,7 @@ class AiExtension(ExtensionApp):
+             "help_message_template": self.help_message_template,
+             "chat_handlers": chat_handlers,
+             "context_providers": self.settings["jai_context_providers"],
++            "message_interrupted": self._message_interrupted,
+         }
+         default_chat_handler = DefaultChatHandler(**chat_handler_kwargs)
+         clear_chat_handler = ClearChatHandler(**chat_handler_kwargs)
+@@ -381,6 +388,13 @@ class AiExtension(ExtensionApp):
+         chat_handlers["default"] = default_chat_handler
+         chat_handlers["/ask"] = ask_chat_handler
+         chat_handlers["/clear"] = clear_chat_handler
++        # optional stop command to let users stop generation via a slash command
++        try:
++            from .chat_handlers.stop import StopChatHandler
++
++            chat_handlers["/stop"] = StopChatHandler(**chat_handler_kwargs)
++        except Exception:
++            pass
+         chat_handlers["/generate"] = generate_chat_handler
+         chat_handlers["/learn"] = learn_chat_handler
+         chat_handlers["/export"] = export_chat_handler
+diff --git a/packages/jupyter-ai/jupyter_ai/handlers.py b/packages/jupyter-ai/jupyter_ai/handlers.py
+index d915279..bd1e272 100644
+--- a/packages/jupyter-ai/jupyter_ai/handlers.py
++++ b/packages/jupyter-ai/jupyter_ai/handlers.py
+@@ -279,6 +279,14 @@ class RootChatHandler(JupyterHandler, websocket.WebSocketHandler):
+             message = json.loads(message)
+             if message.get("type") == "clear":
+                 request = ClearRequest(**message)
++            elif message.get("type") == "stop-generating":
++                # set a transient attribute on the last human message to interrupt streaming
++                # this is a best-effort client-side stop; providers may not support cancel.
++                for msg in reversed(self.chat_history):
++                    if isinstance(msg, HumanChatMessage):
++                        setattr(msg, "interrupted", True)
++                        break
++                return
+             else:
+                 request = ChatRequest(**message)
+         except ValidationError as e:
+diff --git a/packages/jupyter-ai/jupyter_ai/models.py b/packages/jupyter-ai/jupyter_ai/models.py
+index 9bd59ca..60700e6 100644
+--- a/packages/jupyter-ai/jupyter_ai/models.py
++++ b/packages/jupyter-ai/jupyter_ai/models.py
+@@ -135,6 +135,10 @@ class HumanChatMessage(BaseModel):
+     """The selection included with the prompt, if any."""
+     client: ChatClient
+ 
++class StopGenerationRequest(BaseModel):
++    type: Literal["stop-generating"] = "stop-generating"
++
++
+ 
+ class ClearMessage(BaseModel):
+     type: Literal["clear"] = "clear"
+2026-01-01 21:42:31,410 - INFO - Grading answer for jupyterlab__jupyter-ai-1022...
+2026-01-01 21:42:31,420 - INFO - report: {'jupyterlab__jupyter-ai-1022': {'patch_is_None': False, 'patch_exists': True, 'patch_successfully_applied': True, 'resolved': True, 'tests_status': {'FAIL_TO_PASS': {'success': ['packages/jupyter-ai/jupyter_ai/tests/test_handlers.py::test_default_closes_pending_on_success', 'packages/jupyter-ai/jupyter_ai/tests/test_handlers.py::test_default_closes_pending_on_error', 'packages/jupyter-ai/jupyter_ai/tests/test_handlers.py::test_sends_closing_message_at_most_once'], 'failure': []}, 'PASS_TO_PASS': {'success': ['packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_snapshot_default_config', 'packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_property_access_on_default_config', 'packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_indentation_depth', 'packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_update_fails_with_invalid_req', 'packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_handle_bad_provider_ids', 'packages/jupyter-ai/jupyter_ai/tests/test_context_providers.py::test_find_instances', 'packages/jupyter-ai/jupyter_ai/tests/test_context_providers.py::test_replace_prompt', 'packages/jupyter-ai/jupyter_ai/tests/test_directory.py::test_collect_filepaths', 'packages/jupyter-ai/jupyter_ai/tests/test_extension.py::test_max_chat_history[1-4-2]', 'packages/jupyter-ai/jupyter_ai/tests/test_extension.py::test_max_chat_history[1-1-1]', 'packages/jupyter-ai/jupyter_ai/tests/test_extension.py::test_max_chat_history[None-9-9]', 'packages/jupyter-ai/jupyter_ai/tests/test_handlers.py::test_learn_index_permissions', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_on_message', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_on_message_stream', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_request', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_request_with_spurious_fragments[```python\\nTest', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_request_with_spurious_fragments[```\\ntest\\n```\\n', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_request_with_spurious_fragments[```hello```world```-hello```world]', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_request_with_spurious_fragments[', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_request_with_spurious_fragments[```', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_request_with_spurious_fragments_stream[```python\\nTest', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_request_with_spurious_fragments_stream[```\\ntest\\n```\\n', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_request_with_spurious_fragments_stream[```hello```world```-hello```world]', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_request_with_spurious_fragments_stream[', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_request_with_spurious_fragments_stream[```', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_stream_request', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_aliases_config', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_default_model_cell', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_non_default_model_cell', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_default_model_error_line', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_reset', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_provider_metaclass.py::test_provider_metaclass', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_provider_metaclass.py::test_base_provider_server_settings_read_only', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_utils.py::test_get_lm_providers_restricted[restrictions0]', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_utils.py::test_get_lm_providers_restricted[restrictions1]'], 'failure': []}, 'FAIL_TO_FAIL': {'success': [], 'failure': []}, 'PASS_TO_FAIL': {'success': [], 'failure': []}}}}
+Result for jupyterlab__jupyter-ai-1022: resolved: True
+2026-01-01 21:42:31,421 - INFO - Attempting to stop container sweb.eval.jupyterlab__jupyter-ai-1022.live_context...
+2026-01-01 21:42:46,655 - INFO - Attempting to remove container sweb.eval.jupyterlab__jupyter-ai-1022.live_context...
+2026-01-01 21:42:46,680 - INFO - Container sweb.eval.jupyterlab__jupyter-ai-1022.live_context removed.

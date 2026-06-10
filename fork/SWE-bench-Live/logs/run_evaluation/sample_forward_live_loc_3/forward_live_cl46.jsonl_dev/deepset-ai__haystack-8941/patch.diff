@@ -1,0 +1,124 @@
+diff --git a/haystack/components/embedders/azure_document_embedder.py b/haystack/components/embedders/azure_document_embedder.py
+index 2223c82b..85fc6f0b 100644
+--- a/haystack/components/embedders/azure_document_embedder.py
++++ b/haystack/components/embedders/azure_document_embedder.py
+@@ -5,12 +5,15 @@
+ import os
+ from typing import Any, Dict, List, Optional, Tuple
+ 
++from openai import APIError, BadRequestError
+ from openai.lib.azure import AzureOpenAI
+ from tqdm import tqdm
+ 
+-from haystack import Document, component, default_from_dict, default_to_dict
++from haystack import Document, component, default_from_dict, default_to_dict, logging
+ from haystack.utils import Secret, deserialize_secrets_inplace
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ @component
+ class AzureOpenAIDocumentEmbedder:
+@@ -199,33 +202,66 @@ class AzureOpenAIDocumentEmbedder:
+             texts_to_embed.append(text_to_embed)
+         return texts_to_embed
+ 
+-    def _embed_batch(self, texts_to_embed: List[str], batch_size: int) -> Tuple[List[List[float]], Dict[str, Any]]:
++    def _embed_batch(self, texts_to_embed: List[str], batch_size: int) -> Tuple[List[Optional[List[float]]], Dict[str, Any]]:
+         """
+         Embed a list of texts in batches.
++
++        This method is resilient to API errors: if embedding a whole batch fails,
++        it attempts to bisect the batch to isolate problematic documents and embed
++        as many as possible. For documents that cannot be embedded, the resulting
++        embedding will be set to None.
+         """
+ 
+-        all_embeddings: List[List[float]] = []
++        # Prepare a result list aligned with input order, filled with None initially
++        all_embeddings: List[Optional[List[float]]] = [None] * len(texts_to_embed)
+         meta: Dict[str, Any] = {"model": "", "usage": {"prompt_tokens": 0, "total_tokens": 0}}
+-        for i in tqdm(range(0, len(texts_to_embed), batch_size), desc="Embedding Texts"):
+-            batch = texts_to_embed[i : i + batch_size]
++
++        def _embed_range(start: int, end: int) -> None:
++            """Try to embed texts_to_embed[start:end]. On failure, bisect until isolating failing docs."""
++            batch = texts_to_embed[start:end]
++            if not batch:
++                return
++            args: Dict[str, Any] = {"model": self.azure_deployment, "input": batch}
+             if self.dimensions is not None:
+-                response = self._client.embeddings.create(
+-                    model=self.azure_deployment, dimensions=self.dimensions, input=batch
+-                )
+-            else:
+-                response = self._client.embeddings.create(model=self.azure_deployment, input=batch)
+-
+-            # Append embeddings to the list
+-            all_embeddings.extend(el.embedding for el in response.data)
+-
+-            # Update the meta information only once if it's empty
+-            if not meta["model"]:
+-                meta["model"] = response.model
+-                meta["usage"] = dict(response.usage)
+-            else:
+-                # Update the usage tokens
+-                meta["usage"]["prompt_tokens"] += response.usage.prompt_tokens
+-                meta["usage"]["total_tokens"] += response.usage.total_tokens
++                args["dimensions"] = self.dimensions
++            try:
++                response = self._client.embeddings.create(**args)
++                # place embeddings aligned with original positions
++                for offset, el in enumerate(response.data):
++                    all_embeddings[start + offset] = el.embedding
++                # meta info from successful calls
++                def _get_usage_value(usage_obj: Any, key: str) -> int:
++                    # usage may be a dict-like or an object with attributes
++                    if isinstance(usage_obj, dict):
++                        return int(usage_obj.get(key, 0))
++                    return int(getattr(usage_obj, key, 0))
++
++                if not meta["model"]:
++                    meta["model"] = response.model
++                    # initialize usage as a dict
++                    meta["usage"] = {
++                        "prompt_tokens": _get_usage_value(response.usage, "prompt_tokens"),
++                        "total_tokens": _get_usage_value(response.usage, "total_tokens"),
++                    }
++                else:
++                    meta["usage"]["prompt_tokens"] += _get_usage_value(response.usage, "prompt_tokens")
++                    meta["usage"]["total_tokens"] += _get_usage_value(response.usage, "total_tokens")
++            except Exception as exc:  # noqa: BLE001 - catch all to be resilient
++                # If single item fails, mark as None and log
++                if end - start <= 1:
++                    logger.exception(
++                        "Failed embedding of document index {index} caused by {exc}", index=start, exc=exc
++                    )
++                    all_embeddings[start] = None
++                    return
++                # Otherwise, bisect the range and try embedding sub-ranges
++                mid = start + (end - start) // 2
++                _embed_range(start, mid)
++                _embed_range(mid, end)
++
++        # Iterate over batches for progress reporting, but within each batch attempt bisect on failures
++        for i in tqdm(range(0, len(texts_to_embed), batch_size), desc="Embedding Texts"):
++            _embed_range(i, min(i + batch_size, len(texts_to_embed)))
+ 
+         return all_embeddings, meta
+ 
+@@ -248,8 +284,11 @@ class AzureOpenAIDocumentEmbedder:
+         texts_to_embed = self._prepare_texts_to_embed(documents=documents)
+         embeddings, meta = self._embed_batch(texts_to_embed=texts_to_embed, batch_size=self.batch_size)
+ 
+-        # Assign the corresponding embeddings to each document
++        # Assign the corresponding embeddings to each document, if available
+         for doc, emb in zip(documents, embeddings):
+-            doc.embedding = emb
++            if emb is not None:
++                doc.embedding = emb
++        # Filter out documents without embeddings
++        documents_with_embeddings = [doc for doc, emb in zip(documents, embeddings) if emb is not None]
+ 
+-        return {"documents": documents, "meta": meta}
++        return {"documents": documents_with_embeddings, "meta": meta}

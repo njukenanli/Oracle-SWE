@@ -1,0 +1,194 @@
+diff --git a/django/core/servers/basehttp.py b/django/core/servers/basehttp.py
+index fef5532e58..f74c826da0 100644
+--- a/django/core/servers/basehttp.py
++++ b/django/core/servers/basehttp.py
+@@ -143,6 +143,50 @@ class ServerHandler(simple_server.ServerHandler):
+         if self.headers.get("Connection") == "close":
+             self.request_handler.close_connection = True
+ 
++    def write(self, data):
++        """Override write to suppress response body for HEAD requests.
++
++        For compliance with RFC 2616/7231, the response to a HEAD request must
++        not include a message body. Ensure headers are sent but discard any
++        body bytes that the application attempts to write.
++        """
++        # Ensure start_response() has been called.
++        if not self.status:
++            raise AssertionError("write() before start_response()")
++        # If headers haven't been sent yet, send them first.
++        if not self.headers_sent:
++            if self.environ.get("REQUEST_METHOD") == "HEAD":
++                # For HEAD requests, send headers now but do not set bytes_sent.
++                # This avoids forcing a Content-Length header of 0; upstream
++                # applications may have provided an appropriate Content-Length.
++                self.send_headers()
++            else:
++                # Delegate to the base implementation for non-HEAD requests.
++                return super().write(data)
++        # If this is a HEAD request, suppress body writes entirely.
++        if self.environ.get("REQUEST_METHOD") == "HEAD":
++            return
++        # Non-HEAD fallback: use the base implementation which writes data.
++        return super().write(data)
++
++    def finish_response(self):
++        """Finalize the response, suppressing the body for HEAD requests.
++
++        Ensure that no response body is written for HEAD requests while still
++        sending headers and properly closing the result iterator.
++        """
++        if self.environ.get("REQUEST_METHOD") == "HEAD":
++            # Send headers if needed, but don't write any body.
++            if not self.headers_sent:
++                self.send_headers()
++            # Close the result if it has a close() method without iterating
++            # through the response body to avoid unnecessary work.
++            if hasattr(self.result, "close"):
++                self.result.close()
++            self.close()
++            return
++        return super().finish_response()
++
+     def close(self):
+         self.get_stdin().read()
+         super().close()
+diff --git a/repro_head.py b/repro_head.py
+new file mode 100644
+index 0000000000..48d9caf69f
+--- /dev/null
++++ b/repro_head.py
+@@ -0,0 +1,39 @@
++import threading
++import time
++import http.client
++import socket
++
++from django.core.servers.basehttp import run
++
++
++def simple_app(environ, start_response):
++    status = '200 OK'
++    headers = [('Content-Type', 'text/plain')]
++    start_response(status, headers)
++    # Return a non-empty body so that HEAD should strip it.
++    return [b'Hello World!']
++
++
++def start_server():
++    # Bind to an unused port
++    addr = '127.0.0.1'
++    port = 8765
++    run(addr, port, simple_app, ipv6=False, threading=True)
++
++
++def main():
++    t = threading.Thread(target=start_server, daemon=True)
++    t.start()
++    # Wait a bit for server to start
++    time.sleep(0.5)
++    conn = http.client.HTTPConnection('127.0.0.1', 8765, timeout=5)
++    conn.request('HEAD', '/')
++    resp = conn.getresponse()
++    body = resp.read()
++    print('Status:', resp.status)
++    print('Content-Type:', resp.getheader('Content-Type'))
++    print('Body length:', len(body))
++    conn.close()
++
++if __name__ == '__main__':
++    main()
+diff --git a/repro_head_raw.py b/repro_head_raw.py
+new file mode 100644
+index 0000000000..384ccc371b
+--- /dev/null
++++ b/repro_head_raw.py
+@@ -0,0 +1,44 @@
++import threading
++import time
++import socket
++
++from django.core.servers.basehttp import run
++
++
++def simple_app(environ, start_response):
++    status = '200 OK'
++    headers = [('Content-Type', 'text/plain')]
++    start_response(status, headers)
++    return [b'Hello World!\nThis is a body after HEAD should not be sent.']
++
++
++def start_server():
++    addr = '127.0.0.1'
++    port = 8766
++    run(addr, port, simple_app, ipv6=False, threading=False)
++
++
++def main():
++    t = threading.Thread(target=start_server, daemon=True)
++    t.start()
++    time.sleep(0.5)
++    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++    s.connect(('127.0.0.1', 8766))
++    req = (
++        'HEAD / HTTP/1.1\r\n'
++        'Host: 127.0.0.1\r\n'
++        '\r\n'
++    ).encode('ascii')
++    s.sendall(req)
++    print('Raw response bytes:')
++    chunks = []
++    while True:
++        data = s.recv(4096)
++        if not data:
++            break
++        chunks.append(data)
++    print(b''.join(chunks).decode('latin1'))
++    s.close()
++
++if __name__ == '__main__':
++    main()
+diff --git a/repro_head_write.py b/repro_head_write.py
+new file mode 100644
+index 0000000000..b5f3bef32c
+--- /dev/null
++++ b/repro_head_write.py
+@@ -0,0 +1,38 @@
++import threading
++import time
++import http.client
++
++from django.core.servers.basehttp import run
++
++
++def simple_app(environ, start_response):
++    status = '200 OK'
++    headers = [('Content-Type', 'text/plain')]
++    write = start_response(status, headers)
++    # Use the write() callable to emit body data.
++    write(b'Hello via write()')
++    return []
++
++
++def start_server():
++    addr = '127.0.0.1'
++    port = 8767
++    run(addr, port, simple_app, ipv6=False, threading=True)
++
++
++def main():
++    t = threading.Thread(target=start_server, daemon=True)
++    t.start()
++    time.sleep(0.5)
++    conn = http.client.HTTPConnection('127.0.0.1', 8767, timeout=5)
++    conn.request('HEAD', '/')
++    resp = conn.getresponse()
++    body = resp.read()
++    print('Status:', resp.status)
++    print('Content-Type:', resp.getheader('Content-Type'))
++    print('Body length:', len(body))
++    print('Content-Length header:', resp.getheader('Content-Length'))
++    conn.close()
++
++if __name__ == '__main__':
++    main()

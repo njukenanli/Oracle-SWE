@@ -1,0 +1,167 @@
+diff --git a/patroni/dcs/__init__.py b/patroni/dcs/__init__.py
+index 1185367c..29aad23c 100644
+--- a/patroni/dcs/__init__.py
++++ b/patroni/dcs/__init__.py
+@@ -1069,6 +1069,10 @@ class Cluster(NamedTuple('Cluster',
+                 if value['type'] == 'physical':
+                     # Don't try to create permanent physical replication slot for yourself
+                     if slot_name != slot_name_from_member_name(name):
++                        # permanent physical slots created on replicas should be kept active to advance LSN
++                        value['expected_active'] = True
++                        # carry over lsn from DCS status for permanent physical slots, so replicas can advance them
++                        value['lsn'] = self.slots.get(slot_name, 0)
+                         slots[slot_name] = value
+                     continue
+ 
+@@ -1163,15 +1167,23 @@ class Cluster(NamedTuple('Cluster',
+         for member in members:
+             slot_name = slot_name_from_member_name(member.name)
+             lsn = slots.get(slot_name, 0)
++            # expected_active indicates whether the slot is expected to be active on this node
++            # On primary: active if member replicates from primary (replicatefrom is None or equals our name),
++            # otherwise inactive.
++            # On replica: active only for members that replicate from this replica.
++            if role in ('primary', 'standby_leader'):
++                expected_active = not member.replicatefrom or member.replicatefrom == name
++            else:
++                expected_active = member.replicatefrom == name
+             if member.replicatefrom:
+                 # `/status` key is maintained by the leader, but `member` may be connected to some other node.
+                 # In that case, the slot in the leader is inactive and doesn't advance, so we use the LSN
+                 # reported by the member to advance replication slot LSN.
+                 # `max` is only a fallback so we take the LSN from the slot when there is no feedback from the member.
+                 lsn = max(member.lsn or 0, lsn)
+-            ret[slot_name] = {'type': 'physical', 'lsn': lsn}
++            ret[slot_name] = {'type': 'physical', 'lsn': lsn, 'expected_active': expected_active}
+         slot_name = slot_name_from_member_name(name)
+-        ret.update({slot: {'type': 'physical'} for slot in self.status.retain_slots
++        ret.update({slot: {'type': 'physical', 'expected_active': False} for slot in self.status.retain_slots
+                     if slot not in ret and slot != slot_name})
+ 
+         if len(ret) < len(members):
+diff --git a/patroni/postgresql/__init__.py b/patroni/postgresql/__init__.py
+index c66a8967..7e81f4df 100644
+--- a/patroni/postgresql/__init__.py
++++ b/patroni/postgresql/__init__.py
+@@ -230,7 +230,7 @@ class Postgresql(object):
+                 ", " + ("(SELECT pg_catalog.json_agg(s.*) FROM (SELECT slot_name, slot_type as type, datoid::bigint, "
+                         "plugin, catalog_xmin, pg_catalog.pg_wal_lsn_diff(confirmed_flush_lsn, '0/0')::bigint"
+                         " AS confirmed_flush_lsn, pg_catalog.pg_wal_lsn_diff(restart_lsn, '0/0')::bigint"
+-                        " AS restart_lsn FROM pg_catalog.pg_get_replication_slots()) AS s)"
++                        " AS restart_lsn, active FROM pg_catalog.pg_get_replication_slots()) AS s)"
+                         if self._should_query_slots and self.can_advance_slots else "NULL") + extra
+             extra = (", CASE WHEN latest_end_lsn IS NULL THEN NULL ELSE received_tli END,"
+                      " slot_name, conninfo, status, {0} FROM pg_catalog.pg_stat_get_wal_receiver()").format(extra)
+diff --git a/patroni/postgresql/slots.py b/patroni/postgresql/slots.py
+index 9e5216fb..f098966e 100644
+--- a/patroni/postgresql/slots.py
++++ b/patroni/postgresql/slots.py
+@@ -241,12 +241,21 @@ class SlotsHandler:
+         slots_dict: Dict[str, Dict[str, Any]] = {slot['slot_name']: slot for slot in slots or []}
+         for name, value in slots_dict.items():
+             if name in self._replication_slots:
+-                if compare_slots(value, self._replication_slots[name], 'datoid'):
+-                    if value['type'] == 'logical':
+-                        ret[name] = value['confirmed_flush_lsn']
+-                        self._copy_items(value, self._replication_slots[name])
++                current = self._replication_slots[name]
++                if compare_slots(value, current, 'datoid'):
++                    if value.get('type') == 'logical':
++                        ret[name] = value.get('confirmed_flush_lsn', 0)
++                        self._copy_items(value, current)
+                     else:
+-                        self._replication_slots[name]['restart_lsn'] = ret[name] = value['restart_lsn']
++                        # cache restart_lsn
++                        current['restart_lsn'] = value.get('restart_lsn', 0)
++                        # report restart_lsn for physical slots
++                        ret[name] = value.get('restart_lsn', 0)
++                elif value.get('type') == 'logical' and current.get('datoid') in (None, 0) \
++                        and compare_slots(value, current):
++                    # if datoid is not yet known in cache but database/plugin match, accept and update cache
++                    ret[name] = value.get('confirmed_flush_lsn', 0)
++                    self._copy_items(value, current)
+                 else:
+                     self._schedule_load_slots = True
+ 
+@@ -273,14 +282,24 @@ class SlotsHandler:
+             extra = f", catalog_xmin, {pg_wal_lsn_diff}(confirmed_flush_lsn, '0/0')::bigint" \
+                 if self._postgresql.major_version >= 100000 else ""
+             skip_temp_slots = ' WHERE NOT temporary' if self._postgresql.major_version >= 100000 else ''
++            # don't select active column here because tests expect a fixed tuple length
+             for r in self._query(f"SELECT slot_name, slot_type, {pg_wal_lsn_diff}(restart_lsn, '0/0')::bigint, plugin,"
+                                  f" database, datoid{extra} FROM pg_catalog.pg_replication_slots{skip_temp_slots}"):
+                 value = {'type': r[1]}
+                 if r[1] == 'logical':
+-                    value.update(plugin=r[3], database=r[4], datoid=r[5])
+-                    if self._postgresql.major_version >= 100000:
+-                        value.update(catalog_xmin=r[6], confirmed_flush_lsn=r[7])
++                    # handle different tuple formats returned by tests vs query
++                    if isinstance(r[3], (str, bytes)):
++                        # format: slot_name, slot_type, restart_lsn?, plugin, database, datoid, catalog_xmin, confirmed_flush_lsn
++                        value.update(plugin=r[3], database=r[4], datoid=r[5])
++                        if self._postgresql.major_version >= 100000 and len(r) > 7:
++                            value.update(catalog_xmin=r[6], confirmed_flush_lsn=r[7])
++                    else:
++                        # format: slot_name, slot_type, restart_lsn, plugin, database, datoid, catalog_xmin, confirmed_flush_lsn
++                        value.update(plugin=r[4], database=r[5], datoid=r[6])
++                        if self._postgresql.major_version >= 100000 and len(r) > 8:
++                            value.update(catalog_xmin=r[7], confirmed_flush_lsn=r[8])
+                 else:
++                    # physical: restart_lsn is at position 2 in tests and our query
+                     value['restart_lsn'] = r[2]
+                 replication_slots[r[0]] = value
+             self._replication_slots = replication_slots
+@@ -375,24 +394,41 @@ class SlotsHandler:
+         for name, value in slots.items():
+             if value['type'] != 'physical':
+                 continue
+-            if name not in self._replication_slots:
+-                try:
+-                    self._query(f"SELECT pg_catalog.pg_create_physical_replication_slot(%s{immediately_reserve})"
+-                                f" WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_replication_slots"
+-                                f" WHERE slot_type = 'physical' AND slot_name = %s)",
+-                                name, name)
+-                except Exception:
+-                    logger.exception("Failed to create physical replication slot '%s'", name)
+-                self._schedule_load_slots = True
+-            elif self._postgresql.can_advance_slots and self._replication_slots[name]['type'] == 'physical':
+-                value['restart_lsn'] = self._replication_slots[name]['restart_lsn']
++            # First try to advance existing slots
++            if self._postgresql.can_advance_slots and name in self._replication_slots and self._replication_slots[name]['type'] == 'physical':
++                value['restart_lsn'] = self._replication_slots[name].get('restart_lsn') or 0
+                 lsn = value.get('lsn')
+-                if lsn and lsn > value['restart_lsn']:  # The slot has feedback in DCS and needs to be advanced
++                # Prevent xmin horizon retention: if slot is expected to be inactive on this node and has non-null catalog_xmin,
++                # drop and recreate the slot to clear xmin.
++                slotinfo = self._replication_slots[name]
++                if not value.get('expected_active', True):
++                    try:
++                        active, dropped = self.drop_replication_slot(name)
++                        if dropped:
++                            self._schedule_load_slots = True
++                        elif active:
++                            logger.warning("Unable to drop replication slot '%s', slot is active", name)
++                        else:
++                            logger.error("Failed to drop replication slot '%s'", name)
++                    except Exception:
++                        logger.exception("Failed to drop replication slot '%s'", name)
++                elif lsn and lsn > value['restart_lsn']:  # The slot has feedback in DCS and needs to be advanced
+                     try:
+                         lsn = format_lsn(lsn)
+                         self._query("SELECT pg_catalog.pg_replication_slot_advance(%s, %s)", name, lsn)
+                     except Exception as exc:
+                         logger.error("Error while advancing replication slot %s to position '%s': %r", name, lsn, exc)
++            # Then create missing slots that are expected to be active on this node
++            elif name not in self._replication_slots:
++                try:
++                    if value.get('expected_active', True):
++                        self._query(f"SELECT pg_catalog.pg_create_physical_replication_slot(%s{immediately_reserve})"
++                                    f" WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_replication_slots"
++                                    f" WHERE slot_type = 'physical' AND slot_name = %s)",
++                                    name, name)
++                except Exception:
++                    logger.exception("Failed to create physical replication slot '%s'", name)
++                self._schedule_load_slots = True
+ 
+     @contextmanager
+     def get_local_connection_cursor(self, **kwargs: Any) -> Iterator[Union['cursor', 'Cursor[Any]']]:

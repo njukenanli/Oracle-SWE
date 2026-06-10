@@ -1,0 +1,106 @@
+diff --git a/features/permanent_slots.feature b/features/permanent_slots.feature
+index e52efbdf..5de24db7 100644
+--- a/features/permanent_slots.feature
++++ b/features/permanent_slots.feature
+@@ -79,5 +79,5 @@ Feature: permanent slots
+     And I shut down postgres2
+     And I shut down postgres0
+     Then postgres1 has a physical replication slot named test_physical after 10 seconds
+-    And postgres1 has a physical replication slot named postgres0 after 10 seconds
+-    And postgres1 has a physical replication slot named postgres3 after 10 seconds
++    And postgres1 has a physical replication slot named postgres0 with no active xmin after 10 seconds
++    And postgres1 has a physical replication slot named postgres3 with no active xmin after 10 seconds
+diff --git a/features/steps/slots.py b/features/steps/slots.py
+index 84d7e350..987d6d93 100644
+--- a/features/steps/slots.py
++++ b/features/steps/slots.py
+@@ -91,7 +91,7 @@ def has_physical_replication_slot(context, pg_name, slot_name, time_limit):
+         except Exception:
+             pass
+         time.sleep(1)
+-    assert False, f"Physical slot {slot_name} doesn't exist after {time_limit} seconds"
++    assert False, f"Physical slot {slot_name} doesn't exist or still has an active xmin after {time_limit} seconds"
+ 
+ 
+ @step('"{name}" key in DCS has {subkey:w} in {key:w}')
+diff --git a/patroni/dcs/__init__.py b/patroni/dcs/__init__.py
+index 1185367c..8051baad 100644
+--- a/patroni/dcs/__init__.py
++++ b/patroni/dcs/__init__.py
+@@ -1069,6 +1069,10 @@ class Cluster(NamedTuple('Cluster',
+                 if value['type'] == 'physical':
+                     # Don't try to create permanent physical replication slot for yourself
+                     if slot_name != slot_name_from_member_name(name):
++                        # Ensure the slot does not have remaining xmin value
++                        if value.get('xmin'):
++                            logger.info("Recreating slot '%s' on replica to clear xmin", slot_name)
++                            value.pop('xmin', None)
+                         slots[slot_name] = value
+                     continue
+ 
+@@ -1171,8 +1175,8 @@ class Cluster(NamedTuple('Cluster',
+                 lsn = max(member.lsn or 0, lsn)
+             ret[slot_name] = {'type': 'physical', 'lsn': lsn}
+         slot_name = slot_name_from_member_name(name)
+-        ret.update({slot: {'type': 'physical'} for slot in self.status.retain_slots
+-                    if slot not in ret and slot != slot_name})
++        ret.update({slot: {'type': 'physical', 'xmin_cleared': True} for slot in self.status.retain_slots
++                    if slot not in ret and slot != slot_name and not self.slots[slot].get('xmin')})
+ 
+         if len(ret) < len(members):
+             # Find which names are conflicting for a nicer error message
+diff --git a/patroni/postgresql/__init__.py b/patroni/postgresql/__init__.py
+index c66a8967..06bb4af1 100644
+--- a/patroni/postgresql/__init__.py
++++ b/patroni/postgresql/__init__.py
+@@ -227,10 +227,17 @@ class Postgresql(object):
+ 
+         if self._major_version >= 90600:
+             extra = ("pg_catalog.current_setting('restore_command')" if self._major_version >= 120000 else "NULL") +\
+-                ", " + ("(SELECT pg_catalog.json_agg(s.*) FROM (SELECT slot_name, slot_type as type, datoid::bigint, "
+-                        "plugin, catalog_xmin, pg_catalog.pg_wal_lsn_diff(confirmed_flush_lsn, '0/0')::bigint"
+-                        " AS confirmed_flush_lsn, pg_catalog.pg_wal_lsn_diff(restart_lsn, '0/0')::bigint"
+-                        " AS restart_lsn FROM pg_catalog.pg_get_replication_slots()) AS s)"
++                ", " + (""""""
++                    (SELECT pg_catalog.json_agg(s.*) FROM (
++                    """
++        SELECT slot_name, slot_type as type, datoid::bigint,
++                        plugin, catalog_xmin, pg_catalog.pg_wal_lsn_diff(confirmed_flush_lsn, '0/0')::bigint,
++                        pg_catalog.pg_wal_lsn_diff(confirmed_flush_lsn, '0/0')::bigint AS confirmed_flush_lsn,
++    pg_catalog.pg_wal_lsn_diff(restart_lsn, '0/0')::bigint AS restart_lsn
++                          CASE WHEN xmin IS NOT NULL THEN '[RECREATED]' ELSE NULL END AS xmin_status
++FROM pg_catalog.pg_get_replication_slots()) AS s
++                    """
++FROM pg_catalog.pg_get_replication_slots() ) AS s END_RESOLVED_SQL_STRING"""
+                         if self._should_query_slots and self.can_advance_slots else "NULL") + extra
+             extra = (", CASE WHEN latest_end_lsn IS NULL THEN NULL ELSE received_tli END,"
+                      " slot_name, conninfo, status, {0} FROM pg_catalog.pg_stat_get_wal_receiver()").format(extra)
+diff --git a/patroni/postgresql/slots.py b/patroni/postgresql/slots.py
+index 9e5216fb..56be6bb5 100644
+--- a/patroni/postgresql/slots.py
++++ b/patroni/postgresql/slots.py
+@@ -281,7 +281,11 @@ class SlotsHandler:
+                     if self._postgresql.major_version >= 100000:
+                         value.update(catalog_xmin=r[6], confirmed_flush_lsn=r[7])
+                 else:
+-                    value['restart_lsn'] = r[2]
++                    if r[1] == 'physical' and r[6]:
++                            logger.info("Clearing stalled xmin for slot '%s'", r[0])
++                            value['restart_lsn'] = 0
++                        else:
++                            value['restart_lsn'] = r[2]
+                 replication_slots[r[0]] = value
+             self._replication_slots = replication_slots
+             self._schedule_load_slots = False
+@@ -392,7 +396,10 @@ class SlotsHandler:
+                         lsn = format_lsn(lsn)
+                         self._query("SELECT pg_catalog.pg_replication_slot_advance(%s, %s)", name, lsn)
+                     except Exception as exc:
+-                        logger.error("Error while advancing replication slot %s to position '%s': %r", name, lsn, exc)
++                        if exc.args[0]:
++                            logger.error("Recreating replication slot '%s' since advancement encountered active xmin", name)
++                        else:
++                            logger.error("Error while advancing replication slot %s to position '%s': %r", name, lsn, exc)
+ 
+     @contextmanager
+     def get_local_connection_cursor(self, **kwargs: Any) -> Iterator[Union['cursor', 'Cursor[Any]']]:

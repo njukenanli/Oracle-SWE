@@ -1,0 +1,186 @@
+diff --git a/torchtune/modules/loss/ce_chunked_output_loss.py b/torchtune/modules/loss/ce_chunked_output_loss.py
+index 17a5eced..63716037 100644
+--- a/torchtune/modules/loss/ce_chunked_output_loss.py
++++ b/torchtune/modules/loss/ce_chunked_output_loss.py
+@@ -42,6 +42,21 @@ class CEWithChunkedOutputLoss(torch.nn.Module):
+             logits.float(), labels, ignore_index=self.ignore_index, reduction="sum"
+         )
+ 
++    def _split_labels_by_chunks(self, labels: torch.Tensor, logits_chunks: List[torch.Tensor]) -> List[torch.Tensor]:
++        """
++        Split labels along dim=1 to match the sequence lengths of the provided logits chunks.
++        This ensures we always produce exactly len(logits_chunks) label chunks and sizes align
++        even when num_tokens is not divisible by num_output_chunks or is smaller than it.
++        """
++        offsets = []
++        start = 0
++        for chunk in logits_chunks:
++            L = chunk.size(1)
++            offsets.append((start, L))
++            start += L
++        out = [labels[:, s:s+L].reshape(-1) for (s, L) in offsets]
++        return out
++
+     def forward(self, logits: List[torch.Tensor], labels: torch.Tensor) -> torch.Tensor:
+         """
+         Args:
+@@ -66,10 +81,7 @@ class CEWithChunkedOutputLoss(torch.nn.Module):
+         total_elements = (labels != self.ignore_index).sum()
+ 
+         # chunk and reshape labels (bsz, num_tokens, vocab) -> [(bsz*num_tokens/num_chunks, vocab)]
+-        labels = [
+-            target_chunk.reshape(-1)
+-            for target_chunk in labels.chunk(self.num_output_chunks, dim=1)
+-        ]
++        labels = self._split_labels_by_chunks(labels, logits)
+         # reshape logits [(bsz, num_tokens/num_chunks, vocab)] -> [(bsz*num_tokens/num_chunks, vocab)]
+         logits = [
+             logit_chunk.reshape(-1, logit_chunk.size(-1)) for logit_chunk in logits
+diff --git a/torchtune/modules/loss/kd_losses.py b/torchtune/modules/loss/kd_losses.py
+index c3d48af8..02847d94 100644
+--- a/torchtune/modules/loss/kd_losses.py
++++ b/torchtune/modules/loss/kd_losses.py
+@@ -10,6 +10,23 @@ import torch
+ import torch.nn.functional as F
+ 
+ 
++
++def _split_labels_by_chunks(labels: torch.Tensor, logits_chunks: List[torch.Tensor]) -> List[torch.Tensor]:
++    """
++    Split labels along dim=1 to match the sequence lengths of the provided logits chunks.
++    This ensures we always produce exactly len(logits_chunks) label chunks and sizes align
++    even when num_tokens is not divisible by num_output_chunks or is smaller than it.
++    """
++    offsets = []
++    start = 0
++    for chunk in logits_chunks:
++        L = chunk.size(1)
++        offsets.append((start, L))
++        start += L
++    out = [labels[:, s:s+L].reshape(-1) for (s, L) in offsets]
++    return out
++
++
+ class ForwardKLLoss(torch.nn.Module):
+     """
+     The Kullback-Leibler divergence loss for valid indexes.
+@@ -223,6 +240,13 @@ class ForwardKLWithChunkedOutputLoss(torch.nn.Module):
+             >>> loss = loss_fn(output_chunks, teacher_chunks, labels)
+         """
+ 
++        # compute denominator from full labels mask before splitting
++        full_mask = (labels != self.ignore_index).int()
++        sum_masks = torch.sum(full_mask.view(-1), dim=0)
++        if sum_masks == 0:
++            return torch.tensor(0.0, device=teacher_logits[0].device)
++        # split labels before flattening logits
++        label_chunks = _split_labels_by_chunks(labels, student_logits)
+         # reshape logits [(bsz, num_tokens/num_chunks, vocab)] -> [(bsz*num_tokens/num_chunks, vocab)]
+         teacher_logits = [
+             teacher_logits_chunk.reshape(-1, teacher_logits_chunk.size(-1))
+@@ -232,26 +256,16 @@ class ForwardKLWithChunkedOutputLoss(torch.nn.Module):
+             student_logits_chunk.reshape(-1, student_logits_chunk.size(-1))
+             for student_logits_chunk in student_logits
+         ]
+-        mask = (labels != self.ignore_index).int()
+-        # chunk and reshape labels (bsz, num_tokens, vocab) -> [(bsz*num_tokens/num_chunks, vocab)]
+-        labels = [
+-            target_chunk.reshape(-1)
+-            for target_chunk in labels.chunk(self.num_output_chunks, dim=1)
+-        ]
+ 
+         total_fkl_loss = 0.0
+         for student_chunk, teacher_chunk, label_chunk in zip(
+-            student_logits, teacher_logits, labels
++            student_logits, teacher_logits, label_chunks
+         ):
+             total_fkl_loss += self.fkl_loss(
+                 student_chunk, teacher_chunk, label_chunk, normalize=False
+             )
+ 
+-        sum_masks = torch.sum(mask.view(-1), dim=0)
+-        if sum_masks == 0:
+-            return torch.tensor(0.0, device=student_logits[0].device)
+-
+-        return total_fkl_loss / torch.sum(mask.view(-1), dim=0)
++        return total_fkl_loss / sum_masks
+ 
+ 
+ class ReverseKLWithChunkedOutputLoss(torch.nn.Module):
+@@ -308,6 +322,13 @@ class ReverseKLWithChunkedOutputLoss(torch.nn.Module):
+             >>> loss = loss_fn(output_chunks, teacher_chunks, labels)
+         """
+ 
++        # compute denominator from full labels mask before splitting
++        mask = (labels != self.ignore_index).int()
++        sum_masks = torch.sum(mask.view(-1), dim=0)
++        if sum_masks == 0:
++            return torch.tensor(0.0, device=student_logits[0].device)
++
++        label_chunks = _split_labels_by_chunks(labels, student_logits)
+         # reshape logits [(bsz, num_tokens/num_chunks, vocab)] -> [(bsz*num_tokens/num_chunks, vocab)]
+         teacher_logits = [
+             teacher_logits_chunk.reshape(-1, teacher_logits_chunk.size(-1))
+@@ -317,16 +338,10 @@ class ReverseKLWithChunkedOutputLoss(torch.nn.Module):
+             student_logits_chunk.reshape(-1, student_logits_chunk.size(-1))
+             for student_logits_chunk in student_logits
+         ]
+-        mask = (labels != self.ignore_index).int()
+-        # chunk and reshape labels (bsz, num_tokens, vocab) -> [(bsz*num_tokens/num_chunks, vocab)]
+-        labels = [
+-            target_chunk.reshape(-1)
+-            for target_chunk in labels.chunk(self.num_output_chunks, dim=1)
+-        ]
+ 
+         total_rkl_loss = 0.0
+         for student_chunk, teacher_chunk, label_chunk in zip(
+-            student_logits, teacher_logits, labels
++            student_logits, teacher_logits, label_chunks
+         ):
+             total_rkl_loss += self.rkl_loss(
+                 student_chunk, teacher_chunk, label_chunk, normalize=False
+@@ -400,6 +415,13 @@ class SymmetricKLWithChunkedOutputLoss(torch.nn.Module):
+             >>> loss = loss_fn(output_chunks, teacher_chunks, labels)
+         """
+ 
++        # compute denominator from full labels mask before splitting
++        mask = (labels != self.ignore_index).int()
++        sum_masks = torch.sum(mask.view(-1), dim=0)
++        if sum_masks == 0:
++            return torch.tensor(0.0, device=student_logits[0].device)
++
++        label_chunks = _split_labels_by_chunks(labels, student_logits)
+         # reshape logits [(bsz, num_tokens/num_chunks, vocab)] -> [(bsz*num_tokens/num_chunks, vocab)]
+         teacher_logits = [
+             teacher_logits_chunk.reshape(-1, teacher_logits_chunk.size(-1))
+@@ -409,16 +431,10 @@ class SymmetricKLWithChunkedOutputLoss(torch.nn.Module):
+             student_logits_chunk.reshape(-1, student_logits_chunk.size(-1))
+             for student_logits_chunk in student_logits
+         ]
+-        mask = (labels != self.ignore_index).int()
+-        # chunk and reshape labels (bsz, num_tokens, vocab) -> [(bsz*num_tokens/num_chunks, vocab)]
+-        labels = [
+-            target_chunk.reshape(-1)
+-            for target_chunk in labels.chunk(self.num_output_chunks, dim=1)
+-        ]
+ 
+         total_sym_kl_loss = 0.0
+         for student_chunk, teacher_chunk, label_chunk in zip(
+-            student_logits, teacher_logits, labels
++            student_logits, teacher_logits, label_chunks
+         ):
+             total_sym_kl_loss += self.sym_kl_loss(
+                 student_chunk, teacher_chunk, label_chunk, normalize=False
+diff --git a/torchtune/modules/transformer.py b/torchtune/modules/transformer.py
+index 81d841c6..3fa7ea2c 100644
+--- a/torchtune/modules/transformer.py
++++ b/torchtune/modules/transformer.py
+@@ -497,7 +497,7 @@ class TransformerDecoder(nn.Module):
+         """
+         return [
+             self.output(chunk)
+-            for chunk in last_hidden_state.chunk(self.num_output_chunks, dim=1)
++            for chunk in last_hidden_state.tensor_split(self.num_output_chunks, dim=1)
+         ]
+ 
+     def _validate_inputs(

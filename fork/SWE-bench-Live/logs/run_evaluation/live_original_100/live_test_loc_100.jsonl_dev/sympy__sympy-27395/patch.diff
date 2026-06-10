@@ -1,0 +1,144 @@
+diff --git a/sympy/physics/quantum/dagger.py b/sympy/physics/quantum/dagger.py
+index 6305a656c3..761f365561 100644
+--- a/sympy/physics/quantum/dagger.py
++++ b/sympy/physics/quantum/dagger.py
+@@ -80,11 +80,23 @@ class Dagger(adjoint):
+     """
+ 
+     def __new__(cls, arg, evaluate=True):
++        from sympy.concrete.summations import Sum
++        from sympy.core.add import Add
++        from sympy.core.mul import Mul
++        arg = sympify(arg)
++        # Linearity over addition
++        if isinstance(arg, Add):
++            return Add(*[Dagger(term, evaluate=evaluate) for term in arg.args])
++        # Linearity over symbolic Sum
++        if isinstance(arg, Sum):
++            return Sum(Dagger(arg.function, evaluate=evaluate), *arg.limits)
++        # Delegate to object-specific adjoint if available
+         if hasattr(arg, 'adjoint') and evaluate:
+             return arg.adjoint()
++        # Matrices: conjugate transpose
+         elif hasattr(arg, 'conjugate') and hasattr(arg, 'transpose') and evaluate:
+             return arg.conjugate().transpose()
+-        return Expr.__new__(cls, sympify(arg))
++        return Expr.__new__(cls, arg)
+ 
+     def __mul__(self, other):
+         from sympy.physics.quantum import IdentityOperator
+diff --git a/sympy/physics/quantum/qapply.py b/sympy/physics/quantum/qapply.py
+index 2109ed1abc..3c1dae31b2 100644
+--- a/sympy/physics/quantum/qapply.py
++++ b/sympy/physics/quantum/qapply.py
+@@ -82,7 +82,8 @@ def qapply(e, **options):
+     # TensorProducts. The only problem with this is that if we can't apply
+     # all the Operators, we have just expanded everything.
+     # TODO: don't expand the scalars in front of each Mul.
+-    e = e.expand(commutator=True, tensorproduct=True)
++    # Avoid expanding sums into polynomials that confuse summation of noncommutative terms
++    e = e.expand(commutator=True, tensorproduct=True, sum=False)
+ 
+     # If we just have a raw ket, return it.
+     if isinstance(e, KetBase):
+@@ -95,6 +96,12 @@ def qapply(e, **options):
+         for arg in e.args:
+             result += qapply(arg, **options)
+         return result.expand()
++    
++    # Handle linearity over symbolic summations
++    from sympy.concrete.summations import Sum
++    if isinstance(e, Sum):
++        new_func = qapply(e.function, **options)
++        return Sum(new_func, *e.limits)
+ 
+     # For a Density operator call qapply on its state
+     elif isinstance(e, Density):
+@@ -142,6 +149,55 @@ def qapply_Mul(e, **options):
+     rhs = args.pop()
+     lhs = args.pop()
+ 
++    # Distribute dagger over sums and convert daggers of kets to bras
++    from sympy.concrete.summations import Sum
++    from sympy.physics.quantum.dagger import Dagger as _Dagger
++    from sympy import conjugate as _conjugate
++    def _distribute_dagger(obj):
++        # Returns possibly modified obj and possibly appends conjugated scalar factors to args
++        if isinstance(obj, _Dagger):
++            a = obj.args[0]
++            # Linearity over Sum already handled below, but also handle here if seen
++            if isinstance(a, Sum):
++                return Sum(_Dagger(a.function), *a.limits)
++            # Pull out commutative scalar part of a product
++            if isinstance(a, Mul):
++                c_part, nc_part = a.args_cnc()
++                c_mul = Mul(*c_part)
++                if c_mul != 1:
++                    # Move scalar factor outside (to the left of current lhs/rhs) with conjugation
++                    args.append(_conjugate(c_mul))
++                if nc_part:
++                    obj = _Dagger(Mul(*nc_part))
++                else:
++                    # only scalar
++                    return S.One
++                # recurse in case the noncommutative part is still a product
++                return _distribute_dagger(obj)
++            # If dagger of a Ket/Bra/Operator has its own adjoint implementation it will be handled by Dagger.__new__ at construction
++            # Here we explicitly convert dagger of a Ket to its Bra
++            if isinstance(a, KetBase):
++                return a.dual
++        return obj
++    
++    lhs = _distribute_dagger(lhs)
++    rhs = _distribute_dagger(rhs)
++
++    # Linearity: handle sums on either side
++    if isinstance(lhs, Sum):
++        # Linearity: distribute over lhs sum
++        inner = qapply_Mul(e.func(*(args + [lhs.function, rhs])), **options)
++        return Sum(inner, *lhs.limits)
++    if isinstance(rhs, Sum):
++        # Linearity: distribute over rhs sum; avoid variable collision by renaming dummy
++        rvar, rstart, rend = rhs.limits[0]
++        from sympy.core.symbol import Dummy
++        new_var = Dummy(str(rvar) + 'p')
++        new_func = rhs.function.subs(rvar, new_var)
++        new_limits = [(new_var, rstart, rend)] + list(rhs.limits[1:])
++        inner = qapply_Mul(e.func(*(args + [lhs, new_func])), **options)
++        return Sum(inner, *tuple(new_limits))
++
+     # Make sure we have two non-commutative objects before proceeding.
+     if (not isinstance(rhs, Wavefunction) and sympify(rhs).is_commutative) or \
+             (not isinstance(lhs, Wavefunction) and sympify(lhs).is_commutative):
+@@ -179,8 +235,12 @@ def qapply_Mul(e, **options):
+ 
+     # Now try to actually apply the operator and build an inner product.
+     try:
+-        result = lhs._apply_operator(rhs, **options)
+-    except NotImplementedError:
++        # Only Operators are expected to implement _apply_operator
++        if hasattr(lhs, '_apply_operator'):
++            result = lhs._apply_operator(rhs, **options)
++        else:
++            result = None
++    except (NotImplementedError, AttributeError, TypeError):
+         result = None
+ 
+     if result is None:
+@@ -192,7 +252,15 @@ def qapply_Mul(e, **options):
+                 result = None
+ 
+     if result is None:
+-        if isinstance(lhs, BraBase) and isinstance(rhs, KetBase):
++        # Special handling for Dagger(Ket) * Ket as an inner product
++        from sympy.physics.quantum.dagger import Dagger as _Dagger
++        if isinstance(lhs, _Dagger) and isinstance(rhs, KetBase):
++            a = lhs.args[0]
++            if isinstance(a, KetBase):
++                result = InnerProduct(a.dual, rhs)
++                if ip_doit:
++                    result = result.doit()
++        elif isinstance(lhs, BraBase) and isinstance(rhs, KetBase):
+             result = InnerProduct(lhs, rhs)
+             if ip_doit:
+                 result = result.doit()

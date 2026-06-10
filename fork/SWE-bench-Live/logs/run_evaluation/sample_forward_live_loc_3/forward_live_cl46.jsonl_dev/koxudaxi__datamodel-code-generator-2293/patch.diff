@@ -1,0 +1,167 @@
+diff --git a/datamodel_code_generator/model/pydantic_v2/base_model.py b/datamodel_code_generator/model/pydantic_v2/base_model.py
+index 9ab0018d..a7ecda0f 100644
+--- a/datamodel_code_generator/model/pydantic_v2/base_model.py
++++ b/datamodel_code_generator/model/pydantic_v2/base_model.py
+@@ -150,8 +150,113 @@ class DataModelField(DataModelFieldV1):
+         self,
+         field_arguments: List[str],
+     ) -> List[str]:
++        # If this field is required and has no explicit Field arguments, but the
++        # type hint already contains inner Annotated metadata (e.g. a list whose
++        # item type is Annotated[..., Field(...)]), ensure we still emit an outer
++        # Field(...) so that typing.Annotated is imported and the structure matches
++        # expectations like Annotated[list[Annotated[str, Field(...)]] , Field(...)].
++        try:
++            type_hint = self.data_type.type_hint
++        except Exception:  # pragma: no cover
++            type_hint = ''
++        if not field_arguments and self.required:
++            if getattr(self.data_type, 'is_list', False) and 'Annotated[' in type_hint:
++                return ['...']
+         return field_arguments
+ 
++    def __str__(self) -> str:  # override to handle Annotated ordering
++        data: Dict[str, Any] = {
++            k: v for k, v in self.extras.items() if k not in self._EXCLUDE_FIELD_KEYS
++        }
++        if self.alias:
++            data['alias'] = self.alias
++        if (
++            self.constraints is not None
++            and not self.self_reference()
++            and not self.data_type.strict
++        ):
++            data = {
++                **data,
++                **{k: v for k, v in self.constraints.dict(exclude_unset=True).items()},
++            }
++
++        if self.use_field_description:
++            data.pop('description', None)
++
++        self._process_data_in_str(data)
++
++        discriminator = data.pop('discriminator', None)
++        if discriminator:
++            if isinstance(discriminator, str):
++                data['discriminator'] = discriminator
++            elif isinstance(discriminator, dict):  # pragma: no cover
++                data['discriminator'] = discriminator['propertyName']
++
++        if self.required:
++            default_factory = None
++        elif self.default and 'default_factory' not in data:
++            default_factory = self._get_default_as_pydantic_model()
++        else:
++            default_factory = data.pop('default_factory', None)
++
++        field_arguments = sorted(
++            f'{k}={repr(v)}' for k, v in data.items() if v is not None
++        )
++
++        # Important difference from V1: allow annotated hook to add '...'
++        if self.use_annotated:
++            field_arguments = self._process_annotated_field_arguments(field_arguments)
++
++        if not field_arguments and not default_factory:
++            if self.nullable and self.required:
++                return 'Field(...)'  # Field() is for mypy
++            return ''
++
++        if self.use_annotated:
++            pass  # arguments already prepared
++        elif self.required:
++            field_arguments = ['...', *field_arguments]
++        elif default_factory:
++            field_arguments = [f'default_factory={default_factory}', *field_arguments]
++        else:
++            field_arguments = [f'{repr(self.default)}', *field_arguments]
++
++        return f'Field({", ".join(field_arguments)})'
++
++    def _process_annotated_field_arguments(
++        self,
++        field_arguments: List[str],
++    ) -> List[str]:
++        # If this field is required and has no explicit Field arguments, but the
++        # type hint already contains inner Annotated metadata (e.g. a list whose
++        # item type is Annotated[..., Field(...)]), ensure we still emit an outer
++        # Field(...) so that typing.Annotated is imported and the structure matches
++        # expectations like Annotated[list[Annotated[str, Field(...)]] , Field(...)].
++        try:
++            type_hint = self.data_type.type_hint
++        except Exception:  # pragma: no cover
++            type_hint = ''
++        if not field_arguments and self.required:
++            if getattr(self.data_type, 'is_list', False) and 'Annotated[' in type_hint:
++                return ['...']
++        return field_arguments
++
++    @property
++    def annotated(self) -> Optional[str]:
++        if not self.use_annotated:
++            return None
++        field_repr = super().__str__()
++        if field_repr:
++            return f'Annotated[{self.type_hint}, {field_repr}]'
++        # Ensure outer Annotated when inner item type already has Annotated and field is required
++        try:
++            type_hint = self.data_type.type_hint
++        except Exception:  # pragma: no cover
++            type_hint = ''
++        if self.required and getattr(self.data_type, 'is_list', False) and 'Annotated[' in type_hint:
++            return f'Annotated[{self.type_hint}, Field(...)]'
++        return None
++
+ 
+ class ConfigAttribute(NamedTuple):
+     from_: str
+diff --git a/datamodel_code_generator/model/template/pydantic_v2/BaseModel.jinja2 b/datamodel_code_generator/model/template/pydantic_v2/BaseModel.jinja2
+index 65b3e8ca..0e6bd153 100644
+--- a/datamodel_code_generator/model/template/pydantic_v2/BaseModel.jinja2
++++ b/datamodel_code_generator/model/template/pydantic_v2/BaseModel.jinja2
+@@ -21,6 +21,8 @@ class {{ class_name }}({{ base_class }}):{% if comment is defined %}  # {{ comme
+     {%- else %}
+     {%- if field.annotated %}
+     {{ field.name }}: {{ field.annotated }}
++    {%- elif 'Annotated[' in field.type_hint and field.required %}
++    {{ field.name }}: Annotated[{{ field.type_hint }}, Field(...)]
+     {%- else %}
+     {{ field.name }}: {{ field.type_hint }}
+     {%- endif %}
+diff --git a/datamodel_code_generator/parser/base.py b/datamodel_code_generator/parser/base.py
+index 874b64c0..705c3bda 100644
+--- a/datamodel_code_generator/parser/base.py
++++ b/datamodel_code_generator/parser/base.py
+@@ -1062,10 +1062,19 @@ class Parser(ABC):
+                         data_type.parent.data_type = copied_data_type
+ 
+                     elif data_type.parent.is_list:
+-                        if self.field_constraints:
+-                            model_field.constraints = ConstraintsBase.merge_constraints(
+-                                root_type_field.constraints, model_field.constraints
+-                            )
++                        # When collapsing a root model referenced as the item of a list,
++                        # constraints such as pattern/min_length/max_length should be applied
++                        # to the item type, not the list itself. In pydantic v2 applying
++                        # e.g. 'pattern' to list[str] raises an error.
++                        if self.field_constraints and self.use_annotated:
++                            # Move root-type field constraints to the item type via inner Annotated
++                            inner_field_str = str(root_type_field)
++                            if inner_field_str:
++                                base_type_hint = copied_data_type.type_hint
++                                copied_data_type.alias = (
++                                    f'Annotated[{base_type_hint}, {inner_field_str}]'
++                                )
++                        # Preserve discriminator from the root-type field if present
+                         if isinstance(
+                             root_type_field,
+                             pydantic_model.DataModelField,
+@@ -1073,6 +1082,7 @@ class Parser(ABC):
+                             discriminator = root_type_field.extras.get('discriminator')
+                             if discriminator:
+                                 model_field.extras['discriminator'] = discriminator
++                        # Replace the referenced item with the copied root-type data
+                         data_type.parent.data_types.remove(
+                             data_type
+                         )  # pragma: no cover

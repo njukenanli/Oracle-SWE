@@ -1,0 +1,285 @@
+2026-03-21 16:30:44,446 - INFO - Creating container for stanfordnlp__dspy-1609...
+2026-03-21 16:30:44,529 - INFO - Container for stanfordnlp__dspy-1609 created: 3cbf48d79eba97e5b68ae419bab73cddf7d0bee47392549dfd331b8836eaced1
+2026-03-21 16:30:44,744 - INFO - Container for stanfordnlp__dspy-1609 started: 3cbf48d79eba97e5b68ae419bab73cddf7d0bee47392549dfd331b8836eaced1
+2026-03-21 16:30:44,745 - INFO - Intermediate patch for stanfordnlp__dspy-1609 written to logs/run_evaluation/live_50_non/live_50.jsonl_dev/stanfordnlp__dspy-1609/patch.diff, now applying to container...
+2026-03-21 16:30:44,911 - INFO - >>>>> Applied Patch:
+Checking patch dspy/functional/functional.py...
+Applied patch dspy/functional/functional.py cleanly.
+
+2026-03-21 16:30:45,599 - INFO - Git diff before:
+diff --git a/dspy/functional/functional.py b/dspy/functional/functional.py
+index a45e302c..4f3b38fb 100644
+--- a/dspy/functional/functional.py
++++ b/dspy/functional/functional.py
+@@ -229,32 +229,104 @@ class TypedPredictor(dspy.Module):
+                         parser=type_,
+                     )
+                 else:
+-                    # Anything else we wrap in a pydantic object
+-                    if (
+-                        inspect.isclass(type_)
+-                        and typing.get_origin(type_) not in (list, tuple)  # To support Python 3.9
+-                        and issubclass(type_, pydantic.BaseModel)
+-                    ):
+-                        to_json = lambda x: x.model_dump_json()
+-                        from_json = lambda x, type_=type_: type_.model_validate_json(x)
+-                        schema = json.dumps(type_.model_json_schema())
+-                    else:
++                    # Special-case: outputs that are List[str] (or Tuple[str]) often come back in ChatAdapter's
++                    # enumerated format (e.g., "[1] «a»\n[2] «b»"). During optimization (BootstrapFewShot),
++                    # we parse model outputs ourselves (Predict._parse_values=False), so handle that format here.
++                    origin = typing.get_origin(type_)
++                    args = typing.get_args(type_)
++
++                    def _make_parse_enumerated_list(return_tuple=False):
++                        def _parse_enumerated_list(value: str):
++                            v = value.strip()
++                            # Try JSON first
++                            try:
++                                loaded = ujson.loads(v)
++                                if isinstance(loaded, list) and all(isinstance(item, str) for item in loaded):
++                                    return tuple(loaded) if return_tuple else loaded
++                            except Exception:
++                                pass
++                            # Handle code fences wrapping JSON
++                            if v.startswith("```") and v.endswith("```"):
++                                inner = v.strip()[3:]
++                                if inner.startswith("json"):
++                                    inner = inner[4:].strip()
++                                else:
++                                    inner = inner.strip()
++                                try:
++                                    loaded = ujson.loads(inner)
++                                    if isinstance(loaded, list) and all(isinstance(item, str) for item in loaded):
++                                        return tuple(loaded) if return_tuple else loaded
++                                except Exception:
++                                    pass
++                            # Parse ChatAdapter's enumerated format like: [1] «foo» or blocks ««« ... »»»
++                            items = []
++                            # First try multi-line blocks
++                            import re
++                            block_pattern = re.compile(r"\[\s*\d+\s*\]\s*«««\n(.*?)\n»»»", re.DOTALL)
++                            single_pattern = re.compile(r"\[\s*\d+\s*\]\s*«(.*?)»")
++                            # Collect multi-line blocks in order
++                            for m in block_pattern.finditer(v):
++                                items.append(m.group(1))
++                            if not items:
++                                # Collect single-line entries
++                                items = [m.group(1) for m in single_pattern.finditer(v)]
++                            if not items:
++                                # Single item formatted without index: «text» or «««...\n»»»
++                                if v.startswith("«««") and v.endswith("»»»"):
++                                    inner = v[3:-3].strip()
++                                    items = [inner]
++                                else:
++                                    m = re.match(r"^«(.*?)»$", v, re.DOTALL)
++                                    if m:
++                                        items = [m.group(1)]
++                            if items:
++                                return tuple(items) if return_tuple else items
++                            raise ValueError("Could not parse list of strings from model output")
++                        return _parse_enumerated_list
++
++                    if origin in (List, list, Tuple, tuple) and len(args) == 1 and args[0] in (str,):
+                         adapter = pydantic.TypeAdapter(type_)
+-                        to_json = lambda x: adapter.serializer.to_json(x)
+-                        from_json = lambda x, type_=adapter: type_.validate_json(x)
+                         schema = json.dumps(adapter.json_schema())
+-                    if self.wrap_json:
+-                        to_json = lambda x, inner=to_json: "```json\n" + inner(x) + "\n```\n"
+-                        schema = "```json\n" + schema + "\n```"
+-                    signature = signature.with_updated_fields(
+-                        name,
+-                        desc=field.json_schema_extra.get("desc", "")
+-                        + (". Respond with a single JSON object. JSON Schema: " + schema),
+-                        format=lambda x, to_json=to_json: (x if isinstance(x, str) else to_json(x)),
+-                        parser=lambda x, from_json=from_json: from_json(_unwrap_json(x, from_json)),
+-                        schema=schema,
+-                        type_=type_,
+-                    )
++                        if self.wrap_json:
++                            schema = "```json\n" + schema + "\n```"
++                        return_tuple = origin in (Tuple, tuple)
++                        # For demos/examples, we still format lists as strings if provided; no special format function needed.
++                        signature = signature.with_updated_fields(
++                            name,
++                            desc=field.json_schema_extra.get("desc", "")
++                            + (". Respond with a JSON array of strings. JSON Schema: " + schema),
++                            format=lambda x: x if isinstance(x, str) else json.dumps(list(x) if return_tuple else x),
++                            parser=_make_parse_enumerated_list(return_tuple=return_tuple),
++                            schema=schema,
++                            type_=type_,
++                        )
++                    else:
++                        # Anything else we wrap in a pydantic object or general JSON-serializable type
++                        if (
++                            inspect.isclass(type_)
++                            and typing.get_origin(type_) not in (list, tuple)  # To support Python 3.9
++                            and issubclass(type_, pydantic.BaseModel)
++                        ):
++                            to_json = lambda x: x.model_dump_json()
++                            from_json = lambda x, type_=type_: type_.model_validate_json(x)
++                            schema = json.dumps(type_.model_json_schema())
++                        else:
++                            adapter = pydantic.TypeAdapter(type_)
++                            to_json = lambda x: adapter.serializer.to_json(x)
++                            from_json = lambda x, type_=adapter: type_.validate_json(x)
++                            schema = json.dumps(adapter.json_schema())
++                        if self.wrap_json:
++                            to_json = lambda x, inner=to_json: "```json\n" + inner(x) + "\n```\n"
++                            schema = "```json\n" + schema + "\n```"
++                        signature = signature.with_updated_fields(
++                            name,
++                            desc=field.json_schema_extra.get("desc", "")
++                            + (". Respond with a single JSON object. JSON Schema: " + schema),
++                            format=lambda x, to_json=to_json: (x if isinstance(x, str) else to_json(x)),
++                            parser=lambda x, from_json=from_json: from_json(_unwrap_json(x, from_json)),
++                            schema=schema,
++                            type_=type_,
++                        )
+             else:  # If input field
+                 is_json = False
+                 format_ = lambda x: x if isinstance(x, str) else str(x)
+2026-03-21 16:30:45,599 - INFO - Eval script for stanfordnlp__dspy-1609 written to logs/run_evaluation/live_50_non/live_50.jsonl_dev/stanfordnlp__dspy-1609/eval.sh; copying to container...
+2026-03-21 16:31:10,031 - INFO - Test runtime: 24.34 seconds
+2026-03-21 16:31:10,035 - INFO - Test output for stanfordnlp__dspy-1609 written to logs/run_evaluation/live_50_non/live_50.jsonl_dev/stanfordnlp__dspy-1609/test_output.txt
+2026-03-21 16:31:10,132 - INFO - Git diff after:
+diff --git a/dspy/functional/functional.py b/dspy/functional/functional.py
+index a45e302c..4f3b38fb 100644
+--- a/dspy/functional/functional.py
++++ b/dspy/functional/functional.py
+@@ -229,32 +229,104 @@ class TypedPredictor(dspy.Module):
+                         parser=type_,
+                     )
+                 else:
+-                    # Anything else we wrap in a pydantic object
+-                    if (
+-                        inspect.isclass(type_)
+-                        and typing.get_origin(type_) not in (list, tuple)  # To support Python 3.9
+-                        and issubclass(type_, pydantic.BaseModel)
+-                    ):
+-                        to_json = lambda x: x.model_dump_json()
+-                        from_json = lambda x, type_=type_: type_.model_validate_json(x)
+-                        schema = json.dumps(type_.model_json_schema())
+-                    else:
++                    # Special-case: outputs that are List[str] (or Tuple[str]) often come back in ChatAdapter's
++                    # enumerated format (e.g., "[1] «a»\n[2] «b»"). During optimization (BootstrapFewShot),
++                    # we parse model outputs ourselves (Predict._parse_values=False), so handle that format here.
++                    origin = typing.get_origin(type_)
++                    args = typing.get_args(type_)
++
++                    def _make_parse_enumerated_list(return_tuple=False):
++                        def _parse_enumerated_list(value: str):
++                            v = value.strip()
++                            # Try JSON first
++                            try:
++                                loaded = ujson.loads(v)
++                                if isinstance(loaded, list) and all(isinstance(item, str) for item in loaded):
++                                    return tuple(loaded) if return_tuple else loaded
++                            except Exception:
++                                pass
++                            # Handle code fences wrapping JSON
++                            if v.startswith("```") and v.endswith("```"):
++                                inner = v.strip()[3:]
++                                if inner.startswith("json"):
++                                    inner = inner[4:].strip()
++                                else:
++                                    inner = inner.strip()
++                                try:
++                                    loaded = ujson.loads(inner)
++                                    if isinstance(loaded, list) and all(isinstance(item, str) for item in loaded):
++                                        return tuple(loaded) if return_tuple else loaded
++                                except Exception:
++                                    pass
++                            # Parse ChatAdapter's enumerated format like: [1] «foo» or blocks ««« ... »»»
++                            items = []
++                            # First try multi-line blocks
++                            import re
++                            block_pattern = re.compile(r"\[\s*\d+\s*\]\s*«««\n(.*?)\n»»»", re.DOTALL)
++                            single_pattern = re.compile(r"\[\s*\d+\s*\]\s*«(.*?)»")
++                            # Collect multi-line blocks in order
++                            for m in block_pattern.finditer(v):
++                                items.append(m.group(1))
++                            if not items:
++                                # Collect single-line entries
++                                items = [m.group(1) for m in single_pattern.finditer(v)]
++                            if not items:
++                                # Single item formatted without index: «text» or «««...\n»»»
++                                if v.startswith("«««") and v.endswith("»»»"):
++                                    inner = v[3:-3].strip()
++                                    items = [inner]
++                                else:
++                                    m = re.match(r"^«(.*?)»$", v, re.DOTALL)
++                                    if m:
++                                        items = [m.group(1)]
++                            if items:
++                                return tuple(items) if return_tuple else items
++                            raise ValueError("Could not parse list of strings from model output")
++                        return _parse_enumerated_list
++
++                    if origin in (List, list, Tuple, tuple) and len(args) == 1 and args[0] in (str,):
+                         adapter = pydantic.TypeAdapter(type_)
+-                        to_json = lambda x: adapter.serializer.to_json(x)
+-                        from_json = lambda x, type_=adapter: type_.validate_json(x)
+                         schema = json.dumps(adapter.json_schema())
+-                    if self.wrap_json:
+-                        to_json = lambda x, inner=to_json: "```json\n" + inner(x) + "\n```\n"
+-                        schema = "```json\n" + schema + "\n```"
+-                    signature = signature.with_updated_fields(
+-                        name,
+-                        desc=field.json_schema_extra.get("desc", "")
+-                        + (". Respond with a single JSON object. JSON Schema: " + schema),
+-                        format=lambda x, to_json=to_json: (x if isinstance(x, str) else to_json(x)),
+-                        parser=lambda x, from_json=from_json: from_json(_unwrap_json(x, from_json)),
+-                        schema=schema,
+-                        type_=type_,
+-                    )
++                        if self.wrap_json:
++                            schema = "```json\n" + schema + "\n```"
++                        return_tuple = origin in (Tuple, tuple)
++                        # For demos/examples, we still format lists as strings if provided; no special format function needed.
++                        signature = signature.with_updated_fields(
++                            name,
++                            desc=field.json_schema_extra.get("desc", "")
++                            + (". Respond with a JSON array of strings. JSON Schema: " + schema),
++                            format=lambda x: x if isinstance(x, str) else json.dumps(list(x) if return_tuple else x),
++                            parser=_make_parse_enumerated_list(return_tuple=return_tuple),
++                            schema=schema,
++                            type_=type_,
++                        )
++                    else:
++                        # Anything else we wrap in a pydantic object or general JSON-serializable type
++                        if (
++                            inspect.isclass(type_)
++                            and typing.get_origin(type_) not in (list, tuple)  # To support Python 3.9
++                            and issubclass(type_, pydantic.BaseModel)
++                        ):
++                            to_json = lambda x: x.model_dump_json()
++                            from_json = lambda x, type_=type_: type_.model_validate_json(x)
++                            schema = json.dumps(type_.model_json_schema())
++                        else:
++                            adapter = pydantic.TypeAdapter(type_)
++                            to_json = lambda x: adapter.serializer.to_json(x)
++                            from_json = lambda x, type_=adapter: type_.validate_json(x)
++                            schema = json.dumps(adapter.json_schema())
++                        if self.wrap_json:
++                            to_json = lambda x, inner=to_json: "```json\n" + inner(x) + "\n```\n"
++                            schema = "```json\n" + schema + "\n```"
++                        signature = signature.with_updated_fields(
++                            name,
++                            desc=field.json_schema_extra.get("desc", "")
++                            + (". Respond with a single JSON object. JSON Schema: " + schema),
++                            format=lambda x, to_json=to_json: (x if isinstance(x, str) else to_json(x)),
++                            parser=lambda x, from_json=from_json: from_json(_unwrap_json(x, from_json)),
++                            schema=schema,
++                            type_=type_,
++                        )
+             else:  # If input field
+                 is_json = False
+                 format_ = lambda x: x if isinstance(x, str) else str(x)
+2026-03-21 16:31:10,132 - INFO - Grading answer for stanfordnlp__dspy-1609...
+2026-03-21 16:31:10,202 - INFO - report: {'stanfordnlp__dspy-1609': {'patch_is_None': False, 'patch_exists': True, 'patch_successfully_applied': True, 'resolved': False, 'tests_status': {'FAIL_TO_PASS': {'success': [], 'failure': ['tests/functional/test_signature_typed.py::test_pydantic', 'tests/functional/test_signature_typed.py::test_optional_pydantic', 'tests/functional/test_signature_typed.py::test_nested_pydantic', 'tests/functional/test_signature_typed.py::test_dataclass']}, 'PASS_TO_PASS': {'success': ['tests/datasets/test_dataset.py::TestCSVDataset::test_input_keys', 'tests/dsp_LM/evaluate/test_evaluate.py::test_evaluate_call', 'tests/dsp_LM/evaluate/test_evaluate.py::test_multithread_evaluate_call', 'tests/dsp_LM/evaluate/test_evaluate.py::test_multi_thread_evaluate_call_cancelled', 'tests/dsp_LM/evaluate/test_evaluate.py::test_evaluate_call_bad', 'tests/dsp_LM/functional/test_functional.py::test_simple', 'tests/dsp_LM/functional/test_functional.py::test_list_output', 'tests/dsp_LM/functional/test_functional.py::test_simple_type', 'tests/dsp_LM/functional/test_functional.py::test_simple_type_input', 'tests/dsp_LM/functional/test_functional.py::test_simple_class', 'tests/dsp_LM/functional/test_functional.py::test_simple_oop', 'tests/dsp_LM/functional/test_functional.py::test_bootstrap_effectiveness', 'tests/dsp_LM/functional/test_functional.py::test_regex', 'tests/dsp_LM/functional/test_functional.py::test_custom_model_validate_json', 'tests/dsp_LM/functional/test_functional.py::test_raises', 'tests/dsp_LM/functional/test_functional.py::test_multi_errors', 'tests/dsp_LM/functional/test_functional.py::test_field_validator', 'tests/dsp_LM/functional/test_functional.py::test_annotated_field', 'tests/dsp_LM/functional/test_functional.py::test_multiple_outputs', 'tests/dsp_LM/functional/test_functional.py::test_multiple_outputs_int', 'tests/dsp_LM/functional/test_functional.py::test_multiple_outputs_int_cot', 'tests/dsp_LM/functional/test_functional.py::test_parse_type_string', 'tests/dsp_LM/functional/test_functional.py::test_literal', 'tests/dsp_LM/functional/test_functional.py::test_literal_missmatch', 'tests/dsp_LM/functional/test_functional.py::test_literal_int', 'tests/dsp_LM/functional/test_functional.py::test_literal_int_missmatch', 'tests/dsp_LM/functional/test_functional.py::test_fields_on_base_signature', 'tests/dsp_LM/functional/test_functional.py::test_synthetic_data_gen', 'tests/dsp_LM/functional/test_functional.py::test_list_input2', 'tests/dsp_LM/functional/test_functional.py::test_custom_reasoning_field', 'tests/dsp_LM/functional/test_functional.py::test_generic_signature', 'tests/dsp_LM/functional/test_functional.py::test_lm_as_validator', 'tests/dsp_LM/functional/test_functional.py::test_annotated_validator', 'tests/dsp_LM/functional/test_functional.py::test_annotated_validator_functional', 'tests/dsp_LM/functional/test_functional.py::test_demos', 'tests/dsp_LM/functional/test_functional.py::test_conlist', 'tests/dsp_LM/functional/test_functional.py::test_conlist2', 'tests/dsp_LM/functional/test_functional.py::test_model_validator', 'tests/dsp_LM/functional/test_signature_opt_typed.py::test_opt', 'tests/dsp_LM/functional/test_signature_opt_typed.py::test_opt_composed', 'tests/dsp_LM/predict/test_chain_of_thought.py::test_initialization_with_string_signature', 'tests/dsp_LM/predict/test_chain_of_thought_with_hint.py::test_cot_with_no_hint', 'tests/dsp_LM/predict/test_chain_of_thought_with_hint.py::test_cot_with_hint', 'tests/dsp_LM/predict/test_multi_chain_comparison.py::test_basic_example', 'tests/dsp_LM/predict/test_predict.py::test_call_method', 'tests/dsp_LM/predict/test_predict.py::test_forward_method', 'tests/dsp_LM/predict/test_predict.py::test_forward_method2', 'tests/dsp_LM/predict/test_predict.py::test_config_management', 'tests/dsp_LM/predict/test_predict.py::test_multi_output', 'tests/dsp_LM/predict/test_predict.py::test_multi_output2', 'tests/dsp_LM/predict/test_predict.py::test_output_only', 'tests/dsp_LM/predict/test_program_of_thought.py::test_pot_code_generation', 'tests/dsp_LM/predict/test_program_of_thought.py::test_pot_code_generation_with_error', 'tests/dsp_LM/predict/test_react.py::test_example_no_tools', 'tests/dsp_LM/predict/test_react.py::test_example_search', 'tests/dsp_LM/predict/test_react.py::test_custom_tools', 'tests/dsp_LM/predict/test_retry.py::test_retry_simple', 'tests/dsp_LM/predict/test_retry.py::test_retry_forward_with_feedback', 'tests/dsp_LM/predict/test_retry.py::test_retry_forward_with_typed_predictor', 'tests/dsp_LM/primitives/test_program.py::test_forward', 'tests/dsp_LM/signatures/test_signature.py::test_multiline_instructions', 'tests/dsp_LM/teleprompt/test_bootstrap.py::test_compile_with_predict_instances', 'tests/dsp_LM/teleprompt/test_bootstrap.py::test_bootstrap_effectiveness', 'tests/dsp_LM/teleprompt/test_bootstrap.py::test_error_handling_during_bootstrap', 'tests/dsp_LM/teleprompt/test_bootstrap.py::test_validation_set_usage', 'tests/dsp_LM/teleprompt/test_copro_optimizer.py::test_signature_optimizer_initialization', 'tests/dsp_LM/teleprompt/test_copro_optimizer.py::test_signature_optimizer_optimization_process', 'tests/dsp_LM/teleprompt/test_copro_optimizer.py::test_signature_optimizer_statistics_tracking', 'tests/dsp_LM/teleprompt/test_copro_optimizer.py::test_optimization_and_output_verification', 'tests/dsp_LM/teleprompt/test_copro_optimizer.py::test_statistics_tracking_during_optimization', 'tests/dsp_LM/teleprompt/test_mipro_optimizer.py::test_bayesian_signature_optimizer_initialization', 'tests/dsp_LM/teleprompt/test_mipro_optimizer.py::test_signature_optimizer_optimization_process', 'tests/dsp_LM/teleprompt/test_mipro_optimizer.py::test_signature_optimizer_bad_lm', 'tests/dsp_LM/teleprompt/test_mipro_optimizer.py::test_optimization_and_output_verification', 'tests/dsp_LM/teleprompt/test_random_search.py::test_basic_workflow', 'tests/evaluate/test_evaluate.py::test_evaluate_initialization', 'tests/evaluate/test_evaluate.py::test_evaluate_call', 'tests/evaluate/test_evaluate.py::test_multithread_evaluate_call', 'tests/evaluate/test_evaluate.py::test_multi_thread_evaluate_call_cancelled', 'tests/evaluate/test_evaluate.py::test_evaluate_call_bad', 'tests/evaluate/test_evaluate.py::test_evaluate_display_table[True-True]', 'tests/evaluate/test_evaluate.py::test_evaluate_display_table[True-False]', 'tests/evaluate/test_evaluate.py::test_evaluate_display_table[True-1]', 'tests/evaluate/test_evaluate.py::test_evaluate_display_table[False-True]', 'tests/evaluate/test_evaluate.py::test_evaluate_display_table[False-False]', 'tests/evaluate/test_evaluate.py::test_evaluate_display_table[False-1]', 'tests/evaluate/test_metrics.py::test_answer_exact_match_string', 'tests/evaluate/test_metrics.py::test_answer_exact_match_list', 'tests/evaluate/test_metrics.py::test_answer_exact_match_no_match', 'tests/functional/test_functional.py::test_simple', 'tests/functional/test_functional.py::test_list_output', 'tests/functional/test_functional.py::test_simple_type', 'tests/functional/test_functional.py::test_simple_type_input', 'tests/functional/test_functional.py::test_simple_class', 'tests/functional/test_functional.py::test_simple_oop', 'tests/functional/test_functional.py::test_equivalent_signatures', 'tests/functional/test_functional.py::test_named_params', 'tests/functional/test_functional.py::test_bootstrap_effectiveness', 'tests/functional/test_functional.py::test_regex', 'tests/functional/test_functional.py::test_custom_model_validate_json', 'tests/functional/test_functional.py::test_raises', 'tests/functional/test_functional.py::test_multi_errors', 'tests/functional/test_functional.py::test_field_validator', 'tests/functional/test_functional.py::test_annotated_field', 'tests/functional/test_functional.py::test_multiple_outputs', 'tests/functional/test_functional.py::test_multiple_outputs_int', 'tests/functional/test_functional.py::test_list_inputs_and_outputs', 'tests/functional/test_functional.py::test_multiple_outputs_int_cot', 'tests/functional/test_functional.py::test_parse_type_string', 'tests/functional/test_functional.py::test_literal', 'tests/functional/test_functional.py::test_literal_missmatch', 'tests/functional/test_functional.py::test_literal_int', 'tests/functional/test_functional.py::test_literal_int_missmatch', 'tests/functional/test_functional.py::test_fields_on_base_signature', 'tests/functional/test_functional.py::test_synthetic_data_gen', 'tests/functional/test_functional.py::test_list_input2', 'tests/functional/test_functional.py::test_custom_reasoning_field', 'tests/functional/test_functional.py::test_generic_signature', 'tests/functional/test_functional.py::test_field_validator_in_signature', 'tests/functional/test_functional.py::test_lm_as_validator', 'tests/functional/test_functional.py::test_annotated_validator', 'tests/functional/test_functional.py::test_annotated_validator_functional', 'tests/functional/test_functional.py::test_demos', 'tests/functional/test_functional.py::test_demos_missing_input_in_demo', 'tests/functional/test_functional.py::test_conlist', 'tests/functional/test_functional.py::test_conlist2', 'tests/functional/test_functional.py::test_model_validator', 'tests/functional/test_signature_opt_typed.py::test_opt', 'tests/functional/test_signature_opt_typed.py::test_opt_composed', 'tests/functional/test_signature_typed.py::test_basic_types[str-foo-foo]', 'tests/functional/test_signature_typed.py::test_basic_types[int-42-42]', 'tests/functional/test_signature_typed.py::test_basic_types[float-42.42-42.42]', 'tests/functional/test_signature_typed.py::test_boolean', 'tests/functional/test_signature_typed.py::test_sequences[list-["foo",', 'tests/functional/test_signature_typed.py::test_sequences[tuple-[42,', 'tests/functional/test_signature_typed.py::test_unions[test_type0-"foobar"-foobar]', 'tests/functional/test_signature_typed.py::test_unions[test_type1-null-None]', 'tests/functional/test_signature_typed.py::test_unions[test_type2-3.14-3.14]', 'tests/functional/test_signature_typed.py::test_unions[test_type3-true-True]', 'tests/modules/test_hf_model.py::test_load_gated_model', 'tests/modules/test_hf_model.py::test_load_ungated_model', 'tests/predict/test_aggregation.py::test_majority_with_prediction', 'tests/predict/test_aggregation.py::test_majority_with_completions', 'tests/predict/test_aggregation.py::test_majority_with_list', 'tests/predict/test_aggregation.py::test_majority_with_normalize', 'tests/predict/test_aggregation.py::test_majority_with_field', 'tests/predict/test_aggregation.py::test_majority_with_no_majority', 'tests/predict/test_chain_of_thought.py::test_initialization_with_string_signature', 'tests/predict/test_chain_of_thought_with_hint.py::test_cot_with_no_hint', 'tests/predict/test_chain_of_thought_with_hint.py::test_cot_with_hint', 'tests/predict/test_knn.py::test_knn_initialization', 'tests/predict/test_knn.py::test_knn_query', 'tests/predict/test_knn.py::test_knn_query_specificity', 'tests/predict/test_multi_chain_comparison.py::test_basic_example', 'tests/predict/test_predict.py::test_initialization_with_string_signature', 'tests/predict/test_predict.py::test_reset_method', 'tests/predict/test_predict.py::test_lm_after_dump_and_load_state', 'tests/predict/test_predict.py::test_call_method', 'tests/predict/test_predict.py::test_instructions_after_dump_and_load_state', 'tests/predict/test_predict.py::test_demos_after_dump_and_load_state', 'tests/predict/test_predict.py::test_typed_demos_after_dump_and_load_state', 'tests/predict/test_predict.py::test_signature_fields_after_dump_and_load_state', 'tests/predict/test_predict.py::test_forward_method', 'tests/predict/test_predict.py::test_forward_method2', 'tests/predict/test_predict.py::test_config_management', 'tests/predict/test_predict.py::test_multi_output', 'tests/predict/test_predict.py::test_multi_output2', 'tests/predict/test_predict.py::test_named_predictors', 'tests/predict/test_predict.py::test_output_only', 'tests/predict/test_program_of_thought.py::test_pot_code_generation', 'tests/predict/test_program_of_thought.py::test_pot_code_generation_with_error', 'tests/predict/test_react.py::test_example_no_tools', 'tests/predict/test_react.py::test_example_search', 'tests/predict/test_react.py::test_custom_tools', 'tests/predict/test_react.py::test_signature_instructions', 'tests/predict/test_retry.py::test_retry_simple', 'tests/predict/test_retry.py::test_retry_forward_with_feedback', 'tests/predict/test_retry.py::test_retry_forward_with_typed_predictor', 'tests/primitives/test_example.py::test_example_initialization', 'tests/primitives/test_example.py::test_example_initialization_from_base', 'tests/primitives/test_example.py::test_example_initialization_from_dict', 'tests/primitives/test_example.py::test_example_set_get_item', 'tests/primitives/test_example.py::test_example_attribute_access', 'tests/primitives/test_example.py::test_example_deletion', 'tests/primitives/test_example.py::test_example_len', 'tests/primitives/test_example.py::test_example_repr_str', 'tests/primitives/test_example.py::test_example_eq', 'tests/primitives/test_example.py::test_example_hash', 'tests/primitives/test_example.py::test_example_keys_values_items', 'tests/primitives/test_example.py::test_example_get', 'tests/primitives/test_example.py::test_example_with_inputs', 'tests/primitives/test_example.py::test_example_inputs_labels', 'tests/primitives/test_example.py::test_example_copy_without', 'tests/primitives/test_example.py::test_example_to_dict', 'tests/primitives/test_module.py::test_deepcopy_basic', 'tests/primitives/test_module.py::test_deepcopy_with_uncopyable_modules', 'tests/primitives/test_module.py::test_deepcopy_with_nested_modules', 'tests/primitives/test_program.py::test_module_initialization', 'tests/primitives/test_program.py::test_named_predictors', 'tests/primitives/test_program.py::test_predictors', 'tests/primitives/test_program.py::test_forward', 'tests/primitives/test_program.py::test_nested_named_predictors', 'tests/primitives/test_program.py::test_empty_module', 'tests/primitives/test_program.py::test_single_level', 'tests/primitives/test_program.py::test_multiple_levels', 'tests/primitives/test_program.py::test_multiple_sub_modules', 'tests/primitives/test_program.py::test_non_base_module_attributes', 'tests/primitives/test_program.py::test_complex_module_traversal', 'tests/primitives/test_program.py::test_complex_module_set_attribute_by_name', 'tests/primitives/test_program.py::test_named_parameters_duplicate_references', 'tests/primitives/test_python_interpreter.py::test_execute_simple_code', 'tests/primitives/test_python_interpreter.py::test_action_space_limitation', 'tests/primitives/test_python_interpreter.py::test_import_whitelist', 'tests/primitives/test_python_interpreter.py::test_fuzzy_variable_matching', 'tests/primitives/test_python_interpreter.py::test_text_prompt_keyword_extraction', 'tests/primitives/test_python_interpreter.py::test_text_prompt_formatting', 'tests/primitives/test_python_interpreter.py::test_code_prompt_execution', 'tests/signatures/test_signature.py::test_field_types_and_custom_attributes', 'tests/signatures/test_signature.py::test_no_input_output', 'tests/signatures/test_signature.py::test_no_input_output2', 'tests/signatures/test_signature.py::test_all_fields_have_prefix', 'tests/signatures/test_signature.py::test_signature_parsing', 'tests/signatures/test_signature.py::test_with_signature', 'tests/signatures/test_signature.py::test_with_updated_field', 'tests/signatures/test_signature.py::test_empty_signature', 'tests/signatures/test_signature.py::test_instructions_signature', 'tests/signatures/test_signature.py::test_signature_instructions', 'tests/signatures/test_signature.py::test_signature_instructions_none', 'tests/signatures/test_signature.py::test_signature_from_dict', 'tests/signatures/test_signature.py::test_signature_equality', 'tests/signatures/test_signature.py::test_signature_inequality', 'tests/signatures/test_signature.py::test_equality_format', 'tests/signatures/test_signature.py::test_signature_reverse', 'tests/signatures/test_signature.py::test_insert_field_at_various_positions', 'tests/signatures/test_signature.py::test_infer_prefix', 'tests/signatures/test_signature.py::test_insantiating', 'tests/signatures/test_signature.py::test_insantiating2', 'tests/signatures/test_signature.py::test_multiline_instructions', 'tests/signatures/test_signature.py::test_replaced_by_replace_context_manager', 'tests/signatures/test_signature.py::test_multiple_replaced_by_update_signatures', 'tests/signatures/test_signature.py::test_dump_and_load_state', 'tests/teleprompt/test_bootstrap.py::test_bootstrap_initialization', 'tests/teleprompt/test_bootstrap.py::test_compile_with_predict_instances', 'tests/teleprompt/test_bootstrap.py::test_bootstrap_effectiveness', 'tests/teleprompt/test_bootstrap.py::test_error_handling_during_bootstrap', 'tests/teleprompt/test_bootstrap.py::test_validation_set_usage', 'tests/teleprompt/test_copro_optimizer.py::test_signature_optimizer_initialization', 'tests/teleprompt/test_copro_optimizer.py::test_signature_optimizer_optimization_process', 'tests/teleprompt/test_copro_optimizer.py::test_signature_optimizer_statistics_tracking', 'tests/teleprompt/test_copro_optimizer.py::test_optimization_and_output_verification', 'tests/teleprompt/test_copro_optimizer.py::test_statistics_tracking_during_optimization', 'tests/teleprompt/test_ensemble.py::test_ensemble_without_reduction', 'tests/teleprompt/test_ensemble.py::test_ensemble_with_reduction', 'tests/teleprompt/test_ensemble.py::test_ensemble_with_size_limitation', 'tests/teleprompt/test_ensemble.py::test_ensemble_deterministic_behavior', 'tests/teleprompt/test_knn_fewshot.py::test_knn_few_shot_initialization', 'tests/teleprompt/test_random_search.py::test_basic_workflow'], 'failure': []}, 'FAIL_TO_FAIL': {'success': [], 'failure': []}, 'PASS_TO_FAIL': {'success': [], 'failure': []}}}}
+Result for stanfordnlp__dspy-1609: resolved: False
+2026-03-21 16:31:10,203 - INFO - Attempting to stop container sweb.eval.stanfordnlp__dspy-1609.live_50_non...
+2026-03-21 16:31:25,497 - INFO - Attempting to remove container sweb.eval.stanfordnlp__dspy-1609.live_50_non...
+2026-03-21 16:31:25,522 - INFO - Container sweb.eval.stanfordnlp__dspy-1609.live_50_non removed.

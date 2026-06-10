@@ -1,0 +1,138 @@
+diff --git a/patroni/postgresql/slots.py b/patroni/postgresql/slots.py
+index 9e5216fb..0a370805 100644
+--- a/patroni/postgresql/slots.py
++++ b/patroni/postgresql/slots.py
+@@ -387,6 +387,36 @@ class SlotsHandler:
+             elif self._postgresql.can_advance_slots and self._replication_slots[name]['type'] == 'physical':
+                 value['restart_lsn'] = self._replication_slots[name]['restart_lsn']
+                 lsn = value.get('lsn')
++                # On replicas, inactive physical slots with non-null xmin can retain xmin horizon on the primary.
++                # To prevent this, drop and recreate such slots on replicas.
++                if not self._postgresql.is_primary():
++                    try:
++                        rows = self._query("SELECT active, xmin FROM pg_catalog.pg_replication_slots"
++                                           " WHERE slot_type = 'physical' AND slot_name = %s", name)
++                        if rows:
++                            active, xmin = rows[0][0], rows[0][1]
++                            if not active and xmin is not None:
++                                logger.info("Recreating inactive physical replication slot '%s' due to non-null xmin", name)
++                                try:
++                                    active_flag, dropped = self.drop_replication_slot(name)
++                                    if not dropped:
++                                        # Could not drop, likely became active or permission issue; retry later
++                                        logger.debug("Unable to drop slot '%s' (active=%s), will retry later", name, active_flag)
++                                        self._schedule_load_slots = True
++                                    else:
++                                        try:
++                                            self._query(f"SELECT pg_catalog.pg_create_physical_replication_slot(%s{immediately_reserve})", name)
++                                        except Exception:
++                                            logger.exception("Failed to recreate physical replication slot '%s'", name)
++                                        self._schedule_load_slots = True
++                                        continue  # move to next slot after recreation
++                                except Exception:
++                                    logger.exception("Failed to drop physical replication slot '%s' for recreation", name)
++                                    self._schedule_load_slots = True
++                    except Exception:
++                        # Older PostgreSQL versions may not have xmin column; ignore any errors here and proceed.
++                        logger.debug("Failed to check active/xmin state for physical slot '%s'", name)
++                # Advance restart_lsn if there is feedback in DCS and the reported LSN is ahead
+                 if lsn and lsn > value['restart_lsn']:  # The slot has feedback in DCS and needs to be advanced
+                     try:
+                         lsn = format_lsn(lsn)
+diff --git a/repro_xmin_issue.py b/repro_xmin_issue.py
+new file mode 100644
+index 00000000..5133df84
+--- /dev/null
++++ b/repro_xmin_issue.py
+@@ -0,0 +1,91 @@
++# Reproduction script for Patroni inactive slot xmin retention issue
++# It simulates a replica node having an inactive physical slot with a non-null xmin.
++# Prior to the fix, SlotsHandler._ensure_physical_slots does not drop/recreate such a slot.
++# After the fix, it should drop and recreate the slot.
++
++from typing import Any, Dict
++
++# Import the SlotsHandler from the local repository
++from patroni.postgresql.slots import SlotsHandler
++
++
++class DummyConnPool:
++    def __init__(self):
++        # Minimal conn kwargs; not used in this reproduce path
++        self.conn_kwargs = {'host': 'localhost', 'port': '5432'}
++
++
++class DummyPG:
++    def __init__(self):
++        self.name = 'dummy'
++        self.scope = 'dummy-scope'
++        self._data_dir = '/tmp'
++        self.data_dir = self._data_dir
++        self.database = 'postgres'
++        self.connection_pool = DummyConnPool()
++        self.major_version = 150000
++        # Simplify: treat as replica
++        self._role = 'replica'
++
++    def is_primary(self) -> bool:
++        return False
++
++    @property
++    def can_advance_slots(self) -> bool:
++        return self.major_version >= 110000
++
++
++class DummySlotsHandler(SlotsHandler):
++    def __init__(self, postgresql: DummyPG):
++        super().__init__(postgresql)
++        # We'll intercept _query and drop_replication_slot for visibility
++        self.queries: list[str] = []
++        self.drop_calls: list[str] = []
++
++    def _query(self, sql: str, *params: Any):
++        # Record queries instead of executing against Postgres
++        s = sql if isinstance(sql, str) else str(sql)
++        self.queries.append(s % tuple(['%s'] * s.count('%s')))
++        # Simulate the active/xmin query to return inactive slot with non-null xmin
++        if s.startswith("SELECT active, xmin FROM pg_catalog.pg_replication_slots"):
++            return [(False, 13357177)]
++        # Return empty list otherwise
++        return []
++
++    def drop_replication_slot(self, name: str):
++        # Record the attempt and simulate successful drop of inactive slot
++        self.drop_calls.append(name)
++        return (False, True)
++
++
++if __name__ == '__main__':
++    pg = DummyPG()
++    sh = DummySlotsHandler(pg)
++
++    # Simulate replication slots loaded on the node; one physical slot exists, inactive, with non-null xmin
++    sh._replication_slots = {
++        'node2': {
++            'type': 'physical',
++            'restart_lsn': 100,
++            'active': False,
++            'xmin': 13357177,
++        }
++    }
++
++    # Desired slots include this physical slot (e.g., permanent slot)
++    desired_slots: Dict[str, Dict[str, Any]] = {
++        'node2': {'type': 'physical'}
++    }
++
++    # Run ensure_physical_slots
++    sh._ensure_physical_slots(desired_slots)
++
++    attempted_drop = len(sh.drop_calls) > 0
++    attempted_recreate = any('pg_create_physical_replication_slot' in q for q in sh.queries)
++
++    print('attempted_drop:', attempted_drop)
++    print('attempted_recreate:', attempted_recreate)
++    if not attempted_drop:
++        print('BUG: inactive physical slot with non-null xmin was NOT dropped/recreated')
++    else:
++        print('FIXED: inactive physical slot with non-null xmin was dropped/recreated')

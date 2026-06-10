@@ -1,0 +1,250 @@
+diff --git a/packages/jupyter-ai-magics/jupyter_ai_magics/partner_providers/openai.py b/packages/jupyter-ai-magics/jupyter_ai_magics/partner_providers/openai.py
+index 7e97995..be801e2 100644
+--- a/packages/jupyter-ai-magics/jupyter_ai_magics/partner_providers/openai.py
++++ b/packages/jupyter-ai-magics/jupyter_ai_magics/partner_providers/openai.py
+@@ -10,6 +10,32 @@ from ..embedding_providers import BaseEmbeddingsProvider
+ from ..providers import BaseProvider, EnvAuthStrategy, TextField
+ 
+ 
++# Helper: robustly detect OpenAI auth errors across SDK versions
++
++def _is_openai_api_key_error(e: Exception) -> bool:
++    try:
++        import openai  # type: ignore
++    except Exception:
++        return False
++    # openai>=1 may raise AuthenticationError without json_body
++    AuthErr = getattr(openai, "AuthenticationError", None)
++    if AuthErr and isinstance(e, AuthErr):
++        return True
++    # Some versions raise APIStatusError with 401
++    APIStatusError = getattr(openai, "APIStatusError", None)
++    if APIStatusError and isinstance(e, APIStatusError):
++        status = getattr(e, "status_code", None) or getattr(e, "status", None)
++        if status == 401:
++            return True
++    # Fallback for openai<1 style exceptions
++    json_body = getattr(e, "json_body", None)
++    if isinstance(json_body, dict):
++        error_details = json_body.get("error", {})
++        if error_details.get("code") == "invalid_api_key":
++            return True
++    return False
++
++
+ class OpenAIProvider(BaseProvider, OpenAI):
+     id = "openai"
+     name = "OpenAI"
+@@ -23,12 +49,7 @@ class OpenAIProvider(BaseProvider, OpenAI):
+         """
+         Determine if the exception is an OpenAI API key error.
+         """
+-        import openai
+-
+-        if isinstance(e, openai.AuthenticationError):
+-            error_details = e.json_body.get("error", {})
+-            return error_details.get("code") == "invalid_api_key"
+-        return False
++        return _is_openai_api_key_error(e)
+ 
+ 
+ # https://platform.openai.com/docs/models/
+@@ -68,12 +89,7 @@ class ChatOpenAIProvider(BaseProvider, ChatOpenAI):
+         """
+         Determine if the exception is an OpenAI API key error.
+         """
+-        import openai
+-
+-        if isinstance(e, openai.AuthenticationError):
+-            error_details = e.json_body.get("error", {})
+-            return error_details.get("code") == "invalid_api_key"
+-        return False
++        return _is_openai_api_key_error(e)
+ 
+ 
+ class AzureChatOpenAIProvider(BaseProvider, AzureChatOpenAI):
+diff --git a/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py b/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py
+index c844650..ab063d6 100644
+--- a/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py
++++ b/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py
+@@ -260,7 +260,18 @@ class BaseChatHandler:
+         """
+         self.log.error(e)
+         lm_provider = self.config_manager.lm_provider
+-        if lm_provider and lm_provider.is_api_key_exc(e):
++        is_key_err = False
++        if lm_provider:
++            try:
++                is_key_err = lm_provider.is_api_key_exc(e)
++            except Exception:
++                # Fallback detection for common SDKs (e.g., openai>=1)
++                status = getattr(e, "status_code", None) or getattr(e, "status", None)
++                name = e.__class__.__name__
++                mod = (e.__class__.__module__ or "").lower()
++                if ("openai" in mod and (name == "AuthenticationError" or status == 401)):
++                    is_key_err = True
++        if is_key_err:
+             provider_name = getattr(self.config_manager.lm_provider, "name", "")
+             response = f"Oops! There's a problem connecting to {provider_name}. Please update your {provider_name} API key in the chat settings."
+             self.reply(response, message)
+diff --git a/packages/jupyter-ai/jupyter_ai/config_manager.py b/packages/jupyter-ai/jupyter_ai/config_manager.py
+index 2f38ca9..306aef4 100644
+--- a/packages/jupyter-ai/jupyter_ai/config_manager.py
++++ b/packages/jupyter-ai/jupyter_ai/config_manager.py
+@@ -444,20 +444,45 @@ class ConfigManager(Configurable):
+ 
+         lid = gid.split(":", 1)[1]
+ 
+-        # get authn fields
+-        _, Provider = get_em_provider(gid, listing)
++        # resolve provider class (works for both LM/EM listings)
++        # use get_lm_provider for LM listings and get_em_provider for EM listings
++        if listing is self._em_providers:
++            _, Provider = get_em_provider(gid, listing)
++        else:
++            _, Provider = get_lm_provider(gid, listing)
++
++        # gather auth fields from API keys if required
+         authn_fields = {}
+-        if Provider.auth_strategy and Provider.auth_strategy.type == "env":
++        if Provider and Provider.auth_strategy and Provider.auth_strategy.type == "env":
+             keyword_param = (
+                 Provider.auth_strategy.keyword_param
+                 or Provider.auth_strategy.name.lower()
+             )
+             key_name = Provider.auth_strategy.name
+-            authn_fields[keyword_param] = config.api_keys[key_name]
++            # Only add if present in config
++            if key_name in config.api_keys:
++                authn_fields[keyword_param] = config.api_keys[key_name]
+ 
++        # gather per-model user-provided fields from config
++        if key == "completions_model_provider_id":
++            user_fields = (config.completions_fields or {}).get(gid, {})
++        else:
++            user_fields = (config.fields or {}).get(gid, {})
++
++        # minor compat: map 'profile_name' -> 'credentials_profile_name' for Bedrock
++        if (
++            isinstance(user_fields, dict)
++            and "profile_name" in user_fields
++            and "credentials_profile_name" not in user_fields
++        ):
++            user_fields = dict(user_fields)
++            user_fields["credentials_profile_name"] = user_fields["profile_name"]
++
++        # build params
+         return {
+             "model_id": lid,
+             **authn_fields,
++            **(user_fields or {}),
+         }
+ 
+     @property
+diff --git a/repro_issue.py b/repro_issue.py
+new file mode 100644
+index 0000000..58f1d43
+--- /dev/null
++++ b/repro_issue.py
+@@ -0,0 +1,101 @@
++import json, os, tempfile, shutil, sys
++# create a temp jupyter data dir so we don't touch user config
++root = tempfile.mkdtemp(prefix="jai_tmp_")
++os.environ["JUPYTER_DATA_DIR"] = root
++# ensure local packages are importable AFTER setting env
++sys.path.insert(0, '/testbed/packages/jupyter-ai')
++sys.path.insert(0, '/testbed/packages/jupyter-ai-magics')
++from jupyter_ai.config_manager import ConfigManager
++from jupyter_ai_magics.partner_providers.openai import AzureChatOpenAIProvider, ChatOpenAIProvider
++try:
++    from jupyter_ai_magics.partner_providers.aws import SmEndpointProvider
++    HAS_AWS=True
++except Exception:
++    HAS_AWS=False
++
++cfg_dir = os.path.join(root, "jupyter_ai")
++os.makedirs(cfg_dir, exist_ok=True)
++config_path = os.path.join(cfg_dir, "config.json")
++
++
++def make_manager(providers, defaults=None):
++    if defaults is None:
++        defaults = {}
++    return ConfigManager(
++        log=None,
++        lm_providers=providers,
++        em_providers={},
++        allowed_providers=None,
++        blocked_providers=None,
++        allowed_models=None,
++        blocked_models=None,
++        defaults=defaults,
++        config=None,
++    )
++
++print("Temp JUPYTER_DATA_DIR:", root)
++
++# 1) Azure: api_version and azure_endpoint set in UI fields should appear in lm_provider_params
++with open(config_path, "w") as f:
++    json.dump({
++        "model_provider_id": "azure-chat-openai:gpt-35-turbo-16k",
++        "embeddings_provider_id": None,
++        "send_with_shift_enter": False,
++        "fields": {
++            "azure-chat-openai:gpt-35-turbo-16k": {
++                "api_version": "2023-07-01-preview",
++                "azure_endpoint": "https://example.azure.com"
++            }
++        },
++        "api_keys": {"AZURE_OPENAI_API_KEY": "dummy"},
++        "completions_model_provider_id": None,
++        "completions_fields": {}
++    }, f)
++
++mgr = make_manager({AzureChatOpenAIProvider.id: AzureChatOpenAIProvider})
++print("Azure lm_provider_params:", mgr.lm_provider_params)
++
++# 2) OpenAI Chat: openai_api_base from fields should appear
++with open(config_path, "w") as f:
++    json.dump({
++        "model_provider_id": "openai-chat:gpt-4o-mini",
++        "embeddings_provider_id": None,
++        "send_with_shift_enter": False,
++        "fields": {
++            "openai-chat:gpt-4o-mini": {
++                "openai_api_base": "http://www.example.com"
++            }
++        },
++        "api_keys": {"OPENAI_API_KEY": "aaa"},
++        "completions_model_provider_id": None,
++        "completions_fields": {}
++    }, f)
++
++mgr2 = make_manager({ChatOpenAIProvider.id: ChatOpenAIProvider})
++print("OpenAI Chat lm_provider_params:", mgr2.lm_provider_params)
++
++# 3) SageMaker Endpoint: request_schema/response_path should appear
++if HAS_AWS:
++    with open(config_path, "w") as f:
++        json.dump({
++            "model_provider_id": "sagemaker-endpoint:my-endpoint",
++            "embeddings_provider_id": None,
++            "send_with_shift_enter": False,
++            "fields": {
++                "sagemaker-endpoint:my-endpoint": {
++                    "region_name": "us-east-1",
++                    "request_schema": '{"prompt": "<prompt>"}',
++                    "response_path": "$.generated_text"
++                }
++            },
++            "api_keys": {},
++            "completions_model_provider_id": None,
++            "completions_fields": {}
++        }, f)
++    mgr3 = make_manager({SmEndpointProvider.id: SmEndpointProvider})
++    print("SageMaker lm_provider_params:", mgr3.lm_provider_params)
++else:
++    print("AWS providers not available; skipping SageMaker reproduction.")
++
++# cleanup temp dir
++shutil.rmtree(root)

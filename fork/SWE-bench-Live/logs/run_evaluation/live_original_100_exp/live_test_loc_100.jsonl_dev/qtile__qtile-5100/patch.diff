@@ -1,0 +1,287 @@
+diff --git a/libqtile/bar.py b/libqtile/bar.py
+index 79810e92..9e7c427d 100644
+--- a/libqtile/bar.py
++++ b/libqtile/bar.py
+@@ -593,7 +593,10 @@ class Bar(Gap, configurable.Configurable, CommandObject):
+         assert self.qtile is not None
+ 
+         self._has_keyboard = widget
++        # Remember previous keyboard owner to restore later
+         self._saved_focus = self.qtile.current_window
++        # Tell core that a widget has keyboard so focus should not be stolen
++        self.qtile.widget_has_keyboard = True
+         if self.window:
+             self.window.focus(False)
+ 
+@@ -604,6 +607,9 @@ class Bar(Gap, configurable.Configurable, CommandObject):
+         if self._saved_focus is not None:
+             self._saved_focus.focus(False)
+         self._has_keyboard = None
++        # Clear the flag on core so new windows can steal focus if allowed
++        if self.qtile is not None:
++            self.qtile.widget_has_keyboard = False
+ 
+     def draw(self) -> None:
+         assert self.qtile is not None
+diff --git a/libqtile/core/manager.py b/libqtile/core/manager.py
+index 7d4bced0..d1079883 100644
+--- a/libqtile/core/manager.py
++++ b/libqtile/core/manager.py
+@@ -92,6 +92,8 @@ class Qtile(CommandObject):
+ 
+         self._drag: tuple | None = None
+         self._mouse_map: defaultdict[int, list[Mouse]] = defaultdict(list)
++        # Track when a bar widget has grabbed the keyboard so we don't steal focus
++        self.widget_has_keyboard: bool = False
+ 
+         self.windows_map: dict[int, base.WindowType] = {}
+         self.widgets_map: dict[str, _Widget] = {}
+@@ -736,7 +738,8 @@ class Qtile(CommandObject):
+         if self.current_screen and isinstance(win, base.Window):
+             # Window may have been bound to a group in the hook.
+             if not win.group and self.current_screen.group:
+-                self.current_screen.group.add(win, focus=win.can_steal_focus)
++                allow_focus = win.can_steal_focus and not getattr(self, "widget_has_keyboard", False)
++                self.current_screen.group.add(win, focus=allow_focus)
+ 
+         hook.fire("client_managed", win)
+ 
+diff --git a/libqtile/group.py b/libqtile/group.py
+index a4a68136..db0e4528 100644
+--- a/libqtile/group.py
++++ b/libqtile/group.py
+@@ -161,11 +161,16 @@ class _Group(CommandObject):
+                         logger.exception("Exception in layout %s", self.layout.name)
+                 if floating:
+                     self.floating_layout.layout(floating, screen_rect)
+-                if self.current_window and self.screen == self.qtile.current_screen:
++                if (
++                    self.current_window
++                    and self.screen == self.qtile.current_screen
++                    and not getattr(self.qtile, "widget_has_keyboard", False)
++                ):
+                     self.current_window.focus(warp)
+                 else:
+-                    # Screen has lost focus so we reset record of focused window so
+-                    # focus will warp when screen is focused again
++                    # Screen has lost focus or a widget has grabbed keyboard so we
++                    # reset record of focused window so focus will warp when screen
++                    # is focused again
+                     self.last_focused = None
+ 
+     def set_screen(self, screen, warp=True):
+@@ -267,6 +272,10 @@ class _Group(CommandObject):
+                 i.add_client(win)
+         if focus:
+             self.focus(win, warp=True, force=force)
++        else:
++            # If the new window should not take focus, we still need to relayout
++            # windows so that it is placed correctly by the layout.
++            self.layout_all(warp=False)
+ 
+     def remove(self, win, force=False):
+         hook.fire("group_window_remove", self, win)
+diff --git a/repro_focus.py b/repro_focus.py
+new file mode 100644
+index 00000000..4060c0a3
+--- /dev/null
++++ b/repro_focus.py
+@@ -0,0 +1,198 @@
++# Repro script for focus stealing prevention causing windows not to be laid out
++
++# This script simulates adding a window with focus=False (e.g. can_steal_focus=False)
++# and checks whether the group's layout.layout() is called to place windows.
++
++from libqtile.group import _Group
++
++
++class FakeLayout:
++    def __init__(self, name="fake"):
++        self.name = name
++        self.group = None
++        self.added = []
++        self.laid_out = 0
++        self.focus_calls = 0
++        self.blur_calls = 0
++
++    def clone(self, group):
++        nl = FakeLayout(self.name)
++        nl.group = group
++        return nl
++
++
++    def add_client(self, win):
++        self.added.append(win)
++
++    def remove(self, win):
++        if win in self.added:
++            self.added.remove(win)
++        return None
++
++    def layout(self, windows, screen_rect):
++        # Count how many times layout is invoked
++        self.laid_out += 1
++
++    def focus(self, win):
++        self.focus_calls += 1
++
++    def blur(self):
++        self.blur_calls += 1
++
++    def show(self, rect):
++        pass
++
++    def hide(self):
++        pass
++
++
++class FakeFloatingLayout:
++    def __init__(self):
++        self._clients = []
++
++    def match(self, win):
++        # Never float
++        return False
++
++    def add_client(self, win):
++        self._clients.append(win)
++
++    def remove(self, win):
++        if win in self._clients:
++            self._clients.remove(win)
++        return None
++
++    def layout(self, windows, rect):
++        pass
++
++    def focus(self, win):
++        pass
++
++    def blur(self):
++        pass
++
++    def show(self, rect):
++        pass
++
++    def to_screen(self, group, screen):
++        pass
++
++    def info(self):
++        return {}
++
++    def find_clients(self, group):
++        return list(self._clients)
++
++
++class FakeConfig:
++    def __init__(self):
++        self.auto_fullscreen = False
++        self.floats_kept_above = False
++        self.cursor_warp = False
++
++
++class FakeCore:
++    name = "fake"
++    def __enter__(self):
++        return self
++    def __exit__(self, *exc):
++        return False
++
++
++class FakeQtile:
++    def __init__(self, screen):
++        self.config = FakeConfig()
++        self.core = self
++        self.current_screen = screen
++        self._drag = False
++    # context manager for masked
++    def masked(self):
++        return FakeCore()
++
++
++class FakeScreen:
++    index = 0
++    def __init__(self, x=0, y=0, w=800, h=600):
++        self.x, self.y, self.width, self.height = x, y, w, h
++    def get_rect(self):
++        return (self.x, self.y, self.width, self.height)
++
++
++class FakeWin:
++    def __init__(self, name):
++        self.name = name
++        self._group = None
++        self._float_state = None
++        self.minimized = False
++        self._fullscreen = False
++        self._floating = False
++        self.borderwidth = 0
++        self.bordercolor = (0,0,0)
++
++    @property
++    def floating(self):
++        return self._floating
++
++    @property
++    def fullscreen(self):
++        return self._fullscreen
++
++    @property
++    def wants_to_fullscreen(self):
++        return False
++    def focus(self, warp=True):
++        # simulate focus by doing nothing
++        pass
++
++
++
++    @property
++    def group(self):
++        return self._group
++
++    @group.setter
++    def group(self, g):
++        self._group = g
++
++
++if __name__ == "__main__":
++    # Create group and configure
++    group = _Group("test")
++    layout = FakeLayout()
++    floater = FakeFloatingLayout()
++    screen = FakeScreen()
++    qtile = FakeQtile(screen)
++
++    group._configure([layout], floater, qtile)
++
++    # Attach group to a screen
++    group.screen = screen
++
++    # Add an initial window with focus=True so we have a current_window
++    w1 = FakeWin("w1")
++    group.add(w1, focus=True)
++
++    # Use the group's active layout clone for counting
++    active_layout = group.layout
++
++    # Now add a window with focus=False simulating can_steal_focus=False
++    w2 = FakeWin("w2")
++    before = active_layout.laid_out
++    group.add(w2, focus=False)
++    after = active_layout.laid_out
++
++    print(f"Layout calls before: {before}, after adding unfocused: {after}")
++    if after == before:
++        print("REPRO: layout was not called when adding unfocused window (BUG)")
++    else:
++        print("FIXED: layout called when adding unfocused window")
++
++    # Simulate prompt grabbing keyboard then adding window with can_steal_focus True
++    qtile.widget_has_keyboard = True
++    w3 = FakeWin("w3")
++    # adding with focus=True but widget_has_keyboard would prevent focus changes in layout_all
++    before_focus_calls = getattr(w1, "focus_calls", 0)
++    group.add(w3, focus=True)
++    after_focus_calls = getattr(w1, "focus_calls", 0)
++    print("Widget has keyboard: layout should not refocus current_window.")
++    print(f"Focus calls on w1 before: {before_focus_calls}, after: {after_focus_calls}")

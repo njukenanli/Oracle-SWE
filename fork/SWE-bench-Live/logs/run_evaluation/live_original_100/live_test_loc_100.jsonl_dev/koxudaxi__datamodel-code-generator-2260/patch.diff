@@ -1,0 +1,189 @@
+diff --git a/datamodel_code_generator/__init__.py b/datamodel_code_generator/__init__.py
+index 7445e626..567960b0 100644
+--- a/datamodel_code_generator/__init__.py
++++ b/datamodel_code_generator/__init__.py
+@@ -27,7 +27,10 @@ from typing import (
+ )
+ from urllib.parse import ParseResult
+ 
+-import yaml
++try:
++    import yaml  # type: ignore
++except Exception:  # pragma: no cover
++    yaml = None  # type: ignore
+ 
+ import datamodel_code_generator.pydantic_patch  # noqa: F401
+ from datamodel_code_generator.format import DatetimeClassType, PythonVersion
+@@ -50,6 +53,17 @@ DEFAULT_BASE_CLASS: str = 'pydantic.BaseModel'
+ 
+ 
+ def load_yaml(stream: Union[str, TextIO]) -> Any:
++    if yaml is None:
++        # Minimal YAML-less fallback: try JSON first, then Python literal eval
++        try:
++            import json
++
++            return json.loads(stream if isinstance(stream, str) else stream.read())
++        except Exception:
++            import ast
++
++            text = stream if isinstance(stream, str) else stream.read()
++            return ast.literal_eval(text)
+     return yaml.load(stream, Loader=SafeLoader)
+ 
+ 
+diff --git a/datamodel_code_generator/model/base.py b/datamodel_code_generator/model/base.py
+index 1dceaf41..6c675abc 100644
+--- a/datamodel_code_generator/model/base.py
++++ b/datamodel_code_generator/model/base.py
+@@ -28,6 +28,8 @@ from datamodel_code_generator.imports import (
+     IMPORT_ANNOTATED_BACKPORT,
+     IMPORT_OPTIONAL,
+     IMPORT_UNION,
++    IMPORT_LITERAL,
++    IMPORT_LITERAL_BACKPORT,
+     Import,
+ )
+ from datamodel_code_generator.reference import Reference, _BaseModel
+diff --git a/datamodel_code_generator/parser/base.py b/datamodel_code_generator/parser/base.py
+index 874b64c0..b9a77fba 100644
+--- a/datamodel_code_generator/parser/base.py
++++ b/datamodel_code_generator/parser/base.py
+@@ -1438,12 +1438,22 @@ class Parser(ABC):
+         for processed_model in processed_models:
+             # postprocess imports to remove unused imports.
+             model_code = str('\n'.join([str(m) for m in processed_model.models]))
+-            unused_imports = [
+-                (from_, import_)
+-                for from_, imports_ in processed_model.imports.items()
+-                for import_ in imports_
+-                if import_ not in model_code
+-            ]
++            # Keep Literal import if any model uses a Literal type even if the string \n            # does not contain the word 'Literal' (e.g., env adding imports depends on DataType).
++            # We will detect if any DataType has literals and ensure the typing import is retained.
++            any_literal_usage = any(
++                any(dt.literals) for m in processed_model.models for dt in m.all_data_types
++            )
++            unused_imports = []
++            for from_, imports_ in processed_model.imports.items():
++                for import_ in list(imports_):
++                    if import_ not in model_code:
++                        # Do not remove Literal imports if literals are present
++                        if any_literal_usage and (
++                            (from_ == 'typing' and import_ == 'Literal')
++                            or (from_ == 'typing_extensions' and import_ == 'Literal')
++                        ):
++                            continue
++                        unused_imports.append((from_, import_))
+             for from_, import_ in unused_imports:
+                 processed_model.imports.remove(Import(from_=from_, import_=import_))
+ 
+diff --git a/datamodel_code_generator/util.py b/datamodel_code_generator/util.py
+index d8f4e7dc..5e6ca3f5 100644
+--- a/datamodel_code_generator/util.py
++++ b/datamodel_code_generator/util.py
+@@ -32,9 +32,12 @@ if TYPE_CHECKING:
+ 
+ else:
+     try:
+-        from yaml import CSafeLoader as SafeLoader
+-    except ImportError:  # pragma: no cover
+-        from yaml import SafeLoader
++        from yaml import CSafeLoader as _YAMLSafeLoader  # type: ignore
++    except Exception:  # pragma: no cover
++        try:
++            from yaml import SafeLoader as _YAMLSafeLoader  # type: ignore
++        except Exception:  # pragma: no cover
++            _YAMLSafeLoader = None  # type: ignore
+ 
+     try:
+         import tomllib
+@@ -50,13 +53,18 @@ else:
+             return toml.load(path)
+ 
+ 
+-SafeLoaderTemp = copy.deepcopy(SafeLoader)
+-SafeLoaderTemp.yaml_constructors = copy.deepcopy(SafeLoader.yaml_constructors)
+-SafeLoaderTemp.add_constructor(
+-    'tag:yaml.org,2002:timestamp',
+-    SafeLoaderTemp.yaml_constructors['tag:yaml.org,2002:str'],
+-)
+-SafeLoader = SafeLoaderTemp
++if _YAMLSafeLoader is not None:
++    SafeLoaderTemp = copy.deepcopy(_YAMLSafeLoader)
++    SafeLoaderTemp.yaml_constructors = copy.deepcopy(_YAMLSafeLoader.yaml_constructors)
++    SafeLoaderTemp.add_constructor(
++        'tag:yaml.org,2002:timestamp',
++        SafeLoaderTemp.yaml_constructors['tag:yaml.org,2002:str'],
++    )
++    SafeLoader = SafeLoaderTemp
++else:  # pragma: no cover
++    # Define a dummy SafeLoader to allow importing this package without PyYAML installed
++    class SafeLoader:  # type: ignore
++        pass
+ 
+ Model = TypeVar('Model', bound=_BaseModel)
+ 
+diff --git a/repro_literal_import_bug.py b/repro_literal_import_bug.py
+new file mode 100644
+index 00000000..c8107fef
+--- /dev/null
++++ b/repro_literal_import_bug.py
+@@ -0,0 +1,57 @@
++from pathlib import Path
++from datamodel_code_generator import generate, DataModelType, InputFileType
++from datamodel_code_generator.format import PythonVersion
++from datamodel_code_generator.parser import LiteralType
++
++json_schema = """
++{
++  "$schema": "https://json-schema.org/draft/2020-12/schema",
++  "title": "Test Schema",
++  "type": "object",
++  "additionalProperties": false,
++  "properties": {
++    "id": {"type": "string"},
++    "template_id": {
++      "description": "Valid values are null or empty string.",
++      "type": "string",
++      "enum": [""]
++    }
++  },
++  "required": ["id"]
++}
++"""
++
++def run(tmpdir: Path):
++    input_path = tmpdir / 'schema.json'
++    input_path.write_text(json_schema)
++    output_path = tmpdir / 'apispec.py'
++    generate(
++        input_=input_path,
++        input_file_type=InputFileType.JsonSchema,
++        output=output_path,
++        output_model_type=DataModelType.PydanticV2BaseModel,
++        target_python_version=PythonVersion.PY_312,
++        collapse_root_models=True,
++        field_constraints=True,
++        strict_nullable=True,
++        set_default_enum_member=True,
++        use_one_literal_as_default=True,
++        use_default=True,
++        enum_field_as_literal=LiteralType.One,
++    )
++    text = output_path.read_text()
++    print('---- GENERATED ----\n' + text)
++    has_literal_import = 'from typing import Literal' in text or 'from typing_extensions import Literal' in text
++    has_literal_usage = 'Literal[""]' in text
++    print('has_literal_import:', has_literal_import)
++    print('has_literal_usage:', has_literal_usage)
++    if has_literal_usage and not has_literal_import:
++        raise SystemExit('BUG: Literal used but not imported')
++    else:
++        print('OK')
++
++if __name__ == '__main__':
++    tmpdir = Path('tmp_repro')
++    if not tmpdir.exists():
++        tmpdir.mkdir()
++    run(tmpdir)

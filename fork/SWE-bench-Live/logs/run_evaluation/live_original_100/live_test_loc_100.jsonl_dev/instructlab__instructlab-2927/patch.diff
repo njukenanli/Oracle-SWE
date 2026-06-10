@@ -1,0 +1,221 @@
+diff --git a/repro_tps_check.py b/repro_tps_check.py
+new file mode 100644
+index 00000000..d0c9e26b
+--- /dev/null
++++ b/repro_tps_check.py
+@@ -0,0 +1,76 @@
++# Repro script for tensor-parallel-size sanity check with vLLM backend
++# This creates a minimal safetensors model directory and invokes `ilab model serve`
++# requesting tensor-parallel-size larger than available accelerators to trigger the sanity check.
++
++import pathlib
++import sys
++
++from click.testing import CliRunner
++
++from instructlab import lab
++
++
++def create_safetensors_model_directory(directory_path: pathlib.Path):
++    directory_path.mkdir(parents=True, exist_ok=True)
++    # Minimal files expected by is_model_safetensors
++    (directory_path / "config.json").write_text("{}", encoding="utf-8")
++    (directory_path / "tokenizer.json").write_text("{}", encoding="utf-8")
++    (directory_path / "tokenizer_config.json").write_text("{}", encoding="utf-8")
++
++    # Create a tiny safetensors file
++    from safetensors.torch import save_file
++    import torch
++
++    tensors = {
++        "tensor1": torch.randn(1, 1),
++    }
++    save_file(tensors, directory_path / "model.safetensors")
++
++
++def main():
++    tmp_dir = pathlib.Path("./tmp_safetensors_model")
++    create_safetensors_model_directory(tmp_dir)
++
++    # Monkeypatch torch to simulate a single GPU environment
++    class _Cuda:
++        @staticmethod
++        def is_available():
++            return True
++
++        @staticmethod
++        def device_count():
++            return 1
++
++    class _Torch:
++        cuda = _Cuda()
++
++    import sys as _sys
++    _sys.modules["torch"] = _Torch()
++
++    runner = CliRunner()
++
++    # Force the backend to be vLLM by patching is_model_safetensors to return True
++    from unittest import mock
++    with mock.patch("instructlab.utils.is_model_safetensors", return_value=True):
++        # Pass --backend=vllm explicitly and set a high tensor-parallel-size via extra args
++        result = runner.invoke(
++            lab.ilab,
++            [
++                "--config=DEFAULT",
++                "model",
++                "serve",
++                f"--model-path={tmp_dir}",
++                "--backend",
++                "vllm",
++                "--gpus",
++                "4",
++            ],
++        )
++    print("Exit code:", result.exit_code)
++    print("Output:\n", result.output)
++    if result.exception:
++        print("Exception:", result.exception)
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/src/instructlab/cli/model/serve.py b/src/instructlab/cli/model/serve.py
+index 8fe6a0ef..dbeb94ce 100644
+--- a/src/instructlab/cli/model/serve.py
++++ b/src/instructlab/cli/model/serve.py
+@@ -127,6 +127,7 @@ def serve(
+         ctx.obj.config.serve.server.current_max_ctx_size = max_ctx_size
+         write_config(ctx.obj.config)
+ 
++
+     serve_backend(
+         ctx,
+         model_path,
+diff --git a/src/instructlab/model/serve_backend.py b/src/instructlab/model/serve_backend.py
+index f9a1eaf1..273e66c5 100644
+--- a/src/instructlab/model/serve_backend.py
++++ b/src/instructlab/model/serve_backend.py
+@@ -100,6 +100,53 @@ def serve_backend(
+         if ctx.args:
+             vllm_args.extend(ctx.args)
+ 
++        # Sanity check: ensure tensor-parallel-size does not exceed available accelerators
++        try:
++            from instructlab.model.backends.vllm import get_argument as _get_arg
++        except Exception:  # pragma: no cover - very unlikely to fail
++            _get_arg = None
++        if _get_arg is not None:
++            try:
++                has_tps, tps_val = _get_arg("--tensor-parallel-size", vllm_args)
++                if has_tps and tps_val is not None:
++                    try:
++                        tps = int(tps_val)
++                    except ValueError:
++                        logger.warning(
++                            "Invalid --tensor-parallel-size value '%s' found in serve vllm_args",
++                            tps_val,
++                        )
++                        tps = None
++                    if tps is not None and tps > 0:
++                        available_devices = 0
++                        try:
++                            import torch  # type: ignore
++
++                            if hasattr(torch, "cuda") and torch.cuda.is_available():
++                                available_devices = torch.cuda.device_count()
++                            else:
++                                try:
++                                    from habana_frameworks.torch import hpu  # type: ignore
++
++                                    if hpu.is_available():
++                                        available_devices = hpu.device_count()
++                                except Exception:
++                                    # No HPU support available
++                                    pass
++                        except Exception:
++                            # Torch not available or failed to query devices, assume 0
++                            available_devices = 0
++
++                        # Only perform sanity check if we can detect accelerators on this system
++                        if available_devices > 0 and tps > available_devices:
++                            ctx.fail(
++                                f"Configured --tensor-parallel-size ({tps}) exceeds available accelerators ({available_devices}). "
++                                "Reduce the tensor-parallel-size, set an appropriate --gpus value, or run on a system with more accelerators."
++                            )
++            except Exception:
++                # Do not block serving if argument parsing failed unexpectedly
++                pass
++
+         backend_instance = vllm.Server(
+             api_base=ctx.obj.config.serve.api_base(),
+             model_family=model_family,
+diff --git a/src/instructlab/rag/convert.py b/src/instructlab/rag/convert.py
+index 42385c49..6419e424 100644
+--- a/src/instructlab/rag/convert.py
++++ b/src/instructlab/rag/convert.py
+@@ -209,8 +209,17 @@ def _resolve_ocr_options() -> OcrOptions:
+             TesseractOcrModel,
+         )
+ 
+-        _ = TesseractOcrModel(True, ocr_options)
+-        return ocr_options
++        try:
++            # Newer versions require explicit options and accelerator options
++            from docling.datamodel.pipeline_options import (  # type: ignore[import-untyped]
++                AcceleratorOptions,
++            )
++            acc_options = AcceleratorOptions()
++            _ = TesseractOcrModel(True, None, ocr_options, acc_options)  # type: ignore[call-arg]
++            return ocr_options
++        except Exception:
++            # Fall through to try EasyOCR/disable OCR
++            pass
+     except ImportError:
+         # No tesserocr, so try something else
+         pass
+@@ -227,7 +236,15 @@ def _resolve_ocr_options() -> OcrOptions:
+         ocr_options.use_gpu = False
+         # triggers torch loading, import lazily
+ 
+-        _ = EasyOcrModel(True, ocr_options)
++        try:
++            from docling.datamodel.pipeline_options import (  # type: ignore[import-untyped]
++                AcceleratorOptions,
++            )
++            acc_options = AcceleratorOptions()
++            _ = EasyOcrModel(True, None, ocr_options, acc_options)  # type: ignore[call-arg]
++        except Exception:
++            # Fallback to legacy signature if available
++            _ = EasyOcrModel(True, ocr_options)  # type: ignore[call-arg]
+         return ocr_options
+     except ImportError:
+         # no easyocr either, so don't use any OCR
+diff --git a/tmp_safetensors_model/config.json b/tmp_safetensors_model/config.json
+new file mode 100644
+index 00000000..9e26dfee
+--- /dev/null
++++ b/tmp_safetensors_model/config.json
+@@ -0,0 +1 @@
++{}
+\ No newline at end of file
+diff --git a/tmp_safetensors_model/model.safetensors b/tmp_safetensors_model/model.safetensors
+new file mode 100644
+index 00000000..7b225835
+Binary files /dev/null and b/tmp_safetensors_model/model.safetensors differ
+diff --git a/tmp_safetensors_model/tokenizer.json b/tmp_safetensors_model/tokenizer.json
+new file mode 100644
+index 00000000..9e26dfee
+--- /dev/null
++++ b/tmp_safetensors_model/tokenizer.json
+@@ -0,0 +1 @@
++{}
+\ No newline at end of file
+diff --git a/tmp_safetensors_model/tokenizer_config.json b/tmp_safetensors_model/tokenizer_config.json
+new file mode 100644
+index 00000000..9e26dfee
+--- /dev/null
++++ b/tmp_safetensors_model/tokenizer_config.json
+@@ -0,0 +1 @@
++{}
+\ No newline at end of file

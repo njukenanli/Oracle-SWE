@@ -1,0 +1,220 @@
+diff --git a/django/db/backends/base/schema.py b/django/db/backends/base/schema.py
+index 61f88401ab..bfe10a3e66 100644
+--- a/django/db/backends/base/schema.py
++++ b/django/db/backends/base/schema.py
+@@ -348,7 +348,19 @@ class BaseDatabaseSchemaEditor:
+                 self.deferred_sql.remove(sql)
+ 
+     def add_index(self, model, index):
+-        """Add an index on a model."""
++        """Add an index on a model.
++        Avoid recreating an existing non-unique index when moving declarations
++        from index_together to Meta.indexes by checking for an existing index on
++        the same columns.
++        """
++        # Only skip creation for simple, default indexes (no condition/opclasses/tablespace).
++        if not index.opclasses and index.condition is None and index.db_tablespace is None:
++            # Determine the target columns in database order.
++            columns = [model._meta.get_field(field_name).column for field_name, _ in index.fields_orders]
++            # If an equivalent, non-unique index already exists, skip creation.
++            existing = self._constraint_names(model, column_names=columns, unique=False, index=True)
++            if existing:
++                return
+         self.execute(index.create_sql(model, self), params=None)
+ 
+     def remove_index(self, model, index):
+@@ -393,7 +405,19 @@ class BaseDatabaseSchemaEditor:
+         news = {tuple(fields) for fields in new_index_together}
+         # Deleted indexes
+         for fields in olds.difference(news):
+-            self._delete_composed_index(model, fields, {'index': True}, self.sql_delete_index)
++            # If an equivalent index is declared via Meta.indexes, don't drop the
++            # existing index_together to avoid unnecessary re-creation when moving
++            # declarations.
++            for idx in model._meta.indexes:
++                idx_field_names = [name for name, _ in idx.fields_orders]
++                if tuple(idx_field_names) == tuple(fields):
++                    break
++            else:
++                # Only drop non-unique indexes. If a unique_together exists on the
++                # same columns, backends like SQLite implement it as a unique index
++                # which would also match index=True. Filter with unique=False so we
++                # delete only the non-unique index_together.
++                self._delete_composed_index(model, fields, {'index': True, 'unique': False}, self.sql_delete_index)
+         # Created indexes
+         for field_names in news.difference(olds):
+             fields = [model._meta.get_field(field) for field in field_names]
+diff --git a/repro_bug.py b/repro_bug.py
+new file mode 100644
+index 0000000000..c2ca7acea2
+--- /dev/null
++++ b/repro_bug.py
+@@ -0,0 +1,42 @@
++import sys
++sys.path.insert(0, '/testbed')
++
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++        INSTALLED_APPS=[],
++        TIME_ZONE='UTC',
++        USE_TZ=True,
++    )
++
++import django
++django.setup()
++
++from django.db import connection, models
++
++class TestModel(models.Model):
++    a = models.IntegerField()
++    b = models.IntegerField()
++    class Meta:
++        app_label = 'myapp'
++        db_table = 'myapp_test'
++        unique_together = [('a', 'b')]
++        index_together = [('a', 'b')]
++
++
++def main():
++    # Create the model with both unique_together and index_together on same fields.
++    with connection.schema_editor() as se:
++        se.create_model(TestModel)
++    # Now attempt to drop index_together while unique_together remains.
++    try:
++        with connection.schema_editor() as se:
++            se.alter_index_together(TestModel, old_index_together=TestModel._meta.index_together, new_index_together=[])
++        print('Index together dropped successfully')
++    except Exception as e:
++        print('Error while dropping index_together:', type(e).__name__, e)
++
++if __name__ == '__main__':
++    main()
+diff --git a/repro_move.py b/repro_move.py
+new file mode 100644
+index 0000000000..64a1c7ea85
+--- /dev/null
++++ b/repro_move.py
+@@ -0,0 +1,60 @@
++import sys
++sys.path.insert(0, '/testbed')
++
++from django.conf import settings
++if not settings.configured:
++    settings.configure(
++        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++        INSTALLED_APPS=[],
++        TIME_ZONE='UTC',
++        USE_TZ=True,
++    )
++import django
++django.setup()
++
++from django.db import connection, models
++from django.db.models import Index
++
++class ModelA(models.Model):
++    a = models.IntegerField()
++    b = models.IntegerField()
++    class Meta:
++        app_label = 'myapp'
++        db_table = 'myapp_a'
++        index_together = [('a','b')]
++
++class ModelB(models.Model):
++    a = models.IntegerField()
++    b = models.IntegerField()
++    class Meta:
++        app_label = 'myapp'
++        db_table = 'myapp_b'
++        indexes = [Index(fields=['a','b'])]
++
++
++def get_indexes(table):
++    with connection.cursor() as cursor:
++        cursor.execute("PRAGMA index_list(%s)" % connection.ops.quote_name(table))
++        return cursor.fetchall()
++
++
++def main():
++    with connection.schema_editor() as se:
++        se.create_model(ModelA)
++        se.create_model(ModelB)
++    # Both should have one index on (a,b).
++    print('Indexes on myapp_a before move:', get_indexes('myapp_a'))
++    print('Indexes on myapp_b before move:', get_indexes('myapp_b'))
++    # Simulate moving declaration: drop index_together on ModelA and add Meta.indexes.
++    try:
++        with connection.schema_editor() as se:
++            se.alter_index_together(ModelA, old_index_together=ModelA._meta.index_together, new_index_together=[])
++            idx = Index(fields=['a','b'])
++            idx.set_name_with_model(ModelA)
++            se.add_index(ModelA, idx)
++        print('After move, indexes on myapp_a:', get_indexes('myapp_a'))
++    except Exception as e:
++        print('Error during move:', type(e).__name__, e)
++
++if __name__ == '__main__':
++    main()
+diff --git a/repro_move2.py b/repro_move2.py
+new file mode 100644
+index 0000000000..46df25aca3
+--- /dev/null
++++ b/repro_move2.py
+@@ -0,0 +1,54 @@
++import sys
++sys.path.insert(0, '/testbed')
++
++from django.conf import settings
++if not settings.configured:
++    settings.configure(
++        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++        INSTALLED_APPS=[],
++        TIME_ZONE='UTC',
++        USE_TZ=True,
++    )
++import django
++django.setup()
++
++from django.db import connection, models
++from django.db.models import Index
++
++class Old(models.Model):
++    a = models.IntegerField()
++    b = models.IntegerField()
++    class Meta:
++        app_label = 'myapp'
++        db_table = 'myapp_c'
++        index_together = [('a','b')]
++
++class New(models.Model):
++    a = models.IntegerField()
++    b = models.IntegerField()
++    class Meta:
++        app_label = 'myapp'
++        db_table = 'myapp_c'
++        indexes = [Index(fields=['a','b'])]
++
++
++def get_indexes(table):
++    with connection.cursor() as cursor:
++        cursor.execute("PRAGMA index_list(%s)" % connection.ops.quote_name(table))
++        return cursor.fetchall()
++
++
++def main():
++    with connection.schema_editor() as se:
++        se.create_model(Old)
++    print('Before move, indexes:', get_indexes('myapp_c'))
++    # Simulate migration which uses New as the model state.
++    with connection.schema_editor() as se:
++        se.alter_index_together(New, old_index_together=Old._meta.index_together, new_index_together=[])
++        idx = Index(fields=['a','b'])
++        idx.set_name_with_model(New)
++        se.add_index(New, idx)
++    print('After move, indexes:', get_indexes('myapp_c'))
++
++if __name__ == '__main__':
++    main()

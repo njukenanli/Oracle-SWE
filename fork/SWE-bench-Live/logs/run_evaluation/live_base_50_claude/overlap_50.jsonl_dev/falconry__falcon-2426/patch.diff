@@ -1,0 +1,131 @@
+diff --git a/falcon/routing/static.py b/falcon/routing/static.py
+index 57e327ab..614faa9f 100644
+--- a/falcon/routing/static.py
++++ b/falcon/routing/static.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++from datetime import datetime, timezone
+ from functools import partial
+ import io
+ import os
+@@ -19,30 +20,35 @@ if TYPE_CHECKING:
+ 
+ def _open_range(
+     file_path: Union[str, Path], req_range: Optional[Tuple[int, int]]
+-) -> Tuple[ReadableIO, int, Optional[Tuple[int, int, int]]]:
++) -> Tuple[ReadableIO, int, Optional[Tuple[int, int, int]], float]:
+     """Open a file for a ranged request.
+ 
+     Args:
+         file_path (str): Path to the file to open.
+         req_range (Optional[Tuple[int, int]]): Request.range value.
+     Returns:
+-        tuple: Three-member tuple of (stream, content-length, content-range).
++        tuple: Four-member tuple of (stream, content-length, content-range, mtime).
+             If req_range is ``None`` or ignored, content-range will be
+             ``None``; otherwise, the stream will be appropriately seeked and
+             possibly bounded, and the content-range will be a tuple of
+-            (start, end, size).
++            (start, end, size). mtime is the file's modification time as a
++            Unix timestamp.
+     """
+     fh = io.open(file_path, 'rb')
+-    size = os.fstat(fh.fileno()).st_size
++    stat_result = os.fstat(fh.fileno())
++    size = stat_result.st_size
++    # Get modification time, defaulting to current time if not available
++    # (e.g., in test mocks)
++    mtime = getattr(stat_result, 'st_mtime', datetime.now(timezone.utc).timestamp())
+     if req_range is None:
+-        return fh, size, None
++        return fh, size, None, mtime
+ 
+     start, end = req_range
+     if size == 0:
+         # NOTE(tipabu): Ignore Range headers for zero-byte files; just serve
+         #   the empty body since Content-Range can't be used to express a
+         #   zero-byte body.
+-        return fh, 0, None
++        return fh, 0, None, mtime
+ 
+     if start < 0 and end == -1:
+         # NOTE(tipabu): Special case: only want the last N bytes.
+@@ -51,7 +57,7 @@ def _open_range(
+         # NOTE(vytas): Wrap in order to prevent sendfile from being used, as
+         #   its implementation was found to be buggy in many popular WSGI
+         #   servers for open files with a non-zero offset.
+-        return _BoundedFile(fh, -start), -start, (size + start, size - 1, size)
++        return _BoundedFile(fh, -start), -start, (size + start, size - 1, size), mtime
+ 
+     if start >= size:
+         fh.close()
+@@ -63,11 +69,11 @@ def _open_range(
+         #   its implementation was found to be buggy in many popular WSGI
+         #   servers for open files with a non-zero offset.
+         length = size - start
+-        return _BoundedFile(fh, length), length, (start, size - 1, size)
++        return _BoundedFile(fh, length), length, (start, size - 1, size), mtime
+ 
+     end = min(end, size - 1)
+     length = end - start + 1
+-    return _BoundedFile(fh, length), length, (start, end, size)
++    return _BoundedFile(fh, length), length, (start, end, size), mtime
+ 
+ 
+ class _BoundedFile:
+@@ -221,13 +227,13 @@ class StaticRoute:
+         if req.range_unit != 'bytes':
+             req_range = None
+         try:
+-            stream, length, content_range = _open_range(file_path, req_range)
++            stream, length, content_range, mtime = _open_range(file_path, req_range)
+             resp.set_stream(stream, length)
+         except IOError:
+             if self._fallback_filename is None:
+                 raise falcon.HTTPNotFound()
+             try:
+-                stream, length, content_range = _open_range(
++                stream, length, content_range, mtime = _open_range(
+                     self._fallback_filename, req_range
+                 )
+                 resp.set_stream(stream, length)
+@@ -235,11 +241,37 @@ class StaticRoute:
+             except IOError:
+                 raise falcon.HTTPNotFound()
+ 
++        # Convert mtime to datetime for Last-Modified header
++        # Create timezone-aware datetime with microseconds stripped for HTTP date precision
++        last_modified = datetime.utcfromtimestamp(mtime).replace(
++            microsecond=0, tzinfo=timezone.utc
++        )
++        
++        # Check If-Modified-Since header
++        if_modified_since = req.if_modified_since
++        if if_modified_since is not None:
++            # Compare timestamps, ignoring microseconds since HTTP dates don't have that precision
++            if_modified_since = if_modified_since.replace(microsecond=0)
++            
++            if last_modified <= if_modified_since:
++                # File has not been modified, return 304 Not Modified
++                resp.status = falcon.HTTP_304
++                # Close the stream since we won't be using it
++                stream.close()
++                # Don't set a body for 304 responses
++                resp.set_stream(None, 0)
++                # Set the Last-Modified header even for 304 responses
++                resp.last_modified = last_modified
++                return
++
+         suffix = os.path.splitext(file_path)[1]
+         resp.content_type = resp.options.static_media_types.get(
+             suffix, 'application/octet-stream'
+         )
+         resp.accept_ranges = 'bytes'
++        
++        # Set Last-Modified header
++        resp.last_modified = last_modified
+ 
+         if self._downloadable:
+             resp.downloadable_as = os.path.basename(file_path)

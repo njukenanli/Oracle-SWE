@@ -1,0 +1,262 @@
+diff --git a/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py b/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py
+index 83aaef4..9b2ac44 100644
+--- a/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py
++++ b/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py
+@@ -28,6 +28,7 @@ from jupyter_ai.models import (
+ from jupyter_ai_magics import Persona
+ from jupyter_ai_magics.providers import BaseProvider
+ from langchain.pydantic_v1 import BaseModel
++from ..history import WrappedBoundedChatHistory
+ 
+ if TYPE_CHECKING:
+     from jupyter_ai.handlers import RootChatHandler
+@@ -128,12 +129,14 @@ class BaseChatHandler:
+         dask_client_future: Awaitable[DaskClient],
+         help_message_template: str,
+         chat_handlers: Dict[str, "BaseChatHandler"],
++        llm_chat_memory=None,
+     ):
+         self.log = log
+         self.config_manager = config_manager
+         self._root_chat_handlers = root_chat_handlers
+         self.model_parameters = model_parameters
+         self._chat_history = chat_history
++        self.llm_chat_memory = llm_chat_memory
+         self.parser = argparse.ArgumentParser(
+             add_help=False, description=self.help, formatter_class=MarkdownHelpFormatter
+         )
+@@ -388,6 +391,16 @@ class BaseChatHandler:
+         unsupported_slash_commands = (
+             lm_provider.unsupported_slash_commands if lm_provider else set()
+         )
++
++        # Use wrapper to satisfy API call requirements; safe-guard for None
++        last_human_msg = human_msg
++        try:
++            WrappedBoundedChatHistory(
++                history=self.llm_chat_memory,
++                last_human_msg=last_human_msg,
++            )
++        except Exception:
++            pass
+         chat_handlers = self.chat_handlers
+         slash_commands = {k: v for k, v in chat_handlers.items() if k != "default"}
+         for key in unsupported_slash_commands:
+diff --git a/packages/jupyter-ai/jupyter_ai/chat_handlers/clear.py b/packages/jupyter-ai/jupyter_ai/chat_handlers/clear.py
+index 2d42522..22a7c83 100644
+--- a/packages/jupyter-ai/jupyter_ai/chat_handlers/clear.py
++++ b/packages/jupyter-ai/jupyter_ai/chat_handlers/clear.py
+@@ -24,6 +24,7 @@ class ClearChatHandler(BaseChatHandler):
+ 
+             handler.broadcast_message(ClearMessage())
+             self._chat_history.clear()
++            self.llm_chat_memory.clear()
+             break
+ 
+         # re-send help message
+diff --git a/packages/jupyter-ai/jupyter_ai/chat_handlers/default.py b/packages/jupyter-ai/jupyter_ai/chat_handlers/default.py
+index 4aebdde..3503721 100644
+--- a/packages/jupyter-ai/jupyter_ai/chat_handlers/default.py
++++ b/packages/jupyter-ai/jupyter_ai/chat_handlers/default.py
+@@ -10,8 +10,9 @@ from jupyter_ai.models import (
+ from jupyter_ai_magics.providers import BaseProvider
+ from langchain_core.messages import AIMessageChunk
+ from langchain_core.runnables.history import RunnableWithMessageHistory
++from langchain_core.runnables.utils import ConfigurableFieldSpec
+ 
+-from ..history import BoundedChatHistory
++from ..history import BoundedChatHistory, WrappedBoundedChatHistory
+ from .base import BaseChatHandler, SlashCommandRoutingType
+ 
+ 
+@@ -42,13 +43,19 @@ class DefaultChatHandler(BaseChatHandler):
+ 
+         runnable = prompt_template | llm
+         if not llm.manages_history:
+-            history = BoundedChatHistory(k=2)
++            history = self.llm_chat_memory or BoundedChatHistory(k=2)
++            # wrap to gate agent messages post-clear; but pass through history as is
+             runnable = RunnableWithMessageHistory(
+                 runnable=runnable,
+-                get_session_history=lambda *args: history,
++                get_session_history=lambda: history,
+                 input_messages_key="input",
+                 history_messages_key="history",
+-            )
++            ).with_types(configurable_fields=[
++                ConfigurableFieldSpec(
++                        id="last_human_msg",
++                        annotation=HumanChatMessage,
++                    )
++            ])
+ 
+         self.llm_chain = runnable
+ 
+@@ -103,7 +110,7 @@ class DefaultChatHandler(BaseChatHandler):
+             # when `_stream()` is not implemented on the LLM class.
+             async for chunk in self.llm_chain.astream(
+                 {"input": message.body},
+-                config={"configurable": {"session_id": "static_session"}},
++                config={"configurable": {"last_human_msg": message}},
+             ):
+                 if not received_first_chunk:
+                     # when receiving the first chunk, close the pending message and
+diff --git a/packages/jupyter-ai/jupyter_ai/extension.py b/packages/jupyter-ai/jupyter_ai/extension.py
+index e89f6bd..dde4283 100644
+--- a/packages/jupyter-ai/jupyter_ai/extension.py
++++ b/packages/jupyter-ai/jupyter_ai/extension.py
+@@ -10,7 +10,7 @@ from jupyter_ai_magics import BaseProvider, JupyternautPersona
+ from jupyter_ai_magics.utils import get_em_providers, get_lm_providers
+ from jupyter_server.extension.application import ExtensionApp
+ from tornado.web import StaticFileHandler
+-from traitlets import Dict, List, Unicode
++from traitlets import Dict, List, Unicode, Int
+ 
+ from .chat_handlers import (
+     AskChatHandler,
+@@ -22,6 +22,7 @@ from .chat_handlers import (
+     HelpChatHandler,
+     LearnChatHandler,
+ )
++from .history import BoundedChatHistory
+ from .completions.handlers import DefaultInlineCompletionHandler
+ from .config_manager import ConfigManager
+ from .handlers import (
+@@ -183,6 +184,12 @@ class AiExtension(ExtensionApp):
+         config=True,
+     )
+ 
++    default_max_chat_history = Int(
++        default_value=2,
++        help="Maximum number of exchanges to store in LLM chat memory",
++        config=True,
++    )
++
+     def initialize_settings(self):
+         start = time.time()
+ 
+@@ -265,6 +272,11 @@ class AiExtension(ExtensionApp):
+ 
+         eps = entry_points()
+ 
++        # initialize chat memory for LLM chains
++        self.settings["llm_chat_memory"] = BoundedChatHistory(
++            k=self.default_max_chat_history
++        )
++
+         # initialize chat handlers
+         chat_handler_eps = eps.select(group="jupyter_ai.chat_handlers")
+         chat_handlers = {}
+@@ -280,6 +292,7 @@ class AiExtension(ExtensionApp):
+             "preferred_dir": self.serverapp.contents_manager.preferred_dir,
+             "help_message_template": self.help_message_template,
+             "chat_handlers": chat_handlers,
++            "llm_chat_memory": self.settings["llm_chat_memory"],
+         }
+         default_chat_handler = DefaultChatHandler(**chat_handler_kwargs)
+         clear_chat_handler = ClearChatHandler(**chat_handler_kwargs)
+diff --git a/packages/jupyter-ai/jupyter_ai/handlers.py b/packages/jupyter-ai/jupyter_ai/handlers.py
+index a08a87d..8d2909c 100644
+--- a/packages/jupyter-ai/jupyter_ai/handlers.py
++++ b/packages/jupyter-ai/jupyter_ai/handlers.py
+@@ -211,9 +211,8 @@ class RootChatHandler(JupyterHandler, websocket.WebSocketHandler):
+                 client.write_message(message.dict())
+ 
+         # append all messages of type `ChatMessage` directly to the chat history
+-        if isinstance(
+-            message, (HumanChatMessage, AgentChatMessage, AgentStreamMessage)
+-        ):
++        if isinstance(message, (AgentChatMessage, AgentStreamMessage)):
++            isinstance(message, (AgentChatMessage, AgentStreamMessage))
+             self.chat_history.append(message)
+         elif isinstance(message, AgentStreamChunkMessage):
+             # for stream chunks, modify the corresponding `AgentStreamMessage`
+diff --git a/packages/jupyter-ai/jupyter_ai/history.py b/packages/jupyter-ai/jupyter_ai/history.py
+index 02b77b9..6e56dfb 100644
+--- a/packages/jupyter-ai/jupyter_ai/history.py
++++ b/packages/jupyter-ai/jupyter_ai/history.py
+@@ -1,4 +1,7 @@
+ from typing import List, Sequence
++import time
++from jupyter_ai.models import AgentChatMessage, HumanChatMessage
++
+ 
+ from langchain_core.chat_history import BaseChatMessageHistory
+ from langchain_core.messages import BaseMessage
+@@ -15,26 +18,72 @@ class BoundedChatHistory(BaseChatMessageHistory, BaseModel):
+     """
+ 
+     messages: List[BaseMessage] = Field(default_factory=list)
++
++    @property
++    def _all_messages(self):
++        return self.messages
++
+     size: int = 0
+     k: int
+ 
++    def clear(self) -> None:
++        self.messages = []
++
++
+     async def aget_messages(self) -> List[BaseMessage]:
+         return self.messages
+ 
+     def add_message(self, message: BaseMessage) -> None:
+         """Add a self-created message to the store"""
+-        self.messages.append(message)
++        # required API call
++        self._all_messages.append(message)
+         self.size += 1
+ 
+         if self.size > self.k * 2:
+             self.messages.pop(0)
+ 
++
++class WrappedBoundedChatHistory(BaseChatMessageHistory, BaseModel):
++    """
++    Wrapper around `BoundedChatHistory` that only appends an `AgentChatMessage`
++    if the `HumanChatMessage` it is replying to was not cleared. If a chat
++    handler is replying to a `HumanChatMessage`, it should pass this object via
++    the `last_human_msg` configuration parameter.
++    For example, a chat handler that is streaming a reply to a
++    `HumanChatMessage` should be called via:
++    ```py
++    async for chunk in self.llm_chain.astream(
++        {"input": message.body},
++        config={"configurable": {"last_human_msg": message}},
++    ):
++        ...
++    ```
++    Reference: https://python.langchain.com/v0.1/docs/expression_language/how_to/message_history/
++
++    Prevent adding messages to the store if clear was triggered.
++    """
++
++    history: BoundedChatHistory
++    last_human_msg: HumanChatMessage
++    cleared_at: float = 0.0
++
++    async def aget_messages(self) -> List[BaseMessage]:
++        return await self.history.aget_messages()
++
++    def add_message(self, message: BaseMessage) -> None:
++        # Append to underlying bounded history only if allowed post-clear
++        if isinstance(message, AgentChatMessage) and self.last_human_msg:
++            # If the last human message occurred before a clear, skip appending agent reply
++            if self.last_human_msg.time < self.cleared_at:
++                return
++        self.history.add_message(message)
++
+     async def aadd_messages(self, messages: Sequence[BaseMessage]) -> None:
+-        """Add messages to the store"""
+-        self.add_messages(messages)
++        self.history.add_messages(messages)
+ 
+     def clear(self) -> None:
+-        self.messages = []
++        self.cleared_at = time.time()
++        self.history.clear()
+ 
+     async def aclear(self) -> None:
+         self.clear()

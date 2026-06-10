@@ -1,0 +1,290 @@
+diff --git a/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py b/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py
+index fb2559c..8674633 100644
+--- a/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py
++++ b/packages/jupyter-ai/jupyter_ai/chat_handlers/base.py
+@@ -140,6 +140,7 @@ class BaseChatHandler:
+         help_message_template: str,
+         chat_handlers: Dict[str, "BaseChatHandler"],
+         context_providers: Dict[str, "BaseCommandContextProvider"],
++        message_interrupted: Optional[Dict[str, bool]] = None,
+     ):
+         self.log = log
+         self.config_manager = config_manager
+@@ -161,6 +162,7 @@ class BaseChatHandler:
+         self.help_message_template = help_message_template
+         self.chat_handlers = chat_handlers
+         self.context_providers = context_providers
++        self.message_interrupted = message_interrupted if message_interrupted is not None else {}
+ 
+         self.llm: Optional[BaseProvider] = None
+         self.llm_params: Optional[dict] = None
+diff --git a/packages/jupyter-ai/jupyter_ai/chat_handlers/default.py b/packages/jupyter-ai/jupyter_ai/chat_handlers/default.py
+index 607dc92..41c1580 100644
+--- a/packages/jupyter-ai/jupyter_ai/chat_handlers/default.py
++++ b/packages/jupyter-ai/jupyter_ai/chat_handlers/default.py
+@@ -144,6 +144,11 @@ class DefaultChatHandler(BaseChatHandler):
+                     stream_id = self._start_stream(human_msg=message)
+                     received_first_chunk = True
+ 
++                # Check if this message was interrupted
++                if self.message_interrupted.get(stream_id, False):
++                    self.log.info(f"Stream {stream_id} was interrupted by user")
++                    break
++
+                 if isinstance(chunk, AIMessageChunk) and isinstance(chunk.content, str):
+                     self._send_stream_chunk(stream_id, chunk.content)
+                 elif isinstance(chunk, str):
+@@ -153,9 +158,14 @@ class DefaultChatHandler(BaseChatHandler):
+                     break
+ 
+             # complete stream after all chunks have been streamed
+-            self._send_stream_chunk(
+-                stream_id, "", complete=True, metadata=metadata_handler.jai_metadata
+-            )
++            # Only send completion if not already interrupted
++            if not self.message_interrupted.get(stream_id, False):
++                self._send_stream_chunk(
++                    stream_id, "", complete=True, metadata=metadata_handler.jai_metadata
++                )
++            else:
++                # Clean up the interrupted flag
++                self.message_interrupted.pop(stream_id, None)
+ 
+     async def make_context_prompt(self, human_msg: HumanChatMessage) -> str:
+         return "\n\n".join(
+diff --git a/packages/jupyter-ai/jupyter_ai/extension.py b/packages/jupyter-ai/jupyter_ai/extension.py
+index 7d93e2c..d20df5f 100644
+--- a/packages/jupyter-ai/jupyter_ai/extension.py
++++ b/packages/jupyter-ai/jupyter_ai/extension.py
+@@ -276,6 +276,9 @@ class AiExtension(ExtensionApp):
+         # list of pending messages
+         self.settings["pending_messages"] = []
+ 
++        # dictionary tracking interrupted messages
++        self.settings["message_interrupted"] = {}
++
+         # get reference to event loop
+         # `asyncio.get_event_loop()` is deprecated in Python 3.11+, in favor of
+         # the more readable `asyncio.get_event_loop_policy().get_event_loop()`.
+@@ -363,6 +366,7 @@ class AiExtension(ExtensionApp):
+             "help_message_template": self.help_message_template,
+             "chat_handlers": chat_handlers,
+             "context_providers": self.settings["jai_context_providers"],
++            "message_interrupted": self.settings["message_interrupted"],
+         }
+         default_chat_handler = DefaultChatHandler(**chat_handler_kwargs)
+         clear_chat_handler = ClearChatHandler(**chat_handler_kwargs)
+diff --git a/packages/jupyter-ai/jupyter_ai/handlers.py b/packages/jupyter-ai/jupyter_ai/handlers.py
+index d915279..558bc8f 100644
+--- a/packages/jupyter-ai/jupyter_ai/handlers.py
++++ b/packages/jupyter-ai/jupyter_ai/handlers.py
+@@ -38,6 +38,7 @@ from .models import (
+     ListSlashCommandsResponse,
+     Message,
+     PendingMessage,
++    StopRequest,
+     UpdateConfigRequest,
+ )
+ 
+@@ -120,6 +121,13 @@ class RootChatHandler(JupyterHandler, websocket.WebSocketHandler):
+     def pending_messages(self, new_pending_messages):
+         self.settings["pending_messages"] = new_pending_messages
+ 
++    @property
++    def message_interrupted(self) -> Dict[str, bool]:
++        """Dictionary tracking whether messages have been interrupted."""
++        if "message_interrupted" not in self.settings:
++            self.settings["message_interrupted"] = {}
++        return self.settings["message_interrupted"]
++
+     def initialize(self):
+         self.log.debug("Initializing websocket connection %s", self.request.path)
+ 
+@@ -279,12 +287,32 @@ class RootChatHandler(JupyterHandler, websocket.WebSocketHandler):
+             message = json.loads(message)
+             if message.get("type") == "clear":
+                 request = ClearRequest(**message)
++            elif message.get("type") == "stop":
++                request = StopRequest(**message)
+             else:
+                 request = ChatRequest(**message)
+         except ValidationError as e:
+             self.log.error(e)
+             return
+ 
++        if isinstance(request, StopRequest):
++            # Mark all currently streaming messages as interrupted
++            for msg in self.chat_history:
++                if msg.type == "agent-stream" and not msg.complete:
++                    self.message_interrupted[msg.id] = True
++                    # Mark the stream as complete to stop further chunks
++                    msg.complete = True
++                    # Send a final chunk to mark completion
++                    self.broadcast_message(
++                        AgentStreamChunkMessage(
++                            id=msg.id,
++                            content="",
++                            stream_complete=True,
++                            metadata={},
++                        )
++                    )
++            return
++
+         if isinstance(request, ClearRequest):
+             if not request.target:
+                 targets = None
+diff --git a/packages/jupyter-ai/jupyter_ai/models.py b/packages/jupyter-ai/jupyter_ai/models.py
+index 9bd59ca..afa12fd 100644
+--- a/packages/jupyter-ai/jupyter_ai/models.py
++++ b/packages/jupyter-ai/jupyter_ai/models.py
+@@ -161,6 +161,10 @@ class ClosePendingMessage(BaseModel):
+     id: str
+ 
+ 
++class StopRequest(BaseModel):
++    type: Literal["stop"] = "stop"
++
++
+ # the type of messages being broadcast to clients
+ ChatMessage = Union[
+     AgentChatMessage, HumanChatMessage, AgentStreamMessage, AgentStreamChunkMessage
+diff --git a/packages/jupyter-ai/src/components/chat-input.tsx b/packages/jupyter-ai/src/components/chat-input.tsx
+index 8652307..892d7e3 100644
+--- a/packages/jupyter-ai/src/components/chat-input.tsx
++++ b/packages/jupyter-ai/src/components/chat-input.tsx
+@@ -104,8 +104,28 @@ export function ChatInput(props: ChatInputProps): JSX.Element {
+     AiService.AutocompleteOption[]
+   >([]);
+   const [currSlashCommand, setCurrSlashCommand] = useState<string | null>(null);
++  const [streaming, setStreaming] = useState<boolean>(false);
+   const activeCell = useActiveCellContext();
+ 
++  /**
++   * Effect: track streaming state based on chat history
++   */
++  useEffect(() => {
++    function onHistoryChange(_: unknown, history: AiService.ChatHistory) {
++      // Check if there are any incomplete agent-stream messages
++      const hasIncompleteStream = history.messages.some(
++        msg => msg.type === 'agent-stream' && !msg.complete
++      );
++      setStreaming(hasIncompleteStream);
++    }
++
++    props.chatHandler.historyChanged.connect(onHistoryChange);
++
++    return function cleanup() {
++      props.chatHandler.historyChanged.disconnect(onHistoryChange);
++    };
++  }, [props.chatHandler]);
++
+   /**
+    * Effect: fetch the list of available slash commands from the backend on
+    * initial mount to populate the slash command autocomplete.
+@@ -230,6 +250,11 @@ export function ChatInput(props: ChatInputProps): JSX.Element {
+     props.chatHandler.sendMessage({ prompt, selection });
+   }
+ 
++  function onStop() {
++    // Send a stop request to interrupt the current generation
++    props.chatHandler.sendMessage({ type: 'stop' });
++  }
++
+   const inputExists = !!input.trim();
+   function handleKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+     if (event.key !== 'Enter') {
+@@ -272,10 +297,12 @@ export function ChatInput(props: ChatInputProps): JSX.Element {
+ 
+   const sendButtonProps: SendButtonProps = {
+     onSend,
++    onStop,
+     sendWithShiftEnter: props.sendWithShiftEnter,
+     inputExists,
+     activeCellHasError: activeCell.hasError,
+-    currSlashCommand
++    currSlashCommand,
++    streaming
+   };
+ 
+   function filterAutocompleteOptions(
+diff --git a/packages/jupyter-ai/src/components/chat-input/send-button.tsx b/packages/jupyter-ai/src/components/chat-input/send-button.tsx
+index 7dcf09a..29e5e47 100644
+--- a/packages/jupyter-ai/src/components/chat-input/send-button.tsx
++++ b/packages/jupyter-ai/src/components/chat-input/send-button.tsx
+@@ -2,6 +2,7 @@ import React, { useCallback, useState } from 'react';
+ import { Box, Menu, MenuItem, Typography } from '@mui/material';
+ import KeyboardArrowDown from '@mui/icons-material/KeyboardArrowDown';
+ import SendIcon from '@mui/icons-material/Send';
++import StopIcon from '@mui/icons-material/Stop';
+ 
+ import { TooltippedButton } from '../mui-extras/tooltipped-button';
+ import { includeSelectionIcon } from '../../icons';
+@@ -13,10 +14,12 @@ const FIX_TOOLTIP = '/fix requires an active code cell with an error';
+ 
+ export type SendButtonProps = {
+   onSend: (selection?: AiService.Selection) => unknown;
++  onStop?: () => unknown;
+   sendWithShiftEnter: boolean;
+   currSlashCommand: string | null;
+   inputExists: boolean;
+   activeCellHasError: boolean;
++  streaming?: boolean;
+ };
+ 
+ export function SendButton(props: SendButtonProps): JSX.Element {
+@@ -93,6 +96,31 @@ export function SendButton(props: SendButtonProps): JSX.Element {
+     }
+   }
+ 
++  // If streaming, show stop button instead of send button
++  if (props.streaming) {
++    return (
++      <Box sx={{ display: 'flex', flexWrap: 'nowrap' }}>
++        <TooltippedButton
++          onClick={() => props.onStop && props.onStop()}
++          disabled={false}
++          tooltip="Stop generating"
++          buttonProps={{
++            size: 'small',
++            title: 'Stop generating',
++            variant: 'contained',
++            color: 'error'
++          }}
++          sx={{
++            minWidth: 'unset',
++            borderRadius: '2px'
++          }}
++        >
++          <StopIcon />
++        </TooltippedButton>
++      </Box>
++    );
++  }
++
+   return (
+     <Box sx={{ display: 'flex', flexWrap: 'nowrap' }}>
+       <TooltippedButton
+diff --git a/packages/jupyter-ai/src/handler.ts b/packages/jupyter-ai/src/handler.ts
+index b653015..bd2b07f 100644
+--- a/packages/jupyter-ai/src/handler.ts
++++ b/packages/jupyter-ai/src/handler.ts
+@@ -89,6 +89,10 @@ export namespace AiService {
+     after?: boolean;
+   };
+ 
++  export type StopRequest = {
++    type: 'stop';
++  };
++
+   export type Collaborator = {
+     username: string;
+     initials: string;
+@@ -176,7 +180,7 @@ export namespace AiService {
+     metadata: Record<string, any>;
+   };
+ 
+-  export type Request = ChatRequest | ClearRequest;
++  export type Request = ChatRequest | ClearRequest | StopRequest;
+ 
+   export type ChatMessage =
+     | AgentChatMessage

