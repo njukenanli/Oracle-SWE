@@ -1,0 +1,135 @@
+diff --git a/local_repro_no_netcdf.py b/local_repro_no_netcdf.py
+new file mode 100644
+index 00000000..014e9ff4
+--- /dev/null
++++ b/local_repro_no_netcdf.py
+@@ -0,0 +1,23 @@
++import numpy as np
++from xarray.core.variable import Variable
++from xarray import conventions
++
++# Create a timedelta variable with a NaT
++vals = np.array([
++    np.timedelta64(1, 'D'),
++    np.timedelta64(2, 'D'),
++    np.timedelta64('NaT'),
++    np.timedelta64(4, 'D'),
++])
++var = Variable(("x",), vals, attrs={}, encoding={"dtype": np.int16, "_FillValue": np.int16(-1), "units": 'days'})
++
++enc = conventions.encode_cf_variable(var, name='var')
++print('Encoded attrs:', enc.attrs)
++print('Encoded encoding:', enc.encoding)
++print('Encoded dtype:', enc.dtype)
++print('Encoded values:', enc.data)
++
++# Now decode back to ensure round-trip doesn't lose masked NaT
++from xarray.conventions import decode_cf_variable
++var2 = decode_cf_variable('var', enc, decode_timedelta=True)
++print('Decoded dtype:', var2.dtype, 'values:', var2.data)
+diff --git a/timedelta_roundtrip_repro.py b/timedelta_roundtrip_repro.py
+new file mode 100644
+index 00000000..0dc44054
+--- /dev/null
++++ b/timedelta_roundtrip_repro.py
+@@ -0,0 +1,29 @@
++import netCDF4
++import numpy as np
++import xarray as xr
++
++# Create the dataset using plain netCDF4 methods
++fn = './timedelta.nc'
++ds = netCDF4.Dataset(fn, 'w', 'NETCDF4')
++ds.createDimension('x', 4)
++fill_value = np.int16(-1)
++var = ds.createVariable('var', 'i2', ['x'], fill_value=fill_value)
++var[:] = [1, 2, fill_value, 4]
++var.units = 'days'
++ds.close()
++
++# Open with xarray, round-trip to new file
++xr_ds = xr.open_dataset(fn)
++print('Opened dataset:')
++print(xr_ds)
++print(xr_ds['var'])
++
++out_fn = './timedelta-roundtrip.nc'
++xr_ds.to_netcdf(out_fn)
++print('Wrote roundtrip to', out_fn)
++
++# Reopen the written file to check values
++xr_ds2 = xr.open_dataset(out_fn)
++print('Roundtripped dataset:')
++print(xr_ds2)
++print(xr_ds2['var'])
+diff --git a/xarray/coding/times.py b/xarray/coding/times.py
+index d28c6a2d..e2dc2539 100644
+--- a/xarray/coding/times.py
++++ b/xarray/coding/times.py
+@@ -981,6 +981,24 @@ def _cast_to_dtype_if_safe(num: np.ndarray, dtype: np.dtype) -> np.ndarray:
+ 
+     if np.issubdtype(dtype, np.integer):
+         if not array_all(num == cast_num):
++            # Special-case NaT sentinels for datetime/timedelta encoding.
++            # During encoding, missing datetime-like values are represented
++            # as np.iinfo(int64).min. These will be turned into the proper
++            # on-disk _FillValue by CFMaskCoder later in the pipeline. If the
++            # only values that would overflow when casting to a smaller
++            # integer dtype are exactly these NaT sentinels, defer casting by
++            # returning the original array (typically int64) so that masking
++            # can happen before any downcasting.
++            if np.issubdtype(num.dtype, np.integer):
++                try:
++                    num_i64 = num.astype(np.int64, copy=False)
++                except Exception:
++                    num_i64 = num  # best effort; if this fails, we fall through
++                nat_sentinel = np.iinfo(np.int64).min
++                mismatch = num != cast_num
++                # If all mismatches correspond to NaT sentinels, skip casting now
++                if array_all(mismatch == (num_i64 == nat_sentinel)):
++                    return num
+             if np.issubdtype(num.dtype, np.floating):
+                 raise ValueError(
+                     f"Not possible to cast all encoded times from "
+@@ -1342,6 +1360,11 @@ class CFDatetimeCoder(VariableCoder):
+             # retain dtype for packed data
+             if set_dtype_encoding is not None:
+                 safe_setitem(encoding, "dtype", set_dtype_encoding, name=name)
++            # If a dtype was prescribed and we did not already set it for packed
++            # data, retain it in encoding so that later coders can enforce it
++            # after missing values have been handled.
++            if set_dtype_encoding is None and dtype is not None:
++                safe_setitem(encoding, "dtype", dtype, name=name)
+             safe_setitem(attrs, "units", units, name=name)
+             safe_setitem(attrs, "calendar", calendar, name=name)
+ 
+@@ -1408,6 +1431,11 @@ class CFTimedeltaCoder(VariableCoder):
+             # retain dtype for packed data
+             if set_dtype_encoding is not None:
+                 safe_setitem(encoding, "dtype", set_dtype_encoding, name=name)
++            # If a dtype was prescribed and we did not already set it for packed
++            # data, retain it in encoding so that later coders can enforce it
++            # after missing values have been handled.
++            if set_dtype_encoding is None and dtype is not None:
++                safe_setitem(encoding, "dtype", dtype, name=name)
+ 
+             safe_setitem(attrs, "units", units, name=name)
+ 
+diff --git a/xarray/coding/variables.py b/xarray/coding/variables.py
+index 1b7bc95e..41d748df 100644
+--- a/xarray/coding/variables.py
++++ b/xarray/coding/variables.py
+@@ -329,6 +329,13 @@ class CFMaskCoder(VariableCoder):
+                     data = duck_array_ops.where(
+                         data != np.iinfo(np.int64).min, data, fill_value
+                     )
++                    # If the fill_value is of integer type, align the array's dtype
++                    # to the fill_value's dtype. This allows downcasting to smaller
++                    # integer widths after NaT sentinels have been replaced.
++                    if np.array(fill_value).dtype.kind in "iu":
++                        data = duck_array_ops.astype(
++                            duck_array_ops.around(data), type(fill_value)
++                        )
+                 else:
+                     # if we have float data (data was packed prior masking)
+                     # we just fillna

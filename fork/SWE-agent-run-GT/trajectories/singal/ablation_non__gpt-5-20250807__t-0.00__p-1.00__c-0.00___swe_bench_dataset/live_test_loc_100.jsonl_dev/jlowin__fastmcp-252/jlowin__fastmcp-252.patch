@@ -1,0 +1,224 @@
+diff --git a/repro_pre_parse_json_bug.py b/repro_pre_parse_json_bug.py
+new file mode 100644
+index 00000000..e33c92f4
+--- /dev/null
++++ b/repro_pre_parse_json_bug.py
+@@ -0,0 +1,115 @@
++# This script reproduces the pre_parse_json behavior before and after the fix
++# without requiring external dependencies like pydantic.
++# It emulates the parts of FuncMetadata.pre_parse_json that matter for the bug.
++
++import json
++from typing import Any, Annotated, get_args, get_origin
++
++class FakeFieldInfo:
++    def __init__(self, annotation: Any):
++        self.annotation = annotation
++
++class FakeArgModel:
++    def __init__(self, fields: dict[str, Any]):
++        # fields is mapping of name -> annotation
++        self.model_fields = {k: FakeFieldInfo(v) for k, v in fields.items()}
++
++class OldFuncMetadata:
++    def __init__(self, arg_model: FakeArgModel):
++        self.arg_model = arg_model
++
++    def pre_parse_json(self, data: dict[str, Any]) -> dict[str, Any]:
++        new_data = data.copy()
++        for field_name, _field_info in self.arg_model.model_fields.items():
++            if field_name not in data.keys():
++                continue
++            if isinstance(data[field_name], str):
++                try:
++                    pre_parsed = json.loads(data[field_name])
++                except json.JSONDecodeError:
++                    continue
++                if isinstance(pre_parsed, str | int | float):
++                    # Skip scalar JSON
++                    continue
++                new_data[field_name] = pre_parsed
++        assert new_data.keys() == data.keys()
++        return new_data
++
++class NewFuncMetadata:
++    def __init__(self, arg_model: FakeArgModel):
++        self.arg_model = arg_model
++
++    def pre_parse_json(self, data: dict[str, Any]) -> dict[str, Any]:
++        def _unwrap_annotated(ann: Any) -> Any:
++            origin = get_origin(ann)
++            if origin is Annotated:
++                args = get_args(ann)
++                if args:
++                    return args[0]
++            return ann
++
++        def _allows_list(annotation: Any) -> bool:
++            annotation = _unwrap_annotated(annotation)
++            origin = get_origin(annotation)
++            if annotation is Any:
++                return True
++            if origin is None:
++                # list type itself
++                return annotation is list
++            return origin in (list, tuple, set) or any(
++                _allows_list(a) for a in get_args(annotation) or []
++            )
++
++        def _allows_dict(annotation: Any) -> bool:
++            annotation = _unwrap_annotated(annotation)
++            origin = get_origin(annotation)
++            if annotation is Any:
++                return True
++            if origin is None:
++                return annotation is dict
++            return origin in (dict,) or any(
++                _allows_dict(a) for a in get_args(annotation) or []
++            )
++
++        new_data = data.copy()
++        for field_name, _field_info in self.arg_model.model_fields.items():
++            if field_name not in data.keys():
++                continue
++            raw_val = data[field_name]
++            if isinstance(raw_val, str):
++                try:
++                    pre_parsed = json.loads(raw_val)
++                except json.JSONDecodeError:
++                    continue
++                if isinstance(pre_parsed, str | int | float):
++                    continue
++                ann = _field_info.annotation
++                if isinstance(pre_parsed, list):
++                    if _allows_list(ann):
++                        new_data[field_name] = pre_parsed
++                elif isinstance(pre_parsed, dict):
++                    if _allows_dict(ann):
++                        new_data[field_name] = pre_parsed
++        assert new_data.keys() == data.keys()
++        return new_data
++
++if __name__ == "__main__":
++    # Repro scenario: function expects str, got JSON object string
++    fields = {"bar": str}
++    old_meta = OldFuncMetadata(FakeArgModel(fields))
++    new_meta = NewFuncMetadata(FakeArgModel(fields))
++
++    data = {"bar": '{"key": 5}'}
++    print("Original data:", data)
++    print("Old pre_parse_json ->", old_meta.pre_parse_json(data))
++    print("New pre_parse_json ->", new_meta.pre_parse_json(data))
++
++    # Additional checks: union str | list[str]
++    from typing import Union
++    union_fields = {"str_or_list": Union[str, list[str]]}
++    old_u = OldFuncMetadata(FakeArgModel(union_fields))
++    new_u = NewFuncMetadata(FakeArgModel(union_fields))
++
++    print("Union case, raw 'hello':", new_u.pre_parse_json({"str_or_list": "hello"}))
++    print("Union case, raw '\"hello\"':", new_u.pre_parse_json({"str_or_list": '"hello"'}))
++    print("Union case, raw list JSON:", new_u.pre_parse_json({"str_or_list": '["hello","world"]'}))
+diff --git a/src/fastmcp/utilities/func_metadata.py b/src/fastmcp/utilities/func_metadata.py
+index 777e7d74..51b0c525 100644
+--- a/src/fastmcp/utilities/func_metadata.py
++++ b/src/fastmcp/utilities/func_metadata.py
+@@ -79,21 +79,92 @@ class FuncMetadata(BaseModel):
+         it seems incapable of NOT doing this. For sub-models, it tends to pass
+         dicts (JSON objects) as JSON strings, which can be pre-parsed here.
+         """
++        from typing import Any as _Any, Annotated as _Annotated, get_args as _get_args, get_origin as _get_origin
++
++        def _unwrap_annotated(ann: _Any) -> _Any:
++            origin = _get_origin(ann)
++            if origin is _Annotated:
++                args = _get_args(ann)
++                if args:
++                    return args[0]
++            return ann
++
++        def _allows_str(annotation: _Any) -> bool:
++            annotation = _unwrap_annotated(annotation)
++            origin = _get_origin(annotation)
++            if annotation is _Any:
++                return True
++            if origin is None:
++                # Plain types
++                try:
++                    return issubclass(annotation, str)
++                except TypeError:
++                    return annotation is str
++            if origin in (list, dict, tuple, set):
++                return False
++            # Union or Annotated etc
++            args = _get_args(annotation)
++            if not args:
++                return False
++            return any(_allows_str(a) for a in args)
++
++        def _allows_list(annotation: _Any) -> bool:
++            annotation = _unwrap_annotated(annotation)
++            origin = _get_origin(annotation)
++            if annotation is _Any:
++                return True
++            if origin is None:
++                try:
++                    # Pydantic models should NOT be treated as lists
++                    from pydantic import BaseModel as _BM
++                    return False if issubclass(annotation, _BM) else (annotation is list)
++                except TypeError:
++                    return annotation is list
++            if origin in (list, tuple, set):
++                return True
++            args = _get_args(annotation)
++            return any(_allows_list(a) for a in args) if args else False
++
++        def _allows_dict(annotation: _Any) -> bool:
++            annotation = _unwrap_annotated(annotation)
++            origin = _get_origin(annotation)
++            if annotation is _Any:
++                return True
++            if origin is None:
++                # Accept dicts for mappings and pydantic models
++                try:
++                    from pydantic import BaseModel as _BM
++                    if issubclass(annotation, _BM):
++                        return True
++                except TypeError:
++                    pass
++                return annotation is dict
++            if origin in (dict,):
++                return True
++            args = _get_args(annotation)
++            return any(_allows_dict(a) for a in args) if args else False
++
+         new_data = data.copy()  # Shallow copy
+         for field_name, _field_info in self.arg_model.model_fields.items():
+             if field_name not in data.keys():
+                 continue
+-            if isinstance(data[field_name], str):
++            raw_val = data[field_name]
++            if isinstance(raw_val, str):
+                 try:
+-                    pre_parsed = json.loads(data[field_name])
++                    pre_parsed = json.loads(raw_val)
+                 except json.JSONDecodeError:
+                     continue  # Not JSON - skip
++                # Skip scalar JSON values: they risk unwanted conversion for str/int/float
+                 if isinstance(pre_parsed, str | int | float):
+-                    # This is likely that the raw value is e.g. `"hello"` which we
+-                    # Should really be parsed as '"hello"' in Python - but if we parse
+-                    # it as JSON it'll turn into just 'hello'. So we skip it.
+                     continue
+-                new_data[field_name] = pre_parsed
++                # Only convert if the field's annotation allows the resulting JSON type
++                annotation = _field_info.annotation
++                if isinstance(pre_parsed, list):
++                    if _allows_list(annotation):
++                        new_data[field_name] = pre_parsed
++                elif isinstance(pre_parsed, dict):
++                    if _allows_dict(annotation):
++                        new_data[field_name] = pre_parsed
+         assert new_data.keys() == data.keys()
+         return new_data
+ 

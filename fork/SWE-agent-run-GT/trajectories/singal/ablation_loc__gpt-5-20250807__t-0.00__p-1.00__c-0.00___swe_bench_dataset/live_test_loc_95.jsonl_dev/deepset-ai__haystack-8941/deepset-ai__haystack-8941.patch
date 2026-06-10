@@ -1,0 +1,118 @@
+diff --git a/haystack/components/embedders/azure_document_embedder.py b/haystack/components/embedders/azure_document_embedder.py
+index 2223c82b..42333f20 100644
+--- a/haystack/components/embedders/azure_document_embedder.py
++++ b/haystack/components/embedders/azure_document_embedder.py
+@@ -3,14 +3,17 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ import os
++import logging
+ from typing import Any, Dict, List, Optional, Tuple
+ 
+ from openai.lib.azure import AzureOpenAI
++from openai import APIError, BadRequestError
+ from tqdm import tqdm
+ 
+ from haystack import Document, component, default_from_dict, default_to_dict
+ from haystack.utils import Secret, deserialize_secrets_inplace
+ 
++logger = logging.getLogger(__name__)
+ 
+ @component
+ class AzureOpenAIDocumentEmbedder:
+@@ -185,48 +188,77 @@ class AzureOpenAIDocumentEmbedder:
+     def _prepare_texts_to_embed(self, documents: List[Document]) -> List[str]:
+         """
+         Prepare the texts to embed by concatenating the Document text with the metadata fields to embed.
++        Newlines are replaced with spaces to avoid negatively affecting performance.
+         """
+-        texts_to_embed = []
++        texts_to_embed: List[str] = []
+         for doc in documents:
+             meta_values_to_embed = [
+-                str(doc.meta[key]) for key in self.meta_fields_to_embed if key in doc.meta and doc.meta[key] is not None
++                str(doc.meta[key])
++                for key in self.meta_fields_to_embed
++                if key in doc.meta and doc.meta[key] is not None
+             ]
+ 
+             text_to_embed = (
+                 self.prefix + self.embedding_separator.join(meta_values_to_embed + [doc.content or ""]) + self.suffix
+-            ).replace("\n", " ")
++            )
+ 
+-            texts_to_embed.append(text_to_embed)
++            # replace newlines, which can negatively affect performance.
++            texts_to_embed.append(text_to_embed.replace("\n", " "))
+         return texts_to_embed
+ 
+     def _embed_batch(self, texts_to_embed: List[str], batch_size: int) -> Tuple[List[List[float]], Dict[str, Any]]:
+         """
+         Embed a list of texts in batches.
++
++        This method is resilient to failures when a single document in a batch causes the API to
++        raise an error (e.g. because the text exceeds the maximum context length). In such cases,
++        the batch is recursively bisected to isolate the failing document(s) so that as many
++        embeddings as possible are created.
+         """
+ 
+-        all_embeddings: List[List[float]] = []
++        # Pre-allocate output to preserve input ordering. Failed documents will keep a None entry
++        # which will be returned to the caller and can be handled gracefully downstream.
++        all_embeddings: List[Optional[List[float]]] = [None] * len(texts_to_embed)
+         meta: Dict[str, Any] = {"model": "", "usage": {"prompt_tokens": 0, "total_tokens": 0}}
+-        for i in tqdm(range(0, len(texts_to_embed), batch_size), desc="Embedding Texts"):
+-            batch = texts_to_embed[i : i + batch_size]
+-            if self.dimensions is not None:
+-                response = self._client.embeddings.create(
+-                    model=self.azure_deployment, dimensions=self.dimensions, input=batch
+-                )
+-            else:
+-                response = self._client.embeddings.create(model=self.azure_deployment, input=batch)
+-
+-            # Append embeddings to the list
+-            all_embeddings.extend(el.embedding for el in response.data)
+ 
+-            # Update the meta information only once if it's empty
++        def _accumulate_meta(response: Any):
+             if not meta["model"]:
+                 meta["model"] = response.model
+                 meta["usage"] = dict(response.usage)
+             else:
+-                # Update the usage tokens
+                 meta["usage"]["prompt_tokens"] += response.usage.prompt_tokens
+                 meta["usage"]["total_tokens"] += response.usage.total_tokens
+ 
++        def _embed_range(start: int, end: int) -> None:
++            batch = texts_to_embed[start:end]
++            try:
++                if self.dimensions is not None:
++                    response = self._client.embeddings.create(
++                        model=self.azure_deployment, dimensions=self.dimensions, input=batch
++                    )
++                else:
++                    response = self._client.embeddings.create(model=self.azure_deployment, input=batch)
++            except (APIError, BadRequestError) as exc:
++                # If a single document fails, log and skip it. Otherwise, split and try smaller batches.
++                if end - start <= 1:
++                    logger.exception("Failed embedding of document at index %s caused by %s", start, exc)
++                    return
++                mid = start + (end - start) // 2
++                _embed_range(start, mid)
++                _embed_range(mid, end)
++                return
++
++            # Success path: fill the embeddings and accumulate usage/meta
++            for offset, el in enumerate(response.data):
++                all_embeddings[start + offset] = el.embedding
++            _accumulate_meta(response)
++
++        for i in tqdm(
++            range(0, len(texts_to_embed), batch_size), disable=not self.progress_bar, desc="Embedding Texts"
++        ):
++            _embed_range(i, min(i + batch_size, len(texts_to_embed)))
++
++        # Convert Optional[List[float]] to List[List[float]] for the return type; None values indicate failures.
+         return all_embeddings, meta
+ 
+     @component.output_types(documents=List[Document], meta=Dict[str, Any])

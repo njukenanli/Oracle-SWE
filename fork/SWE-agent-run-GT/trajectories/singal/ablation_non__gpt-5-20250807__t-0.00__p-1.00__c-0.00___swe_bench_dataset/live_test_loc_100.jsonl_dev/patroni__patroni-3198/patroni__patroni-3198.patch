@@ -1,0 +1,247 @@
+diff --git a/patroni/postgresql/__init__.py b/patroni/postgresql/__init__.py
+index 33a6cc4b..3f1bfceb 100644
+--- a/patroni/postgresql/__init__.py
++++ b/patroni/postgresql/__init__.py
+@@ -1138,8 +1138,13 @@ class Postgresql(object):
+         if not self.ensure_major_version_is_known():
+             return None
+ 
+-        recovery_params = self.config.build_recovery_params(member)
+-        self.config.write_recovery_conf(recovery_params)
++        # Build and try to persist recovery configuration. In case of IO errors (e.g. disk full)
++        # we still want to proceed with role change callback.
++        try:
++            recovery_params = self.config.build_recovery_params(member)
++            self.config.write_recovery_conf(recovery_params)
++        except Exception:
++            logger.exception('Failed to write recovery configuration during follow()')
+ 
+         # When we demoting the primary or standby_leader to replica or promoting replica to a standby_leader
+         # and we know for sure that postgres was already running before, we will only execute on_role_change
+@@ -1150,21 +1155,35 @@ class Postgresql(object):
+         if change_role:
+             self.__cb_pending = CallbackAction.NOOP
+ 
+-        ret = True
+-        if self.is_running():
+-            if do_reload:
+-                self.config.write_postgresql_conf()
+-                ret = self.reload(block_callbacks=change_role)
+-                if ret and change_role:
+-                    self.set_role(role)
++        ret: Optional[bool] = True
++        role_change_callback_called = False
++        try:
++            if self.is_running():
++                if do_reload:
++                    # Set the new role early so that callbacks report the correct role even if reload fails
++                    if change_role:
++                        self.set_role(role)
++                    self.config.write_postgresql_conf()
++                    ret = self.reload(block_callbacks=change_role)
++                else:
++                    ret = self.restart(block_callbacks=change_role, role=role)
+             else:
+-                ret = self.restart(block_callbacks=change_role, role=role)
+-        else:
+-            ret = self.start(timeout=timeout, block_callbacks=change_role, role=role) or None
+-
+-        if change_role:
+-            # TODO: postpone this until start completes, or maybe do even earlier
+-            self.call_nowait(CallbackAction.ON_ROLE_CHANGE)
++                # If PostgreSQL is not running and we are changing role, execute the callback
++                # before attempting to write configs/start. This ensures callbacks run even
++                # when the disk is full and config writes fail.
++                if change_role:
++                    self.call_nowait(CallbackAction.ON_ROLE_CHANGE)
++                    role_change_callback_called = True
++                ret = self.start(timeout=timeout, block_callbacks=change_role, role=role) or None
++        except Exception:
++            # Make sure we don't lose the role-change callback on unexpected errors (e.g. disk full)
++            logger.exception('Exception during follow() execution')
++            # Preserve original semantics: when start/restart/reload fails unexpectedly, return None
++            ret = None
++        finally:
++            if change_role and not role_change_callback_called:
++                # Execute the role-change callback after the operation when Postgres was running.
++                self.call_nowait(CallbackAction.ON_ROLE_CHANGE)
+         return ret
+ 
+     def _wait_promote(self, wait_seconds: int) -> Optional[bool]:
+diff --git a/repro_follow_disk_full.py b/repro_follow_disk_full.py
+new file mode 100644
+index 00000000..2aa482d7
+--- /dev/null
++++ b/repro_follow_disk_full.py
+@@ -0,0 +1,77 @@
++import sys
++import os
++import types
++
++# Ensure local repository modules are importable
++repo_root = os.path.dirname(__file__)
++sys.path.insert(0, repo_root)
++
++from patroni.postgresql.__init__ import Postgresql, CallbackAction
++
++# Create a minimal stub for MPP
++class DummyMPP:
++    def get_handler_impl(self, pg):
++        class DummyHandler:
++            pass
++        return DummyHandler()
++
++# Prepare a minimal configuration
++DATA_DIR = os.path.join(repo_root, 'tmp_pgdata')
++os.makedirs(DATA_DIR, exist_ok=True)
++
++config = {
++    'name': 'node1',
++    'scope': 'testscope',
++    'data_dir': DATA_DIR,
++    'database': 'postgres',
++    'retry_timeout': 10,
++    'callbacks': {
++        'on_role_change': 'echo'  # command doesn't really run; we monkeypatch executor
++    }
++}
++
++pg = Postgresql(config, DummyMPP())
++
++# Make sure callbacks are allowed (cb_called must be True for change_role path)
++# We'll monkeypatch the callback executor to print when called
++calls = []
++orig_executor = pg._callback_executor
++class DummyExecutor:
++    def call(self, cmd):
++        calls.append(('called', cmd))
++        print('CALLBACK_EXECUTED', cmd)
++pg._callback_executor = DummyExecutor()
++
++# Set initial role to demoted to simulate failed primary
++pg.set_role('demoted')
++# Mark that a callback was called before, to satisfy change_role condition
++pg.call_nowait(CallbackAction.ON_START)
++
++# Patch ensure_major_version_is_known to always return True
++pg.ensure_major_version_is_known = types.MethodType(lambda self: True, pg)
++
++# We simulate disk full by making write_postgresql_conf raise OSError(28)
++from patroni.postgresql import config as pg_config_module
++orig_write_conf = pg.config.write_postgresql_conf
++
++def raise_disk_full(*args, **kwargs):
++    raise OSError(28, 'No space left on device')
++
++pg.config.write_postgresql_conf = raise_disk_full
++
++# Also avoid recovery_conf writes to simplify
++orig_write_recovery = pg.config.write_recovery_conf
++pg.config.write_recovery_conf = lambda *args, **kwargs: None
++
++# Attempt to follow to replica role
++try:
++    print('Running follow() before fix, expecting exception due to disk full...')
++    pg.follow(member=None, role='replica', timeout=5)
++    print('follow() completed without raising')
++except Exception as e:
++    print('ERROR_RAISED', type(e).__name__, e)
++
++# Restore patched methods just in case
++pg.config.write_postgresql_conf = orig_write_conf
++pg.config.write_recovery_conf = orig_write_recovery
++pg._callback_executor = orig_executor
+diff --git a/repro_follow_disk_full_after_fix.py b/repro_follow_disk_full_after_fix.py
+new file mode 100644
+index 00000000..263b9abd
+--- /dev/null
++++ b/repro_follow_disk_full_after_fix.py
+@@ -0,0 +1,88 @@
++import sys
++import os
++import types
++
++repo_root = os.path.dirname(__file__)
++sys.path.insert(0, repo_root)
++
++from patroni.postgresql.__init__ import Postgresql, CallbackAction
++
++class DummyMPP:
++    def get_handler_impl(self, pg):
++        class DummyHandler:
++            def adjust_postgres_gucs(self, parameters):
++                return parameters
++        return DummyHandler()
++
++DATA_DIR = os.path.join(repo_root, 'tmp_pgdata')
++os.makedirs(DATA_DIR, exist_ok=True)
++
++config = {
++    'name': 'node1',
++    'scope': 'testscope',
++    'data_dir': DATA_DIR,
++    'database': 'postgres',
++    'retry_timeout': 10,
++    'authentication': {'superuser': {}},
++    'parameters': {'listen': '127.0.0.1:5432'},
++    'listen': '127.0.0.1:5432',
++    'callbacks': {
++        'on_role_change': 'echo'
++    }
++}
++
++pg = Postgresql(config, DummyMPP())
++
++# Monkeypatch callback executor to capture calls
++calls = []
++class DummyExecutor:
++    def call(self, cmd):
++        calls.append(cmd)
++        print('CALLBACK', cmd)
++pg._callback_executor = DummyExecutor()
++# wrap call_nowait to debug
++orig_call_nowait = pg.call_nowait
++
++def debug_call_nowait(self, cb_type):
++    print('DEBUG call_nowait invoked with', cb_type, 'role', self.role)
++    return orig_call_nowait(cb_type)
++pg.call_nowait = types.MethodType(debug_call_nowait, pg)
++
++# Simulate previous callback called and role demoted
++pg.set_role('demoted')
++pg.call_nowait(CallbackAction.ON_START)
++
++# Avoid real file writes for recovery conf
++from patroni.postgresql import config as pg_config_module
++pg.config.write_recovery_conf = lambda *a, **k: None
++
++# Simulate disk full by making write_postgresql_conf raise OSError
++orig_write_conf = pg.config.write_postgresql_conf
++def raise_disk_full(*args, **kwargs):
++    raise OSError(28, 'No space left on device')
++pg.config.write_postgresql_conf = raise_disk_full
++
++# Also make start/restart paths not try to actually start postgres
++pg.is_running = types.MethodType(lambda self: False, pg)
++pg.start = types.MethodType(lambda self, *a, **k: (_ for _ in ()).throw(OSError(28, 'No space left on device')),
++                            pg)
++# Ensure major version known to bypass check
++pg.ensure_major_version_is_known = types.MethodType(lambda self: True, pg)
++
++print('Running follow() with disk-full simulation after fix...')
++print('cb_called:', pg.cb_called, 'role:', pg.role)
++# Verify callback mechanism works by calling directly
++pg.call_nowait(CallbackAction.ON_ROLE_CHANGE)
++print('after direct call, callbacks:', calls)
++# reset calls
++calls.clear()
++# compute change_role equivalent
++role = 'replica'
++change_role = pg.cb_called and (pg.role in ('primary','demoted') or not set(['standby_leader','replica']) - set([pg.role, role]))
++print('Computed change_role:', change_role, 'callback keys:', list((pg.config.get('callbacks') or {}).keys()))
++res = pg.follow(member=None, role='replica', timeout=1)
++print('follow() returned:', res)
++print('callbacks captured:', calls)
++
++assert any(isinstance(c, list) and 'on_role_change' in c for c in calls), 'Expected callback'
++print('OK: role-change callback executed even on disk-full')

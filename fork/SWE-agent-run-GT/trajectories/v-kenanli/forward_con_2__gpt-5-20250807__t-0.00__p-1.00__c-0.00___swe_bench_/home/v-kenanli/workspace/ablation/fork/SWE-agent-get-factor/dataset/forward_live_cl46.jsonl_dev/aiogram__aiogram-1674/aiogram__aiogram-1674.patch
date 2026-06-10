@@ -1,0 +1,130 @@
+diff --git a/aiogram/fsm/scene.py b/aiogram/fsm/scene.py
+index 1344b4d0..f697ff60 100644
+--- a/aiogram/fsm/scene.py
++++ b/aiogram/fsm/scene.py
+@@ -572,7 +572,50 @@ class SceneWizard:
+             )
+             return False
+ 
+-        await action_config[event_type].call(self.scene, self.event, **{**self.data, **kwargs})
++        # Run scene action handler through the same middleware pipeline as regular handlers
++        # to ensure consistency and availability of context injected by middlewares.
++        action_callable = action_config[event_type]
++
++        # Determine the router to take observer and its middlewares from.
++        # Prefer the current event router from data (actual propagation point),
++        # fallback to the registry router if not available.
++        router = None
++        if isinstance(self.manager.data, dict):
++            from aiogram.dispatcher.router import Router as _Router  # local import to avoid cycles
++            maybe_router = self.manager.data.get("event_router")
++            if isinstance(maybe_router, _Router):
++                router = maybe_router
++        if router is None:
++            # Fallback to registry router if it's a proper Router
++            from aiogram.dispatcher.router import Router as _Router  # local import
++            reg_router = getattr(self.manager.registry, "router", None)
++            if isinstance(reg_router, _Router):
++                router = reg_router
++
++        # If router is not available (e.g., in unit tests with mocks), call directly
++        if router is None:
++            await action_callable.call(self.scene, self.event, **{**self.data, **kwargs})
++            return True
++
++        observer = router.observers.get(event_type)
++
++        # Ensure observer is a real TelegramEventObserver
++        from aiogram.dispatcher.event.telegram import TelegramEventObserver as _TEO  # local import
++        if not isinstance(observer, _TEO):
++            await action_callable.call(self.scene, self.event, **{**self.data, **kwargs})
++            return True
++
++        async def _action_handler(event: TelegramObject, **data: Any) -> Any:
++            # Wrap inner (observer) middlewares and then call the actual scene action
++            inner = observer.outer_middleware.wrap_middlewares(
++                observer._resolve_middlewares(),
++                lambda e, **d: action_callable.call(self.scene, e, **d),
++            )
++            return await inner(event, data)
++
++        # Compose initial data for outer middlewares: original data augmented by kwargs
++        data = {**self.data, **kwargs}
++        await observer.wrap_outer_middleware(_action_handler, event=self.event, data=data)
+         return True
+ 
+     async def set_data(self, data: Dict[str, Any]) -> None:
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..02c37ea1
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,68 @@
++import asyncio
++from aiogram import Bot, Dispatcher, F, BaseMiddleware
++from aiogram.client.default import DefaultBotProperties
++from aiogram.enums import ParseMode
++from aiogram.filters import Command
++from aiogram.types import Message, TelegramObject
++from aiogram.fsm.scene import Scene, on, SceneRegistry
++from typing import Callable, Dict, Any, Awaitable
++
++# Minimal reproduction similar to PR description
++
++class TestScene(Scene, state='test'):
++    @on.message.enter()
++    async def greetings(self, message: Message, test_context: str):
++        # In failure case, this raises because test_context isn't provided by middleware
++        await message.answer(f'Echo mode enabled. Context: {test_context}.')
++
++    @on.message(F.text)
++    async def echo(self, message: Message, test_context: str):
++        await message.reply(f'Your input: {message.text} and Context: {test_context}.')
++
++class TestMiddleware(BaseMiddleware):
++    async def __call__(
++            self,
++            handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
++            event: TelegramObject,
++            data: Dict[str, Any]
++    ) -> Any:
++        data['test_context'] = 'Custom context here'
++        return await handler(event, data)
++
++async def main():
++    # Use mocked bot to avoid real network calls and to capture outgoing methods
++    from tests.mocked_bot import MockedBot
++    from aiogram.methods import SendMessage
++    from aiogram.types import Message as TgMessage
++
++    bot = MockedBot(default=DefaultBotProperties(parse_mode=ParseMode.HTML))
++
++    dp = Dispatcher()
++    # Register scene as normal message handler to enter it
++    dp.message.register(TestScene.as_handler(), Command('test'))
++
++    scene_registry = SceneRegistry(dp)
++    scene_registry.add(TestScene)
++
++    # Register middleware as outer middleware to inject context
++    dp.message.outer_middleware.register(TestMiddleware())
++
++    # Prepare mocked responses for SendMessage used by message.answer/reply
++    from datetime import datetime
++    from aiogram.types import Update, Message, Chat, User
++    user = User(id=1, is_bot=False, first_name="Test")
++    chat = Chat(id=1, type="private")
++    # These messages will be returned as results for SendMessage
++    bot.add_result_for(SendMessage, ok=True, result=TgMessage(message_id=10, date=datetime.now(), from_user=user, chat=chat, text="ok"))
++    bot.add_result_for(SendMessage, ok=True, result=TgMessage(message_id=11, date=datetime.now(), from_user=user, chat=chat, text="ok2"))
++
++    # Build a synthetic update to trigger message handler
++    msg = TgMessage(message_id=1, date=datetime.now(), from_user=user, chat=chat, text="/test")
++    update = Update(update_id=1, message=msg)
++
++    # Feed update and capture result
++    result = await dp.feed_update(bot, update)
++    print("feed_update result:", result)
++
++if __name__ == "__main__":
++    asyncio.run(main())

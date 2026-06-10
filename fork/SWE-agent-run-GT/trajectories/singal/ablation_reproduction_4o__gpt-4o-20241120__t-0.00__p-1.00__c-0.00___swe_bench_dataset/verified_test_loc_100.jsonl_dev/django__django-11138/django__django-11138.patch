@@ -1,0 +1,149 @@
+diff --git a/django/db/backends/base/base.py b/django/db/backends/base/base.py
+index 9fa03cc0ee..9a3282b04d 100644
+--- a/django/db/backends/base/base.py
++++ b/django/db/backends/base/base.py
+@@ -1,4 +1,10 @@
+ import copy
++import logging
++logger = logging.getLogger('django.db.query_log')
++logger.setLevel(logging.DEBUG)
++handler = logging.StreamHandler()
++handler.setLevel(logging.DEBUG)
++logger.addHandler(handler)
+ import threading
+ import time
+ import warnings
+diff --git a/django/db/backends/mysql/operations.py b/django/db/backends/mysql/operations.py
+index 50f85e0621..795f00efc0 100644
+--- a/django/db/backends/mysql/operations.py
++++ b/django/db/backends/mysql/operations.py
+@@ -1,4 +1,13 @@
+ import uuid
++import logging
++logger = logging.getLogger('timezone_test_debug')
++logger.setLevel(logging.DEBUG)
++handler = logging.StreamHandler()
++handler.setLevel(logging.DEBUG)
++logger.addHandler(handler)
++
++def log_debug(message):
++    logger.debug(message)
+ 
+ from django.conf import settings
+ from django.db.backends.base.operations import BaseDatabaseOperations
+@@ -54,6 +63,15 @@ class DatabaseOperations(BaseDatabaseOperations):
+             'year': '%%Y-01-01',
+             'month': '%%Y-%%m-01',
+         }  # Use double percents to escape.
++
++        def apply_timezone_conversion(field_name):
++            db_tz = self.connection.settings_dict.get('TIME_ZONE', 'UTC')
++            if settings.USE_TZ and db_tz != 'UTC':
++                return "CONVERT_TZ(%s, '%s', 'UTC')" % (field_name, db_tz)
++            return field_name
++
++        field_name = apply_timezone_conversion(field_name)
++
+         if lookup_type in fields:
+             format_str = fields[lookup_type]
+             return "CAST(DATE_FORMAT(%s, '%s') AS DATE)" % (field_name, format_str)
+@@ -67,15 +85,26 @@ class DatabaseOperations(BaseDatabaseOperations):
+             )
+         else:
+             return "DATE(%s)" % (field_name)
+-
+     def _convert_field_to_tz(self, field_name, tzname):
+         if settings.USE_TZ:
+-            field_name = "CONVERT_TZ(%s, 'UTC', '%s')" % (field_name, tzname)
++            db_tz = self.connection.settings_dict.get('TIME_ZONE') or 'UTC'
++            if db_tz == tzname:
++                # No conversion needed if both timezones are the same.
++                return field_name
++            field_name = "CONVERT_TZ(%s, '%s', '%s')" % (field_name, db_tz, tzname)
+         return field_name
+ 
+     def datetime_cast_date_sql(self, field_name, tzname):
+-        field_name = self._convert_field_to_tz(field_name, tzname)
+-        return "DATE(%s)" % field_name
++        db_tz = self.connection.settings_dict.get('TIME_ZONE', 'UTC')
++        if settings.USE_TZ and db_tz != tzname:
++            # Convert from database timezone to UTC
++            field_name = "CONVERT_TZ(%s, '%s', 'UTC')" % (field_name, db_tz)
++            # Convert from UTC to application timezone
++            field_name = "CONVERT_TZ(%s, 'UTC', '%s')" % (field_name, tzname)
++        elif not settings.USE_TZ:
++            # If USE_TZ=False, handle as naive (no timezone conversion expected).
++            return "DATE(%s)" % field_name
++        return "CAST(DATE(%s) AS DATE)" % field_name
+ 
+     def datetime_cast_time_sql(self, field_name, tzname):
+         field_name = self._convert_field_to_tz(field_name, tzname)
+@@ -251,7 +280,18 @@ class DatabaseOperations(BaseDatabaseOperations):
+ 
+     def convert_datetimefield_value(self, value, expression, connection):
+         if value is not None:
+-            value = timezone.make_aware(value, self.connection.timezone)
++            log_debug(f"Original value before conversion: {value}")
++            # Use the timezone specified in settings_dict, or default to UTC
++            db_tz = self.connection.settings_dict.get('TIME_ZONE', 'UTC')
++            db_timezone = timezone.pytz_timezone(db_tz)
++            log_debug(f"Database timezone: {db_tz}")
++
++            if settings.USE_TZ:
++                # Convert to the database's timezone
++                value = timezone.make_aware(value, db_timezone)
++                log_debug(f"Converted value post MAKE_AWARE: {value}")
++            else:
++                raise ValueError("MySQL backend does not support timezone-aware datetimes when USE_TZ is False.")
+         return value
+ 
+     def convert_uuidfield_value(self, value, expression, connection):
+diff --git a/django/db/backends/utils.py b/django/db/backends/utils.py
+index 597e6b3a9d..8a2c73f55b 100644
+--- a/django/db/backends/utils.py
++++ b/django/db/backends/utils.py
+@@ -58,6 +58,29 @@ class CursorWrapper:
+             if params is None and kparams is None:
+                 return self.cursor.callproc(procname)
+             elif kparams is None:
++    def execute(self, sql, params=None):
++        start = time()
++        try:
++            return super().execute(sql, params)
++        finally:
++            stop = time()
++            duration = stop - start
++            sql = self.db.ops.last_executed_query(self.cursor, sql, params)
++            self.db.queries_log.append({
++                'sql': sql,
++                'time': f"{duration:.3f}",
++            })
++            logger.debug(f"Executed Query: {sql}, Parameters: {params}", extra={'duration': duration, 'sql': sql, 'params': params})
++
++    def executemany(self, sql, param_list):
++        start = time()
++        try:
++            return super().executemany(sql, param_list)
++        finally:
++            stop = time()
++            duration = stop - start
++            sql = self.db.ops.last_executed_query(self.cursor, sql, param_list)
++            logger.debug(f"Executed Multiple Queries: {sql}, Parameters: {param_list}", extra={'duration': duration, 'sql': sql, 'params': param_list})
+                 return self.cursor.callproc(procname, params)
+             else:
+                 params = params or ()
+diff --git a/tests/timezones/tests.py b/tests/timezones/tests.py
+index d51f1cabeb..bef929ab94 100644
+--- a/tests/timezones/tests.py
++++ b/tests/timezones/tests.py
+@@ -32,6 +32,10 @@ from .forms import (
+ from .models import (
+     AllDayEvent, Event, MaybeEvent, Session, SessionEvent, Timestamp,
+ )
++import logging
++logging.basicConfig(level=logging.DEBUG)
++logger = logging.getLogger('django.db.backends')
++logger.setLevel(logging.DEBUG)
+ 
+ # These tests use the EAT (Eastern Africa Time) and ICT (Indochina Time)
+ # who don't have Daylight Saving Time, so we can represent them easily

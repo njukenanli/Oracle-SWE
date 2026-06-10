@@ -1,0 +1,167 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..47f83190
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,109 @@
++import asyncio
++import json
++from unittest.mock import Mock
++
++import trio
++
++from streamlink.session import Streamlink
++from streamlink.webbrowser.cdp.client import CDPClient
++from streamlink.webbrowser.cdp.connection import connect_websocket_url as real_connect
++from tests.webbrowser.cdp import FakeWebsocketConnection
++
++
++async def main():
++    session = Streamlink()
++
++    # Monkeypatch connect_websocket_url to use FakeWebsocketConnection
++    fake_ws = FakeWebsocketConnection()
++
++    async def mock_connect_websocket_url(nursery, url, max_message_size=None):
++        return fake_ws
++
++    import streamlink.webbrowser.cdp.connection as cdp_connection_mod
++    cdp_connection_mod.connect_websocket_url = mock_connect_websocket_url
++
++    # Monkeypatch ChromiumWebbrowser
++    import streamlink.webbrowser.cdp.client as cdp_client_mod
++
++    def mock_launch(*args, **kwargs):
++        return trio.open_nursery()
++
++    mock_browser = Mock(
++        launch=Mock(side_effect=mock_launch),
++        get_websocket_url=Mock(return_value="ws://localhost:1234/fake"),
++    )
++    cdp_client_mod.ChromiumWebbrowser = Mock(return_value=mock_browser)
++
++    loaded = {"done": False}
++
++    async def navigate_flow():
++        async with CDPClient.run(session) as cdp_client:
++            async with cdp_client.session() as client_session:
++                async with client_session.navigate("https://foo") as frame_id:
++                    await client_session.loaded(frame_id)
++                    loaded["done"] = True
++
++    async def driver():
++        # Handle Target.createTarget (connection-level id 0)
++        await trio.sleep(0)
++        await fake_ws.sender.send('{"id":0,"result":{"targetId":"01234"}}')
++        # Handle Target.attachToTarget (connection-level id 1)
++        await trio.sleep(0)
++        await fake_ws.sender.send('{"id":1,"result":{"sessionId":"56789"}}')
++
++        # Expect Browser.getVersion (session-level id 0)
++        # Send a UA with HeadlessChrome so the code triggers UA override
++        await trio.sleep(0)
++        await fake_ws.sender.send(
++            '{"id":0,"result":{"protocolVersion":"1.3","product":"Chrome","revision":"r","userAgent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/127.0.0.0 Safari/537.36","jsVersion":"v8"},"sessionId":"56789"}'
++        )
++        # Emulation.setUserAgentOverride (session-level id 1)
++        await trio.sleep(0)
++        await fake_ws.sender.send('{"id":1,"result":{},"sessionId":"56789"}')
++
++        # Page.enable (session-level id 2)
++        await trio.sleep(0)
++        await fake_ws.sender.send('{"id":2,"result":{},"sessionId":"56789"}')
++
++        # Page.navigate (session-level id 3)
++        await trio.sleep(0)
++        await fake_ws.sender.send('{"id":3,"result":{"frameId":"frame-id-1"},"sessionId":"56789"}')
++
++        # Emit unrelated frame load event, then the correct one
++        await trio.sleep(0)
++        await fake_ws.sender.send('{"method":"Page.frameStoppedLoading","params":{"frameId":"frame-id-unknown"},"sessionId":"56789"}')
++        await trio.sleep(0)
++        await fake_ws.sender.send('{"method":"Page.frameStoppedLoading","params":{"frameId":"frame-id-1"},"sessionId":"56789"}')
++
++        # Page.disable (session-level id 4)
++        await trio.sleep(0)
++        await fake_ws.sender.send('{"id":4,"result":{},"sessionId":"56789"}')
++
++    async with trio.open_nursery() as nursery:
++        nursery.start_soon(navigate_flow)
++        nursery.start_soon(driver)
++        await trio.sleep(0.5)
++
++    # Verify that the UA override call was made before Page.enable
++    # Filter session-level messages
++    sent = fake_ws.sent
++    session_msgs = [json.loads(m) for m in sent if 'sessionId' in json.loads(m)]
++    methods = [m.get('method') for m in session_msgs if 'method' in m]
++
++    # Expect sequence to start with Browser.getVersion, Emulation.setUserAgentOverride, Page.enable
++    expected_prefix = [
++        'Browser.getVersion',
++        'Emulation.setUserAgentOverride',
++        'Page.enable',
++        'Page.navigate',
++    ]
++    assert methods[:4] == expected_prefix, f"Unexpected method sequence: {methods}"
++    assert loaded["done"], "Page did not finish loading"
++
++    print("Reproduction successful. Messages:")
++    for m in sent:
++        print(m)
++
++
++if __name__ == "__main__":
++    trio.run(main)
+diff --git a/src/streamlink/webbrowser/cdp/client.py b/src/streamlink/webbrowser/cdp/client.py
+index f10a0d7a..64d9d26e 100644
+--- a/src/streamlink/webbrowser/cdp/client.py
++++ b/src/streamlink/webbrowser/cdp/client.py
+@@ -8,7 +8,7 @@ import trio
+ 
+ from streamlink.session import Streamlink
+ from streamlink.webbrowser.cdp.connection import CDPConnection, CDPSession
+-from streamlink.webbrowser.cdp.devtools import fetch, network, page, runtime, target
++from streamlink.webbrowser.cdp.devtools import browser, emulation, fetch, network, page, runtime, target
+ from streamlink.webbrowser.cdp.exceptions import CDPError
+ from streamlink.webbrowser.chromium import ChromiumWebbrowser
+ 
+@@ -86,9 +86,10 @@ class CDPClient:
+     ``streamlink.webbrowser.cdp.devtools`` package, but be aware that only a subset of the available domains is supported.
+     """
+ 
+-    def __init__(self, cdp_connection: CDPConnection, nursery: trio.Nursery):
++    def __init__(self, cdp_connection: CDPConnection, nursery: trio.Nursery, headless: bool = True):
+         self.cdp_connection = cdp_connection
+         self.nursery = nursery
++        self.headless = headless
+ 
+     @classmethod
+     def launch(
+@@ -186,7 +187,7 @@ class CDPClient:
+             websocket_url = webbrowser.get_websocket_url(session)
+             cdp_connection: CDPConnection
+             async with CDPConnection.create(websocket_url, timeout=cdp_timeout) as cdp_connection:
+-                yield cls(cdp_connection, nursery)
++                yield cls(cdp_connection, nursery, headless=headless)
+ 
+     @asynccontextmanager
+     async def session(
+@@ -279,6 +280,17 @@ class CDPClientSession:
+                 nursery.start_soon(self._on_fetch_request_paused)
+                 await self.cdp_session.send(fetch.enable(request_patterns, True))
+ 
++            # If running headless, cloak the user agent by replacing HeadlessChrome with Chrome
++            # This mitigates sites detecting headless mode via the UA string.
++            if self.cdp_client.headless:
++                try:
++                    _proto, _product, _rev, user_agent, _js = await self.cdp_session.send(browser.get_version())
++                    if "HeadlessChrome" in user_agent:
++                        await self.cdp_session.send(emulation.set_user_agent_override(user_agent.replace("HeadlessChrome", "Chrome")))
++                except Exception:
++                    # Best-effort: ignore failures and continue
++                    pass
++
+             await self.cdp_session.send(page.enable())
+ 
+             try:

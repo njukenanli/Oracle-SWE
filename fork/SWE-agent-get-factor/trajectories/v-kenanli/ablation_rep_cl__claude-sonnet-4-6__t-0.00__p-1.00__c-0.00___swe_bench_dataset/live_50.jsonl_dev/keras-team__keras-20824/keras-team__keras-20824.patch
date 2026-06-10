@@ -1,0 +1,347 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..8808a4dbb
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,338 @@
++"""
++Reproduction for: Error deserializing saved model after Keras bump 3.6 -> 3.7
++
++Issue: https://github.com/keras-team/keras/issues/20806
++
++Root cause: commit 0c2bdff3 ("Fix serialization / deserialization. #20406") made
++two changes:
++  1. Serialization now stores the full registered name "package>fn_name" instead
++     of just the bare function name "fn_name" in the `config` field.
++  2. The fallback lookup code that searched by postfix in `_retrieve_class_or_fn`
++     was removed.
++
++This means models saved with Keras <=3.6 used the old format:
++    {"module": "builtins", "class_name": "function",
++     "config": "attention_loss", "registered_name": "function"}
++
++But Keras >=3.7 looks up only by the exact `name` (which comes from `config`),
++so `get_registered_object("attention_loss")` fails because the object was
++registered under "attention_loss>attention_loss".
++
++Fix (PR #20824): add a postfix-based fallback lookup in `_retrieve_class_or_fn`
++when `obj_type == "function"` and `module == "builtins"`.
++"""
++
++import sys
++import traceback
++
++import keras
++from keras.src.saving import object_registration
++from keras.src.saving import serialization_lib
++
++
++# ---------------------------------------------------------------------------
++# Helper: run a test case; return True if it PASSES (no exception), False if
++# it raises TypeError (reproducing the bug).
++# ---------------------------------------------------------------------------
++
++def _run(desc, fn):
++    try:
++        fn()
++        print(f"  [PASS] {desc}")
++        return True
++    except TypeError as exc:
++        print(f"  [FAIL] {desc}")
++        print(f"         TypeError: {exc}")
++        return False
++    except Exception as exc:
++        print(f"  [ERROR] {desc}")
++        traceback.print_exc()
++        return False
++
++
++# ---------------------------------------------------------------------------
++# Register custom functions that reproduce the user scenario.
++# Note: `package` is passed as the first positional arg, matching the user
++# code:  @tf.keras.utils.register_keras_serializable("attention_loss")
++# ---------------------------------------------------------------------------
++
++@object_registration.register_keras_serializable(package="attention_loss")
++def attention_loss(y_actual, y_predicted):
++    """Simulate the user's custom loss function."""
++    import keras.src.ops as ops
++    return ops.mean(ops.square(y_predicted - y_actual), axis=-1)
++
++
++@object_registration.register_keras_serializable(package="my_package")
++def my_custom_fn(x):
++    """Another custom function with a distinct package name."""
++    import keras.src.ops as ops
++    return x ** 2
++
++
++@object_registration.register_keras_serializable(package="pkg")
++def loss_fn(y_true, y_pred):
++    import keras.src.ops as ops
++    return ops.mean(ops.square(y_pred - y_true), axis=-1)
++
++
++# ---------------------------------------------------------------------------
++# Test 1 – Exact reproduction from the bug report.
++#
++# A model was saved with Keras <=3.6 using:
++#   @tf.keras.utils.register_keras_serializable("attention_loss")
++#   def attention_loss(y_actual, y_predicted): ...
++#
++# The Keras 3.6 serialization stored:
++#   {"module": "builtins", "class_name": "function",
++#    "config": "attention_loss", "registered_name": "function"}
++#
++# The registered key in GLOBAL_CUSTOM_OBJECTS is "attention_loss>attention_loss".
++# Without the fix, looking up "attention_loss" fails.
++# ---------------------------------------------------------------------------
++
++KERAS_36_CONFIG_ATTENTION_LOSS = {
++    "module": "builtins",
++    "class_name": "function",
++    "config": "attention_loss",       # Keras 3.6: bare function name
++    "registered_name": "function",    # Keras 3.6: literal string "function"
++}
++
++def test_attention_loss_exact_bug_report():
++    obj = serialization_lib.deserialize_keras_object(KERAS_36_CONFIG_ATTENTION_LOSS)
++    assert obj is attention_loss, (
++        f"Expected {attention_loss}, got {obj}"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 2 – Same scenario but the saved `config` accidentally uses the package
++# as a prefix (e.g. "attention_loss>attention_loss"), which is the 3.7+ format.
++# This should continue to work in all Keras versions.
++# ---------------------------------------------------------------------------
++
++KERAS_37_CONFIG_ATTENTION_LOSS = {
++    "module": "builtins",
++    "class_name": "function",
++    "config": "attention_loss>attention_loss",
++    "registered_name": "function",
++}
++
++def test_attention_loss_new_format():
++    obj = serialization_lib.deserialize_keras_object(KERAS_37_CONFIG_ATTENTION_LOSS)
++    assert obj is attention_loss, (
++        f"Expected {attention_loss}, got {obj}"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 3 – A different custom function "my_custom_fn" with package "my_package".
++# Keras 3.6 format: config="my_custom_fn", registered key="my_package>my_custom_fn".
++# ---------------------------------------------------------------------------
++
++KERAS_36_CONFIG_MY_CUSTOM_FN = {
++    "module": "builtins",
++    "class_name": "function",
++    "config": "my_custom_fn",
++    "registered_name": "function",
++}
++
++def test_my_custom_fn_keras36_format():
++    obj = serialization_lib.deserialize_keras_object(KERAS_36_CONFIG_MY_CUSTOM_FN)
++    assert obj is my_custom_fn, (
++        f"Expected {my_custom_fn}, got {obj}"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 4 – Round-trip test: serialize the function with the CURRENT version of
++# Keras and then deserialize it. This should work regardless of any fix.
++# ---------------------------------------------------------------------------
++
++def test_round_trip_current_format():
++    serialized = serialization_lib.serialize_keras_object(attention_loss)
++    deserialized = serialization_lib.deserialize_keras_object(serialized)
++    assert deserialized is attention_loss, (
++        f"Round-trip failed: expected {attention_loss}, got {deserialized}"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 5 – Round-trip for my_custom_fn.
++# ---------------------------------------------------------------------------
++
++def test_round_trip_my_custom_fn():
++    serialized = serialization_lib.serialize_keras_object(my_custom_fn)
++    deserialized = serialization_lib.deserialize_keras_object(serialized)
++    assert deserialized is my_custom_fn, (
++        f"Round-trip failed: expected {my_custom_fn}, got {deserialized}"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 6 – A function registered with the DEFAULT package ("Custom").
++# Keras 3.6 serialized it as just the bare name; we should still be able to
++# load it when the key is "Custom>fn_name".
++# ---------------------------------------------------------------------------
++
++@object_registration.register_keras_serializable()   # package defaults to "Custom"
++def default_pkg_fn(x):
++    import keras.src.ops as ops
++    return ops.relu(x)
++
++KERAS_36_CONFIG_DEFAULT_PKG = {
++    "module": "builtins",
++    "class_name": "function",
++    "config": "default_pkg_fn",
++    "registered_name": "function",
++}
++
++def test_default_package_fn_keras36_format():
++    obj = serialization_lib.deserialize_keras_object(KERAS_36_CONFIG_DEFAULT_PKG)
++    assert obj is default_pkg_fn, (
++        f"Expected {default_pkg_fn}, got {obj}"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 7 – Simulate full save/load of a compiled model where the loss is a
++# registered custom function.  We inject a Keras-3.6-style config into the
++# compile_config and verify that deserialization succeeds.
++# ---------------------------------------------------------------------------
++
++def test_compile_config_deserialize_keras36_loss():
++    """Simulates compile_from_config with a Keras-3.6-serialized loss."""
++    compile_config = {
++        "optimizer": "adam",
++        "loss": {
++            "module": "builtins",
++            "class_name": "function",
++            "config": "attention_loss",      # Keras 3.6 format
++            "registered_name": "function",
++        },
++        "loss_weights": None,
++        "metrics": None,
++        "weighted_metrics": None,
++        "run_eagerly": False,
++        "steps_per_execution": 1,
++        "jit_compile": "auto",
++    }
++    # Deserializing the whole compile config should not raise
++    deserialized = serialization_lib.deserialize_keras_object(compile_config)
++    # The loss key should come back as the actual function
++    assert deserialized["loss"] is attention_loss, (
++        f"Expected {attention_loss}, got {deserialized['loss']}"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 8 – Same as test 7 but also with my_custom_fn.
++# ---------------------------------------------------------------------------
++
++def test_compile_config_deserialize_keras36_my_custom_fn():
++    compile_config = {
++        "optimizer": "adam",
++        "loss": {
++            "module": "builtins",
++            "class_name": "function",
++            "config": "my_custom_fn",
++            "registered_name": "function",
++        },
++        "loss_weights": None,
++        "metrics": None,
++        "weighted_metrics": None,
++        "run_eagerly": False,
++        "steps_per_execution": 1,
++        "jit_compile": "auto",
++    }
++    deserialized = serialization_lib.deserialize_keras_object(compile_config)
++    assert deserialized["loss"] is my_custom_fn, (
++        f"Expected {my_custom_fn}, got {deserialized['loss']}"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 9 – Built-in functions (e.g. "relu") stored with module="builtins"
++# should still work – this is the existing behaviour we must not break.
++# ---------------------------------------------------------------------------
++
++def test_builtin_function_still_works():
++    config = {
++        "module": "builtins",
++        "class_name": "function",
++        "config": "relu",
++        "registered_name": "function",
++    }
++    obj = serialization_lib.deserialize_keras_object(config)
++    import keras
++    assert obj is keras.activations.relu, (
++        f"Expected keras.activations.relu, got {obj}"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 10 – loss_fn with package="pkg": Keras 3.6 format stores bare name.
++# ---------------------------------------------------------------------------
++
++KERAS_36_CONFIG_LOSS_FN = {
++    "module": "builtins",
++    "class_name": "function",
++    "config": "loss_fn",
++    "registered_name": "function",
++}
++
++def test_loss_fn_keras36_format():
++    obj = serialization_lib.deserialize_keras_object(KERAS_36_CONFIG_LOSS_FN)
++    assert obj is loss_fn, (
++        f"Expected {loss_fn}, got {obj}"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Run all tests and report results.
++# ---------------------------------------------------------------------------
++
++def main():
++    tests = [
++        ("Test 1: attention_loss – exact bug report (Keras 3.6 format)",
++         test_attention_loss_exact_bug_report),
++        ("Test 2: attention_loss – Keras 3.7+ format (should always pass)",
++         test_attention_loss_new_format),
++        ("Test 3: my_custom_fn – Keras 3.6 format with different package",
++         test_my_custom_fn_keras36_format),
++        ("Test 4: round-trip current format – attention_loss",
++         test_round_trip_current_format),
++        ("Test 5: round-trip current format – my_custom_fn",
++         test_round_trip_my_custom_fn),
++        ("Test 6: default package ('Custom') – Keras 3.6 format",
++         test_default_package_fn_keras36_format),
++        ("Test 7: compile_config with Keras 3.6 loss (attention_loss)",
++         test_compile_config_deserialize_keras36_loss),
++        ("Test 8: compile_config with Keras 3.6 loss (my_custom_fn)",
++         test_compile_config_deserialize_keras36_my_custom_fn),
++        ("Test 9: built-in 'relu' function – must still work",
++         test_builtin_function_still_works),
++        ("Test 10: loss_fn with package='pkg' – Keras 3.6 format",
++         test_loss_fn_keras36_format),
++    ]
++
++    print(f"\nKeras version: {keras.__version__}\n")
++    results = []
++    for desc, fn in tests:
++        passed = _run(desc, fn)
++        results.append((desc, passed))
++
++    print("\n" + "=" * 70)
++    failed = [d for d, p in results if not p]
++    if failed:
++        print(f"FAILED {len(failed)}/{len(results)} tests:")
++        for d in failed:
++            print(f"  - {d}")
++        sys.exit(1)
++    else:
++        print(f"All {len(results)} tests passed.")
++        sys.exit(0)
++
++
++if __name__ == "__main__":
++    main()
+
+

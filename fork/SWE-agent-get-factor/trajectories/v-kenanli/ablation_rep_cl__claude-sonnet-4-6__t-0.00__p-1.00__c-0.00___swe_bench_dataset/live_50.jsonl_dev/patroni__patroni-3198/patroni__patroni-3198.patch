@@ -1,0 +1,364 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..1b9de47d
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,355 @@
++"""
++Reproduction test for the issue:
++  "Patroni not executing callback script when primary server's disk is full"
++
++Issue description:
++  When the primary server's disk is full, Patroni successfully demotes the
++  primary database and promotes the standby database, but the callback script
++  (on_role_change) is NOT executed on the original primary server.
++
++Root cause:
++  In `patroni/postgresql/__init__.py`, `follow()` calls `self.start(...)` when
++  postgres is not running. Inside `start()`, `self.config.write_postgresql_conf()`
++  is called. When the disk is full this raises `OSError: [Errno 28] No space
++  left on device`.
++
++  Because neither `start()` nor `follow()` catches this exception, it propagates
++  past lines 1165-1167 in `follow()`:
++
++      if change_role:
++          self.call_nowait(CallbackAction.ON_ROLE_CHANGE)   # <-- NEVER REACHED
++
++  The `ON_ROLE_CHANGE` callback is therefore never called even though the role
++  has already changed from 'primary' (or 'demoted') to 'replica'.
++
++Expected behaviour (after fix):
++  The `ON_ROLE_CHANGE` callback must be executed even when `start()` raises an
++  exception, as long as `change_role` is True.
++
++Test strategy:
++  We reuse the existing BaseTestPostgresql / TestPostgresql setUp machinery
++  from tests/ so that the Postgresql instance is correctly initialised with all
++  required mocks.  The individual test methods then inject faults into
++  `start()` / `restart()` / `write_postgresql_conf()` to reproduce the exact
++  stack trace from the bug report.
++
++  Tests 1-3 and 7 are expected to FAIL before the fix is applied (they
++  demonstrate the bug) and PASS after the fix.
++
++  Tests 4-6 are sanity / regression checks that should always pass.
++"""
++
++import sys
++import os
++import unittest
++from unittest.mock import Mock, patch, PropertyMock
++
++# Make sure the project root is on the path
++sys.path.insert(0, '/testbed')
++
++# ── Reuse the full test-infrastructure from the project's own test-suite ──────
++from tests import BaseTestPostgresql, mock_available_gucs
++
++from patroni.dcs import RemoteMember
++from patroni.postgresql import Postgresql
++from patroni.postgresql.callback_executor import CallbackAction
++from patroni.postgresql.config import ConfigHandler
++
++
++# ── Helper to build a RemoteMember that build_recovery_params() accepts ───────
++
++def _make_member():
++    """Return a RemoteMember similar to the one used by the existing test_follow."""
++    return RemoteMember('1', {
++        'restore_command': '2',
++        'primary_slot_name': 'foo',
++        'conn_kwargs': {'host': 'foo,bar'},
++    })
++
++
++# ── Test class ────────────────────────────────────────────────────────────────
++
++@patch('subprocess.call', Mock(return_value=0))
++@patch('subprocess.check_output', Mock(return_value=b"postgres (PostgreSQL) 14.1"))
++@patch('patroni.psycopg.connect', Mock())
++@patch.object(Postgresql, 'available_gucs', mock_available_gucs)
++class TestFollowCallbackOnDiskFull(BaseTestPostgresql):
++    """Verify that the ON_ROLE_CHANGE callback is invoked inside follow() even
++    when start() / restart() / write_postgresql_conf() raise OSError."""
++
++    @patch('subprocess.call', Mock(return_value=0))
++    @patch('os.rename', Mock())
++    @patch('patroni.postgresql.CallbackExecutor', Mock())
++    @patch.object(Postgresql, 'get_major_version', Mock(return_value=140000))
++    @patch.object(Postgresql, 'is_running', Mock(return_value=True))
++    @patch.object(Postgresql, 'available_gucs', mock_available_gucs)
++    def setUp(self):
++        super().setUp()
++        self.p.config.write_postgresql_conf()
++
++    # ── internal helper ───────────────────────────────────────────────────────
++
++    def _setup_change_role(self, initial_role: str):
++        """Ensure the preconditions for change_role == True inside follow()."""
++        # cb_called must be True
++        self.p.call_nowait(CallbackAction.ON_START)
++        self.assertTrue(self.p.cb_called,
++                        "Precondition: cb_called must be True")
++        self.p.set_role(initial_role)
++        self.assertEqual(self.p.role, initial_role)
++
++    def _track_call_nowait(self):
++        """Replace call_nowait with a tracking wrapper; returns the call-log."""
++        original = self.p.call_nowait
++        log = []
++
++        def _tracking(cb_type):
++            log.append(cb_type)
++            return original(cb_type)
++
++        self.p.call_nowait = _tracking
++        return log
++
++    # ─────────────────────────────────────────────────────────────────────────
++    # Test 1 – primary role, postgres NOT running, start() raises OSError
++    # ─────────────────────────────────────────────────────────────────────────
++
++    @patch.object(Postgresql, 'is_running', Mock(return_value=False))
++    @patch.object(Postgresql, 'major_version', PropertyMock(return_value=140000))
++    def test_on_role_change_called_when_primary_start_raises_oserror(self):
++        """
++        Bug scenario (exact match to the issue):
++          - postgres is NOT running (crashed due to full disk)
++          - role was 'primary'
++          - start() raises OSError([Errno 28] No space left on device)
++
++        Before the fix: exception propagates, ON_ROLE_CHANGE is never called.
++        After  the fix: ON_ROLE_CHANGE is called despite the exception.
++        """
++        self._setup_change_role('primary')
++        log = self._track_call_nowait()
++
++        disk_full = OSError(28, "No space left on device")
++        with patch.object(Postgresql, 'start', side_effect=disk_full):
++            try:
++                self.p.follow(_make_member(), role='replica')
++            except OSError:
++                # Pre-fix: exception propagates; post-fix: caught internally.
++                pass
++
++        self.assertIn(
++            CallbackAction.ON_ROLE_CHANGE,
++            log,
++            "BUG: ON_ROLE_CHANGE was NOT called when start() raised OSError "
++            "(disk full) during role change 'primary' -> 'replica'."
++        )
++
++    # ─────────────────────────────────────────────────────────────────────────
++    # Test 2 – demoted role, postgres NOT running, start() raises OSError
++    # ─────────────────────────────────────────────────────────────────────────
++
++    @patch.object(Postgresql, 'is_running', Mock(return_value=False))
++    @patch.object(Postgresql, 'major_version', PropertyMock(return_value=140000))
++    def test_on_role_change_called_when_demoted_start_raises_oserror(self):
++        """
++        Bug scenario:
++          - postgres is NOT running
++          - role was already set to 'demoted' (primary stopped abnormally)
++          - start() raises OSError
++
++        ON_ROLE_CHANGE must still be invoked.
++        """
++        self._setup_change_role('demoted')
++        log = self._track_call_nowait()
++
++        disk_full = OSError(28, "No space left on device")
++        with patch.object(Postgresql, 'start', side_effect=disk_full):
++            try:
++                self.p.follow(_make_member(), role='replica')
++            except OSError:
++                pass
++
++        self.assertIn(
++            CallbackAction.ON_ROLE_CHANGE,
++            log,
++            "BUG: ON_ROLE_CHANGE was NOT called when start() raised OSError "
++            "(disk full) during role change 'demoted' -> 'replica'."
++        )
++
++    # ─────────────────────────────────────────────────────────────────────────
++    # Test 3 – postgres IS running, restart() raises OSError
++    # ─────────────────────────────────────────────────────────────────────────
++
++    @patch.object(Postgresql, 'major_version', PropertyMock(return_value=140000))
++    def test_on_role_change_called_when_running_restart_raises_oserror(self):
++        """
++        Bug scenario:
++          - postgres IS still running when follow() is called
++          - restart() (which calls start() internally) raises OSError
++
++        ON_ROLE_CHANGE must still be invoked.
++        """
++        self._setup_change_role('primary')
++        log = self._track_call_nowait()
++
++        disk_full = OSError(28, "No space left on device")
++        with patch.object(Postgresql, 'is_running', Mock(return_value=True)), \
++             patch.object(Postgresql, 'restart', side_effect=disk_full):
++            try:
++                self.p.follow(_make_member(), role='replica')
++            except OSError:
++                pass
++
++        self.assertIn(
++            CallbackAction.ON_ROLE_CHANGE,
++            log,
++            "BUG: ON_ROLE_CHANGE was NOT called when restart() raised OSError "
++            "(disk full) during role change 'primary' -> 'replica'."
++        )
++
++    # ─────────────────────────────────────────────────────────────────────────
++    # Test 4 – Control: start() succeeds normally – callback still fired
++    # ─────────────────────────────────────────────────────────────────────────
++
++    @patch.object(Postgresql, 'is_running', Mock(return_value=False))
++    @patch.object(Postgresql, 'major_version', PropertyMock(return_value=140000))
++    def test_on_role_change_called_when_start_succeeds_normally(self):
++        """
++        Regression guard: normal (no-error) path must still invoke the callback.
++        """
++        self._setup_change_role('primary')
++        log = self._track_call_nowait()
++
++        with patch.object(Postgresql, 'start', return_value=None):
++            self.p.follow(_make_member(), role='replica')
++
++        self.assertIn(
++            CallbackAction.ON_ROLE_CHANGE,
++            log,
++            "Regression: ON_ROLE_CHANGE was NOT called in the normal path "
++            "'primary' -> 'replica'."
++        )
++
++    # ─────────────────────────────────────────────────────────────────────────
++    # Test 5 – standby_leader role, start() raises OSError
++    # ─────────────────────────────────────────────────────────────────────────
++
++    @patch.object(Postgresql, 'is_running', Mock(return_value=False))
++    @patch.object(Postgresql, 'major_version', PropertyMock(return_value=140000))
++    def test_on_role_change_called_when_standby_leader_start_raises_oserror(self):
++        """
++        Bug scenario:
++          - role was 'standby_leader'
++          - transition to 'replica'
++          - start() raises OSError
++
++        change_role is True because both current and target roles are in
++        {'standby_leader', 'replica'}.
++        ON_ROLE_CHANGE must still be invoked.
++        """
++        self._setup_change_role('standby_leader')
++        log = self._track_call_nowait()
++
++        disk_full = OSError(28, "No space left on device")
++        with patch.object(Postgresql, 'start', side_effect=disk_full):
++            try:
++                self.p.follow(_make_member(), role='replica')
++            except OSError:
++                pass
++
++        self.assertIn(
++            CallbackAction.ON_ROLE_CHANGE,
++            log,
++            "BUG: ON_ROLE_CHANGE was NOT called when start() raised OSError "
++            "(disk full) during role change 'standby_leader' -> 'replica'."
++        )
++
++    # ─────────────────────────────────────────────────────────────────────────
++    # Test 6 – cb_called is False → change_role is False → NO callback
++    # ─────────────────────────────────────────────────────────────────────────
++
++    @patch.object(Postgresql, 'is_running', Mock(return_value=False))
++    @patch.object(Postgresql, 'major_version', PropertyMock(return_value=140000))
++    def test_on_role_change_not_called_when_cb_not_called_yet(self):
++        """
++        Sanity check: if cb_called is False (Patroni hasn't issued any callback
++        yet since startup), change_role must be False and ON_ROLE_CHANGE must
++        NOT be called by follow().
++        """
++        # We deliberately DO NOT call call_nowait(ON_START) here.
++        # Reset cb_called to False (it might have been set by setUp's
++        # write_postgresql_conf path indirectly).
++        self.p._Postgresql__cb_called = False
++        self.assertFalse(self.p.cb_called,
++                         "Precondition: cb_called must be False for this test")
++        self.p.set_role('primary')
++
++        log = self._track_call_nowait()
++
++        with patch.object(Postgresql, 'start', return_value=None):
++            self.p.follow(_make_member(), role='replica')
++
++        self.assertNotIn(
++            CallbackAction.ON_ROLE_CHANGE,
++            log,
++            "ON_ROLE_CHANGE must NOT be called when cb_called is False."
++        )
++
++    # ─────────────────────────────────────────────────────────────────────────
++    # Test 7 – exact stack trace from the bug report:
++    #          write_postgresql_conf() inside start() raises OSError
++    # ─────────────────────────────────────────────────────────────────────────
++
++    @patch.object(Postgresql, 'is_running', Mock(return_value=False))
++    @patch.object(Postgresql, 'major_version', PropertyMock(return_value=140000))
++    def test_on_role_change_called_when_write_postgresql_conf_raises_oserror(self):
++        """
++        This test exercises the *exact* code path from the bug report:
++
++          File ".../patroni/postgresql/__init__.py", line 769, in start
++            self.config.write_postgresql_conf(configuration)
++          OSError: [Errno 28] No space left on device
++
++        The exception bubbles from write_postgresql_conf() → start() → follow().
++        Before the fix, it bypasses call_nowait(ON_ROLE_CHANGE) at lines 1165-1167.
++        After the fix, ON_ROLE_CHANGE must be called regardless.
++        """
++        self._setup_change_role('primary')
++        log = self._track_call_nowait()
++
++        disk_full = OSError(28, "No space left on device")
++
++        # We need start() to actually run (not be mocked away) so the exception
++        # originates from write_postgresql_conf() inside start(), replicating
++        # the exact traceback in the issue.
++        with patch.object(Postgresql, 'ensure_major_version_is_known',
++                          return_value=True), \
++             patch.object(ConfigHandler, 'write_postgresql_conf',
++                          side_effect=disk_full), \
++             patch.object(ConfigHandler, 'check_directories', Mock()), \
++             patch.object(ConfigHandler, 'write_recovery_conf', Mock()):
++            try:
++                self.p.follow(_make_member(), role='replica')
++            except OSError:
++                # Pre-fix: exception propagates out of follow().
++                # Post-fix: follow() catches it internally.
++                pass
++
++        self.assertIn(
++            CallbackAction.ON_ROLE_CHANGE,
++            log,
++            "BUG: ON_ROLE_CHANGE was NOT called when write_postgresql_conf() "
++            "raised OSError (disk full) inside start(), during role change "
++            "'primary' -> 'replica'. This is the exact failure path from the "
++            "bug report."
++        )
++
++
++# ── Entry point ───────────────────────────────────────────────────────────────
++
++if __name__ == '__main__':
++    loader = unittest.TestLoader()
++    suite = loader.loadTestsFromTestCase(TestFollowCallbackOnDiskFull)
++    runner = unittest.TextTestRunner(verbosity=2)
++    result = runner.run(suite)
++    sys.exit(0 if result.wasSuccessful() else 1)
+
+

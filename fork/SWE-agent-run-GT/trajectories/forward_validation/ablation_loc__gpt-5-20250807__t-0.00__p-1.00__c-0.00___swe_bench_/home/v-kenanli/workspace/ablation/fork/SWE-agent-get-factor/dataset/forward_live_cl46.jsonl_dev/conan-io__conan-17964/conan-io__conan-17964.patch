@@ -1,0 +1,132 @@
+diff --git a/conan/internal/model/cpp_info.py b/conan/internal/model/cpp_info.py
+index 1a702ba6e..924f77293 100644
+--- a/conan/internal/model/cpp_info.py
++++ b/conan/internal/model/cpp_info.py
+@@ -511,19 +511,50 @@ class _Component:
+             for file_name in files:
+                 full_path = os.path.join(dir_, file_name)
+                 if os.path.isfile(full_path) and pattern.match(file_name):
+-                    # File name could be a symlink, e.g., mylib.1.0.0.so -> mylib.so
+-                    if os.path.islink(full_path):
+-                        # Important! os.path.realpath returns the final path of the symlink even if it points
+-                        # to another symlink, i.e., libmylib.dylib -> libmylib.1.dylib -> libmylib.1.0.0.dylib
+-                        # then os.path.realpath("libmylib.1.0.0.dylib") == "libmylib.dylib"
+-                        # Note: os.readlink() returns the path which the symbolic link points to.
+-                        real_path = os.path.realpath(full_path)
+-                        ret.add(real_path)
+-                    else:
+-                        ret.add(full_path)
++                    # Keep the symlink path itself to preserve SONAME-like filenames
++                    # Runtime loaders typically search by SONAME (e.g., libfoo.so.X or libfoo.X.dylib),
++                    # so we must not collapse symlinks to their realpath here.
++                    ret.add(full_path)
+             return list(ret)
+ 
+         def _find_matching(dirs, pattern):
++            def _score_candidate(p):
++                # Prefer SONAME-like names over fully versioned leaves or unversioned names.
++                # Lower scores are better.
++                b = os.path.basename(p)
++                # Linux styles
++                linux_soname = re.match(r"^.+\.so\.[0-9]+(\.[0-9]+)*$", b)
++                # macOS styles
++                mac_versioned = re.match(r"^.+\.[0-9]+(\.[0-9]+)*\.dylib$", b)
++                is_unversioned_so = b.endswith('.so') and '.so.' not in b
++                is_unversioned_dylib = b.endswith('.dylib') and not mac_versioned
++
++                # Count numeric groups: fewer is closer to SONAME, more is likely the leaf
++                def count_numeric_groups_linux(name):
++                    try:
++                        tail = name.split('.so.', 1)[1]
++                        return len([t for t in tail.split('.') if t.isdigit()])
++                    except Exception:
++                        return 0
++
++                def count_numeric_groups_mac(name):
++                    try:
++                        head = name.rsplit('.dylib', 1)[0]
++                        nums = [t for t in head.split('.') if t.isdigit()]
++                        return len(nums)
++                    except Exception:
++                        return 0
++
++                if linux_soname:
++                    return (0, count_numeric_groups_linux(b), len(b))
++                if mac_versioned:
++                    # Prefer fewer numeric groups (e.g., libfoo.1.dylib over libfoo.1.0.0.dylib)
++                    return (0, count_numeric_groups_mac(b), len(b))
++                if is_unversioned_so or is_unversioned_dylib:
++                    return (2, 0, len(b))
++                # Other candidates (likely fully versioned leaf on Linux if not matching linux_soname)
++                return (1, 99, len(b))
++
+             for d in dirs:
+                 if not os.path.exists(d):
+                     continue
+@@ -535,7 +566,8 @@ class _Component:
+                     lib_found = _lib_match_by_regex(d, pattern)
+                 if lib_found:
+                     if len(lib_found) > 1:
+-                        lib_found.sort()
++                        # Sort candidates by our priority to select a stable, SONAME-preferred path
++                        lib_found.sort(key=_score_candidate)
+                         found, _ = os.path.splitext(os.path.basename(lib_found[0]))
+                         if found != libname and found != f"lib{libname}":
+                             out.warning(f"There were several matches for Lib {libname}: {lib_found}")
+diff --git a/repro_symlink_issue.py b/repro_symlink_issue.py
+new file mode 100644
+index 000000000..f164338d7
+--- /dev/null
++++ b/repro_symlink_issue.py
+@@ -0,0 +1,51 @@
++import os
++import tempfile
++from conan.internal.model.cpp_info import CppInfo
++from conan.internal.model.pkg_type import PackageType
++
++class CF:
++    def __init__(self):
++        class Ref: pass
++        self.ref = Ref()
++        self.ref.name = "z3"
++        self.package_type = PackageType.SHARED
++    def __str__(self):
++        return "ConanfileStub"
++
++
++def setup_temp_libdir():
++    d = tempfile.mkdtemp(prefix="conan_bazel_symlink_")
++    # create a dummy real .so file and symlinks
++    leaf = os.path.join(d, "libz3.so.4.12.4.0")
++    with open(leaf, "wb") as f:
++        f.write(b"\x7fELF" + b"\x00"*64)  # content doesn't matter for this reproduction
++    so_soname = os.path.join(d, "libz3.so.4.12")
++    so_plain = os.path.join(d, "libz3.so")
++    try:
++        os.symlink(os.path.basename(leaf), so_soname)
++        os.symlink(os.path.basename(so_soname), so_plain)
++    except FileExistsError:
++        pass
++    return d
++
++
++def main():
++    tmpdir = setup_temp_libdir()
++    cpp = CppInfo(set_defaults=True)
++    cpp.libdirs = [tmpdir]
++    cpp.libs = ["z3"]
++    cf = CF()
++    # deduce locations for the root package component
++    cpp._package.deduce_locations(cf)
++    print("Deduced location:", cpp._package.location)
++    # We expect the symlink with the SONAME-ish name to be chosen
++    # because runtime loaders use SONAME and Bazel should include that file name.
++    if cpp._package.location.endswith("libz3.so.4.12"):
++        print("OK: chose symlink (soname)")
++        exit(0)
++    else:
++        print("FAIL: chose leaf or unexpected:", cpp._package.location)
++        exit(1)
++
++if __name__ == "__main__":
++    main()

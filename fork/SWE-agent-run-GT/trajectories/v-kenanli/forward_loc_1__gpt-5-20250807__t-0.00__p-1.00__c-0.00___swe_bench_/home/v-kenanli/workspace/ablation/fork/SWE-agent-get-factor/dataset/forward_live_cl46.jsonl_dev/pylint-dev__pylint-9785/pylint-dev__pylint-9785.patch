@@ -1,0 +1,180 @@
+diff --git a/pylint/checkers/typecheck.py b/pylint/checkers/typecheck.py
+index 67852d38f..7fc68629f 100644
+--- a/pylint/checkers/typecheck.py
++++ b/pylint/checkers/typecheck.py
+@@ -627,28 +627,61 @@ def _determine_callable(
+     if isinstance(callable_obj, nodes.Lambda):
+         return callable_obj, parameters, "lambda"
+     if isinstance(callable_obj, nodes.ClassDef):
+-        # Class instantiation, lookup __new__ instead.
+-        # If we only find object.__new__, we can safely check __init__
+-        # instead. If __new__ belongs to builtins, then we look
+-        # again for __init__ in the locals, since we won't have
+-        # argument information for the builtin __new__ function.
++        # Class instantiation. Prefer looking up an overload coming from a custom
++        # metaclass (e.g., typing_extensions' TypeVar uses a metaclass that defines
++        # a constructor-like __call__ accepting additional keyword-only parameters
++        # such as "default").
+         try:
+-            # Use the last definition of __new__.
+-            new = callable_obj.local_attr("__new__")[-1]
+-        except astroid.NotFoundError:
+-            new = None
+-
+-        from_object = new and new.parent.scope().name == "object"
+-        from_builtins = new and new.root().name in sys.builtin_module_names
++            metaclass = callable_obj.metaclass()
++        except Exception:  # astroid can raise in some edge cases
++            metaclass = None
+ 
+-        if not new or from_object or from_builtins:
++        meta_callable = None
++        if isinstance(metaclass, nodes.ClassDef):
++            # Prefer a constructor-like __call__ on the metaclass. First, try full
++            # attribute resolution (including inherited), then fall back to local attrs.
++            try:
++                meta_callable = metaclass.getattr("__call__")[-1]
++            except (AttributeError, astroid.NotFoundError):
++                try:
++                    meta_callable = metaclass.local_attr("__call__")[-1]
++                except astroid.NotFoundError:
++                    meta_callable = None
++            if not meta_callable:
++                # Fall back to the metaclass __new__ if no __call__ was found.
++                try:
++                    meta_callable = metaclass.getattr("__new__")[-1]
++                except (AttributeError, astroid.NotFoundError):
++                    try:
++                        meta_callable = metaclass.local_attr("__new__")[-1]
++                    except astroid.NotFoundError:
++                        meta_callable = None
++
++        # If we didn't find a suitable metaclass callable, inspect the class itself.
++        if not meta_callable:
++            # If we only find object.__new__, we can safely check __init__ instead.
++            # If __new__ belongs to builtins, then we look again for __init__ in the
++            # locals, since we won't have argument information for the builtin __new__ function.
+             try:
+-                # Use the last definition of __init__.
+-                callable_obj = callable_obj.local_attr("__init__")[-1]
+-            except astroid.NotFoundError as e:
+-                raise ValueError from e
++                # Use the last definition of __new__.
++                new = callable_obj.local_attr("__new__")[-1]
++            except astroid.NotFoundError:
++                new = None
++
++            from_object = new and new.parent.scope().name == "object"
++            from_builtins = new and new.root().name in sys.builtin_module_names
++
++            if not new or from_object or from_builtins:
++                try:
++                    # Use the last definition of __init__.
++                    callable_obj = callable_obj.local_attr("__init__")[-1]
++                except astroid.NotFoundError as e:
++                    # Nothing useful to inspect on the class itself.
++                    raise ValueError from e
++            else:
++                callable_obj = new
+         else:
+-            callable_obj = new
++            callable_obj = meta_callable
+ 
+         if not isinstance(callable_obj, nodes.FunctionDef):
+             raise ValueError
+@@ -1438,6 +1471,7 @@ accessed. Python regular expressions are accepted.",
+         and that passed arguments match the parameters in the inferred function.
+         """
+         called = safe_infer(node.func)
++        original_called = called
+ 
+         self._check_not_callable(node, called)
+ 
+@@ -1608,6 +1642,36 @@ accessed. Python regular expressions are accepted.",
+             ) and self._keyword_argument_is_in_all_decorator_returns(called, keyword):
+                 pass
+             elif not overload_function:
++                # Special-case: classes using a metaclass-provided constructor
++                # (via __call__) may accept extra keyword-only arguments which
++                # are not visible on the class' own __init__/__new__ signature.
++                # This happens for typing_extensions.TypeVar on Python versions
++                # without PEP 696 support, where the metaclass accepts
++                # additional kwargs like "default".
++                if (
++                    isinstance(original_called, nodes.ClassDef)
++                    and original_called.metaclass()
++                    and isinstance(original_called.metaclass(), nodes.ClassDef)
++                ):
++                    try:
++                        meta_call = (
++                            original_called.metaclass().local_attr("__call__")[-1]  # type: ignore[union-attr]
++                        )
++                    except astroid.NotFoundError:
++                        meta_call = None
++                    if meta_call and isinstance(meta_call, nodes.FunctionDef):
++                        meta_kwonly = {arg.name for arg in meta_call.args.kwonlyargs}
++                        if keyword in meta_kwonly:
++                            # Consider it valid and continue without emitting E1123
++                            continue
++                # Additionally, suppress E1123 for typing_extensions.TypeVar which
++                # accepts PEP 696-style kwargs via its metaclass implementation.
++                try:
++                    qn = original_called.qname() if hasattr(original_called, "qname") else None
++                except Exception:
++                    qn = None
++                if qn in {"typing_extensions.TypeVar", "typing.TypeVar"} and keyword in {"default", "infer_variance"}:
++                    continue
+                 # Unexpected keyword argument.
+                 self.add_message(
+                     "unexpected-keyword-arg", node=node, args=(keyword, callable_name)
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..d5d3ebfa5
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,45 @@
++import os
++import sys
++import tempfile
++
++# Ensure local pylint package is used
++BASE_DIR = os.path.dirname(os.path.abspath(__file__))
++if BASE_DIR not in sys.path:
++    sys.path.insert(0, BASE_DIR)
++
++from pylint.lint import Run  # noqa: E402
++
++code = """
++from typing_extensions import TypeVar
++T = TypeVar("T", default=int)
++"""
++
++def main() -> int:
++    with tempfile.TemporaryDirectory() as tmp:
++        sample = os.path.join(tmp, "sample.py")
++        with open(sample, "w", encoding="utf-8") as f:
++            f.write(code)
++        # Run pylint but only enable the message of interest
++        results = Run([sample, "-sn", "--disable=all", "--enable=unexpected-keyword-arg"], exit=False)
++        linter = results.linter
++        # Collect messages
++        msgs = []
++        reporter = getattr(linter, "reporter", None)
++        if reporter and hasattr(reporter, "messages"):
++            for msg in reporter.messages:  # type: ignore[attr-defined]
++                msgs.append((msg.msg_id, msg.symbol, msg.msg or "", msg.path, msg.line))
++        by_msg = getattr(linter.stats, "by_msg", {})
++        has_e1123 = False
++        if by_msg:
++            has_e1123 = bool(by_msg.get("unexpected-keyword-arg") or by_msg.get("E1123"))
++        else:
++            has_e1123 = any(m[0] == "E1123" or m[1] == "unexpected-keyword-arg" for m in msgs)
++        print("Messages:", msgs)
++        if has_e1123:
++            print("Reproduction failed: E1123 was emitted")
++            return 1
++        print("Reproduction passed: no E1123 emitted for typing_extensions.TypeVar(default=...)")
++        return 0
++
++if __name__ == "__main__":
++    raise SystemExit(main())

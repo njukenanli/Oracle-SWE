@@ -1,0 +1,155 @@
+diff --git a/patroni/postgresql/__init__.py b/patroni/postgresql/__init__.py
+index 33a6cc4b..43ebfd6a 100644
+--- a/patroni/postgresql/__init__.py
++++ b/patroni/postgresql/__init__.py
+@@ -1151,20 +1151,28 @@ class Postgresql(object):
+             self.__cb_pending = CallbackAction.NOOP
+ 
+         ret = True
+-        if self.is_running():
+-            if do_reload:
+-                self.config.write_postgresql_conf()
+-                ret = self.reload(block_callbacks=change_role)
+-                if ret and change_role:
+-                    self.set_role(role)
+-            else:
+-                ret = self.restart(block_callbacks=change_role, role=role)
+-        else:
+-            ret = self.start(timeout=timeout, block_callbacks=change_role, role=role) or None
+ 
++        # If role is changing, set it and execute the callback as early as possible.
++        # This guarantees that the on_role_change callback is executed even if subsequent
++        # operations (like writing configuration files) fail due to I/O errors (e.g. disk full).
+         if change_role:
+-            # TODO: postpone this until start completes, or maybe do even earlier
++            self.set_role(role)
+             self.call_nowait(CallbackAction.ON_ROLE_CHANGE)
++
++        try:
++            if self.is_running():
++                if do_reload:
++                    self.config.write_postgresql_conf()
++                    # Block on_reload callback if role already changed; we already executed on_role_change above.
++                    ret = self.reload(block_callbacks=change_role)
++                else:
++                    ret = self.restart(block_callbacks=change_role, role=role)
++            else:
++                ret = self.start(timeout=timeout, block_callbacks=change_role, role=role) or None
++        except Exception:
++            logger.exception('Exception during follow (restart/reload/start)')
++            ret = False
++
+         return ret
+ 
+     def _wait_promote(self, wait_seconds: int) -> Optional[bool]:
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..753fd5fe
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,105 @@
++# Reproduction script for Patroni callback execution on role change when disk is full
++# It simulates the follow() path where Postgres is not running and start() fails due to OSError (ENOSPC),
++# ensuring that on_role_change callback is executed regardless of the failure to write configuration files.
++
++import types
++
++from patroni.postgresql.__init__ import Postgresql
++from patroni.postgresql.callback_executor import CallbackAction
++from threading import Lock
++
++
++class DummyConfig:
++    def __init__(self):
++        self._callbacks = {
++            # We won't actually execute external scripts; call_nowait is monkeypatched to record calls.
++            CallbackAction.ON_ROLE_CHANGE: "/bin/true",
++        }
++
++    def get(self, key, default=None):
++        if key == 'callbacks':
++            return self._callbacks
++        return default
++
++    def build_recovery_params(self, member):
++        return {}
++
++    def write_recovery_conf(self, recovery_params):
++        # Simulate success
++        return True
++
++    def write_postgresql_conf(self, configuration=None):
++        # This would fail on disk full in real environment when called from start(); we simulate failure via start().
++        return True
++
++
++class DummyMPP:
++    def get_handler_impl(self, *_args, **_kwargs):
++        class Dummy:
++            def schedule_cache_rebuild(self):
++                pass
++        return Dummy()
++
++
++def main():
++    # Create Postgresql instance without running the heavy __init__ logic.
++    pg = object.__new__(Postgresql)
++
++    # Minimal attribute initialization the follow() method depends on
++    pg.bootstrapping = False
++    pg._Postgresql__cb_called = True  # simulate that callbacks were already used earlier
++    pg._role_lock = Lock()
++    pg._state_lock = Lock()
++    pg._Postgresql__cb_pending = None
++    pg._data_dir = '/non/existent'  # not used by our fake methods
++    pg.name = 'node1'
++    pg.scope = 'test'
++    pg._database = 'postgres'
++
++    # Start with primary role and stopped state
++    pg.set_role('primary')
++    pg.set_state('stopped')
++
++    # Provide required helpers/methods
++    pg.ensure_major_version_is_known = types.MethodType(lambda self: True, pg)
++    pg.is_running = types.MethodType(lambda self: None, pg)  # not running
++
++    # Inject dummy config and mpp handler
++    pg.config = DummyConfig()
++    pg.mpp_handler = DummyMPP().get_handler_impl(pg)
++
++    # Intercept callback invocations to capture them and avoid spawning subprocesses
++    calls = []
++
++    def fake_call_nowait(self, cb_type):
++        # Record callback action and emulate side-effect of setting __cb_called for relevant actions
++        if cb_type in (CallbackAction.ON_START, CallbackAction.ON_STOP, CallbackAction.ON_RESTART, CallbackAction.ON_ROLE_CHANGE):
++            self._Postgresql__cb_called = True
++        calls.append(cb_type.value)
++
++    pg.call_nowait = types.MethodType(fake_call_nowait, pg)
++
++    # Make start raise the same error that disk full would cause while writing config
++    def fake_start(self, timeout=None, task=None, block_callbacks=False, role=None, after_start=None):
++        raise OSError(28, 'No space left on device')
++
++    pg.start = types.MethodType(fake_start, pg)
++
++    # Execute follow() to change role to replica; this should execute on_role_change before start is attempted
++    result = pg.follow(member=None, role='replica', timeout=1, do_reload=False)
++
++    # Validate expectations
++    print('follow result:', result)
++    print('callbacks:', calls)
++    print('final role:', pg.role)
++
++    # Assertions
++    assert 'on_role_change' in calls, 'on_role_change callback was not executed'
++    assert pg.role == 'replica', 'role was not updated to replica before failure'
++    assert result is False, 'follow() should return False when start fails'
++
++    print('Reproduction passed: on_role_change executed even when start fails with ENOSPC.')
++
++
++if __name__ == '__main__':
++    main()

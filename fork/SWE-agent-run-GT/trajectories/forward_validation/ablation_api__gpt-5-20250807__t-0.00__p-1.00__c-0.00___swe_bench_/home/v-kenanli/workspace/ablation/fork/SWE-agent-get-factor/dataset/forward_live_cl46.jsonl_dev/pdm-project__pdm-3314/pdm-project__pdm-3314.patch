@@ -1,0 +1,144 @@
+diff --git a/repro_patch_strategy.py b/repro_patch_strategy.py
+new file mode 100644
+index 00000000..8f63f482
+--- /dev/null
++++ b/repro_patch_strategy.py
+@@ -0,0 +1,40 @@
++import sys
++sys.path.insert(0, "/testbed/src")
++from pdm.cli.utils import save_version_specifiers
++print('func from:', save_version_specifiers.__module__, save_version_specifiers.__code__.co_filename)
++from pdm.models.requirements import NamedRequirement
++from pdm.models.candidates import Candidate
++
++# Prepare a requirement without specifier
++req = NamedRequirement.create(name="example")
++resolved = {
++    req.identify(): [Candidate(req, name="example", version="1.2.3")]
++}
++
++# Use compatible strategy (current behavior: ~=1.2)
++save_version_specifiers([req], resolved, save_strategy="compatible")
++print("compatible:", str(req.specifier))
++
++# Reset specifier for next check
++req.specifier = type(req.specifier)("")
++print("reset empty?", bool(req.specifier), repr(req.specifier))
++
++# Use the new compatible_patch strategy (expected ~=1.2.3 after fix)
++print("identify:", req.identify(), "keys:", list(resolved.keys()))
++print("is_named:", req.is_named, "not spec:", not req.specifier)
++from pdm.utils import comparable_version
++v = comparable_version(resolved[req.identify()][0].version)
++print("version:", v, v.major, v.minor, v.micro)
++s = f"~={v.major}.{v.minor}.{v.micro}"
++print("wanted spec:", s)
++from pdm.models.specifiers import get_specifier
++try:
++    g = get_specifier(s)
++    print("get_spec:", str(g), repr(g))
++except Exception as e:
++    print("get_spec error:", e)
++
++save_version_specifiers([req], resolved, save_strategy="compatible_patch")
++print("compatible_patch:", str(req.specifier), repr(req.specifier))
++req.specifier = get_specifier(s)
++print("direct assign:", str(req.specifier), repr(req.specifier))
+diff --git a/src/pdm/cli/commands/add.py b/src/pdm/cli/commands/add.py
+index 5f9ab858..d4df8f4d 100644
+--- a/src/pdm/cli/commands/add.py
++++ b/src/pdm/cli/commands/add.py
+@@ -68,11 +68,15 @@ class Command(BaseCommand):
+     def handle(self, project: Project, options: argparse.Namespace) -> None:
+         if options.editables and options.no_editable:
+             raise PdmUsageError("`--no-editable` cannot be used with `-e/--editable`")
++        # Determine save strategy, honoring save_compatibility config when using compatible
++        _save = options.save_strategy or project.config["strategy.save"]
++        if options.save_strategy is None and _save == "compatible" and project.config.get("strategy.save_compatibility", "minor") == "patch":
++            _save = "compatible_patch"
+         self.do_add(
+             project,
+             selection=GroupSelection.from_options(project, options),
+             sync=options.sync,
+-            save=options.save_strategy or project.config["strategy.save"],
++            save=_save,
+             strategy=options.update_strategy or project.config["strategy.update"],
+             editables=options.editables,
+             packages=options.packages,
+diff --git a/src/pdm/cli/commands/update.py b/src/pdm/cli/commands/update.py
+index 8a407499..3f345be1 100644
+--- a/src/pdm/cli/commands/update.py
++++ b/src/pdm/cli/commands/update.py
+@@ -72,10 +72,14 @@ class Command(BaseCommand):
+         parser.set_defaults(dev=None)
+ 
+     def handle(self, project: Project, options: argparse.Namespace) -> None:
++        # Determine save strategy, honoring save_compatibility config when using compatible
++        _save = options.save_strategy or project.config["strategy.save"]
++        if options.save_strategy is None and _save == "compatible" and project.config.get("strategy.save_compatibility", "minor") == "patch":
++            _save = "compatible_patch"
+         self.do_update(
+             project,
+             selection=GroupSelection.from_options(project, options),
+-            save=options.save_strategy or project.config["strategy.save"],
++            save=_save,
+             strategy=options.update_strategy or project.config["strategy.update"],
+             unconstrained=options.unconstrained,
+             top=options.top,
+diff --git a/src/pdm/cli/options.py b/src/pdm/cli/options.py
+index 1a7ab3f1..e3f673c1 100644
+--- a/src/pdm/cli/options.py
++++ b/src/pdm/cli/options.py
+@@ -324,6 +324,15 @@ _save_sub_group.add_argument(
+     const="minimum",
+     help="Save minimum version specifiers",
+ )
++
++_save_sub_group.add_argument(
++    "--save-compatible-patch",
++    action="store_const",
++    dest="save_strategy",
++    const="compatible_patch",
++    help="Save compatible version specifiers at the patch level",
++)
++
+ save_strategy_group.add_argument(_save_sub_group)
+ 
+ skip_option = Option(
+diff --git a/src/pdm/cli/utils.py b/src/pdm/cli/utils.py
+index 928e4d23..94edb971 100644
+--- a/src/pdm/cli/utils.py
++++ b/src/pdm/cli/utils.py
+@@ -571,6 +571,16 @@ def save_version_specifiers(
+                     r.specifier = get_specifier(f">={version},<{version.major + 1}")
+                 else:
+                     r.specifier = get_specifier(f"~={version.major}.{version.minor}")
++            elif save_strategy == "compatible_patch":
++                if version.is_prerelease or version.is_devrelease:
++                    # Pin within the same minor version range
++                    r.specifier = get_specifier(
++                        f">={version},<{version.major}.{version.minor + 1}.0"
++                    )
++                else:
++                    r.specifier = get_specifier(
++                        f"~={version.major}.{version.minor}.{version.micro}"
++                    )
+             elif save_strategy == "minimum":
+                 r.specifier = get_specifier(f">={version}")
+ 
+diff --git a/src/pdm/project/config.py b/src/pdm/project/config.py
+index 31a79af7..2a58c5c3 100644
+--- a/src/pdm/project/config.py
++++ b/src/pdm/project/config.py
+@@ -151,6 +151,11 @@ class Config(MutableMapping[str, str]):
+         "global_project.user_site": ConfigItem("Whether to install to user site", False, True, coerce=ensure_boolean),
+         "strategy.update": ConfigItem("The default strategy for updating packages", "reuse", False),
+         "strategy.save": ConfigItem("Specify how to save versions when a package is added", "minimum", False),
++        "strategy.save_compatibility": ConfigItem(
++            "Specify the granularity level for compatible save strategy: 'minor' or 'patch'",
++            "minor",
++            False,
++        ),
+         "strategy.resolve_max_rounds": ConfigItem(
+             "Specify the max rounds of resolution process",
+             10000,

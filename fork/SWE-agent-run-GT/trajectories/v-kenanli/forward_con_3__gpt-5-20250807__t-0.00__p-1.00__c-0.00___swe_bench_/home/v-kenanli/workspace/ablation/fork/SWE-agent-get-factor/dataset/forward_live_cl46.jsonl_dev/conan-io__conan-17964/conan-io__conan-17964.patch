@@ -1,0 +1,141 @@
+diff --git a/conan/tools/google/bazeldeps.py b/conan/tools/google/bazeldeps.py
+index fa73a9fbc..bf256bb6f 100644
+--- a/conan/tools/google/bazeldeps.py
++++ b/conan/tools/google/bazeldeps.py
+@@ -125,6 +125,68 @@ def _relativize_path(path, pattern):
+     return path
+ 
+ 
++def _prefer_soname_symlink(real_lib_path, cpp_info_, package_folder_path):
++    """
++    Given a resolved shared library path (potentially outside libdir because of os.path.realpath
++    during deduction), try to find a symlink inside any declared libdir that points to the same
++    real file and whose filename matches the SONAME-like pattern (e.g., libz3.so.4.12, libfoo.1.dylib).
++    If found, return that symlink path. Otherwise, return the original real_lib_path.
++    """
++    try:
++        from conan.internal.model.pkg_type import PackageType as _PkgType
++    except Exception:
++        _PkgType = PackageType
++    # Only meaningful for shared libraries on non-Windows
++    if cpp_info_.type != _PkgType.SHARED:
++        return real_lib_path
++    # If no libdirs information, nothing to do
++    libdirs = getattr(cpp_info_, 'libdirs', None) or []
++    # Normalize
++    real_abs = os.path.realpath(real_lib_path)
++    best_match = None
++    versioned_candidates = []
++    unversioned_candidates = []
++    for d in libdirs:
++        d_abs = d
++        # libdirs might be relative to package folder
++        if not os.path.isabs(d_abs):
++            d_abs = os.path.join(package_folder_path, d_abs)
++        if not os.path.isdir(d_abs):
++            continue
++        try:
++            for name in os.listdir(d_abs):
++                full = os.path.join(d_abs, name)
++                if not os.path.islink(full):
++                    continue
++                try:
++                    target = os.path.realpath(full)
++                except OSError:
++                    continue
++                if os.path.realpath(target) != real_abs:
++                    continue
++                # It is a symlink pointing to the same real lib
++                # Classify linux .so candidates and macOS .dylib candidates
++                if re.search(r"\.so\.\d+(?:\.\d+)*$", name):
++                    versioned_candidates.append(full)
++                elif name.endswith('.so'):
++                    unversioned_candidates.append(full)
++                elif re.search(r"\.\d+\.dylib$", name):
++                    versioned_candidates.append(full)
++                elif name.endswith('.dylib'):
++                    unversioned_candidates.append(full)
++        except OSError:
++            continue
++    # Prefer versioned SONAME symlink if any
++    if versioned_candidates:
++        versioned_candidates.sort()
++        best_match = versioned_candidates[0]
++    elif unversioned_candidates:
++        unversioned_candidates.sort()
++        best_match = unversioned_candidates[0]
++    return best_match or real_lib_path
++
++
++
+ class _BazelDependenciesBZLGenerator:
+     """
+     Bazel 6.0 needs to know all the dependencies for its current project. So, the only way
+@@ -252,7 +314,9 @@ class _LibInfo:
+     def __init__(self, lib_name, cpp_info_, package_folder_path):
+         self.name = lib_name
+         self.is_shared = cpp_info_.type == PackageType.SHARED
+-        self.lib_path = _relativize_path(cpp_info_.location, package_folder_path)
++        # Prefer SONAME symlink within libdirs for shared libraries to match runtime expectations
++        preferred_location = _prefer_soname_symlink(cpp_info_.location, cpp_info_, package_folder_path)
++        self.lib_path = _relativize_path(preferred_location, package_folder_path)
+         self.import_lib_path = _relativize_path(cpp_info_.link_location, package_folder_path)
+ 
+ 
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..4b4b3cb32
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,51 @@
++import os
++import platform
++from conan.internal.model.cpp_info import CppInfo
++from conan.test.utils.mocks import ConanFileMock
++from conan.api.model import RecipeReference
++from conan.test.utils.test_files import temp_folder
++
++
++def _save(path, content=""):
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    with open(path, "w", encoding="utf-8") as f:
++        f.write(content)
++
++
++def setup_symlink_chain():
++    folder = temp_folder()
++    real = os.path.join(folder, 'other', 'libz3.so.4.12.4.0')
++    _save(real, '')
++    os.makedirs(os.path.join(folder, 'libdir'), exist_ok=True)
++    soname = os.path.join(folder, 'libdir', 'libz3.so.4.12')
++    unversioned = os.path.join(folder, 'libdir', 'libz3.so')
++    # Create chain: real <- soname <- unversioned
++    os.symlink(real, soname)
++    os.symlink(soname, unversioned)
++    return folder, real, soname, unversioned
++
++
++def reproduce_current_behavior():
++    if platform.system() == 'Windows':
++        print('Skipping symlink test on Windows')
++        return 0
++    from unittest.mock import MagicMock
++    from conan.tools.google.bazeldeps import _LibInfo
++    folder, real, soname, unversioned = setup_symlink_chain()
++    cppinfo = CppInfo()
++    cppinfo.libdirs = ['libdir']
++    cppinfo.libs = ['z3']
++    cppinfo.set_relative_base_folder(folder)
++    c = ConanFileMock()
++    c._conan_node = MagicMock(ref=RecipeReference(""))
++    result = cppinfo.deduce_full_cpp_info(c)
++    print('Deduced real location:', result.location)
++    # What Bazel generator will use today for cc_import
++    libinfo = _LibInfo('z3', result, folder)
++    print('Bazel cc_import shared_library path:', libinfo.lib_path)
++    print('Expected to prefer SONAME symlink:', soname)
++    return 0
++
++
++if __name__ == '__main__':
++    reproduce_current_behavior()

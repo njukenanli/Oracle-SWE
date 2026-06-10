@@ -1,0 +1,125 @@
+diff --git a/conan/tools/google/bazeldeps.py b/conan/tools/google/bazeldeps.py
+index fa73a9fbc..ee566aca7 100644
+--- a/conan/tools/google/bazeldeps.py
++++ b/conan/tools/google/bazeldeps.py
+@@ -252,7 +252,59 @@ class _LibInfo:
+     def __init__(self, lib_name, cpp_info_, package_folder_path):
+         self.name = lib_name
+         self.is_shared = cpp_info_.type == PackageType.SHARED
+-        self.lib_path = _relativize_path(cpp_info_.location, package_folder_path)
++        # Prefer SONAME symlink for shared libraries when available (e.g., libz3.so.4.12)
++        # Some packages ship versioned leaf files (libfoo.so.X.Y.Z) with symlinks:
++        #   libfoo.so -> libfoo.so.X.Y
++        #   libfoo.so.X.Y -> libfoo.so.X.Y.Z
++        # Binaries typically depend on the SONAME (libfoo.so.X.Y). If we point Bazel cc_import
++        # to the leaf file, runfiles may only contain the leaf and miss the SONAME name.
++        # Detect symlinks in the same directory that resolve to the same real file and pick
++        # the best candidate (prefer the shortest versioned name, e.g., libfoo.so.X.Y).
++        location = cpp_info_.location
++        chosen_path = location
++        try:
++            if self.is_shared and location:
++                dir_path = os.path.dirname(location)
++                real_leaf = os.path.realpath(location)
++                # Iterate over directory entries to find symlinks that point to the same leaf
++                candidates = []
++                for fname in os.listdir(dir_path):
++                    full_path = os.path.join(dir_path, fname)
++                    if os.path.islink(full_path):
++                        # Resolve symlink chain
++                        if os.path.realpath(full_path) == real_leaf:
++                            candidates.append(full_path)
++                if candidates:
++                    # Rank candidates: prefer versioned SONAME-like names over fully versioned leaf and
++                    # over unversioned .so. As a heuristic, choose the symlink with 
++                    #   - extension .so or .dylib
++                    #   - containing at least one numeric version segment after the extension
++                    #   - minimal number of dot-separated numeric segments (prefer X.Y over X.Y.Z)
++                    def score(path):
++                        base = os.path.basename(path)
++                        # Linux: unversioned .so
++                        if base.endswith('.so') and '.so.' not in base:
++                            return (2, len(base))
++                        # Linux: versioned SONAME like libfoo.so.X or libfoo.so.X.Y
++                        if '.so.' in base:
++                            ver = base.split('.so.', 1)[1]
++                            nums = ver.split('.')
++                            numeric = sum(1 for x in nums if x.isdigit())
++                            return (0 if numeric >= 1 else 3, numeric, len(base))
++                        # macOS: versioned SONAME like libfoo.1.dylib
++                        if re.search(r"\.\d+\.dylib$", base):
++                            return (0, 1, len(base))
++                        # macOS: unversioned .dylib
++                        if base.endswith('.dylib'):
++                            return (2, len(base))
++                        # Other patterns
++                        return (3, len(base))
++                    candidates.sort(key=score)
++                    chosen_path = candidates[0]
++        except Exception:
++            # If anything goes wrong, keep the original location
++            chosen_path = location
++        self.lib_path = _relativize_path(chosen_path, package_folder_path)
+         self.import_lib_path = _relativize_path(cpp_info_.link_location, package_folder_path)
+ 
+ 
+diff --git a/repro_symlink_cc_import.py b/repro_symlink_cc_import.py
+new file mode 100644
+index 000000000..e113c69a0
+--- /dev/null
++++ b/repro_symlink_cc_import.py
+@@ -0,0 +1,54 @@
++import os
++import shutil
++from conan.internal.model.cpp_info import _Component
++from conan.internal.model.pkg_type import PackageType
++from conan.tools.google.bazeldeps import _LibInfo
++
++
++def setup_mock_lib_tree(base):
++    libdir = os.path.join(base, "lib")
++    os.makedirs(libdir, exist_ok=True)
++    # Create a real file to act as the leaf
++    leaf = os.path.join(libdir, "libz3.so.4.12.4.0")
++    with open(leaf, "wb") as f:
++        f.write(b"\x7fELFmock")
++    # Create SONAME symlink and unversioned symlink
++    soname = os.path.join(libdir, "libz3.so.4.12")
++    unversioned = os.path.join(libdir, "libz3.so")
++    try:
++        if not os.path.exists(soname):
++            os.symlink(os.path.basename(leaf), soname)
++        if not os.path.exists(unversioned):
++            os.symlink(os.path.basename(soname), unversioned)
++    except OSError as e:
++        print("Symlink creation failed (likely on Windows). Skipping symlink-based test:", e)
++    return leaf, soname, unversioned
++
++
++def run_once(expect_soname=False):
++    base = os.path.abspath("./_tmp_pkg")
++    if os.path.exists(base):
++        shutil.rmtree(base)
++    os.makedirs(base, exist_ok=True)
++    leaf, soname, unversioned = setup_mock_lib_tree(base)
++
++    comp = _Component()
++    comp.type = PackageType.SHARED
++    comp.location = leaf  # what location deduction currently returns in some cases
++    comp.link_location = None
++
++    info = _LibInfo("z3", comp, base)
++    print("Computed lib_path:", info.lib_path)
++    # We expect that lib_path prefers the SONAME symlink (libz3.so.4.12) over the leaf (libz3.so.4.12.4.0)
++    if expect_soname:
++        assert info.lib_path.endswith("lib/libz3.so.4.12"), f"Expected SONAME symlink, got {info.lib_path}"
++    else:
++        assert info.lib_path.endswith("lib/libz3.so.4.12.4.0"), f"Expected leaf, got {info.lib_path}"
++
++
++if __name__ == "__main__":
++    # This script is used in two phases:
++    #  - Before fix: it should assert the buggy behavior (leaf chosen)
++    #  - After fix: it should assert the corrected behavior (SONAME symlink chosen)
++    expect_env = os.environ.get("EXPECT_SONAME", "0") == "1"
++    run_once(expect_soname=expect_env)

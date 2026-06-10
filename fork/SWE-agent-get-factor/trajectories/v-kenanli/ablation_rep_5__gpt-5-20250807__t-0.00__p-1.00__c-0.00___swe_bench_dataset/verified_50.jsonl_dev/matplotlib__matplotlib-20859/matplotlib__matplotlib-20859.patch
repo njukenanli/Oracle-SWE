@@ -1,0 +1,224 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..1bddce2af0
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,218 @@
++import sys
++import re
++
++# Minimal Django setup for a standalone reproduction script.
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY="repro",
++        INSTALLED_APPS=[
++            # Minimal set. We don't need auth, sessions, etc. for this test.
++            "django.contrib.contenttypes",
++        ],
++        DATABASES={
++            "default": {
++                "ENGINE": "django.db.backends.sqlite3",
++                "NAME": ":memory:",
++            }
++        },
++        TIME_ZONE="UTC",
++        USE_TZ=True,
++    )
++
++import django
++from django.db import connection, models
++from django.db.models import F, Q, Case, When, FilteredRelation, Max
++
++django.setup()
++
++# Define a minimal model graph that matches the PR description:
++# Product -> MyRelation (reverse name: myrelation) -> Nested (reverse name: nested)
++# Nested has fields: price (Decimal), is_all (bool), zone (FK to Zone)
++
++class Zone(models.Model):
++    name = models.CharField(max_length=50)
++
++    class Meta:
++        app_label = "repro"
++
++
++class PriceEntry(models.Model):
++    zone = models.ForeignKey(Zone, on_delete=models.CASCADE, null=True, blank=True)
++    is_all = models.BooleanField(default=False)
++    price = models.DecimalField(max_digits=10, decimal_places=2, null=True)
++
++    class Meta:
++        app_label = "repro"
++
++
++class Product(models.Model):
++    name = models.CharField(max_length=50)
++    zone = models.ForeignKey(Zone, on_delete=models.CASCADE)
++    prices = models.ManyToManyField(PriceEntry, related_name="products")
++
++    class Meta:
++        app_label = "repro"
++
++
++# Create database tables for the above models.
++with connection.schema_editor() as schema_editor:
++    for model in (Zone, PriceEntry, Product):
++        schema_editor.create_model(model)
++
++
++def seed_data():
++    # Zones
++    zone_a = Zone.objects.create(name="A")
++    zone_b = Zone.objects.create(name="B")
++
++    # Products
++    p1 = Product.objects.create(name="P1", zone=zone_a)
++    p2 = Product.objects.create(name="P2", zone=zone_b)
++
++    # Price entries:
++    # For P1: both zone-specific and is_all=True exist.
++    pe1_zone = PriceEntry.objects.create(zone=zone_a, is_all=False, price=10)
++    pe1_all = PriceEntry.objects.create(zone=None, is_all=True, price=100)
++    p1.prices.add(pe1_zone, pe1_all)
++
++    # For P2: only is_all=True exists (zone-specific missing), to test fallback.
++    pe2_all = PriceEntry.objects.create(zone=None, is_all=True, price=200)
++    p2.prices.add(pe2_all)
++
++    return p1, p2, zone_a, zone_b
++
++
++def run_query_alias_order(zone_first=True):
++    # Build the queryset using two FilteredRelation aliases on the SAME relation path
++    # but with different filters, exactly as in the PR description.
++    qs = Product.objects.all()
++    if zone_first:
++        qs = qs.alias(
++            prices_zone=FilteredRelation(
++                "prices",
++                condition=Q(prices__zone=F("zone")),
++            ),
++            prices_all=FilteredRelation(
++                "prices",
++                condition=Q(prices__is_all=True),
++            ),
++            price_zone=F("prices_zone__price"),
++        ).annotate(
++            price_final=Case(
++                When(price_zone__isnull=True, then=F("prices_all__price")),
++                default=F("price_zone"),
++            )
++        )
++    else:
++        qs = qs.alias(
++            prices_all=FilteredRelation(
++                "prices",
++                condition=Q(prices__is_all=True),
++            ),
++            prices_zone=FilteredRelation(
++                "prices",
++                condition=Q(prices__zone=F("zone")),
++            ),
++            price_zone=F("prices_zone__price"),
++        ).annotate(
++            price_final=Case(
++                When(price_zone__isnull=True, then=F("prices_all__price")),
++                default=F("price_zone"),
++            )
++        )
++    return qs
++
++
++def assert_sql_has_two_price_joins(qs):
++    sql = str(qs.query)
++    # Count LEFT OUTER JOIN occurrences for the PriceEntry table specifically.
++    price_join_pattern = r"LEFT OUTER JOIN \"repro_priceentry\""
++    joins = re.findall(price_join_pattern, sql)
++    # We expect 2 separate LEFT OUTER JOINs to the same table due to two FilteredRelation aliases.
++    assert len(joins) == 2, (
++        "Expected 2 LEFT OUTER JOINs to repro_priceentry due to two FilteredRelation aliases, "
++        f"but found {len(joins)}. SQL was:\n{sql}"
++    )
++
++
++
++def assert_m2m_through_has_two_joins(qs):
++    sql = str(qs.query)
++    # Ensure the M2M through join appears only once (expected), but price table twice.
++    through_join_pattern = r"LEFT OUTER JOIN \"repro_product_prices\""
++    through_joins = re.findall(through_join_pattern, sql)
++    assert len(through_joins) == 1, (
++        "Expected a single LEFT OUTER JOIN to M2M through table repro_product_prices, "
++        f"found {len(through_joins)}. SQL was:\n{sql}"
++    )
++
++
++def _to_int(val):
++    if val is None:
++        return None
++    try:
++        return int(val)
++    except Exception:
++        try:
++            from decimal import Decimal
++            return int(Decimal(val))
++        except Exception:
++            return int(float(val))
++
++
++def assert_prices(qs, p1_id, p2_id):
++    rows = {row["id"]: row for row in qs.order_by("id").values("id", "price_final", "price_zone")}
++
++    # For product 1 (has a zone-specific price=10), expect price_final == 10
++    p1_row = rows[p1_id]
++    assert _to_int(p1_row["price_final"]) == 10, (
++        f"Product 1 expected price_final=10, got {p1_row['price_final']} (rows={rows})"
++    )
++    # For product 2 (no zone-specific price, fallback to is_all=True with price=200), expect price_final == 200
++    p2_row = rows[p2_id]
++    assert _to_int(p2_row["price_final"]) == 200, (
++        f"Product 2 expected price_final=200, got {p2_row['price_final']} (rows={rows})"
++    )
++
++
++def run_tests():
++    p1, p2, zone_a, zone_b = seed_data()
++
++    # Case 1: Alias order: zone first, then all. Expect two joins and correct prices.
++    qs1 = run_query_alias_order(zone_first=True)
++    assert_sql_has_two_price_joins(qs1)
++    assert_prices(qs1, p1.id, p2.id)
++
++    # Case 2: Alias order: all first, then zone. Expect two joins and correct prices.
++    qs2 = run_query_alias_order(zone_first=False)
++    assert_sql_has_two_price_joins(qs2)
++    # Case 2 checks
++    assert_sql_has_two_price_joins(qs2)
++    assert_m2m_through_has_two_joins(qs2)
++
++    assert_prices(qs2, p1.id, p2.id)
++
++    # Additional corner case: Ensure fallback to ALL price when zone price is NULL.
++    Product.objects.get(id=p1.id).prices.filter(zone=zone_a, is_all=False).update(price=None)
++    qs3 = run_query_alias_order(zone_first=True)
++    # Even if the zone-specific row exists, since price_zone is NULL, fallback should kick in.
++    rows3 = {row.id: row for row in qs3.order_by("id").values("id", "price_final", "price_zone")}
++    assert str(rows3[p1.id]["price_final"]) == "100", (
++        f"Product 1 expected price_final to fallback to 100 due to NULL zone price, "
++        f"got {rows3[p1.id]['price_final']} (rows={rows3})"
++    )
++
++    print("All reproduction assertions passed (this indicates the bug has been fixed).")
++
++
++if __name__ == "__main__":
++    try:
++        run_tests()
++    except AssertionError as e:
++        # Print the error and exit with non-zero status to mark reproduction failure.
++        print("Reproduction failed as expected (bug present):")
++        print(e)
++        sys.exit(1)

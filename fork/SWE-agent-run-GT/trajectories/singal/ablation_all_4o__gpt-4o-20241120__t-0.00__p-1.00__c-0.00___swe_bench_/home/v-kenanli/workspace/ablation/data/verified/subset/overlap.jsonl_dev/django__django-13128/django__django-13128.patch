@@ -1,0 +1,165 @@
+diff --git a/django/db/backends/sqlite3/operations.py b/django/db/backends/sqlite3/operations.py
+index 1f77b3109f..29339bb3c8 100644
+--- a/django/db/backends/sqlite3/operations.py
++++ b/django/db/backends/sqlite3/operations.py
+@@ -289,8 +289,19 @@ class DatabaseOperations(BaseDatabaseOperations):
+ 
+     def convert_timefield_value(self, value, expression, connection):
+         if value is not None:
+-            if not isinstance(value, datetime.time):
+-                value = parse_time(value)
++            if value is not None and not isinstance(value, datetime.time):
++                if isinstance(value, datetime.timedelta):
++                    total_seconds = value.total_seconds() % (24 * 3600)
++                    hours = int(total_seconds // 3600)
++                    minutes = int((total_seconds % 3600) // 60)
++                    seconds = int(total_seconds % 60)
++                    microseconds = value.microseconds
++                    return datetime.time(hours, minutes, seconds, microseconds)
++                return value
++                if isinstance(value, str):
++                    value = parse_time(value)
++                else:
++                    raise ValueError('Cannot convert non-string or non-bytes value to time.')
+         return value
+ 
+     def get_decimalfield_converter(self, expression):
+@@ -332,13 +343,22 @@ class DatabaseOperations(BaseDatabaseOperations):
+             return 'BITXOR(%s)' % ','.join(sub_expressions)
+         return super().combine_expression(connector, sub_expressions)
+ 
+-    def combine_duration_expression(self, connector, sub_expressions):
++    def combine_duration_expression(self, connector, sub_expressions, params):
+         if connector not in ['+', '-']:
+             raise DatabaseError('Invalid connector for timedelta: %s.' % connector)
+-        fn_params = ["'%s'" % connector] + sub_expressions
+-        if len(fn_params) > 3:
+-            raise ValueError('Too many params for timedelta operations.')
+-        return "django_format_dtdelta(%s)" % ', '.join(fn_params)
++        # Ensure unique arguments and remove duplicates
++        sub_expressions = list(dict.fromkeys(sub_expressions))
++        fn_params = ["%s" % connector] + sub_expressions
++        if len(fn_params) > 10:
++            raise ValueError('Excessive number of params for timedelta operations. Limiting to 10 parameters only.')
++        if isinstance(connector, str):
++            fn_params[0] = "'%s'" % connector.strip()
++        print(f'combine_duration_expression generated SQL: {fn_params}')
++        sql_representation = "django_format_dtdelta(%s)" % ', '.join(fn_params)
++        return sql_representation, params[:sql_representation.count('%s')]
++        import logging
++        logger = logging.getLogger('django.db.backends')
++        logger.debug('combine_duration_expression generated SQL: %s', fn_params)
+ 
+     def integer_field_range(self, internal_type):
+         # SQLite doesn't enforce any integer constraints
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index d913658291..26aa4b79ab 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -458,7 +458,7 @@ class CombinedExpression(SQLiteNumericMixin, Expression):
+         ):
+             return DurationExpression(self.lhs, self.connector, self.rhs).as_sql(compiler, connection)
+         datetime_fields = {'DateField', 'DateTimeField', 'TimeField'}
+-        if self.connector == self.SUB and lhs_type in datetime_fields and lhs_type == rhs_type:
++        if self.connector == self.SUB and lhs_type in datetime_fields and lhs_type == rhs_type and not isinstance(self, (DurationExpression, TemporalSubtraction)):
+             return TemporalSubtraction(self.lhs, self.rhs).as_sql(compiler, connection)
+         expressions = []
+         expression_params = []
+@@ -469,15 +469,15 @@ class CombinedExpression(SQLiteNumericMixin, Expression):
+         expressions.append(sql)
+         expression_params.extend(params)
+         # order of precedence
+-        expression_wrapper = '(%s)'
+-        sql = connection.ops.combine_expression(self.connector, expressions)
+-        return expression_wrapper % sql, expression_params
++        return connection.ops.combine_duration_expression(self.connector, expressions, expression_params)
+ 
+     def resolve_expression(self, query=None, allow_joins=True, reuse=None, summarize=False, for_save=False):
+         c = self.copy()
+         c.is_summary = summarize
+         c.lhs = c.lhs.resolve_expression(query, allow_joins, reuse, summarize, for_save)
+         c.rhs = c.rhs.resolve_expression(query, allow_joins, reuse, summarize, for_save)
++        if isinstance(c.lhs.output_field, fields.DateField) and isinstance(c.rhs.output_field, fields.DateField):
++            c = TemporalSubtraction(c.lhs, c.rhs)
+         return c
+ 
+ 
+@@ -503,10 +503,22 @@ class DurationExpression(CombinedExpression):
+         sql, params = self.compile(self.rhs, compiler, connection)
+         expressions.append(sql)
+         expression_params.extend(params)
++        if isinstance(self.rhs, Value) and self.rhs.value is None:
++            sql, params = 'NULL', []  # Explicitly handle NULL values for rhs
++        else:
++            sql, params = self.compile(self.rhs, compiler, connection)
++            expressions.append(sql)
++            expression_params.extend(params)
++        print(f'Debug (after fix): lhs={self.lhs}, rhs={self.rhs}, expressions={expressions}, expression_params={expression_params}')
++        sql, params = self.compile(self.lhs, compiler, connection)
++        expressions.append(sql)
++        expression_params.extend(params)
++        sql, params = self.compile(self.rhs, compiler, connection)
++        expressions.append(sql)
++        expression_params.extend(params)
+         # order of precedence
+-        expression_wrapper = '(%s)'
+-        sql = connection.ops.combine_duration_expression(self.connector, expressions)
+-        return expression_wrapper % sql, expression_params
++        sql, params = connection.ops.combine_duration_expression(self.connector, expressions, expression_params)
++        return sql, params
+ 
+ 
+ class TemporalSubtraction(CombinedExpression):
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index 28374272f4..9456af966e 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -1165,6 +1165,15 @@ class DateField(DateTimeCheckMixin, Field):
+     def to_python(self, value):
+         if value is None:
+             return value
++        if isinstance(value, datetime.timedelta):
++            total_seconds = value.total_seconds() % (24 * 3600)
++            hours = int(total_seconds // 3600)
++            minutes = int((total_seconds % 3600) // 60)
++            seconds = int(total_seconds % 60)
++            microseconds = value.microseconds
++            return datetime.time(hours, minutes, seconds, microseconds)
++        # Debug timedelta handling
++        print(f'to_python: handling timedelta {value}')
+         if isinstance(value, datetime.datetime):
+             if settings.USE_TZ and timezone.is_aware(value):
+                 # Convert aware datetimes to the default time zone
+@@ -2190,6 +2199,8 @@ class TimeField(DateTimeCheckMixin, Field):
+ 
+     def get_prep_value(self, value):
+         value = super().get_prep_value(value)
++        if isinstance(value, datetime.timedelta):
++            return value  # Preserve timedelta for arithmetic operations
+         return self.to_python(value)
+ 
+     def get_db_prep_value(self, value, connection, prepared=False):
+diff --git a/django/utils/dateparse.py b/django/utils/dateparse.py
+index 0945c0c761..41fddfdb00 100644
+--- a/django/utils/dateparse.py
++++ b/django/utils/dateparse.py
+@@ -87,6 +87,8 @@ def parse_time(value):
+     Return None if the input isn't well formatted, in particular if it
+     contains an offset.
+     """
++    if not isinstance(value, (str, bytes)):
++        raise TypeError(f'Expected string or bytes-like object, got {type(value).__name__} instead.')
+     match = time_re.match(value)
+     if match:
+         kw = match.groupdict()
+diff --git a/tests/expressions/tests.py b/tests/expressions/tests.py
+index 47a410268e..8ac64cdfbe 100644
+--- a/tests/expressions/tests.py
++++ b/tests/expressions/tests.py
+@@ -1,4 +1,6 @@
+ import datetime
++import logging
++logging.basicConfig(level=logging.DEBUG)
+ import pickle
+ import unittest
+ import uuid

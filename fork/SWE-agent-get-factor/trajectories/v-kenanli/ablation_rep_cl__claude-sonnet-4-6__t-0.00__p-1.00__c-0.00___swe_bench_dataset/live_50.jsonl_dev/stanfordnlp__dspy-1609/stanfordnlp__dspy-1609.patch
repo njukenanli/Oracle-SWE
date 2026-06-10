@@ -1,0 +1,405 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..cee7a4b1
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,396 @@
++"""
++Reproduction test for: DSPy 2.5 + TypedPredictor with List[str] outputs throws during
++optimization, but inference works.
++
++Root cause: When TypedPredictor with List[str] (or other list types) output fields is
++compiled with demos (e.g., via BootstrapFewShot or LabeledFewShot), the demo values are
++formatted in the assistant messages as numbered lists ("[1] «EU»\n[2] «rejects»") by
++_format_field_value in chat_adapter.py rather than as JSON (["EU","rejects"]) that the
++TypedPredictor's JSON parser expects.
++
++This mismatch causes real LLMs — which observe the numbered-list demo format and try to
++mimic it — to produce outputs the TypedPredictor cannot parse, leading to:
++  ValueError: ('Too many retries trying to get the correct output format...
++               {'tokens': "JSONDecodeError('Trailing data')"})
++
++These tests verify the fix by:
++  1. Showing that inference works WITHOUT demos.
++  2. Showing that the demo format in assistant messages is JSON, not a numbered list
++     (this FAILS before the fix, PASSES after it).
++  3. Showing that when the LM returns the numbered-list format (as a real LM would after
++     seeing numbered-list demos), the TypedPredictor fails with JSONDecodeError.
++  4. Showing that BootstrapFewShot compilation succeeds end-to-end (passes both before and
++     after fix when DummyLM returns valid JSON; the *reason* it fails before fix is the
++     demo format driving real LLMs to return garbage).
++  5. Showing List[int] output demo format is also JSON after the fix.
++"""
++
++from typing import List
++
++import pytest
++
++import dspy
++from dspy.adapters.chat_adapter import format_fields
++from dspy.functional import TypedPredictor
++from dspy.primitives.example import Example
++from dspy.teleprompt.bootstrap import BootstrapFewShot
++from dspy.teleprompt.vanilla import LabeledFewShot
++from dspy.utils.dummies import DummyLM
++
++
++# ---------------------------------------------------------------------------
++# Signatures used across tests
++# ---------------------------------------------------------------------------
++
++class TokenizerSignature(dspy.Signature):
++    """Tokenize text into a list of string tokens."""
++    text: str = dspy.InputField(desc="Text to tokenize")
++    tokens: List[str] = dspy.OutputField(desc="A list of tokens extracted from the text")
++
++
++class IntListSignature(dspy.Signature):
++    """Produce a list of integers."""
++    input: str = dspy.InputField(desc="Input text")
++    numbers: List[int] = dspy.OutputField(desc="A list of numbers")
++
++
++# ---------------------------------------------------------------------------
++# Helper
++# ---------------------------------------------------------------------------
++
++def _get_all_assistant_demo_contents(lm_history):
++    """
++    Return contents of all assistant messages from the last LM call.
++    Demo assistant messages appear before the final user turn in ChatAdapter output.
++    """
++    messages = lm_history[-1]["messages"]
++    # Assistant messages that carry [[ ## completed ## ]] are demo/response turns
++    return [
++        m["content"]
++        for m in messages
++        if m["role"] == "assistant" and "[[ ## completed ## ]]" in m.get("content", "")
++    ]
++
++
++# ===========================================================================
++# Test 1 – Inference (no demos) works for List[str] output
++# ===========================================================================
++
++def test_list_str_inference_works():
++    """TypedPredictor with List[str] output should work fine during plain inference."""
++    lm = DummyLM([{"tokens": '["EU", "rejects", "German", "call"]'}])
++    dspy.settings.configure(lm=lm)
++
++    tokenizer = TypedPredictor(TokenizerSignature)
++    result = tokenizer(text="EU rejects German call")
++
++    assert result.tokens == ["EU", "rejects", "German", "call"], (
++        f"Inference failed: {result.tokens!r}"
++    )
++
++
++# ===========================================================================
++# Test 2 – Demos must use JSON format in assistant messages (not numbered list)
++# This is the KEY test: FAILS before the fix, PASSES after the fix.
++# ===========================================================================
++
++def test_list_str_demo_format_is_json_not_numbered_list():
++    """
++    When a TypedPredictor with List[str] output is compiled with LabeledFewShot, the
++    assistant-role demo messages must format the list field as JSON (e.g. '["EU","rejects"]')
++    rather than a numbered list ('[1] «EU»\n[2] «rejects»').
++
++    Before the fix, _format_field_value calls format_list for any Python list, so demo
++    outputs appear as '[1] «EU»\n[2] «rejects»' which confuses real LLMs.
++    """
++    trainset = [
++        Example(text="EU rejects German call", tokens=["EU", "rejects", "German", "call"]).with_inputs("text")
++    ]
++
++    # Use a DummyLM that always returns valid JSON so the call succeeds.
++    lm = DummyLM([{"tokens": '["EU", "rejects", "German", "call"]'}])
++    dspy.settings.configure(lm=lm)
++
++    tokenizer = TypedPredictor(TokenizerSignature)
++    compiled = LabeledFewShot(k=1).compile(tokenizer, trainset=trainset)
++
++    # Run the compiled predictor so we can inspect what was sent to the LM.
++    compiled(text="EU rejects German call")
++
++    assistant_contents = _get_all_assistant_demo_contents(lm.history)
++    assert len(assistant_contents) >= 1, "No assistant demo messages found in LM history"
++
++    for content in assistant_contents:
++        # After the fix the tokens field should be serialised as JSON in the demo,
++        # NOT as a numbered list like "[1] «EU»\n[2] «rejects»".
++        assert "[1]" not in content, (
++            "Demo assistant message still uses numbered list format (old bug present).\n"
++            "Expected JSON in demo, got:\n" + content
++        )
++        # Verify the demo does contain valid JSON-style tokens
++        assert '"EU"' in content, (
++            "Demo assistant message does not contain JSON-encoded token 'EU':\n" + content
++        )
++
++
++# ===========================================================================
++# Test 3 – Parsing fails with the numbered-list format (exact error from issue)
++# ===========================================================================
++
++def test_list_str_numbered_format_causes_parse_error():
++    """
++    Directly verify that the numbered-list format string '[1] «EU»\n[2] «rejects»...'
++    — exactly what the old code placed in demo assistant messages — cannot be parsed as
++    a List[str] by the TypedPredictor parser.
++
++    The numbered-list format '[1] «EU»' is parsed by ujson as:
++      - '[1]' → valid JSON list containing integer 1
++      - ' «EU»...' → trailing data → JSONDecodeError('Trailing data')
++
++    This is the exact error from the issue description.
++    """
++    import pydantic
++    import ujson
++
++    adapter = pydantic.TypeAdapter(List[str])
++    numbered_format = "[1] «EU»\n[2] «rejects»\n[3] «German»\n[4] «call»"
++
++    # Step 1: pydantic validate_json must fail
++    validation_error = None
++    try:
++        adapter.validate_json(numbered_format)
++    except (pydantic.ValidationError, ValueError) as e:
++        validation_error = e
++    assert validation_error is not None, (
++        "Expected pydantic to fail on numbered-list format, but it succeeded"
++    )
++
++    # Step 2: ujson.loads must fail with JSONDecodeError('Trailing data')
++    # This is the exact error surfaced in the issue: {'tokens': "JSONDecodeError('Trailing data')"}
++    ujson_error = None
++    try:
++        ujson.loads(numbered_format)
++    except Exception as e:
++        ujson_error = e
++    assert ujson_error is not None, (
++        "Expected ujson.loads to fail on numbered-list format, but it succeeded"
++    )
++    assert "Trailing data" in str(ujson_error), (
++        f"Expected JSONDecodeError('Trailing data') but got: {ujson_error!r}"
++    )
++
++
++# ===========================================================================
++# Test 4 – BootstrapFewShot with List[str] output: the demo format is the bug
++# ===========================================================================
++
++def test_bootstrap_fewshot_list_str_demo_format():
++    """
++    During BootstrapFewShot the teacher sees demos from LabeledFewShot.
++    These demos contain List[str] values which, before the fix, are formatted as
++    numbered lists in the assistant demo messages. After the fix they are JSON.
++
++    We run BootstrapFewShot and then inspect what demo messages were used.
++    """
++    trainset = [
++        Example(text="EU rejects German call", tokens=["EU", "rejects", "German", "call"]).with_inputs("text"),
++        Example(text="Peter Blackburn", tokens=["Peter", "Blackburn"]).with_inputs("text"),
++    ]
++
++    lm = DummyLM(
++        [
++            {"tokens": '["EU", "rejects", "German", "call"]'},
++            {"tokens": '["Peter", "Blackburn"]'},
++            {"tokens": '["EU", "rejects", "German", "call"]'},
++            {"tokens": '["Peter", "Blackburn"]'},
++        ]
++    )
++    dspy.settings.configure(lm=lm)
++
++    tokenizer = TypedPredictor(TokenizerSignature)
++
++    def validate_tokens(example, prediction, trace=None):
++        return example.tokens == prediction.tokens
++
++    optimizer = BootstrapFewShot(
++        metric=validate_tokens,
++        max_bootstrapped_demos=2,
++        max_labeled_demos=4,
++        max_errors=5,
++    )
++    optimizer.compile(tokenizer, trainset=trainset)
++
++    # Inspect ALL LM calls made during bootstrap to check demo format
++    numbered_list_found = False
++    for entry in lm.history:
++        messages = entry["messages"]
++        for m in messages:
++            if m["role"] == "assistant" and "[[ ## tokens ## ]]" in m.get("content", ""):
++                content = m["content"]
++                if "[1]" in content:
++                    numbered_list_found = True
++                    break
++
++    assert not numbered_list_found, (
++        "Found numbered-list format '[1]' in demo assistant messages during BootstrapFewShot.\n"
++        "After the fix, List[str] demo outputs should be JSON, not numbered lists.\n"
++        "This is the root cause of the optimization failure with real LLMs."
++    )
++
++
++# ===========================================================================
++# Test 5 – LabeledFewShot with List[str] demos, then inference still works
++# ===========================================================================
++
++def test_labeled_fewshot_list_str_inference_after_compile():
++    """
++    After compiling with LabeledFewShot (which adds List[str] demos), calling the
++    compiled TypedPredictor should still produce correct List[str] output.
++    """
++    trainset = [
++        Example(text="EU rejects German call", tokens=["EU", "rejects", "German", "call"]).with_inputs("text"),
++    ]
++
++    lm = DummyLM(
++        [
++            {"tokens": '["Peter", "Blackburn"]'},
++        ]
++    )
++    dspy.settings.configure(lm=lm)
++
++    tokenizer = TypedPredictor(TokenizerSignature)
++    compiled = LabeledFewShot(k=1).compile(tokenizer, trainset=trainset)
++
++    result = compiled(text="Peter Blackburn")
++    assert result.tokens == ["Peter", "Blackburn"], (
++        f"Post-compile inference failed: {result.tokens!r}"
++    )
++
++
++# ===========================================================================
++# Test 6 – List[int] output: same issue applies to other list types
++# ===========================================================================
++
++def test_list_int_demo_format_is_json_not_numbered_list():
++    """
++    The same numbered-list vs JSON mismatch applies to List[int] output fields.
++    After the fix, demos must show JSON for List[int] too.
++    """
++    trainset = [
++        Example(input="first three primes", numbers=[2, 3, 5]).with_inputs("input"),
++    ]
++
++    lm = DummyLM([{"numbers": "[2, 3, 5]"}])
++    dspy.settings.configure(lm=lm)
++
++    pred = TypedPredictor(IntListSignature)
++    compiled = LabeledFewShot(k=1).compile(pred, trainset=trainset)
++
++    compiled(input="first three primes")
++
++    assistant_contents = _get_all_assistant_demo_contents(lm.history)
++    assert len(assistant_contents) >= 1, "No assistant demo messages found in LM history"
++
++    for content in assistant_contents:
++        # After the fix: the numbers field should be JSON in the demo, not numbered list.
++        # Before the fix, the list [2, 3, 5] is rendered as:
++        #   [1] «2»\n[2] «3»\n[3] «5»
++        # which contains "[1]".
++        assert "[1]" not in content, (
++            "Demo assistant message still uses numbered list format for List[int] (old bug):\n"
++            + content
++        )
++        # Verify it contains the actual numbers
++        assert "2" in content and "3" in content, (
++            "Demo assistant message does not contain the expected numbers:\n" + content
++        )
++
++
++# ===========================================================================
++# Test 7 – The format_fields function of chat_adapter formats List[str] demo
++#           values as numbered list (demonstrating the root cause)
++# ===========================================================================
++
++def test_format_fields_formats_list_as_numbered_list_before_fix():
++    """
++    Directly verifies the root-cause behaviour in chat_adapter.format_fields:
++    a Python list value is formatted as '[1] «EU»\n[2] «rejects»...' instead of JSON.
++
++    When this numbered-list text appears in demo assistant messages, it contradicts
++    the TypedPredictor's JSON format requirement, causing real LLMs to produce
++    outputs that cannot be parsed (JSONDecodeError('Trailing data')).
++
++    This test documents the exact content that was being shown to the LM in demos.
++    """
++    tokens = ["EU", "rejects", "German", "call"]
++
++    # format_fields is what chat_adapter uses to render demo assistant messages
++    rendered = format_fields({"tokens": tokens})
++
++    # Before the fix, this renders as a numbered list — the root cause of the bug
++    if "[1]" in rendered:
++        # OLD BEHAVIOUR (bug): numbered list in demo
++        # Real LLMs see this and return the same format, causing JSONDecodeError
++        assert "[1] «EU»" in rendered, (
++            f"Unexpected numbered-list format: {rendered!r}"
++        )
++        # This IS the bug — we're asserting what the old code produces
++        # so that after the fix this test can be updated
++    else:
++        # FIXED BEHAVIOUR: JSON in demo
++        # The rendered output should contain a JSON-encoded version
++        import json
++        try:
++            # The rendered string under the tokens header should be parseable JSON
++            # Extract the part after the header
++            token_content = rendered.split("[[ ## tokens ## ]]")[1].strip()
++            parsed = json.loads(token_content)
++            assert parsed == tokens, f"JSON in demo does not match: {parsed!r}"
++        except (json.JSONDecodeError, IndexError) as e:
++            pytest.fail(
++                f"After fix, expected JSON in demo but got unparseable content:\n{rendered}\n{e}"
++            )
++
++
++# ===========================================================================
++# Entry point
++# ===========================================================================
++
++if __name__ == "__main__":
++    print("Running reproduction tests for TypedPredictor List[str] optimization bug...")
++    print("(Tests 2, 4, 6 FAIL before fix; all should PASS after fix)")
++    print()
++
++    tests = [
++        ("Test 1: Inference works for List[str] output (should always pass)",
++         test_list_str_inference_works),
++        ("Test 2: Demo format must be JSON, not numbered list (FAILS before fix)",
++         test_list_str_demo_format_is_json_not_numbered_list),
++        ("Test 3: Numbered-list format causes JSONDecodeError (always fails/passes consistently)",
++         test_list_str_numbered_format_causes_parse_error),
++        ("Test 4: BootstrapFewShot demo messages use numbered list format (FAILS before fix)",
++         test_bootstrap_fewshot_list_str_demo_format),
++        ("Test 5: LabeledFewShot + inference still works after compile",
++         test_labeled_fewshot_list_str_inference_after_compile),
++        ("Test 6: List[int] demo format must also be JSON (FAILS before fix)",
++         test_list_int_demo_format_is_json_not_numbered_list),
++        ("Test 7: format_fields root-cause behaviour (documents the bug)",
++         test_format_fields_formats_list_as_numbered_list_before_fix),
++    ]
++
++    passed = 0
++    failed = 0
++    for name, test_fn in tests:
++        try:
++            test_fn()
++            print(f"  PASSED  {name}")
++            passed += 1
++        except Exception as e:
++            print(f"  FAILED  {name}")
++            print(f"          {type(e).__name__}: {e}")
++            failed += 1
++
++    print()
++    print(f"Results: {passed} passed, {failed} failed out of {len(tests)} tests")
++    if failed > 0:
++        raise SystemExit(1)
+
+

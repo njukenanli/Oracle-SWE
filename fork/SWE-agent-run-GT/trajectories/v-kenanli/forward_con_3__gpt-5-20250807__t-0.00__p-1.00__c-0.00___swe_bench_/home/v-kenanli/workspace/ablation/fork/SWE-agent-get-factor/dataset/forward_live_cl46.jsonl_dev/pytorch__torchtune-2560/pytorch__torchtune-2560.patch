@@ -1,0 +1,94 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..4d43d049
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,42 @@
++import torch
++from torchtune.modules.transformer import TransformerDecoder
++import torch.nn as nn
++
++def main():
++    torch.manual_seed(0)
++    bsz, seq_len, d, vocab = 2, 49, 16, 100
++    # Build a minimal TransformerDecoder to exercise chunked_output
++    tok_embeddings = nn.Embedding(1000, d)
++    layers = nn.ModuleList([])  # we won't call forward, only chunked_output
++    model = TransformerDecoder(
++        tok_embeddings=tok_embeddings,
++        layers=layers,
++        max_seq_len=seq_len,
++        num_heads=1,
++        head_dim=d,
++        norm=nn.Identity(),
++        output=nn.Linear(d, vocab),
++    )
++    model.set_num_output_chunks(8)
++
++    # Simulate a last hidden state of length 49
++    last_hidden_state = torch.randn(bsz, seq_len, d)
++
++    chunks = model.chunked_output(last_hidden_state)
++    print("Num chunks:", len(chunks))
++    print("Chunk shapes:", [tuple(c.shape) for c in chunks])
++
++    # Expect exactly num_output_chunks items
++    assert len(chunks) == model.num_output_chunks, (
++        f"Expected {model.num_output_chunks} chunks, got {len(chunks)}"
++    )
++
++    # Also verify the loss can consume these chunks without size mismatch
++    from torchtune.modules.loss.ce_chunked_output_loss import CEWithChunkedOutputLoss
++    labels = torch.randint(0, vocab, (bsz, seq_len), dtype=torch.long)
++    loss_fn = CEWithChunkedOutputLoss(num_output_chunks=model.num_output_chunks)
++    loss = loss_fn(chunks, labels)
++    print("Loss computed:", float(loss))
++
++if __name__ == "__main__":
++    main()
+diff --git a/torchtune/modules/loss/ce_chunked_output_loss.py b/torchtune/modules/loss/ce_chunked_output_loss.py
+index 17a5eced..e3fc2eaf 100644
+--- a/torchtune/modules/loss/ce_chunked_output_loss.py
++++ b/torchtune/modules/loss/ce_chunked_output_loss.py
+@@ -65,12 +65,19 @@ class CEWithChunkedOutputLoss(torch.nn.Module):
+ 
+         total_elements = (labels != self.ignore_index).sum()
+ 
+-        # chunk and reshape labels (bsz, num_tokens, vocab) -> [(bsz*num_tokens/num_chunks, vocab)]
++        # Split labels to mirror the provided logits chunk sizes. This keeps the
++        # loss robust to how the logits were chunked (torch.chunk or tensor_split),
++        # and avoids any mismatch when seq_len is not divisible by the number of chunks.
++        chunk_token_lengths = [logit_chunk.size(1) for logit_chunk in logits]
++        if sum(chunk_token_lengths) != labels.size(1):
++            raise ValueError(
++                "Sum of logits chunk token lengths does not match labels sequence length"
++            )
+         labels = [
+             target_chunk.reshape(-1)
+-            for target_chunk in labels.chunk(self.num_output_chunks, dim=1)
++            for target_chunk in torch.split(labels, chunk_token_lengths, dim=1)
+         ]
+-        # reshape logits [(bsz, num_tokens/num_chunks, vocab)] -> [(bsz*num_tokens/num_chunks, vocab)]
++        # reshape logits [(bsz, num_tokens_i, vocab)] -> [(bsz*num_tokens_i, vocab)]
+         logits = [
+             logit_chunk.reshape(-1, logit_chunk.size(-1)) for logit_chunk in logits
+         ]
+diff --git a/torchtune/modules/transformer.py b/torchtune/modules/transformer.py
+index 81d841c6..c2461c57 100644
+--- a/torchtune/modules/transformer.py
++++ b/torchtune/modules/transformer.py
+@@ -495,9 +495,13 @@ class TransformerDecoder(nn.Module):
+             List[torch.Tensor]: List of num_chunks output tensors, each with shape
+                 [b, seq_len/num_chunks, out_dim], where out_dim is usually the vocab size.
+         """
++        # Use tensor_split to ensure we always create exactly `num_output_chunks` chunks,
++        # distributing any remainder across the first chunks. This avoids cases where
++        # `torch.chunk` may return fewer chunks when the sequence length is not divisible
++        # by the requested number of chunks (e.g., seq_len=49 and num_chunks=8).
+         return [
+             self.output(chunk)
+-            for chunk in last_hidden_state.chunk(self.num_output_chunks, dim=1)
++            for chunk in torch.tensor_split(last_hidden_state, self.num_output_chunks, dim=1)
+         ]
+ 
+     def _validate_inputs(

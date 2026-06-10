@@ -1,0 +1,337 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..dc80990d
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,328 @@
++import sys
++import os
++import textwrap
++import tempfile
++import importlib.util
++from pathlib import Path
++
++# Use the local repository version of datamodel_code_generator
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++
++from datamodel_code_generator import (
++    generate,
++    InputFileType,
++    DataModelType,
++    PythonVersion,
++)
++
++
++def write_and_generate(openapi_yaml: str, *, module_name: str, **gen_kwargs):
++    """
++    Write the given OpenAPI YAML to a temp file, run code generation into a module file,
++    and return the generated source text and the loaded module object.
++    """
++    tmpdir = tempfile.mkdtemp(prefix="dcg_repro_")
++    in_path = Path(tmpdir) / "api.yaml"
++    out_path = Path(tmpdir) / f"{module_name}.py"
++    in_path.write_text(openapi_yaml, encoding="utf-8")
++
++    # Default generation kwargs to reproduce the issue
++    default_gen_kwargs = dict(
++        use_annotated=True,
++        field_constraints=True,  # required when use_annotated=True
++        collapse_root_models=True,
++        use_standard_collections=False,
++        capitalise_enum_members=True,
++    )
++    default_gen_kwargs.update(gen_kwargs)
++
++    # Run code generation
++    generate(
++        input_=in_path,
++        input_file_type=InputFileType.OpenAPI,
++        output=out_path,
++        output_model_type=DataModelType.PydanticV2BaseModel,
++        target_python_version=PythonVersion.PY_38,  # ensure compatibility in this runtime
++        **default_gen_kwargs,
++    )
++
++    # Import the generated module by executing its source in a prepared module namespace
++    import types
++    import typing as _typing
++    try:
++        import typing_extensions as _typing_extensions
++    except Exception:  # pragma: no cover
++        _typing_extensions = None
++
++    src = out_path.read_text(encoding="utf-8")
++    module = types.ModuleType(module_name)
++    module.__file__ = str(out_path)
++    sys.modules[module_name] = module
++    g = module.__dict__
++    # Pre-populate common symbols so that forward-ref evaluation in pydantic can resolve them
++    g.setdefault("__name__", module_name)
++    # Ensure Annotated is available in globals
++    if hasattr(_typing, "Annotated"):
++        g["Annotated"] = _typing.Annotated
++    elif _typing_extensions is not None:
++        g["Annotated"] = _typing_extensions.Annotated  # type: ignore[attr-defined]
++    # Also ensure Optional/List exist
++    g["Optional"] = _typing.Optional
++    g["List"] = _typing.List
++
++    try:
++        exec(compile(src, str(out_path), "exec"), g)
++    except Exception:
++        # Re-raise to allow the test harness to capture and report the exact error
++        raise
++    return src, module
++
++
++def assert_true(condition: bool, message: str):
++    if not condition:
++        raise AssertionError(message)
++
++
++def run_test_reference_items_pattern():
++    """
++    Reproduce the issue using a referenced string schema with a pattern and an array field that uses it.
++    This should import successfully after the fix. Before the fix, importing will raise:
++    TypeError: The following constraints cannot be applied to list[str]: 'pattern'
++    """
++    openapi_yaml = textwrap.dedent(
++        """
++        openapi: "3.0.0"
++        info:
++          title: Pet API
++          version: "1.0"
++        paths: {}
++        components:
++          schemas:
++            PetOpts:
++              type: string
++              pattern: '^[a-zA-Z]+$'
++            Pet:
++              type: object
++              properties:
++                id:
++                  type: integer
++                  format: int64
++                name:
++                  type: string
++                tag:
++                  type: string
++                opts:
++                  type: array
++                  items:
++                    $ref: "#/components/schemas/PetOpts"
++              required:
++                - id
++                - name
++                - opts
++        """
++    ).strip()
++
++    src, mod = write_and_generate(openapi_yaml, module_name="model_ref_pattern")
++
++    # Show the problematic generated annotation for debugging context
++    print("Generated model snippet (reference_items_pattern):")
++    print("\n" + "\n".join(line for line in src.splitlines() if "opts:" in line or "class Pet" in line))
++
++    # Validate model behavior: pattern should be enforced on each item, not on the list itself
++    Pet = getattr(mod, "Pet")
++
++    # Valid instance
++    m = Pet(id=1, name="Fido", opts=["Abc", "XYZ"], tag=None)
++    assert_true(m.opts == ["Abc", "XYZ"], "Valid opts should be accepted")
++
++    # Invalid: an element breaks the pattern
++    from pydantic import ValidationError
++
++    try:
++        Pet(id=2, name="Rex", opts=["abc123"])  # contains digits -> should fail
++        raise AssertionError("Expected ValidationError for invalid item pattern, but model creation succeeded")
++    except ValidationError:
++        # ensure it's a validation error, meaning model import succeeded and constraints applied
++        pass
++
++
++def run_test_inline_items_pattern():
++    """
++    Same as above but with the pattern defined inline on items instead of a $ref.
++    """
++    openapi_yaml = textwrap.dedent(
++        """
++        openapi: "3.0.0"
++        info:
++          title: Pet API Inline
++          version: "1.0"
++        paths: {}
++        components:
++          schemas:
++            Pet:
++              type: object
++              properties:
++                id:
++                  type: integer
++                  format: int64
++                name:
++                  type: string
++                opts:
++                  type: array
++                  items:
++                    type: string
++                    pattern: '^[a-zA-Z]+$'
++              required:
++                - id
++                - name
++                - opts
++        """
++    ).strip()
++
++    mod = write_and_generate(openapi_yaml, module_name="model_inline_pattern")
++    Pet = getattr(mod, "Pet")
++
++    # Valid instance
++    m = Pet(id=1, name="Fido", opts=["Abc", "XYZ"])
++    assert_true(m.opts == ["Abc", "XYZ"], "Valid opts should be accepted (inline pattern)")
++
++    # Invalid: an element breaks the pattern
++    from pydantic import ValidationError
++
++    try:
++        Pet(id=2, name="Rex", opts=["abc123"])  # contains digits -> should fail
++        raise AssertionError("Expected ValidationError for invalid item pattern (inline), but model creation succeeded")
++    except ValidationError:
++        pass
++
++
++def run_test_array_and_item_constraints():
++    """
++    An array with both list-level and item-level constraints: minItems on array and pattern on items.
++    Ensure both constraints are applied correctly after fix.
++    """
++    openapi_yaml = textwrap.dedent(
++        """
++        openapi: "3.0.0"
++        info:
++          title: Pet API MinItems
++          version: "1.0"
++        paths: {}
++        components:
++          schemas:
++            PetOpts:
++              type: string
++              pattern: '^[a-zA-Z]+$'
++            Pet:
++              type: object
++              properties:
++                id:
++                  type: integer
++                  format: int64
++                name:
++                  type: string
++                opts:
++                  type: array
++                  minItems: 1
++                  items:
++                    $ref: "#/components/schemas/PetOpts"
++              required:
++                - id
++                - name
++                - opts
++        """
++    ).strip()
++
++    mod = write_and_generate(openapi_yaml, module_name="model_array_item_constraints")
++    Pet = getattr(mod, "Pet")
++
++    # List-level minItems should be enforced
++    from pydantic import ValidationError
++
++    try:
++        Pet(id=3, name="Zero", opts=[])
++        raise AssertionError("Expected ValidationError for minItems=1 on list, but model creation succeeded")
++    except ValidationError:
++        pass
++
++    # Item-level pattern should be enforced as well
++    try:
++        Pet(id=3, name="BadItem", opts=["abc123"])  # contains digits -> should fail
++        raise AssertionError("Expected ValidationError for invalid item pattern with minItems, but model creation succeeded")
++    except ValidationError:
++        pass
++
++
++def run_test_without_collapse_root_models_imports():
++    """
++    Sanity check: without collapse_root_models, import should succeed even before the fix,
++    and behavior should remain correct after the fix.
++    """
++    openapi_yaml = textwrap.dedent(
++        """
++        openapi: "3.0.0"
++        info:
++          title: Pet API No Collapse
++          version: "1.0"
++        paths: {}
++        components:
++          schemas:
++            PetOpts:
++              type: string
++              pattern: '^[a-zA-Z]+$'
++            Pet:
++              type: object
++              properties:
++                id:
++                  type: integer
++                  format: int64
++                name:
++                  type: string
++                opts:
++                  type: array
++                  items:
++                    $ref: "#/components/schemas/PetOpts"
++              required:
++                - id
++                - name
++                - opts
++        """
++    ).strip()
++
++    # Generate with collapse_root_models disabled for this test
++    mod = write_and_generate(
++        openapi_yaml,
++        module_name="model_no_collapse",
++        collapse_root_models=False,
++    )
++    Pet = getattr(mod, "Pet")
++
++    # Valid instance should work
++    m = Pet(id=1, name="Fido", opts=["Abc", "XYZ"])
++    assert_true(m.opts == ["Abc", "XYZ"], "Valid opts should be accepted without collapse")
++
++
++if __name__ == "__main__":
++    tests = [
++        ("reference_items_pattern", run_test_reference_items_pattern),
++        ("inline_items_pattern", run_test_inline_items_pattern),
++        ("array_and_item_constraints", run_test_array_and_item_constraints),
++        ("without_collapse_root_models", run_test_without_collapse_root_models_imports),
++    ]
++
++    failures = []
++    for name, fn in tests:
++        try:
++            fn()
++            print(f"[PASS] {name}")
++        except Exception as e:
++            failures.append((name, e))
++            print(f"[FAIL] {name}: {e.__class__.__name__}: {e}")
++
++    if failures:
++        print("\nReproduction complete: one or more tests failed as expected before the fix.\n")
++        # Re-raise the first failure to make the script exit with non-zero status
++        name, e = failures[0]
++        raise SystemExit(1)
++    else:
++        print("\nAll reproduction tests passed. The issue appears to be fixed.\n")
+
+

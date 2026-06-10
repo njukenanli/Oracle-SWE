@@ -1,0 +1,284 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..4bd3e131aa
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,278 @@
++import os
++import sys
++import traceback
++
++# Configure Django settings for an in-memory SQLite database.
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY="test",
++        INSTALLED_APPS=[
++            # Minimal apps; our models use a custom app_label and we create tables manually.
++            "django.contrib.contenttypes",
++        ],
++        DATABASES={
++            "default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}
++        },
++        USE_TZ=True,
++    )
++
++import django
++
++django.setup()
++
++from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
++from django.db import connection, models
++from django.db.models import Q, F
++from django.db.models.functions import Lower
++
++# We will detect if the new API to customize the ValidationError code exists.
++from django.db.models.constraints import BaseConstraint, CheckConstraint, UniqueConstraint
++import inspect
++
++
++def api_supports_violation_error_code():
++    """
++    Detect whether constraints accept a 'violation_error_code' kwarg.
++    We try real instantiation to cover explicit signatures.
++    """
++    try:
++        # Try to instantiate with the parameter.
++        _ = CheckConstraint(check=Q(id__gte=0), name="chk_tmp", violation_error_code="x")
++        _ = UniqueConstraint(Lower("id"), name="uniq_tmp", violation_error_code="x")
++        return True
++    except TypeError:
++        return False
++    except Exception:
++        # Any other exception means the kwarg was accepted but something else failed;
++        # consider it supported for our purposes.
++        return True
++
++
++SUPPORTS_CODE_KWARG = api_supports_violation_error_code()
++
++
++def create_table_for_model(model_cls):
++    with connection.schema_editor() as editor:
++        editor.create_model(model_cls)
++
++
++def first_non_field_error_code(e: ValidationError):
++    errs = e.error_dict.get(NON_FIELD_ERRORS)
++    if not errs:
++        raise AssertionError("Expected non-field errors on the model, got none.")
++    # Return the code of the first error
++    return errs[0].code, str(errs[0].message)
++
++
++FAILURES = []
++
++
++def record_failure(name, msg, exc=None):
++    text = f"[FAIL] {name}: {msg}"
++    if exc is not None:
++        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
++        text += f"\n{tb}"
++    FAILURES.append(text)
++
++
++# Test 1: CheckConstraint should allow customizing ValidationError.code via a kwarg.
++
++def test_check_constraint_code_customizable():
++    expected_code = "price_nonneg"
++    # Define model class dynamically.
++    attrs = {
++        "__module__": __name__,
++        "name": models.CharField(max_length=50),
++        "price": models.IntegerField(),
++        "Meta": type(
++            "Meta",
++            (),
++            {
++                "app_label": "repro_app",
++                "db_table": "repro_product_check",
++                "constraints": [
++                    CheckConstraint(
++                        check=Q(price__gte=0),
++                        name="repro_price_nonneg",
++                        violation_error_message="Price must be non-negative",
++                        **({"violation_error_code": expected_code} if SUPPORTS_CODE_KWARG else {})
++                    )
++                ],
++            },
++        ),
++    }
++    ModelCheck = type("ProductCheck", (models.Model,), attrs)
++
++    # Create table
++    create_table_for_model(ModelCheck)
++
++    # Create invalid instance
++    obj = ModelCheck(name="X", price=-1)
++    try:
++        obj.validate_constraints()
++        record_failure(
++            "CheckConstraint validation",
++            "Expected ValidationError for negative price but none was raised.",
++        )
++        return
++    except ValidationError as e:
++        code, msg = first_non_field_error_code(e)
++        if SUPPORTS_CODE_KWARG:
++            assert (
++                code == expected_code
++            ), f"Expected code '{expected_code}' but got '{code}'. Message: {msg}"
++        else:
++            # Before fix: the code isn't customizable and should not match expected_code.
++            assert code != expected_code, (
++                "Constraint did not support 'violation_error_code' kwarg, but error "
++                f"code unexpectedly matched '{expected_code}'."
++            )
++            # Force failure to highlight the missing customization feature.
++            raise AssertionError(
++                "ValidationError.code is not customizable for CheckConstraint. "
++                f"Got code={code!r}; expected to be '{expected_code}'."
++            )
++
++
++# Test 2: UniqueConstraint with expressions should allow customizing code.
++
++def test_unique_expression_constraint_code_customizable():
++    expected_code = "uniq_lower_name"
++    attrs = {
++        "__module__": __name__,
++        "name": models.CharField(max_length=50),
++        "Meta": type(
++            "Meta",
++            (),
++            {
++                "app_label": "repro_app",
++                "db_table": "repro_product_unique_expr",
++                "constraints": [
++                    UniqueConstraint(
++                        Lower("name"),
++                        name="repro_uniq_lower_name",
++                        violation_error_message="Name must be unique (case-insensitive)",
++                        **({"violation_error_code": expected_code} if SUPPORTS_CODE_KWARG else {})
++                    )
++                ],
++            },
++        ),
++    }
++    ModelUExpr = type("ProductUniqueExpr", (models.Model,), attrs)
++
++    create_table_for_model(ModelUExpr)
++
++    # Seed an existing row
++    ModelUExpr.objects.create(name="AbC")
++
++    # Now a new instance that violates the expression-based unique constraint
++    obj = ModelUExpr(name="abc")
++    try:
++        obj.validate_constraints()
++        record_failure(
++            "UniqueConstraint (expressions) validation",
++            "Expected ValidationError for duplicate (case-insensitive) name but none was raised.",
++        )
++        return
++    except ValidationError as e:
++        code, msg = first_non_field_error_code(e)
++        if SUPPORTS_CODE_KWARG:
++            assert (
++                code == expected_code
++            ), f"Expected code '{expected_code}' but got '{code}'. Message: {msg}"
++        else:
++            # Before fix: force failure since code can't be customized and will be None.
++            raise AssertionError(
++                "ValidationError.code is not customizable for expression-based UniqueConstraint. "
++                f"Got code={code!r}; expected to be '{expected_code}'."
++            )
++
++
++# Test 3: UniqueConstraint with a condition should allow customizing code.
++
++def test_unique_condition_constraint_code_customizable():
++    expected_code = "cond_uniq"
++    attrs = {
++        "__module__": __name__,
++        "name": models.CharField(max_length=50),
++        "deleted": models.BooleanField(default=False),
++        "Meta": type(
++            "Meta",
++            (),
++            {
++                "app_label": "repro_app",
++                "db_table": "repro_product_unique_cond",
++                "constraints": [
++                    UniqueConstraint(
++                        Lower("name"),
++                        condition=Q(deleted=False),
++                        name="repro_cond_uniq",
++                        violation_error_message="Name must be unique among non-deleted",
++                        **({"violation_error_code": expected_code} if SUPPORTS_CODE_KWARG else {})
++                    )
++                ],
++            },
++        ),
++    }
++    ModelUCond = type("ProductUniqueCond", (models.Model,), attrs)
++
++    create_table_for_model(ModelUCond)
++
++    # Seed an existing non-deleted row
++    ModelUCond.objects.create(name="ZZ", deleted=False)
++
++    # Violating instance (non-deleted)
++    obj = ModelUCond(name="zz", deleted=False)
++    try:
++        obj.validate_constraints()
++        record_failure(
++            "UniqueConstraint (condition) validation",
++            "Expected ValidationError for conditional unique constraint but none was raised.",
++        )
++        return
++    except ValidationError as e:
++        code, msg = first_non_field_error_code(e)
++        if SUPPORTS_CODE_KWARG:
++            assert (
++                code == expected_code
++            ), f"Expected code '{expected_code}' but got '{code}'. Message: {msg}"
++        else:
++            # Before fix: force failure since code can't be customized and will be None.
++            raise AssertionError(
++                "ValidationError.code is not customizable for conditional UniqueConstraint. "
++                f"Got code={code!r}; expected to be '{expected_code}'."
++            )
++
++    # Non-violating instance (deleted=True) should be fine even with code support.
++    obj_ok = ModelUCond(name="zz", deleted=True)
++    obj_ok.validate_constraints()
++
++
++if __name__ == "__main__":
++    tests = [
++        ("CheckConstraint code customization", test_check_constraint_code_customizable),
++        ("UniqueConstraint (expressions) code customization", test_unique_expression_constraint_code_customizable),
++        ("UniqueConstraint (condition) code customization", test_unique_condition_constraint_code_customizable),
++    ]
++
++    for name, fn in tests:
++        try:
++            fn()
++        except AssertionError as e:
++            record_failure(name, str(e))
++        except Exception as e:
++            record_failure(name, f"Unexpected exception: {e}", exc=e)
++
++    if FAILURES:
++        print("Reproduction FAILED. Details:")
++        for f in FAILURES:
++            print(f)
++        sys.exit(1)
++    else:
++        print(
++            "Reproduction PASSED: ValidationError.code is customizable via constraints in all tested cases."
++        )
++        sys.exit(0)

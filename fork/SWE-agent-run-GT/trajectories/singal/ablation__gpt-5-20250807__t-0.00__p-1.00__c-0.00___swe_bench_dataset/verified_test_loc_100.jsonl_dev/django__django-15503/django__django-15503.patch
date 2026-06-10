@@ -1,0 +1,127 @@
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index fdca700c9d..ed26d9dc37 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -172,6 +172,22 @@ class ContainedBy(PostgresOperatorLookup):
+ class HasKeyLookup(PostgresOperatorLookup):
+     logical_operator = None
+ 
++    def compile_json_path_final_key(self, rhs_key_transforms):
++        """
++        Compile a JSON path suffix for has_key/has_keys/has_any_keys lookups
++        ensuring that the final component is always treated as an object key,
++        even if it looks like a numeric index. Intermediate components retain
++        their standard behavior (e.g., numeric strings used for array indices).
++        """
++        if not rhs_key_transforms:
++            return ""
++        head = rhs_key_transforms[:-1]
++        final = rhs_key_transforms[-1]
++        # Compile the head normally (no root), then append the final key as a
++        # quoted object member reference.
++        prefix = compile_json_path(head, include_root=False)
++        return "%s.%s" % (prefix, json.dumps(str(final)))
++
+     def as_sql(self, compiler, connection, template=None):
+         # Process JSON path from the left-hand side.
+         if isinstance(self.lhs, KeyTransform):
+@@ -192,12 +208,16 @@ class HasKeyLookup(PostgresOperatorLookup):
+             if isinstance(key, KeyTransform):
+                 *_, rhs_key_transforms = key.preprocess_lhs(compiler, connection)
+             else:
++                # Single key provided. On Oracle, escape any "%" used in keys
++                # to avoid string formatting issues when inlining paths.
++                if connection.vendor == "oracle" and isinstance(key, str):
++                    key = key.replace("%", "%%")
+                 rhs_key_transforms = [key]
+             rhs_params.append(
+                 "%s%s"
+                 % (
+                     lhs_json_path,
+-                    compile_json_path(rhs_key_transforms, include_root=False),
++                    self.compile_json_path_final_key(rhs_key_transforms),
+                 )
+             )
+         # Add condition for each key.
+@@ -252,6 +272,12 @@ class HasAnyKeys(HasKeys):
+     postgres_operator = "?|"
+     logical_operator = " OR "
+ 
++    # Ensure consistent handling of numeric-looking keys by delegating to the
++    # base implementation which always treats the final component as an object
++    # key (not an array index).
++    def compile_json_path_final_key(self, rhs_key_transforms):
++        return super().compile_json_path_final_key(rhs_key_transforms)
++
+ 
+ class CaseInsensitiveMixin:
+     """
+@@ -387,25 +413,42 @@ class KeyTransformTextLookupMixin:
+ class KeyTransformIsNull(lookups.IsNull):
+     # key__isnull=False is the same as has_key='key'
+     def as_oracle(self, compiler, connection):
+-        sql, params = HasKey(
+-            self.lhs.lhs,
+-            self.lhs.key_name,
+-        ).as_oracle(compiler, connection)
++        # Build full JSON path for the key transform to properly handle numeric
++        # indices (e.g., array access) and object keys.
++        lhs, lhs_params, key_transforms = self.lhs.preprocess_lhs(compiler, connection)
++        json_path = compile_json_path(key_transforms)
++        # Use JSON_EXISTS to check path existence. On Oracle, inline the path in
++        # SQL since bind variables are not supported in JSON path expressions.
++        exists_sql = "JSON_EXISTS(%s, '%s')" % (lhs, json_path)
+         if not self.rhs:
+-            return sql, params
+-        # Column doesn't have a key or IS NULL.
+-        lhs, lhs_params, _ = self.lhs.preprocess_lhs(compiler, connection)
+-        return "(NOT %s OR %s IS NULL)" % (sql, lhs), tuple(params) + tuple(lhs_params)
++            # IS NOT NULL -> path must exist.
++            return exists_sql, tuple(lhs_params)
++        # IS NULL -> path doesn't exist OR value at path is SQL NULL.
++        is_null_expr = self.lhs.get_lookup("isnull")(self.lhs, True)
++        is_null_sql, is_null_params = is_null_expr.as_sql(compiler, connection)
++        return "(NOT %s OR %s)" % (exists_sql, is_null_sql), tuple(lhs_params) + tuple(is_null_params)
+ 
+     def as_sqlite(self, compiler, connection):
+-        template = "JSON_TYPE(%s, %%s) IS NULL"
++        # Build path without forcing the final numeric component to be treated as
++        # an object key. For array indices, JSON1 expects bracket notation.
++        template = "JSON_TYPE(%s, %s)"
+         if not self.rhs:
+-            template = "JSON_TYPE(%s, %%s) IS NOT NULL"
+-        return HasKey(self.lhs.lhs, self.lhs.key_name).as_sql(
+-            compiler,
+-            connection,
+-            template=template,
+-        )
++            # IS NOT NULL
++            comparator = " IS NOT NULL"
++        else:
++            comparator = " IS NULL"
++        if isinstance(self.lhs, KeyTransform):
++            lhs, lhs_params, lhs_key_transforms = self.lhs.preprocess_lhs(
++                compiler, connection
++            )
++            json_path = compile_json_path(lhs_key_transforms)
++        else:
++            lhs, lhs_params = compiler.compile(self.lhs)
++            json_path = "$"
++        sql = (template + comparator) % (lhs, "%s")
++        # Debug: print path used for sqlite isnull lookup.
++        # print("[DEBUG KeyTransformIsNull.as_sqlite] path=", json_path)
++        return sql, tuple(lhs_params) + (json_path,)
+ 
+ 
+ class KeyTransformIn(lookups.In):
+@@ -465,7 +508,9 @@ class KeyTransformExact(JSONExact):
+     def as_oracle(self, compiler, connection):
+         rhs, rhs_params = super().process_rhs(compiler, connection)
+         if rhs_params == ["null"]:
+-            # Field has key and it's NULL.
++            # Field has key and it's NULL. Use HasKey.as_oracle() which treats the
++            # final component of the path as an object key even if it looks
++            # numeric (e.g., "0"). This matches has_key semantics.
+             has_key_expr = HasKey(self.lhs.lhs, self.lhs.key_name)
+             has_key_sql, has_key_params = has_key_expr.as_oracle(compiler, connection)
+             is_null_expr = self.lhs.get_lookup("isnull")(self.lhs, True)

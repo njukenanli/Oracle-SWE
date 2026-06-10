@@ -1,0 +1,206 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..375d7cec
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,197 @@
++import os
++import sys
++import ssl
++import time
++import socket
++import threading
++import subprocess
++import tempfile
++from http.server import BaseHTTPRequestHandler, HTTPServer
++
++# Streamlink imports from the repository under /testbed
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
++from streamlink.session import Streamlink  # noqa: E402
++from streamlink.exceptions import PluginError  # noqa: E402
++
++
++class SimpleHandler(BaseHTTPRequestHandler):
++    def do_GET(self):  # noqa: N802
++        self.send_response(200)
++        self.send_header("Content-Type", "text/plain")
++        self.end_headers()
++        self.wfile.write(b"ok")
++
++    def log_message(self, *args, **kwargs):  # silence server logs
++        pass
++
++
++def find_openssl():
++    cmds = [
++        ["openssl", "version"],
++    ]
++    for cmd in cmds:
++        try:
++            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
++            if p.returncode == 0:
++                return True
++        except FileNotFoundError:
++            continue
++    return False
++
++
++def generate_self_signed_cert(tmpdir):
++    cert_path = os.path.join(tmpdir, "cert.pem")
++    key_path = os.path.join(tmpdir, "key.pem")
++    # Generate key+cert valid for CN=localhost using OpenSSL if available
++    cmd = [
++        "openssl",
++        "req",
++        "-x509",
++        "-newkey",
++        "rsa:2048",
++        "-keyout",
++        key_path,
++        "-out",
++        cert_path,
++        "-days",
++        "1",
++        "-nodes",
++        "-subj",
++        "/CN=localhost",
++    ]
++    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
++    if p.returncode != 0:
++        raise RuntimeError(f"Failed to generate test certificate via openssl: {p.stderr.decode(errors='ignore')}")
++    return cert_path, key_path
++
++
++def start_https_server(certfile, keyfile):
++    httpd = HTTPServer(("127.0.0.1", 0), SimpleHandler)
++    # Wrap with TLS
++    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
++    context.load_cert_chain(certfile=certfile, keyfile=keyfile)
++    httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
++
++    port = httpd.server_address[1]
++
++    th = threading.Thread(target=httpd.serve_forever, daemon=True)
++    th.start()
++
++    # wait briefly for server to be ready
++    for _ in range(50):
++        try:
++            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
++                pass
++            break
++        except OSError:
++            time.sleep(0.05)
++
++    return httpd, port
++
++
++def assert_raises_contains(fn, substrings, exc=PluginError):
++    try:
++        fn()
++    except exc as e:
++        msg = str(e)
++        if not any(s in msg for s in substrings):
++            raise AssertionError(f"Expected exception message to contain one of {substrings!r}, got: {msg!r}")
++        return
++    except Exception as e:
++        raise AssertionError(f"Expected {exc.__name__}, but got different exception: {e.__class__.__name__}: {e}")
++    raise AssertionError(f"Expected {exc.__name__} to be raised, but no exception was raised")
++
++
++def run_tests():
++    print("Reproduction: HTTP NO SSL Verify broken")
++    # Prepare HTTPS server with self-signed certificate
++    if not find_openssl():
++        print("ERROR: OpenSSL binary not available to generate a test certificate. Cannot run reproduction tests.")
++        sys.exit(2)
++
++    with tempfile.TemporaryDirectory() as td:
++        certfile, keyfile = generate_self_signed_cert(td)
++        httpd, port = start_https_server(certfile, keyfile)
++        url = f"https://127.0.0.1:{port}/"
++
++        try:
++            # Create a Streamlink session instance
++            s = Streamlink()
++            s.set_option("http-timeout", 2.0)
++
++            # Test case 1: Default SSL verify enabled should fail with certificate verify error
++            print("Test 1: SSL verify enabled should fail on self-signed cert...")
++            def _t1():
++                s.http.get(url)
++            assert_raises_contains(_t1, ["certificate verify failed"])  # OpenSSL message substring
++            print("  -> OK (failed as expected)")
++
++            # Test case 2: Disable SSL verify should allow connecting successfully
++            print("Test 2: --http-no-ssl-verify should disable verification and allow connection...")
++            s.set_option("http-ssl-verify", False)
++            resp = None
++            failed = None
++            try:
++                resp = s.http.get(url)
++            except PluginError as e:
++                failed = str(e)
++            except Exception as e:
++                failed = f"{e.__class__.__name__}: {e}"
++
++            if resp is not None and getattr(resp, "status_code", None) == 200:
++                print("  -> OK (connected successfully with SSL verify disabled)")
++            else:
++                # This is the current buggy behavior we want to reproduce
++                print("  -> FAILED (current behavior)")
++                print("     Expected successful connection, but got error:")
++                print("     ", failed)
++                # Assert to fail the reproduction before the fix
++                assert False, (
++                    "Disabling SSL verification did not allow the HTTPS request to succeed. "
++                    "This reproduces the bug: 'Cannot set verify_mode to CERT_NONE when check_hostname is enabled.'"
++                )
++
++            # Test case 3: Also ensure that http-disable-dh in combination with disabled SSL verify works
++            print("Test 3: --http-disable-dh combined with --http-no-ssl-verify should also work...")
++            s2 = Streamlink()
++            s2.set_option("http-timeout", 2.0)
++            s2.set_option("http-disable-dh", True)
++            s2.set_option("http-ssl-verify", False)
++            resp2 = None
++            failed2 = None
++            try:
++                resp2 = s2.http.get(url)
++            except PluginError as e:
++                failed2 = str(e)
++            except Exception as e:
++                failed2 = f"{e.__class__.__name__}: {e}"
++            if resp2 is not None and getattr(resp2, "status_code", None) == 200:
++                print("  -> OK (connected successfully)")
++            else:
++                print("  -> FAILED (current behavior)")
++                print("     Expected successful connection with http-disable-dh + no-ssl-verify, but got error:")
++                print("     ", failed2)
++                assert False, (
++                    "Reproduced bug: Disabling SSL verification while http-disable-dh is enabled causes failure: "
++                    "'Cannot set verify_mode to CERT_NONE when check_hostname is enabled.'"
++                )
++
++            # Test case 4: With http-disable-dh enabled but SSL verification ON, request should fail with cert verify error (control test)
++            print("Test 4: With http-disable-dh enabled and SSL verify enabled, should fail on self-signed cert...")
++            s3 = Streamlink()
++            s3.set_option("http-timeout", 2.0)
++            s3.set_option("http-disable-dh", True)
++            def _t4():
++                s3.http.get(url)
++            assert_raises_contains(_t4, ["certificate verify failed"])  # still must verify by default
++            print("  -> OK (failed as expected)")
++
++        finally:
++            httpd.shutdown()
++            httpd.server_close()
++
++    print("All reproduction tests passed.")
++
++
++if __name__ == "__main__":
++    run_tests()
+
+

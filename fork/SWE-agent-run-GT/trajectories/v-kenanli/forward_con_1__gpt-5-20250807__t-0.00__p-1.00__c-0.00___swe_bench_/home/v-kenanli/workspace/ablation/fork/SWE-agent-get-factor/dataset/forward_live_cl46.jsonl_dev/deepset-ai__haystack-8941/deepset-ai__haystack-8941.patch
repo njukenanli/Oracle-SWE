@@ -1,0 +1,196 @@
+diff --git a/haystack/components/embedders/azure_document_embedder.py b/haystack/components/embedders/azure_document_embedder.py
+index 2223c82b..0340069b 100644
+--- a/haystack/components/embedders/azure_document_embedder.py
++++ b/haystack/components/embedders/azure_document_embedder.py
+@@ -5,12 +5,17 @@
+ import os
+ from typing import Any, Dict, List, Optional, Tuple
+ 
++from more_itertools import batched
++from openai import APIError
+ from openai.lib.azure import AzureOpenAI
+ from tqdm import tqdm
+ 
+-from haystack import Document, component, default_from_dict, default_to_dict
++from haystack import Document, component, default_from_dict, default_to_dict, logging
+ from haystack.utils import Secret, deserialize_secrets_inplace
+ 
++logger = logging.getLogger(__name__)
++
++
+ 
+ @component
+ class AzureOpenAIDocumentEmbedder:
+@@ -204,30 +209,61 @@ class AzureOpenAIDocumentEmbedder:
+         Embed a list of texts in batches.
+         """
+ 
+-        all_embeddings: List[List[float]] = []
++        # Initialize result list with placeholders to preserve alignment with input documents
++        result_embeddings: List[Optional[List[float]]] = [None] * len(texts_to_embed)
+         meta: Dict[str, Any] = {"model": "", "usage": {"prompt_tokens": 0, "total_tokens": 0}}
+-        for i in tqdm(range(0, len(texts_to_embed), batch_size), desc="Embedding Texts"):
+-            batch = texts_to_embed[i : i + batch_size]
+-            if self.dimensions is not None:
+-                response = self._client.embeddings.create(
+-                    model=self.azure_deployment, dimensions=self.dimensions, input=batch
+-                )
+-            else:
+-                response = self._client.embeddings.create(model=self.azure_deployment, input=batch)
+-
+-            # Append embeddings to the list
+-            all_embeddings.extend(el.embedding for el in response.data)
++
++        # Prepare (index, text) pairs so we can place embeddings in the correct positions
++        indexed_inputs = list(enumerate(texts_to_embed))
++
++        # Iterate by batches, but handle provider errors gracefully so that one failing batch does not abort the run
++        for batch in tqdm(
++            batched(indexed_inputs, batch_size), disable=not self.progress_bar, desc="Embedding Texts"
++        ):
++            batch_list = list(batch)
++
++            def embed_with_bisect(inputs: List[Tuple[int, str]]) -> Tuple[List[Tuple[int, List[float]]], int, int, Optional[str]]:
++                try:
++                    in_texts = [t for _, t in inputs]
++                    if self.dimensions is not None:
++                        response = self._client.embeddings.create(
++                            model=self.azure_deployment, dimensions=self.dimensions, input=in_texts
++                        )
++                    else:
++                        response = self._client.embeddings.create(model=self.azure_deployment, input=in_texts)
++                    indexed_embeddings = [(inputs[i][0], el.embedding) for i, el in enumerate(response.data)]
++                    return indexed_embeddings, response.usage.prompt_tokens, response.usage.total_tokens, response.model
++                except APIError as exc:
++                    # If a batch fails, split it into halves and try to embed as many as possible
++                    if len(inputs) == 1:
++                        # Single item still fails: log and skip it
++                        logger.exception("Failed embedding of a document caused by {exc}", exc=exc)
++                        return [], 0, 0, None
++                    mid = len(inputs) // 2
++                    left_embs, l_pt, l_tt, l_model = embed_with_bisect(inputs[:mid])
++                    right_embs, r_pt, r_tt, r_model = embed_with_bisect(inputs[mid:])
++                    model = l_model or r_model
++                    return left_embs + right_embs, l_pt + r_pt, l_tt + r_tt, model
++
++            indexed_embeddings, prompt_tokens, total_tokens, model = embed_with_bisect(batch_list)
++
++            # Place embeddings in the correct positions
++            for idx, emb in indexed_embeddings:
++                result_embeddings[idx] = emb
+ 
+             # Update the meta information only once if it's empty
+-            if not meta["model"]:
+-                meta["model"] = response.model
+-                meta["usage"] = dict(response.usage)
+-            else:
+-                # Update the usage tokens
+-                meta["usage"]["prompt_tokens"] += response.usage.prompt_tokens
+-                meta["usage"]["total_tokens"] += response.usage.total_tokens
++            if not meta["model"] and model:
++                meta["model"] = model
++                # if we got at least one successful call, initialize usage with zeros first to safely increment below
++                meta["usage"] = {"prompt_tokens": 0, "total_tokens": 0}
++
++            # Update the usage tokens with what we collected for this batch (may be zero if nothing succeeded)
++            meta["usage"]["prompt_tokens"] += prompt_tokens
++            meta["usage"]["total_tokens"] += total_tokens
+ 
+-        return all_embeddings, meta
++        # Filter out None placeholders when returning embeddings to keep the original method signature
++        # However, the run() method will use positional assignment, so we return the full list including None values
++        return result_embeddings, meta
+ 
+     @component.output_types(documents=List[Document], meta=Dict[str, Any])
+     def run(self, documents: List[Document]) -> Dict[str, Any]:
+@@ -248,8 +284,11 @@ class AzureOpenAIDocumentEmbedder:
+         texts_to_embed = self._prepare_texts_to_embed(documents=documents)
+         embeddings, meta = self._embed_batch(texts_to_embed=texts_to_embed, batch_size=self.batch_size)
+ 
+-        # Assign the corresponding embeddings to each document
+-        for doc, emb in zip(documents, embeddings):
+-            doc.embedding = emb
++        # Assign the corresponding embeddings to each document.
++        # Some embeddings might be None if a specific document failed during embedding. We keep None in that case
++        # to signal downstream components that the document couldn't be embedded, but we do not abort the whole run.
++        for idx, doc in enumerate(documents):
++            if idx < len(embeddings):
++                doc.embedding = embeddings[idx]
+ 
+         return {"documents": documents, "meta": meta}
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..461b8bf1
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,70 @@
++import os
++from unittest.mock import Mock, patch
++
++from openai import APIError
++
++from haystack import Document
++from haystack.components.embedders.azure_document_embedder import AzureOpenAIDocumentEmbedder
++
++
++def reproduce_failure():
++    # No real keys/endpoints are needed because we'll mock the network call
++    os.environ.setdefault("AZURE_OPENAI_API_KEY", "fake-key")
++    embedder = AzureOpenAIDocumentEmbedder(azure_endpoint="https://example-resource.azure.openai.com/")
++
++    docs = [
++        Document(id="1", content="short text 1"),
++        Document(id="2", content="short text 2"),
++    ]
++
++    texts_to_embed = embedder._prepare_texts_to_embed(docs)
++
++    # Force the underlying client call to raise an APIError to simulate provider errors
++    with patch.object(embedder._client.embeddings, "create", side_effect=APIError("Mocked error", request=Mock(), body=None)):
++        # Calling the private method to reproduce the crash behavior precisely
++        return embedder._embed_batch(texts_to_embed=texts_to_embed, batch_size=2)
++
++
++def reproduce_bisect_success():
++    os.environ.setdefault("AZURE_OPENAI_API_KEY", "fake-key")
++    embedder = AzureOpenAIDocumentEmbedder(azure_endpoint="https://example-resource.azure.openai.com/")
++
++    docs = [
++        Document(id="1", content="bad will fail"),
++        Document(id="2", content="ok will pass"),
++    ]
++
++    texts_to_embed = embedder._prepare_texts_to_embed(docs)
++
++    class FakeEmb:
++        def __init__(self, emb):
++            self.embedding = emb
++
++    class FakeResp:
++        def __init__(self, n):
++            self.data = [FakeEmb([float(i)]) for i in range(n)]
++            self.model = "text-embedding-ada-002"
++            self.usage = type("u", (), {"prompt_tokens": n, "total_tokens": n})
++
++    def side_effect(input=None, **kwargs):
++        # Simulate failure if any text contains 'bad'
++        if any("bad" in t for t in input):
++            raise APIError("BadRequest simulated", request=Mock(), body=None)
++        return FakeResp(len(input))
++
++    with patch.object(embedder._client.embeddings, "create", side_effect=side_effect):
++        embeddings, meta = embedder._embed_batch(texts_to_embed=texts_to_embed, batch_size=2)
++        return embeddings, meta
++
++
++if __name__ == "__main__":
++    try:
++        reproduce_failure()
++        print("No exception occurred (embedding continued).")
++    except Exception as e:  # noqa: BLE001 - demonstration script
++        print(f"Exception raised as expected before fix: {e.__class__.__name__}: {e}")
++
++    # Show bisect behaviour with partial success
++    embs, meta = reproduce_bisect_success()
++    print("Embeddings (None means failed doc):", embs)
++    print("Meta:", meta)

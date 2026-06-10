@@ -1,0 +1,737 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000..b7c9502
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,728 @@
++"""
++Reproduction test for the bukuserver filter index assignment bug.
++
++Issue: Filter indices in bukuserver aren't assigned correctly when modifying
++filter types (thus changing their order in UI).
++
++According to flask-admin's filter parsing code, the `pos` (prefix number in
++`flt{pos}_{key}` URL parameters) determines filter ordering. The bug is in
++the JavaScript `filters.js` file's `makeName` function, which:
++1. When CHANGING filter type via dropdown: assigns a NEW, HIGHER index
++   (instead of retaining the old index for that row position)
++2. When ADDING a new filter: assigns `lastCount` (which may be inflated by
++   prior type-change operations) instead of using the current row position
++
++The correct behavior should be:
++1. When CHANGING filter type: retain the same index (e.g., row 0 keeps flt0_)
++2. When ADDING a new filter: use the row count (position) at time of adding
++
++These tests simulate the UI interactions at the HTTP/URL parameter level,
++verifying that:
++- Filter order in active_filters (passed to JS) matches the order implied by
++  the `pos` (flt{pos}_) numbers in the submitted URL parameters.
++- The `filter_groups` data in rendered HTML provides correct JS initialization.
++- The rendering of active_filters correctly reflects the submitted filter
++  ordering so that the UI can be re-rendered in the right order.
++"""
++
++import json
++import re
++import sys
++import tempfile
++import os
++
++sys.path.insert(0, '/testbed')
++
++
++def create_app_and_client():
++    """Create a test app and client with a temporary database."""
++    from bukuserver import server
++    tmp = tempfile.mkdtemp()
++    dbfile = os.path.join(tmp, 'test.db')
++    app = server.create_app(dbfile)
++    app.config.update({'TESTING': True, 'WTF_CSRF_ENABLED': False})
++    client = app.test_client()
++    return app, client
++
++
++def add_bookmarks(app):
++    """Add test bookmarks to the database."""
++    import flask
++    from tests.util import _add_rec
++    with app.test_request_context():
++        bukudb = flask.g.bukudb
++        _add_rec(bukudb, 'http://example.com', 'Example Domain', ',python,web,tools,', 'Example description')
++        _add_rec(bukudb, 'http://python.org', 'Python Home', ',python,programming,', 'Python home page')
++        _add_rec(bukudb, 'http://django.org', 'Django', ',python,django,web,', 'Django description')
++
++
++def extract_json_data(content, element_id):
++    """Extract JSON data from a hidden div element."""
++    pattern = fr'id="{element_id}"[^>]*>(.*?)</div>'
++    match = re.search(pattern, content)
++    if match:
++        return json.loads(match.group(1))
++    return None
++
++
++def get_active_filters(client, query_string):
++    """GET /bookmark/ with given query_string and return parsed active_filters."""
++    resp = client.get('/bookmark/', query_string=query_string)
++    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}"
++    content = resp.data.decode()
++    return extract_json_data(content, 'active-filters-data')
++
++
++def get_filter_groups(client):
++    """GET /bookmark/ and return parsed filter_groups."""
++    resp = client.get('/bookmark/')
++    assert resp.status_code == 200
++    content = resp.data.decode()
++    return extract_json_data(content, 'filter-groups-data')
++
++
++# =====================================================================
++# Test 1: Verify that submitting filters with CORRECT pos order
++# results in active_filters in the correct (submitted) order.
++# This is the baseline: correct pos values => correct filter order.
++# =====================================================================
++def test_correct_pos_order_preserved():
++    """
++    When filters are submitted with correct, sequential pos values (0, 1, 2),
++    active_filters must preserve that order:
++    - pos=0 => first in active_filters
++    - pos=1 => second in active_filters
++    - pos=2 => third in active_filters
++    """
++    app, client = create_app_and_client()
++    add_bookmarks(app)
++
++    # Three filters with correct pos: 0, 1, 2
++    query = {
++        'flt0_tags_contain': 'python',
++        'flt1_url_contains': 'example',
++        'flt2_title_contains': 'Django',
++    }
++    active = get_active_filters(client, query)
++    assert active is not None, "active_filters should not be None"
++    assert len(active) == 3, f"Expected 3 active filters, got {len(active)}: {active}"
++
++    # Order must match pos values: tags(0), url(1), title(2)
++    assert active[0][1] == 'tags',  f"Filter 0 should be 'tags', got '{active[0][1]}' — order: {active}"
++    assert active[1][1] == 'url',   f"Filter 1 should be 'url', got '{active[1][1]}' — order: {active}"
++    assert active[2][1] == 'title', f"Filter 2 should be 'title', got '{active[2][1]}' — order: {active}"
++
++    print("PASS test_correct_pos_order_preserved")
++
++
++# =====================================================================
++# Test 2: Reproduce the bug — when a filter type is changed via dropdown,
++# the JS assigns a NEW, HIGHER index (e.g., 4) instead of retaining the
++# original pos (0). After resubmission, the filter that was first (pos=0)
++# now gets a higher pos and moves to the END of active_filters.
++# =====================================================================
++def test_type_change_wrong_index_causes_reordering():
++    """
++    BUG REPRODUCTION:
++    If user has:
++      flt0_tags_contain=python, flt1_url_contains=example, flt2_title_contains=Django
++
++    And changes the type of the FIRST filter (row 0, was tags_contain) to
++    tags_not_contain, the buggy JS assigns a NEW index (e.g., 4) instead of
++    retaining 0:
++      flt4_tags_not_contain=python, flt1_url_contains=example, flt2_title_contains=Django
++
++    After resubmission, flask-admin sorts by pos (string sort):
++    '1' < '2' < '4' (lexicographically), so the order becomes:
++      url(1), title(2), tags_not_contain(4)
++    instead of the correct:
++      tags_not_contain(0), url(1), title(2)
++
++    The test asserts the WRONG behavior that occurs BEFORE the fix.
++    If the test passes, the bug is present. If it fails, the bug is fixed.
++    """
++    app, client = create_app_and_client()
++    add_bookmarks(app)
++
++    # Simulate what buggy JS produces when user changes type at row 0:
++    # JS assigned index 4 (lastCount=3, then incremented) for the type change
++    query_buggy = {
++        'flt4_tags_not_contain': 'python',   # was row 0, JS assigned wrong index 4
++        'flt1_url_contains': 'example',       # row 1, correct
++        'flt2_title_contains': 'Django',      # row 2, correct
++    }
++    active_buggy = get_active_filters(client, query_buggy)
++    assert active_buggy is not None
++
++    # BUG: tags_not_contain has pos='4', so after string sort:
++    # '1' < '2' < '4' → url comes FIRST, title SECOND, tags THIRD
++    # But logically, tags should still be FIRST (it was in row 0)
++    names_buggy = [f[1] for f in active_buggy]
++
++    # The bug means tags is NOT first — it's been pushed to the end
++    assert names_buggy[0] != 'tags', (
++        f"BUG NOT REPRODUCED: tags filter should be displaced from position 0 "
++        f"due to wrong index assignment, but got order: {names_buggy}"
++    )
++    assert names_buggy[-1] == 'tags', (
++        f"BUG: tags filter (changed type) should be LAST due to wrong index 4, "
++        f"but got order: {names_buggy}"
++    )
++
++    print(f"PASS test_type_change_wrong_index_causes_reordering (order: {names_buggy})")
++
++
++# =====================================================================
++# Test 3: Verify CORRECT behavior after fix — when a filter type changes,
++# the pos should be RETAINED (not a new, higher value).
++# With correct index (0), the filter stays at position 0 in active_filters.
++# =====================================================================
++def test_type_change_correct_index_retains_order():
++    """
++    CORRECT BEHAVIOR (after fix):
++    When the user changes the type of filter at row 0 from tags_contain to
++    tags_not_contain, the pos should be RETAINED as 0:
++      flt0_tags_not_contain=python, flt1_url_contains=example, flt2_title_contains=Django
++
++    After resubmission, flask-admin sorts by pos:
++    '0' < '1' < '2', so the order is:
++      tags_not_contain(0), url(1), title(2)
++    which correctly keeps the changed filter at position 0.
++    """
++    app, client = create_app_and_client()
++    add_bookmarks(app)
++
++    # Simulate what CORRECT JS should produce (retain pos=0 for the changed filter)
++    query_correct = {
++        'flt0_tags_not_contain': 'python',  # type changed but pos retained as 0
++        'flt1_url_contains': 'example',     # row 1, unchanged
++        'flt2_title_contains': 'Django',    # row 2, unchanged
++    }
++    active_correct = get_active_filters(client, query_correct)
++    assert active_correct is not None
++    assert len(active_correct) == 3, f"Expected 3 filters, got: {active_correct}"
++
++    names_correct = [f[1] for f in active_correct]
++
++    # CORRECT: tags_not_contain stays at position 0 (pos retained from before)
++    assert names_correct[0] == 'tags', (
++        f"AFTER FIX: tags filter should be FIRST (pos=0 retained), "
++        f"but got order: {names_correct}"
++    )
++    assert names_correct[1] == 'url', (
++        f"AFTER FIX: url filter should be SECOND (pos=1), "
++        f"but got order: {names_correct}"
++    )
++    assert names_correct[2] == 'title', (
++        f"AFTER FIX: title filter should be THIRD (pos=2), "
++        f"but got order: {names_correct}"
++    )
++
++    print(f"PASS test_type_change_correct_index_retains_order (order: {names_correct})")
++
++
++# =====================================================================
++# Test 4: Reproduce the bug for ADDING a new filter.
++# When lastCount is inflated (due to prior type changes), the new filter
++# gets an index higher than its row position, which can cause wrong ordering.
++# =====================================================================
++def test_new_filter_inflated_index_causes_wrong_order():
++    """
++    BUG REPRODUCTION (adding new filter):
++    If user has:
++      flt0_tags_contain=python
++    Then changes type at row 0 (JS increments lastCount to 2):
++      flt2_tags_not_contain=python
++    Then adds a new filter (JS assigns lastCount=3 instead of position=1):
++      flt2_tags_not_contain=python, flt3_url_contains=example
++
++    After resubmission with these params, flask-admin sorts by pos:
++    '2' < '3' → order is: tags_not_contain(2), url(3)
++    which LOOKS correct here, but the indices are inflated (should be 0, 1).
++
++    More problematic: if user had 2 existing filters, changed type of first,
++    then the third new filter gets index 3 (instead of 2 for position 2):
++      flt3_tags_not_contain=python, flt1_url_contains=example, flt2_title_contains=Django
++
++    After sort: '1' < '2' < '3' → url, title, tags_not_contain (WRONG order,
++    tags should be first).
++    """
++    app, client = create_app_and_client()
++    add_bookmarks(app)
++
++    # Simulate: user had flt0_tags_contain + flt1_url_contains,
++    # changed type of flt0 → JS assigned index 2 (lastCount was 2),
++    # then added new filter at position 2 → JS assigned index 3 (lastCount=3)
++    # Result: tags at pos=3, url at pos=1 — url comes before tags!
++    query_buggy_new = {
++        'flt3_tags_not_contain': 'python',  # was row 0, inflated index due to type change then new filter
++        'flt1_url_contains': 'example',     # row 1
++        'flt2_title_contains': 'Django',    # row 2 (new filter added at position 2 got correct index here)
++    }
++    active_buggy_new = get_active_filters(client, query_buggy_new)
++    assert active_buggy_new is not None
++
++    names_buggy_new = [f[1] for f in active_buggy_new]
++
++    # BUG: tags (which was the first filter in the UI) ends up LAST
++    # because its pos=3 is highest (string sort: '1' < '2' < '3')
++    assert names_buggy_new[-1] == 'tags', (
++        f"BUG: tags filter should be LAST due to inflated index 3, "
++        f"but got order: {names_buggy_new}"
++    )
++    assert names_buggy_new[0] == 'url', (
++        f"BUG: url filter should be FIRST (pos=1 < pos=2 < pos=3), "
++        f"but got order: {names_buggy_new}"
++    )
++
++    print(f"PASS test_new_filter_inflated_index_causes_wrong_order (order: {names_buggy_new})")
++
++
++# =====================================================================
++# Test 5: Verify CORRECT behavior for adding a new filter.
++# New filter should use position-based index.
++# =====================================================================
++def test_new_filter_position_based_index():
++    """
++    CORRECT BEHAVIOR (after fix):
++    When adding a new filter, its index should be based on its position
++    (number of existing filter rows). So:
++      - 2 existing filters at positions 0 and 1
++      - New filter added at position 2 should get index 2 (not lastCount=3)
++
++    With correct indices:
++      flt0_tags_not_contain=python, flt1_url_contains=example, flt2_title_contains=Django
++
++    After sort: '0' < '1' < '2' → tags, url, title (correct order).
++    """
++    app, client = create_app_and_client()
++    add_bookmarks(app)
++
++    # Simulate correct behavior: all indices match row positions
++    query_correct_new = {
++        'flt0_tags_not_contain': 'python',  # row 0, index=0 (position-based)
++        'flt1_url_contains': 'example',     # row 1, index=1
++        'flt2_title_contains': 'Django',    # row 2, index=2 (new filter, position-based)
++    }
++    active_correct_new = get_active_filters(client, query_correct_new)
++    assert active_correct_new is not None
++    assert len(active_correct_new) == 3
++
++    names_correct_new = [f[1] for f in active_correct_new]
++
++    # CORRECT: all filters in position order
++    assert names_correct_new == ['tags', 'url', 'title'], (
++        f"AFTER FIX: filter order should be ['tags', 'url', 'title'], "
++        f"but got: {names_correct_new}"
++    )
++
++    print(f"PASS test_new_filter_position_based_index (order: {names_correct_new})")
++
++
++# =====================================================================
++# Test 6: Verify filter_groups data in rendered HTML has the correct
++# `index` and `arg` fields that the JS uses to initialize lastCount and
++# identify filters. This is the foundation for the JS fix.
++# =====================================================================
++def test_filter_groups_data_structure():
++    """
++    The filter_groups data in the rendered HTML is what the JS uses to:
++    1. Build the filter type dropdown options
++    2. Initialize active filters on page load
++    3. Determine the `arg` to use in `makeName` when adding/changing filters
++
++    Verify that filter_groups has the expected structure with correct
++    `index`, `arg`, and `operation` fields for key filter types.
++    """
++    app, client = create_app_and_client()
++    add_bookmarks(app)
++
++    groups = get_filter_groups(client)
++    assert groups is not None, "filter_groups data should be present"
++
++    # Verify tags filter group has contain and not_contain
++    assert 'tags' in groups, f"'tags' should be in filter_groups, got: {list(groups.keys())}"
++    tags_filters = groups['tags']
++    tags_args = [f['arg'] for f in tags_filters]
++    assert 'tags_contain' in tags_args, f"'tags_contain' should be in tags filters: {tags_args}"
++    assert 'tags_not_contain' in tags_args, f"'tags_not_contain' should be in tags filters: {tags_args}"
++
++    # Verify url filter group
++    assert 'url' in groups, f"'url' should be in filter_groups, got: {list(groups.keys())}"
++    url_filters = groups['url']
++    url_args = [f['arg'] for f in url_filters]
++    assert 'url_contains' in url_args, f"'url_contains' should be in url filters: {url_args}"
++
++    # Verify title filter group
++    assert 'title' in groups, f"'title' should be in filter_groups"
++    title_filters = groups['title']
++    title_args = [f['arg'] for f in title_filters]
++    assert 'title_contains' in title_args, f"'title_contains' should be in title filters: {title_args}"
++
++    # Verify each filter has required fields (index, arg, operation, type, options)
++    for group_name, filters in groups.items():
++        for flt in filters:
++            assert 'index' in flt, f"Filter in '{group_name}' missing 'index': {flt}"
++            assert 'arg' in flt, f"Filter in '{group_name}' missing 'arg': {flt}"
++            assert 'operation' in flt, f"Filter in '{group_name}' missing 'operation': {flt}"
++
++    # Verify that tags_contain and tags_not_contain have DIFFERENT indices
++    # (they are different filter types)
++    tags_contain_idx = next(f['index'] for f in tags_filters if f['arg'] == 'tags_contain')
++    tags_not_contain_idx = next(f['index'] for f in tags_filters if f['arg'] == 'tags_not_contain')
++    assert tags_contain_idx != tags_not_contain_idx, (
++        f"tags_contain and tags_not_contain should have different indices: "
++        f"{tags_contain_idx} vs {tags_not_contain_idx}"
++    )
++
++    print(f"PASS test_filter_groups_data_structure")
++
++
++# =====================================================================
++# Test 7: Verify the critical string-sort ordering behavior of pos values.
++# When pos values are assigned as strings, higher numbers sort lexicographically,
++# which can cause issues if pos values are not 0-based sequential.
++# =====================================================================
++def test_pos_string_sort_ordering():
++    """
++    Flask-admin sorts filter args by pos as STRINGS (lexicographic order).
++    Verified in flask_admin/model/base.py _get_list_filter_args:
++      return [v[1] for v in sorted(filters, key=lambda n: n[0])]
++
++    This means:
++      '0' < '1' < '2' (correct for sequential 0-based indices)
++      '1' < '10' < '2' (WRONG for multi-digit - '10' sorts before '2')
++      '1' < '2' < '4' (correct for these specific values)
++
++    So if indices stay at 0-based sequential values, ordering is correct.
++    If indices get large (due to type changes inflating lastCount), the
++    string sort may produce unexpected orderings.
++
++    Test that the inflated index (from simulated JS bug) results in wrong
++    order when filters are re-submitted.
++    """
++    app, client = create_app_and_client()
++    add_bookmarks(app)
++
++    # Simulate scenario where type changes inflate lastCount to 10+
++    # (multiple type changes from different filter rows)
++    # After many changes, the index may be 10, 11, etc.
++    # String sort: '1' < '10' < '11' < '2' < ... this would reorder filters!
++    query_inflated = {
++        'flt10_tags_not_contain': 'python',  # inflated from type changes
++        'flt1_url_contains': 'example',
++        'flt2_title_contains': 'Django',
++    }
++    active_inflated = get_active_filters(client, query_inflated)
++    assert active_inflated is not None
++
++    names_inflated = [f[1] for f in active_inflated]
++
++    # String sort: '1' < '10' < '2', so url(1), tags(10), title(2) 
++    # Wait - actually '10' > '1' and '10' < '2' in string compare?
++    # Let's verify: '10' vs '2': compare char by char: '1' < '2', so '10' < '2'!
++    # So sort order of '1','10','2' is: '1','10','2' -> url, tags, title (tags in middle, not last!)
++    
++    # Verify the string-sort behavior matches what we expect
++    sorted_keys = sorted(['10', '1', '2'])
++    assert sorted_keys == ['1', '10', '2'], f"String sort order unexpected: {sorted_keys}"
++
++    # So with pos='10', tags is sorted BETWEEN url(1) and title(2) — still wrong!
++    assert names_inflated[0] == 'url', (
++        f"BUG: url (pos=1) should be first in string sort '1'<'10'<'2', "
++        f"but got: {names_inflated}"
++    )
++    assert names_inflated[1] == 'tags', (
++        f"BUG: tags (pos=10) should be second in string sort '1'<'10'<'2', "
++        f"but got: {names_inflated}"
++    )
++    assert names_inflated[2] == 'title', (
++        f"BUG: title (pos=2) should be third in string sort '1'<'10'<'2', "
++        f"but got: {names_inflated}"
++    )
++
++    # This confirms the bug: tags was meant to be first (it was in row 0)
++    # but due to inflated index (10), it ended up in the wrong position
++    assert names_inflated[0] != 'tags', (
++        f"BUG NOT DEMONSTRATED: tags should be displaced from first position "
++        f"due to inflated index, but got: {names_inflated}"
++    )
++
++    print(f"PASS test_pos_string_sort_ordering (order: {names_inflated})")
++
++
++# =====================================================================
++# Test 8: Verify that active_filters returned in HTML exactly matches
++# the ordering implied by submitted pos values.
++# This is the key contract: pos determines order in active_filters.
++# =====================================================================
++def test_active_filters_order_matches_pos():
++    """
++    The active_filters data in the rendered HTML is passed directly to the
++    JS addFilter loop. The order of items in active_filters determines
++    the visual order of filter rows in the UI.
++
++    Verify that the order of active_filters matches the ascending pos order
++    of the submitted flt{pos}_{key} parameters.
++
++    With correct pos assignment (0, 1, 2), the filter UI rows appear in
++    the same order as the user placed them.
++
++    With incorrect pos (e.g., first filter at pos=4, others at pos=1,2),
++    the filter at pos=4 would appear LAST in the UI, not first.
++    """
++    app, client = create_app_and_client()
++    add_bookmarks(app)
++
++    # Case A: Correct pos assignment — all in order 0, 1, 2
++    query_correct = {
++        'flt0_tags_contain': 'python',
++        'flt1_url_contains': 'example',
++        'flt2_title_contains': 'Django',
++    }
++    active_correct = get_active_filters(client, query_correct)
++    assert active_correct is not None
++    names_correct = [f[1] for f in active_correct]
++    assert names_correct == ['tags', 'url', 'title'], (
++        f"Case A: Expected ['tags', 'url', 'title'], got: {names_correct}"
++    )
++
++    # Case B: Wrong pos for first filter (as if type was changed via JS) — pos=4 instead of 0
++    query_wrong = {
++        'flt4_tags_not_contain': 'python',  # BUG: pos=4 assigned by buggy JS
++        'flt1_url_contains': 'example',
++        'flt2_title_contains': 'Django',
++    }
++    active_wrong = get_active_filters(client, query_wrong)
++    assert active_wrong is not None
++    names_wrong = [f[1] for f in active_wrong]
++
++    # BUG: due to wrong pos=4, tags_not_contain is LAST (not first)
++    assert names_wrong != ['tags', 'url', 'title'], (
++        f"BUG NOT DEMONSTRATED: With wrong pos=4 for tags, order should NOT be "
++        f"['tags', 'url', 'title'], but got: {names_wrong}"
++    )
++    assert names_wrong == ['url', 'title', 'tags'], (
++        f"BUG: With wrong pos values (1,2,4), expected order ['url','title','tags'], "
++        f"but got: {names_wrong}"
++    )
++
++    # Case C: Correct pos after type change (fix) — pos retained as 0
++    query_fixed = {
++        'flt0_tags_not_contain': 'python',  # FIX: pos=0 retained from before type change
++        'flt1_url_contains': 'example',
++        'flt2_title_contains': 'Django',
++    }
++    active_fixed = get_active_filters(client, query_fixed)
++    assert active_fixed is not None
++    names_fixed = [f[1] for f in active_fixed]
++    assert names_fixed == ['tags', 'url', 'title'], (
++        f"Case C (fix): Expected ['tags', 'url', 'title'], got: {names_fixed}"
++    )
++
++    print(f"PASS test_active_filters_order_matches_pos")
++    print(f"  Case A (correct): {names_correct}")
++    print(f"  Case B (bug - type change): {names_wrong}")
++    print(f"  Case C (fixed): {names_fixed}")
++
++
++# =====================================================================
++# Test 9: Verify filter value is preserved across type changes.
++# When changing filter type, the value should be preserved in active_filters.
++# =====================================================================
++def test_filter_value_preserved_across_type_change():
++    """
++    When a user changes the filter type but NOT the value, the filter value
++    should be preserved. This tests both:
++    1. The correct behavior (pos retained → value in correct slot)
++    2. The buggy behavior (pos inflated → value still exists but in wrong position)
++    """
++    app, client = create_app_and_client()
++    add_bookmarks(app)
++
++    VALUE = 'python'
++
++    # With correct pos (retained after type change)
++    query_correct = {'flt0_tags_not_contain': VALUE, 'flt1_url_contains': 'example'}
++    active_correct = get_active_filters(client, query_correct)
++    assert active_correct is not None
++
++    # Find the tags filter in active_filters
++    tags_filter = next((f for f in active_correct if f[1] == 'tags'), None)
++    assert tags_filter is not None, f"tags filter not found in: {active_correct}"
++    assert tags_filter[2] == VALUE, (
++        f"Filter value should be '{VALUE}', got: '{tags_filter[2]}'"
++    )
++    assert active_correct.index(tags_filter) == 0, (
++        f"With correct pos=0, tags filter should be at index 0, "
++        f"but found at: {active_correct.index(tags_filter)}"
++    )
++
++    # With wrong pos (inflated by buggy JS)
++    query_buggy = {'flt4_tags_not_contain': VALUE, 'flt1_url_contains': 'example'}
++    active_buggy = get_active_filters(client, query_buggy)
++    assert active_buggy is not None
++
++    tags_filter_buggy = next((f for f in active_buggy if f[1] == 'tags'), None)
++    assert tags_filter_buggy is not None, f"tags filter not found in: {active_buggy}"
++    assert tags_filter_buggy[2] == VALUE, (
++        f"Filter value should be preserved as '{VALUE}', got: '{tags_filter_buggy[2]}'"
++    )
++    # BUG: with wrong pos=4, tags filter is NOT at position 0 but at position 1 (last)
++    assert active_buggy.index(tags_filter_buggy) != 0, (
++        f"BUG NOT REPRODUCED: With wrong pos=4, tags filter should not be at index 0, "
++        f"but got active_filters: {active_buggy}"
++    )
++
++    print(f"PASS test_filter_value_preserved_across_type_change")
++
++
++# =====================================================================
++# Test 10: Verify that a single filter submitted with correct vs wrong pos
++# results in identical active_filters (since there's only one filter,
++# order doesn't matter). This is a sanity check.
++# =====================================================================
++def test_single_filter_pos_irrelevant():
++    """
++    With only one filter, the pos value doesn't affect ordering (there's
++    nothing else to order relative to). Both pos=0 and pos=4 should give
++    the same single-element active_filters.
++    """
++    app, client = create_app_and_client()
++    add_bookmarks(app)
++
++    active_pos0 = get_active_filters(client, {'flt0_tags_contain': 'python'})
++    active_pos4 = get_active_filters(client, {'flt4_tags_contain': 'python'})
++
++    assert active_pos0 is not None
++    assert active_pos4 is not None
++    assert len(active_pos0) == 1
++    assert len(active_pos4) == 1
++
++    # Both should have the same filter index (position in _filters array)
++    assert active_pos0[0][0] == active_pos4[0][0], (
++        f"Same filter type should have same _filters index regardless of pos: "
++        f"{active_pos0[0]} vs {active_pos4[0]}"
++    )
++    assert active_pos0[0][1] == 'tags'
++    assert active_pos4[0][1] == 'tags'
++    assert active_pos0[0][2] == 'python'
++    assert active_pos4[0][2] == 'python'
++
++    print("PASS test_single_filter_pos_irrelevant")
++
++
++# =====================================================================
++# Test 11: Two-filter scenario — verify that swapped pos values
++# result in swapped filter order (core of the ordering contract).
++# =====================================================================
++def test_two_filters_swapped_pos_swaps_order():
++    """
++    With two filters, swapping their pos values should swap their order
++    in active_filters. This confirms the contract that pos determines order.
++
++    Normal: flt0_tags_contain, flt1_url_contains → [tags, url]
++    Swapped: flt1_tags_contain, flt0_url_contains → [url, tags]
++
++    This is the mechanism behind the bug: when JS assigns a higher pos to
++    a filter whose row is logically first, the filter ends up later.
++    """
++    app, client = create_app_and_client()
++    add_bookmarks(app)
++
++    # Normal order
++    active_normal = get_active_filters(client, {
++        'flt0_tags_contain': 'python',
++        'flt1_url_contains': 'example',
++    })
++    assert active_normal is not None
++    names_normal = [f[1] for f in active_normal]
++    assert names_normal == ['tags', 'url'], (
++        f"Normal pos order should give [tags, url], got: {names_normal}"
++    )
++
++    # Swapped pos (bug scenario: if JS assigns pos=1 to tags and pos=0 to url)
++    active_swapped = get_active_filters(client, {
++        'flt1_tags_contain': 'python',  # pos=1 (wrong for a filter that was at row 0)
++        'flt0_url_contains': 'example', # pos=0 (wrong for a filter that was at row 1)
++    })
++    assert active_swapped is not None
++    names_swapped = [f[1] for f in active_swapped]
++
++    # Swapped pos → swapped order
++    assert names_swapped == ['url', 'tags'], (
++        f"Swapped pos should give [url, tags], got: {names_swapped}"
++    )
++    assert names_swapped != names_normal, "Swapped pos should produce different order"
++
++    print(f"PASS test_two_filters_swapped_pos_swaps_order")
++    print(f"  Normal order: {names_normal}")
++    print(f"  Swapped pos order: {names_swapped}")
++
++
++if __name__ == '__main__':
++    print("=" * 70)
++    print("Running filter index assignment reproduction tests")
++    print("=" * 70)
++    print()
++
++    tests = [
++        test_correct_pos_order_preserved,
++        test_type_change_wrong_index_causes_reordering,
++        test_type_change_correct_index_retains_order,
++        test_new_filter_inflated_index_causes_wrong_order,
++        test_new_filter_position_based_index,
++        test_filter_groups_data_structure,
++        test_pos_string_sort_ordering,
++        test_active_filters_order_matches_pos,
++        test_filter_value_preserved_across_type_change,
++        test_single_filter_pos_irrelevant,
++        test_two_filters_swapped_pos_swaps_order,
++    ]
++
++    passed = 0
++    failed = 0
++    errors = []
++
++    for test in tests:
++        try:
++            test()
++            passed += 1
++        except AssertionError as e:
++            failed += 1
++            errors.append((test.__name__, str(e)))
++            print(f"FAIL {test.__name__}: {e}")
++        except Exception as e:
++            failed += 1
++            errors.append((test.__name__, f"ERROR: {e}"))
++            import traceback
++            traceback.print_exc()
++            print(f"ERROR {test.__name__}: {e}")
++
++    print()
++    print("=" * 70)
++    print(f"Results: {passed} passed, {failed} failed")
++
++    if errors:
++        print()
++        print("Failed tests:")
++        for name, msg in errors:
++            print(f"  {name}: {msg}")
++        print()
++        print("NOTE: Tests 2, 4, 7, 8 (and sub-cases of 8, 9) are expected to")
++        print("PASS before the fix is applied (they demonstrate the buggy behavior).")
++        print("Tests 1, 3, 5, 6, 8c, 9, 10, 11 verify the correct behavior.")
++        sys.exit(1)
++
++    print()
++    print("All tests passed.")
++    print()
++    print("IMPORTANT: Some tests verify the BUGGY behavior (demonstrating the issue).")
++    print("After the fix is applied:")
++    print("  - test_type_change_wrong_index_causes_reordering should FAIL")
++    print("    (because the bug will no longer be present)")
++    print("  - All other tests should continue to PASS")
++    print()
++    print("The fix is in filters.js:")
++    print("  1. changeOperation: retain old input's name (index) instead of calling makeName")
++    print("  2. addFilter (new): use row count (position) for index, not lastCount")
+
+

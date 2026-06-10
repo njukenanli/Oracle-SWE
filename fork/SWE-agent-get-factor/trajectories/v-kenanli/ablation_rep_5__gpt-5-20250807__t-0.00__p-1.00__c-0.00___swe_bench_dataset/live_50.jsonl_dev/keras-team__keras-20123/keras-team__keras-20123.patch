@@ -1,0 +1,405 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..c59d56d46
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,396 @@
++import os
++import sys
++import json
++import subprocess
++import shlex
++import time
++import importlib.util
++import re
++
++"""
++Reproduction script for Keras issue:
++Using steps_per_epoch with PyDataset and use_multiprocessing=True runs out of data / skips epochs.
++
++This script runs multiple test cases in subprocesses to isolate Keras backend selection
++and multiprocessing behavior. It asserts the correct behavior (no warnings/errors, all
++epochs completed with exactly steps_per_epoch batches). With Keras==3.4.1, the tests that
++use use_multiprocessing=True will fail, revealing the bug. Once fixed, all tests should pass.
++
++Run: cd /testbed && python reproduction.py
++"""
++
++
++def is_module_available(name: str) -> bool:
++    return importlib.util.find_spec(name) is not None
++
++
++def run_child(backend: str, finite: bool, workers: int, use_multiprocessing: bool,
++              epochs: int, steps_per_epoch: int, timeout: int = 60) -> dict:
++    """
++    Run the child training process with the given configuration and return a dict with results.
++    """
++    args = [
++        sys.executable,
++        os.path.abspath(__file__),
++        "child",
++        backend,
++        str(int(finite)),
++        str(workers),
++        str(int(use_multiprocessing)),
++        str(epochs),
++        str(steps_per_epoch),
++    ]
++    env = os.environ.copy()
++    env["KERAS_BACKEND"] = backend
++    # Keep stdout small; but capture stderr to show warnings/errors
++    try:
++        proc = subprocess.run(
++            args,
++            capture_output=True,
++            text=True,
++            env=env,
++            timeout=timeout,
++        )
++    except subprocess.TimeoutExpired as e:
++        return {
++            "ok": False,
++            "error": f"TimeoutExpired: {e}",
++            "stderr": "",
++            "stdout": "",
++            "result": None,
++            "returncode": None,
++        }
++
++    stdout = proc.stdout
++    stderr = proc.stderr
++    returncode = proc.returncode
++
++    result_obj = None
++    # Child prints a single JSON line; try to parse last JSON line present
++    json_match = None
++    for line in stdout.strip().splitlines():
++        line = line.strip()
++        if not line:
++            continue
++        if line.startswith("{") and line.endswith("}"):
++            json_match = line
++    if json_match:
++        try:
++            result_obj = json.loads(json_match)
++        except Exception as e:
++            result_obj = {
++                "parse_error": repr(e),
++                "raw": json_match,
++            }
++
++    return {
++        "ok": returncode == 0,
++        "error": None if returncode == 0 else f"Child exited with code {returncode}",
++        "stderr": stderr,
++        "stdout": stdout,
++        "result": result_obj,
++        "returncode": returncode,
++    }
++
++
++def assert_no_warnings(stderr: str, warnings_list):
++    """Return list of matched problematic warnings in stderr or captured warnings."""
++    patterns = [
++        r"ran out of data",
++        r"End of sequence",
++        r"OUT_OF_RANGE",
++        r"os\.fork\(\) was called",
++        r"MaybeEncodingError",
++    ]
++    hits = []
++    for pat in patterns:
++        if re.search(pat, stderr, flags=re.IGNORECASE):
++            hits.append(pat)
++    if warnings_list:
++        for w in warnings_list:
++            for pat in patterns:
++                if re.search(pat, w, flags=re.IGNORECASE):
++                    hits.append(pat + " (pywarnings)")
++    return hits
++
++
++def format_case_name(backend, finite, workers, use_multiprocessing, epochs, steps):
++    return (
++        f"backend={backend}|finite={'yes' if finite else 'no'}|workers={workers}|"
++        f"multiproc={'on' if use_multiprocessing else 'off'}|epochs={epochs}|steps={steps}"
++    )
++
++
++def run_tests():
++    # Determine available backends to test
++    backends = []
++    if is_module_available("tensorflow"):
++        backends.append("tensorflow")
++    if is_module_available("torch"):
++        backends.append("torch")
++    # JAX can deadlock when using os.fork; include but limit runtime and mark as flaky
++    if is_module_available("jax"):
++        backends.append("jax")
++
++    if not backends:
++        print("SKIP: No Keras backend runtime found (tensorflow/torch/jax not installed).")
++        print("Please install at least one backend to run reproduction.")
++        return 0
++
++    # Test matrix
++    epochs = 4
++    steps = 5
++
++    cases = []
++    for be in backends:
++        # Control case: use_multiprocessing=False (should pass even before fix)
++        cases.append({
++            "backend": be, "finite": False, "workers": 1, "use_multiprocessing": False,
++            "epochs": epochs, "steps": steps,
++            "expect_pass": True,
++            "desc": "Control: infinite dataset without multiprocessing should run all steps",
++        })
++        # Bug case: infinite dataset with use_multiprocessing=True (expected to fail before fix)
++        cases.append({
++            "backend": be, "finite": False, "workers": 1, "use_multiprocessing": True,
++            "epochs": epochs, "steps": steps,
++            "expect_pass": True,  # We assert correct behavior; currently fails
++            "desc": "Infinite dataset with multiprocessing should not run out of data or skip epochs",
++        })
++        # Bug case: finite dataset large enough with use_multiprocessing=True (expected to fail before fix)
++        cases.append({
++            "backend": be, "finite": True, "workers": 1, "use_multiprocessing": True,
++            "epochs": epochs, "steps": steps,
++            "expect_pass": True,
++            "desc": "Finite dataset (large) with multiprocessing should not run out of data",
++        })
++        # Bug case with multiple workers
++        cases.append({
++            "backend": be, "finite": False, "workers": 2, "use_multiprocessing": True,
++            "epochs": epochs, "steps": steps,
++            "expect_pass": True,
++            "desc": "Infinite dataset with multiprocessing workers=2 should not skip epochs",
++        })
++
++    # JAX: Use fewer epochs to avoid deadlock risk and adapt expectations
++    for c in cases:
++        if c["backend"] == "jax":
++            c["epochs"] = 2
++            c["steps"] = 3
++
++    failures = []
++    results_log = []
++
++    for c in cases:
++        name = format_case_name(c["backend"], c["finite"], c["workers"], c["use_multiprocessing"], c["epochs"], c["steps"]) \
++               + " :: " + c["desc"]
++        res = run_child(
++            backend=c["backend"], finite=c["finite"], workers=c["workers"],
++            use_multiprocessing=c["use_multiprocessing"], epochs=c["epochs"], steps_per_epoch=c["steps"],
++            timeout=90,
++        )
++
++        # Prepare details for logging
++        result_obj = res.get("result") or {}
++        epoch_end = result_obj.get("epoch_end")
++        batch_counts = result_obj.get("batch_counts") or []
++        warnings_list = result_obj.get("warnings") or []
++        exception = result_obj.get("exception")
++        stderr = res.get("stderr") or ""
++        stderr_hits = assert_no_warnings(stderr, warnings_list)
++
++        # Expected correct behavior conditions:
++        # - No exception
++        # - No problematic warnings
++        # - epoch_end equals epochs
++        # - Every batch_counts entry equals steps
++        expect_epochs = c["epochs"]
++        expect_steps = c["steps"]
++
++        pass_conditions = (
++            exception is None and
++            len(stderr_hits) == 0 and
++            epoch_end == expect_epochs and
++            len(batch_counts) == expect_epochs and
++            all(bc == expect_steps for bc in batch_counts)
++        )
++
++        # We expect pass in all cases for correct behavior; buggy runs will fail these assertions
++        if not pass_conditions:
++            failures.append({
++                "name": name,
++                "epoch_end": epoch_end,
++                "batch_counts": batch_counts,
++                "warnings": warnings_list,
++                "stderr": stderr,
++                "exception": exception,
++                "stderr_hits": stderr_hits,
++                "child_returncode": res.get("returncode"),
++            })
++            status = "FAIL"
++        else:
++            status = "PASS"
++
++        # Summarize
++        results_log.append({
++            "name": name,
++            "status": status,
++            "epoch_end": epoch_end,
++            "batch_counts": batch_counts,
++            "stderr_hits": stderr_hits,
++            "exception": exception,
++        })
++
++    # Print human-readable summary
++    print("\n===== Reproduction Summary =====")
++    for item in results_log:
++        print(f"{item['status']}: {item['name']}")
++        print(f"  epoch_end={item['epoch_end']}, batch_counts={item['batch_counts']}")
++        if item['stderr_hits']:
++            print(f"  Detected warnings/errors: {item['stderr_hits']}")
++        if item['exception']:
++            print(f"  Exception: {item['exception']}")
++    print("===== End Summary =====\n")
++
++    if failures:
++        print("One or more test cases failed. This matches the current bug behavior.")
++        print("Detailed failure diagnostics follow:\n")
++        for f in failures:
++            print(f"--- {f['name']} ---")
++            print(f"epoch_end: {f['epoch_end']}")
++            print(f"batch_counts: {f['batch_counts']}")
++            print(f"exception: {f['exception']}")
++            print(f"stderr warning matches: {f['stderr_hits']}")
++            print("Captured stderr:")
++            print(f["stderr"])
++            print("-------------------------------\n")
++        # Non-zero exit to indicate reproduction failure before fix
++        return 1
++    else:
++        print("All test cases passed; issue appears fixed.")
++        return 0
++
++
++# Child process: runs the actual training with given backend and dataset configuration
++
++def child_main():
++    import warnings
++    import json as _json
++
++    # Args: child backend finite workers use_multiprocessing epochs steps
++    if len(sys.argv) < 8:
++        print(_json.dumps({"exception": "Invalid arguments"}))
++        return
++    backend = sys.argv[2]
++    finite = bool(int(sys.argv[3]))
++    workers = int(sys.argv[4])
++    use_multiprocessing = bool(int(sys.argv[5]))
++    epochs = int(sys.argv[6])
++    steps_per_epoch = int(sys.argv[7])
++
++    # Ensure backend is set before importing keras
++    os.environ["KERAS_BACKEND"] = backend
++    try:
++        import keras
++    except Exception as e:
++        print(_json.dumps({
++            "exception": repr(e),
++            "epoch_end": 0,
++            "batch_counts": [],
++            "warnings": [],
++        }))
++        return
++
++    class InfinitePyDataset(keras.utils.PyDataset):
++        def __getitem__(self, item):
++            x = keras.ops.zeros((1, 1))
++            y = keras.ops.zeros((1, 10))
++            return x, y
++
++        @property
++        def num_batches(self):
++            return None
++
++    class FinitePyDataset(keras.utils.PyDataset):
++        def __init__(self, size, **kwargs):
++            super().__init__(**kwargs)
++            self._size = size
++
++        def __getitem__(self, item):
++            x = keras.ops.zeros((1, 1))
++            y = keras.ops.zeros((1, 10))
++            return x, y
++
++        @property
++        def num_batches(self):
++            return self._size
++
++    class MyModel(keras.Model):
++        def __init__(self, **kwargs):
++            super().__init__(**kwargs)
++            self.dense = keras.layers.Dense(10)
++
++        def call(self, x):
++            return self.dense(x)
++
++        def compute_loss(self, x=None, y=None, y_pred=None, sample_weight=None, training=True):
++            return keras.ops.mean(keras.losses.mean_squared_error(y, y_pred))
++
++    # Build dataset according to flags
++    dataset_kwargs = {
++        "workers": workers,
++        "use_multiprocessing": use_multiprocessing,
++    }
++    if finite:
++        dataset = FinitePyDataset(size=100, **dataset_kwargs)  # big enough
++    else:
++        dataset = InfinitePyDataset(**dataset_kwargs)
++
++    # Build model
++    model = MyModel()
++    model.compile(optimizer="adam")
++
++    class CounterCallback(keras.callbacks.Callback):
++        def __init__(self):
++            super().__init__()
++            self.epoch_end = 0
++            self.batch_counts = []
++            self.current_batch_count = 0
++
++        def on_train_batch_end(self, batch, logs=None):
++            self.current_batch_count += 1
++
++        def on_epoch_end(self, epoch, logs=None):
++            self.epoch_end += 1
++            self.batch_counts.append(self.current_batch_count)
++            self.current_batch_count = 0
++
++    cb = CounterCallback()
++
++    warnings.simplefilter("always")
++    with warnings.catch_warnings(record=True) as wrec:
++        try:
++            model.fit(dataset, epochs=epochs, steps_per_epoch=steps_per_epoch, callbacks=[cb], verbose=0)
++            out = {
++                "epoch_end": cb.epoch_end,
++                "batch_counts": cb.batch_counts,
++                "warnings": [str(w.message) for w in wrec],
++                "exception": None,
++            }
++        except Exception as e:
++            out = {
++                "epoch_end": cb.epoch_end,
++                "batch_counts": cb.batch_counts,
++                "warnings": [str(w.message) for w in wrec],
++                "exception": repr(e),
++                "exc_type": type(e).__name__,
++            }
++        print(_json.dumps(out))
++
++
++if __name__ == "__main__":
++    if len(sys.argv) > 1 and sys.argv[1] == "child":
++        child_main()
++    else:
++        exit_code = run_tests()
++        sys.exit(exit_code)
+
+

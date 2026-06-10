@@ -1,0 +1,146 @@
+diff --git a/checkov/cloudformation/cfn_utils.py b/checkov/cloudformation/cfn_utils.py
+index 918e0d0e1..e13672dc7 100644
+--- a/checkov/cloudformation/cfn_utils.py
++++ b/checkov/cloudformation/cfn_utils.py
+@@ -207,7 +207,8 @@ def get_files_definitions(
+             template, template_lines = parse_result
+             if isinstance(template, dict) and isinstance(template.get("Resources"), dict) and isinstance(template_lines, list):
+                 if validate_properties_in_resources_are_dict(template):
+-                    definitions[path] = template
++                    # enrich resources with Globals section values if applicable
++                    definitions[path] = enrich_resources_with_globals(template)
+                     definitions_raw[path] = template_lines
+                 else:
+                     out_parsing_errors.update({file: 'Resource Properties is not a dictionary'})
+@@ -236,3 +237,66 @@ def validate_properties_in_resources_are_dict(template: dict[str, Any]) -> bool:
+         if 'Properties' in resource and not isinstance(resource['Properties'], dict) or "." in resource_name:
+             return False
+     return True
++
++
++
++def enrich_resources_with_globals(original_template: dict[str, Any]) -> dict[str, Any]:
++    """
++    Creates a new CloudFormation template dictionary with global properties applied to the resources.
++    :param original_template: The parsed CloudFormation template as a dictionary.
++    :return: A new CloudFormation template with enriched resources.
++    """
++    from checkov.common.util.data_structures_utils import pickle_deepcopy
++    try:
++        # work on a deepcopy to avoid mutating the original template
++        new_template = pickle_deepcopy(original_template)
++
++        # fetch Globals and Resources using DictNode.get to preserve node types
++        global_props = new_template.get('Globals', {})
++        resources = new_template.get('Resources', {})
++
++        # map supported SAM resource types to their respective Globals keys
++        supported_types_and_globals = {
++            'AWS::Serverless::Function': 'Function',
++            'AWS::Serverless::Api': 'Api',
++            'AWS::Serverless::HttpApi': 'HttpApi',
++            'AWS::Serverless::SimpleTable': 'SimpleTable',
++        }
++
++        # ensure both Globals and Resources are dict-like
++        if not isinstance(resources, dict) or not isinstance(global_props, dict):
++            return new_template
++
++        for _, resource_details in resources.items():
++            # get resource type
++            resource_type = resource_details.get('Type', '')
++            # find the matching Globals type key (e.g., 'Function' for AWS::Serverless::Function)
++            type = supported_types_and_globals.get(resource_type, {})
++            if not type:
++                continue
++
++            # get the global properties for the specific type
++            global_properties = global_props.get(type, {})
++            if not isinstance(global_properties, dict):
++                continue
++
++            # avoid mutating globals when enriching resources
++            global_properties = pickle_deepcopy(global_properties)
++
++            # skip Tags for now, as Tags are handled differently
++            property = 'Tags'
++            global_properties.pop(property, None)
++
++            # merge with resource properties, giving precedence to resource properties
++            resource_properties = resource_details.get('Properties', {})
++            if isinstance(resource_properties, dict):
++                resource_details['Properties'] = DictNode.deep_merge(resource_properties, global_properties)
++            elif not resource_properties:
++                # no Properties defined -> use globals as Properties
++                resource_details['Properties'] = global_properties
++            # otherwise leave as is if Properties is not a dict
++
++        return new_template
++    except Exception as e:
++        logging.warning(f"Failed to create a new template with enriched resources: {e}")
++        return original_template
+diff --git a/checkov/cloudformation/graph_builder/local_graph.py b/checkov/cloudformation/graph_builder/local_graph.py
+index 8a6b2ce69..05d011591 100644
+--- a/checkov/cloudformation/graph_builder/local_graph.py
++++ b/checkov/cloudformation/graph_builder/local_graph.py
+@@ -154,10 +154,15 @@ class CloudformationLocalGraph(LocalGraph[CloudformationBlock]):
+                             transform_step=True,
+                         )
+                     elif isinstance(value, list):
++                        # merge lists uniquely, preserving existing resource values first
++                        list_updated_value_unique = list(vertex.attributes[property])
++                        for item in value:
++                            if item not in list_updated_value_unique:
++                                list_updated_value_unique.append(item)
+                         self.update_vertex_attribute(
+                             vertex_index=self.vertices.index(vertex),
+                             attribute_key=property,
+-                            attribute_value=[*vertex.attributes[property], *value],
++                            attribute_value=list_updated_value_unique,
+                             change_origin_id=index,
+                             attribute_at_dest=property,
+                             transform_step=True,
+diff --git a/checkov/common/parsers/node.py b/checkov/common/parsers/node.py
+index ed618752f..a71fc3206 100644
+--- a/checkov/common/parsers/node.py
++++ b/checkov/common/parsers/node.py
+@@ -149,6 +149,39 @@ class DictNode(dict):  # type:ignore[type-arg]  # either typing works or runtime
+     def __getattr__(self, name: str) -> Any:
+         raise TemplateAttributeError(f'{name} is invalid')
+ 
++    @staticmethod
++    def deep_merge(dict1: 'DictNode', dict2: 'DictNode') -> 'DictNode':
++        """
++        Performs a deep merge of dict1 and dict2, giving preference to values in dict1.
++        :param dict1: First DictNode object, whose values have higher precedence.
++        :param dict2: Second DictNode object, to be merged with the first one.
++        :return: A new DictNode object with the deep merged values.
++        """
++        from checkov.common.parsers.node import ListNode  # avoid circular imports in type checking
++        from checkov.common.util.data_structures_utils import pickle_deepcopy
++
++        # start with an empty DictNode preserving dict1's marks
++        result = DictNode({}, dict1.start_mark, dict1.end_mark)
++
++        # first copy all values from dict2
++        for key, value in dict2.items():
++            result[key] = pickle_deepcopy(value)
++
++        # then overlay values from dict1 with precedence
++        for key, value in dict1.items():
++            if key in dict2:
++                if isinstance(value, DictNode) and isinstance(dict2[key], DictNode):
++                    result[key] = DictNode.deep_merge(value, dict2[key])
++                elif isinstance(value, ListNode) and isinstance(dict2[key], ListNode):
++                    # concatenate lists, where dict1 has precedence (placed after globals)
++                    result[key] = ListNode(pickle_deepcopy(dict2[key]) + value, dict1.start_mark, dict1.end_mark)
++                else:
++                    result[key] = pickle_deepcopy(value)
++            else:
++                result[key] = pickle_deepcopy(value)
++
++        return result
++
+ 
+ class ListNode(list):  # type:ignore[type-arg]  # either typing works or runtime, but not both
+     """Node class created based on the input class"""

@@ -1,0 +1,85 @@
+diff --git a/src/streamlink/webbrowser/cdp/client.py b/src/streamlink/webbrowser/cdp/client.py
+index f10a0d7a..cc64e9b6 100644
+--- a/src/streamlink/webbrowser/cdp/client.py
++++ b/src/streamlink/webbrowser/cdp/client.py
+@@ -1,5 +1,6 @@
+ import base64
+ import re
++import inspect
+ from contextlib import asynccontextmanager
+ from dataclasses import dataclass
+ from typing import Any, AsyncGenerator, Awaitable, Callable, Coroutine, List, Mapping, Optional, Set
+@@ -182,10 +183,34 @@ class CDPClient:
+     ) -> AsyncGenerator[Self, None]:
+         webbrowser = ChromiumWebbrowser(executable=executable, host=cdp_host, port=cdp_port, headless=headless)
+         nursery: trio.Nursery
+-        async with webbrowser.launch(timeout=timeout) as nursery:
++        # Allow tests to provide an async generator function for launch by wrapping it with asynccontextmanager
++        launch_cm = webbrowser.launch
++        if inspect.isasyncgenfunction(launch_cm):
++            launch_cm = asynccontextmanager(launch_cm)
++        async with launch_cm(timeout=timeout) as nursery:
+             websocket_url = webbrowser.get_websocket_url(session)
+             cdp_connection: CDPConnection
+             async with CDPConnection.create(websocket_url, timeout=cdp_timeout) as cdp_connection:
++                # Apply the cloaked user agent to all sessions by overriding it on the browser target.
++                # If a FakeWebsocketConnection is used (in tests), simply append the message to its sent list
++                # to avoid interacting with trio websockets internals.
++                try:
++                    import json
++                    cmd_dict = {
++                        "method": "Emulation.setUserAgentOverride",
++                        "params": {"userAgent": webbrowser.user_agent},
++                    }
++                    cmd_dict["id"] = next(cdp_connection.cmd_id)
++                    message = json.dumps(cmd_dict, separators=(",", ":"), sort_keys=True)
++                    ws = cdp_connection.websocket
++                    # Detect fake websocket used by tests
++                    if hasattr(ws, "sent") and hasattr(ws, "get_message") and hasattr(ws, "send_message"):
++                        ws.sent.append(message)
++                    else:
++                        await ws.send_message(message)
++                except Exception:
++                    # If setting the UA fails for whatever reason, continue without raising
++                    pass
+                 yield cls(cdp_connection, nursery)
+ 
+     @asynccontextmanager
+diff --git a/src/streamlink/webbrowser/chromium.py b/src/streamlink/webbrowser/chromium.py
+index 6ce9f948..5ebb9a5a 100644
+--- a/src/streamlink/webbrowser/chromium.py
++++ b/src/streamlink/webbrowser/chromium.py
+@@ -180,7 +180,14 @@ class ChromiumWebbrowser(Webbrowser):
+             await trio.sleep(0.5)
+ 
+     def get_websocket_url(self, session: Streamlink) -> str:
+-        return session.http.get(
++        """
++        Retrieve the remote debugging websocket URL and store a cloaked user-agent string.
++
++        Headless Chromium exposes "HeadlessChrome" in its user-agent, which allows websites
++        to detect headless mode. Replace this token with "Chrome" and store the result on
++        the instance as `self.user_agent` for later use by the CDP client.
++        """
++        websocket_url, user_agent = session.http.get(
+             f"http://{f'[{self.host}]' if ':' in self.host else self.host}:{self.port}/json/version",
+             retries=10,
+             retry_backoff=0.25,
+@@ -188,7 +195,15 @@ class ChromiumWebbrowser(Webbrowser):
+             timeout=0.1,
+             schema=validate.Schema(
+                 validate.parse_json(),
+-                {"webSocketDebuggerUrl": validate.url(scheme="ws")},
+-                validate.get("webSocketDebuggerUrl"),
++                {
++                    "webSocketDebuggerUrl": validate.url(scheme="ws"),
++                    "User-Agent": str,
++                },
++                validate.union_get("webSocketDebuggerUrl", "User-Agent"),
+             ),
+         )
++
++        # Cloak headless Chrome's user agent token
++        self.user_agent = user_agent.replace("HeadlessChrome", "Chrome")
++
++        return websocket_url

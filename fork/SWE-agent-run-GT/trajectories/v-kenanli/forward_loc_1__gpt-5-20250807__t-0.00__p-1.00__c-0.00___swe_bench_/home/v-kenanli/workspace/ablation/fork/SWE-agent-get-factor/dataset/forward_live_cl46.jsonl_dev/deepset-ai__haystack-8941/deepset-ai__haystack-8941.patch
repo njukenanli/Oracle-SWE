@@ -1,0 +1,174 @@
+diff --git a/haystack/components/embedders/azure_document_embedder.py b/haystack/components/embedders/azure_document_embedder.py
+index 2223c82b..924d32c5 100644
+--- a/haystack/components/embedders/azure_document_embedder.py
++++ b/haystack/components/embedders/azure_document_embedder.py
+@@ -8,10 +8,13 @@ from typing import Any, Dict, List, Optional, Tuple
+ from openai.lib.azure import AzureOpenAI
+ from tqdm import tqdm
+ 
+-from haystack import Document, component, default_from_dict, default_to_dict
++from haystack import Document, component, default_from_dict, default_to_dict, logging
+ from haystack.utils import Secret, deserialize_secrets_inplace
+ 
+ 
++logger = logging.getLogger(__name__)
++
++
+ @component
+ class AzureOpenAIDocumentEmbedder:
+     """
+@@ -199,33 +202,57 @@ class AzureOpenAIDocumentEmbedder:
+             texts_to_embed.append(text_to_embed)
+         return texts_to_embed
+ 
+-    def _embed_batch(self, texts_to_embed: List[str], batch_size: int) -> Tuple[List[List[float]], Dict[str, Any]]:
++    def _embed_batch(self, texts_to_embed: List[str], batch_size: int) -> Tuple[List[Optional[List[float]]], Dict[str, Any]]:
+         """
+         Embed a list of texts in batches.
++
++        Gracefully handles errors when embedding batches by bisecting failing batches to
++        isolate problematic documents and embed as many as possible.
+         """
+ 
+-        all_embeddings: List[List[float]] = []
++        # Pre-allocate result list aligned with input order; None marks failed embeddings
++        all_embeddings: List[Optional[List[float]]] = [None] * len(texts_to_embed)
+         meta: Dict[str, Any] = {"model": "", "usage": {"prompt_tokens": 0, "total_tokens": 0}}
+-        for i in tqdm(range(0, len(texts_to_embed), batch_size), desc="Embedding Texts"):
+-            batch = texts_to_embed[i : i + batch_size]
+-            if self.dimensions is not None:
+-                response = self._client.embeddings.create(
+-                    model=self.azure_deployment, dimensions=self.dimensions, input=batch
+-                )
+-            else:
+-                response = self._client.embeddings.create(model=self.azure_deployment, input=batch)
+ 
+-            # Append embeddings to the list
+-            all_embeddings.extend(el.embedding for el in response.data)
+-
+-            # Update the meta information only once if it's empty
+-            if not meta["model"]:
+-                meta["model"] = response.model
+-                meta["usage"] = dict(response.usage)
+-            else:
+-                # Update the usage tokens
+-                meta["usage"]["prompt_tokens"] += response.usage.prompt_tokens
+-                meta["usage"]["total_tokens"] += response.usage.total_tokens
++        def embed_range(start: int, end: int) -> None:
++            """Attempt to embed texts_to_embed[start:end]; on failure, bisect to isolate errors."""
++            batch = texts_to_embed[start:end]
++            try:
++                if self.dimensions is not None:
++                    response = self._client.embeddings.create(
++                        model=self.azure_deployment, dimensions=self.dimensions, input=batch
++                    )
++                else:
++                    response = self._client.embeddings.create(model=self.azure_deployment, input=batch)
++
++                # Fill embeddings for this successful range
++                for offset, el in enumerate(response.data):
++                    all_embeddings[start + offset] = el.embedding
++
++                # Update meta information defensively
++                if not meta["model"] and getattr(response, "model", None):
++                    meta["model"] = response.model
++                # Safely read usage fields
++                usage_prompt = getattr(getattr(response, "usage", None), "prompt_tokens", 0)
++                usage_total = getattr(getattr(response, "usage", None), "total_tokens", 0)
++                meta["usage"]["prompt_tokens"] += usage_prompt
++                meta["usage"]["total_tokens"] += usage_total
++            except Exception as exc:  # Catch any error to prevent aborting the whole run
++                if end - start <= 1:
++                    # Log and skip the failing single document
++                    msg = "Failed embedding of document at index {idx} caused by {exc}"
++                    logger.exception(msg, idx=start, exc=exc)
++                    return
++                # Bisect the batch to embed as many as possible
++                mid = start + (end - start) // 2
++                embed_range(start, mid)
++                embed_range(mid, end)
++
++        # Iterate input in user-defined batch sizes, but handle failures within each batch via bisect
++        for i in tqdm(range(0, len(texts_to_embed), batch_size), disable=not self.progress_bar, desc="Embedding Texts"):
++            start = i
++            end = min(i + batch_size, len(texts_to_embed))
++            embed_range(start, end)
+ 
+         return all_embeddings, meta
+ 
+@@ -248,8 +275,12 @@ class AzureOpenAIDocumentEmbedder:
+         texts_to_embed = self._prepare_texts_to_embed(documents=documents)
+         embeddings, meta = self._embed_batch(texts_to_embed=texts_to_embed, batch_size=self.batch_size)
+ 
+-        # Assign the corresponding embeddings to each document
++        # Assign the corresponding embeddings to each document, skipping failures
+         for doc, emb in zip(documents, embeddings):
+-            doc.embedding = emb
++            if emb is not None:
++                doc.embedding = emb
++            else:
++                # Leave embedding as None if embedding failed for this doc
++                logger.warning("No embedding generated for document", extra={"doc_id": doc.id})
+ 
+         return {"documents": documents, "meta": meta}
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..57aff834
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,55 @@
++import os
++from haystack import Document
++from haystack.components.embedders import AzureOpenAIDocumentEmbedder
++
++# Create a fake Azure client to simulate BadRequestError when a long document is present
++class FakeEmbeddingsAPI:
++    def create(self, model=None, input=None, dimensions=None):
++        from openai import BadRequestError
++        # Simulate failure if any input contains the marker 'LONG'
++        if any("LONG" in text for text in input):
++            raise BadRequestError(message="Simulated model context length exceeded", response=None, body=None)
++        # Otherwise, return a fake successful response
++        class El:
++            def __init__(self, idx):
++                # Return a stable-sized embedding
++                self.embedding = [float(idx), 0.0, 1.0]
++        class Usage:
++            def __init__(self, n):
++                self.prompt_tokens = n
++                self.total_tokens = n
++        class Response:
++            def __init__(self, n):
++                self.data = [El(i) for i in range(n)]
++                self.model = model or "text-embedding-ada-002"
++                self.usage = Usage(n)
++        return Response(len(input))
++
++class FakeClient:
++    def __init__(self):
++        self.embeddings = FakeEmbeddingsAPI()
++
++
++def main():
++    os.environ.setdefault("AZURE_OPENAI_API_KEY", "fake-key")
++    # We need an endpoint even though we won't actually call it
++    endpoint = "https://example-resource.azure.openai.com/"
++    embedder = AzureOpenAIDocumentEmbedder(azure_endpoint=endpoint)
++    # Monkeypatch the client
++    embedder._client = FakeClient()
++
++    docs = [
++        Document(content="short doc"),
++        Document(content="this is a VERY LONG document that should trigger LONG error", meta={}),
++        Document(content="another short doc"),
++    ]
++
++    try:
++        result = embedder.run(docs)
++        print("Reproduction unexpectedly succeeded. Result:", result)
++    except Exception as e:
++        print("Reproduction failed as expected with exception:")
++        print(type(e).__name__, str(e))
++
++if __name__ == "__main__":
++    main()

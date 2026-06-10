@@ -1,0 +1,193 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..2f8e3ff67d
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,187 @@
++import unittest
++import pytz
++import types
++import datetime
++
++import django
++from django.conf import settings
++from django.utils import timezone
++
++# Configure Django settings for tests.
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        USE_TZ=True,
++        TIME_ZONE='Europe/Paris',  # tz1 (app/current timezone)
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++                # Simulate database timezone tz2: legacy DB storing naive datetimes in this local time.
++                'TIME_ZONE': 'Europe/Paris',
++            }
++        },
++        INSTALLED_APPS=(
++            # Minimal app to satisfy Django; models below use a manual app_label.
++            'django.contrib.contenttypes',
++        ),
++        SECRET_KEY='repro-secret',
++    )
++
++django.setup()
++
++
++class FakeFeatures:
++    # Simulate backends that do not support time zones natively.
++    supports_timezones = False
++
++
++class FakeConnection:
++    def __init__(self, db_tzname):
++        # db_tzname: TIME_ZONE set on the database connection (DATABASES[alias]['TIME_ZONE'])
++        self.settings_dict = {'TIME_ZONE': db_tzname}
++        self.features = FakeFeatures()
++
++    @property
++    def timezone(self):
++        # Mirror BaseDatabaseWrapper.timezone logic for non-TZ-aware backends.
++        if not settings.USE_TZ or self.features.supports_timezones:
++            return None
++        if self.settings_dict['TIME_ZONE'] is None:
++            return pytz.UTC
++        return pytz.timezone(self.settings_dict['TIME_ZONE'])
++
++    @property
++    def timezone_name(self):
++        # Mirror BaseDatabaseWrapper.timezone_name.
++        if not settings.USE_TZ:
++            return settings.TIME_ZONE
++        if self.settings_dict['TIME_ZONE'] is None:
++            return 'UTC'
++        return self.settings_dict['TIME_ZONE']
++
++
++class TimezoneAwareSQLGenerationTests(unittest.TestCase):
++    def setUp(self):
++        timezone.activate(settings.TIME_ZONE)
++
++    def tearDown(self):
++        timezone.deactivate()
++
++    def test_mysql_datetime_cast_date_converts_from_db_tz_to_current_tz(self):
++        # tz1: current/app timezone, tz2: database TIME_ZONE.
++        tz1 = 'UTC'
++        tz2 = 'Europe/Paris'
++        timezone.activate(tz1)
++        from django.db.backends.mysql.operations import DatabaseOperations as MySQLDatabaseOperations
++        conn = FakeConnection(db_tzname=tz2)
++        ops = MySQLDatabaseOperations(conn)
++        field_sql = 'my_table`.`my_datetime_field'
++        sql = ops.datetime_cast_date_sql(field_sql, tz1)
++        # EXPECTED (correct/fixed behavior): convert from DB tz (tz2) to current tz (tz1).
++        expected = "DATE(CONVERT_TZ(%s, '%s', '%s'))" % (field_sql, tz2, tz1)
++        # Current buggy behavior converts from 'UTC' instead of tz2.
++        self.assertEqual(
++            sql,
++            expected,
++            msg=(
++                'MySQL datetime_cast_date_sql should convert from DB TIME_ZONE to current tz.\n'
++                'Expected: %r\nGot:      %r\n(Note: Got likely contains from-UTC conversion, which is incorrect.)' % (expected, sql)
++            )
++        )
++
++    def test_mysql_datetime_cast_date_skips_convert_when_tz_equal(self):
++        # When tz1 == tz2, conversion is unnecessary and should be omitted to avoid
++        # requiring MySQL time zone tables.
++        tz1 = tz2 = 'Europe/Paris'
++        timezone.activate(tz1)
++        from django.db.backends.mysql.operations import DatabaseOperations as MySQLDatabaseOperations
++        conn = FakeConnection(db_tzname=tz2)
++        ops = MySQLDatabaseOperations(conn)
++        field_sql = 'my_table`.`my_datetime_field'
++        sql = ops.datetime_cast_date_sql(field_sql, tz1)
++        # EXPECTED (correct/fixed behavior): plain DATE(field) with no CONVERT_TZ.
++        self.assertNotIn(
++            'CONVERT_TZ', sql,
++            msg=(
++                'MySQL should not use CONVERT_TZ when DB TIME_ZONE equals current tz.\n'
++                'Got SQL: %r' % sql
++            )
++        )
++        self.assertEqual(sql, 'DATE(%s)' % field_sql)
++
++
++class SQLiteDateLookupTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        from django.db import connection
++        from django.db import models
++        timezone.activate('Europe/Paris')  # tz1
++        cls.tz = pytz.timezone('Europe/Paris')
++        # Define a minimal model with a DateTimeField.
++        class ReproModel(models.Model):
++            my_datetime_field = models.DateTimeField()
++            class Meta:
++                app_label = 'reproapp'
++        cls.ReproModel = ReproModel
++        # Create the table.
++        with connection.schema_editor() as se:
++            se.create_model(ReproModel)
++
++    @classmethod
++    def tearDownClass(cls):
++        from django.db import connection
++        with connection.schema_editor() as se:
++            se.delete_model(cls.ReproModel)
++        timezone.deactivate()
++
++    def setUp(self):
++        # Clear table between tests.
++        self.ReproModel.objects.all().delete()
++
++    def test_equality_without_date_lookup_matches(self):
++        # Store a datetime that is timezone-aware in tz1 (Europe/Paris).
++        dt = timezone.make_aware(datetime.datetime(2017, 7, 6, 23, 30), self.tz)
++        obj = self.ReproModel.objects.create(my_datetime_field=dt)
++        self.assertTrue(
++            self.ReproModel.objects.filter(my_datetime_field=dt).exists(),
++            'Direct equality on DateTimeField should match when DB stores naive values in DB TIME_ZONE.'
++        )
++
++    def test_date_lookup_with_same_tz_should_match(self):
++        # tz1 == tz2 == Europe/Paris
++        dt = timezone.make_aware(datetime.datetime(2017, 7, 6, 23, 30), self.tz)
++        self.ReproModel.objects.create(my_datetime_field=dt)
++        # Expect True, but current buggy behavior converts from UTC to tz1,
++        # which yields 2017-07-07 for the stored 2017-07-06 23:30 local time.
++        self.assertTrue(
++            self.ReproModel.objects.filter(my_datetime_field__date=dt.date()).exists(),
++            'Date lookup should match when app tz equals DB TIME_ZONE.'
++        )
++
++    def test_date_lookup_with_different_tz_should_convert_from_db_tz(self):
++        # Simulate app current tz being UTC while DB TIME_ZONE is Europe/Paris.
++        timezone.activate('UTC')
++        dt_paris = timezone.make_aware(datetime.datetime(2017, 7, 6, 1, 30), self.tz)
++        # This instant is 2017-07-05 23:30 in UTC.
++        self.ReproModel.objects.create(my_datetime_field=dt_paris)
++        expected_utc_date = dt_paris.astimezone(pytz.UTC).date()
++        # Expect True after fix: field is converted from DB tz (Europe/Paris) to UTC before DATE().
++        self.assertTrue(
++            self.ReproModel.objects.filter(my_datetime_field__date=expected_utc_date).exists(),
++            'Date lookup should convert from DB TIME_ZONE to current tz before truncation.'
++        )
++        # Restore tz1 for subsequent tests.
++        timezone.activate('Europe/Paris')
++
++
++if __name__ == '__main__':
++    # Run tests.
++    loader = unittest.TestLoader()
++    suite = unittest.TestSuite()
++    suite.addTests(loader.loadTestsFromTestCase(TimezoneAwareSQLGenerationTests))
++    suite.addTests(loader.loadTestsFromTestCase(SQLiteDateLookupTests))
++    runner = unittest.TextTestRunner(verbosity=2)
++    result = runner.run(suite)
++    if not result.wasSuccessful():
++        raise SystemExit(1)

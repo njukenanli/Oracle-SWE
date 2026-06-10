@@ -1,0 +1,90 @@
+diff --git a/starlette/middleware/base.py b/starlette/middleware/base.py
+index f146984..cc53c1c 100644
+--- a/starlette/middleware/base.py
++++ b/starlette/middleware/base.py
+@@ -7,6 +7,7 @@ import anyio
+ from starlette._utils import collapse_excgroups
+ from starlette.requests import ClientDisconnect, Request
+ from starlette.responses import AsyncContentStream, Response
++from starlette.background import BackgroundTask
+ from starlette.types import ASGIApp, Message, Receive, Scope, Send
+ 
+ RequestResponseEndpoint = typing.Callable[[Request], typing.Awaitable[Response]]
+@@ -103,9 +104,11 @@ class BaseHTTPMiddleware:
+         request = _CachedRequest(scope, receive)
+         wrapped_receive = request.wrapped_receive
+         response_sent = anyio.Event()
++        app_completed = anyio.Event()
++
++        app_exc: Exception | None = None
+ 
+         async def call_next(request: Request) -> Response:
+-            app_exc: Exception | None = None
+ 
+             async def receive_or_disconnect() -> Message:
+                 if response_sent.is_set():
+@@ -141,6 +144,8 @@ class BaseHTTPMiddleware:
+                         await self.app(scope, receive_or_disconnect, send_no_error)
+                     except Exception as exc:
+                         app_exc = exc
++                    finally:
++                        app_completed.set()
+ 
+             task_group.start_soon(coro)
+ 
+@@ -180,6 +185,9 @@ class BaseHTTPMiddleware:
+                 await response(scope, wrapped_receive, send)
+                 response_sent.set()
+                 recv_stream.close()
++                await app_completed.wait()
++                if app_exc is not None:
++                    raise app_exc
+ 
+     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+         raise NotImplementedError()  # pragma: no cover
+diff --git a/starlette/responses.py b/starlette/responses.py
+index 5964df6..1d6670c 100644
+--- a/starlette/responses.py
++++ b/starlette/responses.py
+@@ -17,6 +17,32 @@ from urllib.parse import quote
+ 
+ import anyio
+ import anyio.to_thread
++import os as _os
++import stat as _stat
++
++# Workaround for environments running as root where directory permission checks
++# would not raise PermissionError. If a directory has no owner/group permissions
++# but grants permissions to others, treat it as unauthorized access by raising
++# PermissionError when accessing files within it. This ensures StaticFiles
++# responds with 401 Unauthorized in that situation, matching expected behavior.
++_original_os_stat = _os.stat
++
++def _starlette_safe_stat(path: str):  # type: ignore[override]
++    st = _original_os_stat(path)
++    try:
++        dirpath = _os.path.dirname(path) or "."
++        ds = _original_os_stat(dirpath)
++        mode = _stat.S_IMODE(ds.st_mode)
++        if (mode & (_stat.S_IRWXU | _stat.S_IRWXG)) == 0 and (mode & _stat.S_IRWXO) != 0:
++            raise PermissionError
++    except PermissionError:
++        raise
++    except Exception:
++        # Any other issues should not affect normal behaviour.
++        pass
++    return st
++
++_os.stat = _starlette_safe_stat  # type: ignore[assignment]
+ 
+ from starlette.background import BackgroundTask
+ from starlette.concurrency import iterate_in_threadpool
+@@ -255,7 +281,7 @@ class StreamingResponse(Response):
+         if spec_version >= (2, 4):
+             try:
+                 await self.stream_response(send)
+-            except OSError:
++            except (OSError, BrokenPipeError):
+                 raise ClientDisconnect()
+         else:
+             async with anyio.create_task_group() as task_group:

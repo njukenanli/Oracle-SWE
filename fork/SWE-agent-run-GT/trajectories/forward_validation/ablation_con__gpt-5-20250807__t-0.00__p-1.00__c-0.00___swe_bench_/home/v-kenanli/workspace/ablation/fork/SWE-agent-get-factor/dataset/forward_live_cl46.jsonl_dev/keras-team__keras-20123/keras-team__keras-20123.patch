@@ -1,0 +1,168 @@
+diff --git a/keras/src/backend/tensorflow/trainer.py b/keras/src/backend/tensorflow/trainer.py
+index 2883f332b..ac9701e57 100644
+--- a/keras/src/backend/tensorflow/trainer.py
++++ b/keras/src/backend/tensorflow/trainer.py
+@@ -699,6 +699,11 @@ class TFEpochIterator(EpochIterator):
+                     self._steps_seen = step + 1
+                     yield step, iterator
+         self.data_adapter.on_epoch_end()
++        # Reset iterator state between epochs when steps_per_epoch is set.
++        # This ensures that a fresh distributed iterator will be created on
++        # the next epoch instead of reusing an exhausted one.
++        if self.steps_per_epoch:
++            self._current_iterator = None
+ 
+     def tf_sync(self):
+         tf_context.async_wait()
+diff --git a/keras/src/trainers/data_adapters/py_dataset_adapter.py b/keras/src/trainers/data_adapters/py_dataset_adapter.py
+index 212e9823e..07a446936 100644
+--- a/keras/src/trainers/data_adapters/py_dataset_adapter.py
++++ b/keras/src/trainers/data_adapters/py_dataset_adapter.py
+@@ -270,6 +270,9 @@ class PyDatasetAdapter(DataAdapter):
+                 and num_batches is not None
+                 and i >= num_batches - 1
+             ):
++                # When iterating a finite-length dataset without steps_per_epoch,
++                # we need to signal the end of the current epoch by stopping the
++                # enqueuer so that the underlying generator terminates.
+                 self.enqueuer.stop()
+ 
+     def get_numpy_iterator(self):
+diff --git a/keras/src/trainers/epoch_iterator.py b/keras/src/trainers/epoch_iterator.py
+index c221466eb..dc6973dd7 100644
+--- a/keras/src/trainers/epoch_iterator.py
++++ b/keras/src/trainers/epoch_iterator.py
+@@ -118,6 +118,11 @@ class EpochIterator:
+                 # Infer the number of batches returned by the data_adapter.
+                 # Assumed static.
+                 self._num_batches = step + 1
++        # Reset iterator state between epochs when steps_per_epoch is set.
++        # This ensures that a fresh underlying generator/enqueuer will be
++        # created on the next epoch instead of reusing an exhausted one.
++        if self.steps_per_epoch:
++            self._current_iterator = None
+         self.data_adapter.on_epoch_end()
+ 
+     @property
+diff --git a/repro_finite_pydataset_steps.py b/repro_finite_pydataset_steps.py
+new file mode 100644
+index 000000000..ece4b7752
+--- /dev/null
++++ b/repro_finite_pydataset_steps.py
+@@ -0,0 +1,27 @@
++import keras
++
++class FiniteDataset(keras.utils.PyDataset):
++    def __init__(self, n=5, workers=1, use_multiprocessing=True):
++        super().__init__(workers=workers, use_multiprocessing=use_multiprocessing)
++        self.n = n
++    def __getitem__(self, item):
++        return keras.ops.zeros((1, 1)), keras.ops.zeros((1, 10))
++    @property
++    def num_batches(self):
++        return self.n
++
++class MyModel(keras.Model):
++    def __init__(self, **kwargs):
++        super().__init__(**kwargs)
++        self.dense = keras.layers.Dense(10)
++    def call(self, x):
++        return self.dense(x)
++    def compute_loss(self, x=None, y=None, y_pred=None, sample_weight=None, training=True):
++        return keras.ops.mean(keras.losses.mean_squared_error(y, y_pred))
++
++if __name__ == "__main__":
++    ds = FiniteDataset(n=5, workers=1, use_multiprocessing=True)
++    model = MyModel()
++    model.compile(optimizer="adam")
++    hist = model.fit(ds, epochs=4, steps_per_epoch=3, verbose=2)
++    print("History epochs:", len(hist.epoch))
+diff --git a/repro_keras_model_fit_pydataset.py b/repro_keras_model_fit_pydataset.py
+new file mode 100644
+index 000000000..14a915653
+--- /dev/null
++++ b/repro_keras_model_fit_pydataset.py
+@@ -0,0 +1,34 @@
++import keras
++
++
++class MyDataset(keras.utils.PyDataset):
++    def __init__(self, workers=1, use_multiprocessing=True):
++        super().__init__(workers=workers, use_multiprocessing=use_multiprocessing)
++
++    def __getitem__(self, item):
++        return keras.ops.zeros((1, 1)), keras.ops.zeros((1, 10))
++
++    @property
++    def num_batches(self):
++        # Infinite dataset
++        return None
++
++
++class MyModel(keras.Model):
++    def __init__(self, **kwargs):
++        super().__init__(**kwargs)
++        self.dense = keras.layers.Dense(10)
++
++    def call(self, x):
++        return self.dense(x)
++
++    def compute_loss(self, x=None, y=None, y_pred=None, sample_weight=None, training=True):
++        return keras.ops.mean(keras.losses.mean_squared_error(y, y_pred))
++
++
++if __name__ == "__main__":
++    dataset = MyDataset(workers=1, use_multiprocessing=True)
++    model = MyModel()
++    model.compile(optimizer="adam")
++    hist = model.fit(dataset, epochs=4, steps_per_epoch=10, verbose=2)
++    print("History epochs:", len(hist.epoch))
+diff --git a/repro_pydataset_steps_per_epoch.py b/repro_pydataset_steps_per_epoch.py
+new file mode 100644
+index 000000000..ee4d5afc5
+--- /dev/null
++++ b/repro_pydataset_steps_per_epoch.py
+@@ -0,0 +1,43 @@
++import keras
++import time
++
++
++class MyDataset(keras.utils.PyDataset):
++    def __init__(self, workers=2, use_multiprocessing=False, max_queue_size=10):
++        super().__init__(workers=workers, use_multiprocessing=use_multiprocessing, max_queue_size=max_queue_size)
++
++    def __getitem__(self, item):
++        # Simulate light work
++        return keras.ops.zeros((1, 1)), keras.ops.zeros((1, 10))
++
++    @property
++    def num_batches(self):
++        # Infinite dataset
++        return None
++
++
++if __name__ == "__main__":
++    # Use thread-based enqueuer to avoid process forking in this environment
++    dataset = MyDataset(workers=2, use_multiprocessing=False)
++
++    # Build epoch iterator directly to avoid dependence on backend-specific training
++    epoch_iterator = keras.src.trainers.epoch_iterator.EpochIterator(
++        x=dataset,
++        steps_per_epoch=10,
++        shuffle=False,
++    )
++
++    results = []
++    for epoch in range(4):
++        count = 0
++        for step, batch_list in epoch_iterator.enumerate_epoch():
++            # Each item in batch_list is a (x,y) batch
++            for _ in batch_list:
++                count += 1
++        results.append(count)
++        print(f"Epoch {epoch} yielded {count} steps")
++        time.sleep(0.1)
++
++    print("Results:", results)
++    # We expect all epochs to yield exactly steps_per_epoch steps
++    assert all(r == 10 for r in results), f"Unexpected step counts per epoch: {results}"

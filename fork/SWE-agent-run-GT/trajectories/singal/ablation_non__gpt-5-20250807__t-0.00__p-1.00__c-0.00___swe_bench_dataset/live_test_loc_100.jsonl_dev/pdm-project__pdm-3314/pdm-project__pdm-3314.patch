@@ -1,0 +1,153 @@
+diff --git a/repro_save_compat.py b/repro_save_compat.py
+new file mode 100644
+index 00000000..3cb9e71a
+--- /dev/null
++++ b/repro_save_compat.py
+@@ -0,0 +1,22 @@
++import sys
++sys.path.insert(0, "/testbed/src")
++from pdm.models.requirements import NamedRequirement
++from pdm.models.candidates import Candidate
++from pdm.cli.utils import save_version_specifiers
++
++# Reproduce current behavior: compatible strategy uses ~=major.minor by default
++req = NamedRequirement(name="Django")
++resolved = {
++    req.identify(): [Candidate(req, name="Django", version="5.1.1")]
++}
++print("Before saving:", str(req.specifier))
++save_version_specifiers([req], resolved, save_strategy="compatible")
++print("After saving (compatible, default minor):", str(req.specifier))
++
++# With patch preference
++req2 = NamedRequirement(name="Django")
++resolved2 = {
++    req2.identify(): [Candidate(req2, name="Django", version="5.1.1")]
++}
++save_version_specifiers([req2], resolved2, save_strategy="compatible", compatibility_preference="patch")
++print("After saving (compatible, patch):", str(req2.specifier))
+diff --git a/repro_save_compat_patch.py b/repro_save_compat_patch.py
+new file mode 100644
+index 00000000..2b28746b
+--- /dev/null
++++ b/repro_save_compat_patch.py
+@@ -0,0 +1,19 @@
++from pdm.models.requirements import NamedRequirement
++from pdm.models.candidates import Candidate
++from pdm.cli.utils import save_version_specifiers
++
++# Reproduce desired behavior: per-dependency precision selection
++req_minor = NamedRequirement(name="django-allauth")
++req_patch = NamedRequirement(name="Django")
++resolved = {
++    req_minor.identify(): [Candidate(req_minor, name="django-allauth", version="66.0")],
++    req_patch.identify(): [Candidate(req_patch, name="Django", version="5.1.1")],
++}
++
++print("Before saving:", str(req_minor.specifier), str(req_patch.specifier))
++# Use compatible_decimals to specify precision per dependency
++save_version_specifiers([req_minor, req_patch], resolved, save_strategy="compatible", compatible_decimals={
++    req_minor.identify(): "minor",
++    req_patch.identify(): "patch",
++})
++print("After saving:", str(req_minor.specifier), str(req_patch.specifier))
+diff --git a/src/pdm/cli/commands/add.py b/src/pdm/cli/commands/add.py
+index 5f9ab858..ed9c840a 100644
+--- a/src/pdm/cli/commands/add.py
++++ b/src/pdm/cli/commands/add.py
+@@ -164,7 +164,12 @@ class Command(BaseCommand):
+ 
+         # Update dependency specifiers and lockfile hash.
+         deps_to_update = group_deps if unconstrained else requirements
+-        save_version_specifiers(deps_to_update, resolved, save)
++        save_version_specifiers(
++            deps_to_update,
++            resolved,
++            save,
++            compatibility_preference=project.config.get("strategy.save_compatibility", "minor"),
++        )
+         if not dry_run:
+             project.add_dependencies(deps_to_update, group, selection.dev or False)
+             project.write_lockfile(project.lockfile._data, False)
+diff --git a/src/pdm/cli/commands/update.py b/src/pdm/cli/commands/update.py
+index 8a407499..65675a38 100644
+--- a/src/pdm/cli/commands/update.py
++++ b/src/pdm/cli/commands/update.py
+@@ -189,7 +189,12 @@ class Command(BaseCommand):
+             )
+         if unconstrained:
+             # Need to update version constraints
+-            save_version_specifiers(chain.from_iterable(updated_deps.values()), resolved, save)
++            save_version_specifiers(
++                chain.from_iterable(updated_deps.values()),
++                resolved,
++                save,
++                compatibility_preference=project.config.get("strategy.save_compatibility", "minor"),
++            )
+         if not dry_run:
+             if unconstrained:
+                 for group, deps in updated_deps.items():
+diff --git a/src/pdm/cli/utils.py b/src/pdm/cli/utils.py
+index 928e4d23..6d65900d 100644
+--- a/src/pdm/cli/utils.py
++++ b/src/pdm/cli/utils.py
+@@ -543,12 +543,20 @@ def save_version_specifiers(
+     requirements: Iterable[Requirement],
+     resolved: dict[str, list[Candidate]],
+     save_strategy: str,
++    *,
++    compatible_decimals: dict[str, str] | None = None,
++    compatibility_preference: str = "minor",
+ ) -> None:
+     """Rewrite the version specifiers according to the resolved result and save strategy
+ 
+     :param requirements: the requirements to be updated
+     :param resolved: the resolved mapping
+     :param save_strategy: compatible/wildcard/exact
++    :param compatible_decimals: optional mapping from requirement identify() to desired
++        compatibility level: 'minor' or 'patch'. If provided, it has priority over
++        the global compatibility_preference.
++    :param compatibility_preference: global default compatibility level, either
++        'minor' (~=X.Y) or 'patch' (~=X.Y.Z). Defaults to 'minor'.
+     """
+ 
+     def candidate_version(candidates: list[Candidate]) -> Version | None:
+@@ -568,9 +576,21 @@ def save_version_specifiers(
+                 r.specifier = get_specifier(f"=={version}")
+             elif save_strategy == "compatible":
+                 if version.is_prerelease or version.is_devrelease:
++                    # For pre/dev releases, keep the explicit range to avoid unintended upgrades
+                     r.specifier = get_specifier(f">={version},<{version.major + 1}")
+                 else:
+-                    r.specifier = get_specifier(f"~={version.major}.{version.minor}")
++                    # Determine desired compatibility precision
++                    level = compatibility_preference or "minor"
++                    if compatible_decimals is not None:
++                        # Use per-requirement precision if available
++                        level = compatible_decimals.get(name, level)
++                    if level == "patch":
++                        r.specifier = get_specifier(
++                            f"~={version.major}.{version.minor}.{version.micro}"
++                        )
++                    else:
++                        # Default to minor precision
++                        r.specifier = get_specifier(f"~={version.major}.{version.minor}")
+             elif save_strategy == "minimum":
+                 r.specifier = get_specifier(f">={version}")
+ 
+diff --git a/src/pdm/project/config.py b/src/pdm/project/config.py
+index 31a79af7..dc4a10c4 100644
+--- a/src/pdm/project/config.py
++++ b/src/pdm/project/config.py
+@@ -151,6 +151,11 @@ class Config(MutableMapping[str, str]):
+         "global_project.user_site": ConfigItem("Whether to install to user site", False, True, coerce=ensure_boolean),
+         "strategy.update": ConfigItem("The default strategy for updating packages", "reuse", False),
+         "strategy.save": ConfigItem("Specify how to save versions when a package is added", "minimum", False),
++        "strategy.save_compatibility": ConfigItem(
++            "Specify the compatibility precision when saving compatible specifiers: 'minor' (~=X.Y) or 'patch' (~=X.Y.Z)",
++            "minor",
++            False,
++        ),
+         "strategy.resolve_max_rounds": ConfigItem(
+             "Specify the max rounds of resolution process",
+             10000,

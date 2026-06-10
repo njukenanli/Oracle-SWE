@@ -1,0 +1,167 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..38e00ff7
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,81 @@
++import torch
++import torch.nn as nn
++from torchtune.modules.transformer import TransformerDecoder, TransformerSelfAttentionLayer
++from torchtune.modules.loss.ce_chunked_output_loss import CEWithChunkedOutputLoss
++
++# Minimal components to build a small TransformerDecoder-like object
++class DummyOutput(nn.Module):
++    def __init__(self, out_dim):
++        super().__init__()
++        self.lin = nn.Linear(16, out_dim)
++    def forward(self, x):
++        return self.lin(x)
++
++class DummyLayer(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.mlp = nn.Linear(16,16)
++    def caches_are_setup(self):
++        return True
++    def caches_are_enabled(self):
++        return False
++    def setup_caches(self, *args, **kwargs):
++        pass
++    def reset_cache(self):
++        pass
++    def forward(self, x, **kwargs):
++        return x + self.mlp(x)
++
++# Build a small decoder
++embed_dim=16
++vocab=32
++layers=[DummyLayer() for _ in range(2)]
++tok_emb=nn.Embedding(100, embed_dim)
++# reuse norm as identity
++norm=nn.Identity()
++output=DummyOutput(vocab)
++
++model=TransformerDecoder(
++    tok_embeddings=tok_emb,
++    layers=layers,
++    max_seq_len=1024,
++    num_heads=2,
++    head_dim=8,
++    norm=norm,
++    output=output,
++)
++
++# Set chunking to 8
++model.set_num_output_chunks(8)
++
++loss_fn=CEWithChunkedOutputLoss(num_output_chunks=8)
++
++# Simulate a batch with sequence length 49, which previously caused empty last chunk
++batch_size=4
++seq_len=49
++x=torch.randn(batch_size, seq_len, embed_dim)
++# forward through layers to get last_hidden_state
++for layer in model.layers:
++    x=layer(x)
++# produce chunked logits
++logits_chunks=model.chunked_output(x)
++print('chunk lengths:', [c.size(1) for c in logits_chunks])
++
++# labels of shape (bsz, seq_len)
++labels=torch.randint(0, vocab, (batch_size, seq_len))
++
++# compute loss; this will internally chunk labels to match logits_chunks
++loss=loss_fn(logits_chunks, labels)
++print('loss ok, value:', float(loss))
++
++# Also test lengths that divide to empty last chunk pattern candidates
++for s in [7,14,21,28,35,42,49]:
++    x=torch.randn(batch_size, s, embed_dim)
++    for layer in model.layers:
++        x=layer(x)
++    chunks=model.chunked_output(x)
++    lens=[c.size(1) for c in chunks]
++    print('seq', s, 'chunk lens', lens)
++    labels=torch.randint(0, vocab, (batch_size, s))
++    loss=loss_fn(chunks, labels)
++    print('loss', float(loss))
+diff --git a/torchtune/modules/loss/ce_chunked_output_loss.py b/torchtune/modules/loss/ce_chunked_output_loss.py
+index 17a5eced..0179e072 100644
+--- a/torchtune/modules/loss/ce_chunked_output_loss.py
++++ b/torchtune/modules/loss/ce_chunked_output_loss.py
+@@ -66,9 +66,11 @@ class CEWithChunkedOutputLoss(torch.nn.Module):
+         total_elements = (labels != self.ignore_index).sum()
+ 
+         # chunk and reshape labels (bsz, num_tokens, vocab) -> [(bsz*num_tokens/num_chunks, vocab)]
++        # Chunk labels to match the number of output chunks produced by the model
++        n_chunks = len(logits)
+         labels = [
+             target_chunk.reshape(-1)
+-            for target_chunk in labels.chunk(self.num_output_chunks, dim=1)
++            for target_chunk in labels.chunk(n_chunks, dim=1)
+         ]
+         # reshape logits [(bsz, num_tokens/num_chunks, vocab)] -> [(bsz*num_tokens/num_chunks, vocab)]
+         logits = [
+diff --git a/torchtune/modules/loss/kd_losses.py b/torchtune/modules/loss/kd_losses.py
+index c3d48af8..a57a9413 100644
+--- a/torchtune/modules/loss/kd_losses.py
++++ b/torchtune/modules/loss/kd_losses.py
+@@ -234,9 +234,11 @@ class ForwardKLWithChunkedOutputLoss(torch.nn.Module):
+         ]
+         mask = (labels != self.ignore_index).int()
+         # chunk and reshape labels (bsz, num_tokens, vocab) -> [(bsz*num_tokens/num_chunks, vocab)]
++        # Match label chunking to the actual number of logit chunks
++        n_chunks = len(student_logits)
+         labels = [
+             target_chunk.reshape(-1)
+-            for target_chunk in labels.chunk(self.num_output_chunks, dim=1)
++            for target_chunk in labels.chunk(n_chunks, dim=1)
+         ]
+ 
+         total_fkl_loss = 0.0
+@@ -319,9 +321,11 @@ class ReverseKLWithChunkedOutputLoss(torch.nn.Module):
+         ]
+         mask = (labels != self.ignore_index).int()
+         # chunk and reshape labels (bsz, num_tokens, vocab) -> [(bsz*num_tokens/num_chunks, vocab)]
++        # Match label chunking to the actual number of logit chunks
++        n_chunks = len(student_logits)
+         labels = [
+             target_chunk.reshape(-1)
+-            for target_chunk in labels.chunk(self.num_output_chunks, dim=1)
++            for target_chunk in labels.chunk(n_chunks, dim=1)
+         ]
+ 
+         total_rkl_loss = 0.0
+@@ -411,9 +415,11 @@ class SymmetricKLWithChunkedOutputLoss(torch.nn.Module):
+         ]
+         mask = (labels != self.ignore_index).int()
+         # chunk and reshape labels (bsz, num_tokens, vocab) -> [(bsz*num_tokens/num_chunks, vocab)]
++        # Match label chunking to the actual number of logit chunks
++        n_chunks = len(student_logits)
+         labels = [
+             target_chunk.reshape(-1)
+-            for target_chunk in labels.chunk(self.num_output_chunks, dim=1)
++            for target_chunk in labels.chunk(n_chunks, dim=1)
+         ]
+ 
+         total_sym_kl_loss = 0.0
+diff --git a/torchtune/modules/transformer.py b/torchtune/modules/transformer.py
+index 81d841c6..543f2cac 100644
+--- a/torchtune/modules/transformer.py
++++ b/torchtune/modules/transformer.py
+@@ -495,10 +495,11 @@ class TransformerDecoder(nn.Module):
+             List[torch.Tensor]: List of num_chunks output tensors, each with shape
+                 [b, seq_len/num_chunks, out_dim], where out_dim is usually the vocab size.
+         """
+-        return [
+-            self.output(chunk)
+-            for chunk in last_hidden_state.chunk(self.num_output_chunks, dim=1)
+-        ]
++        # Split the sequence dimension into chunks, but avoid creating empty chunks
++        # which can happen when num_output_chunks > seq_len or due to uneven splits.
++        n_chunks = min(self.num_output_chunks, last_hidden_state.size(1))
++        chunks = last_hidden_state.chunk(n_chunks, dim=1)
++        return [self.output(chunk) for chunk in chunks if chunk.size(1) > 0]
+ 
+     def _validate_inputs(
+         self,

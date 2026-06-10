@@ -1,0 +1,463 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..61ac15c7
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,454 @@
++"""
++Reproduction test for:
++  "Cannot package setuptools>=73.0.0 for universal builds for macOS"
++
++The bug:
++  setuptools>=73.0.0 started including `dist-info` directories for its vendored
++  packages inside the package directory itself.  One of those vendored copies
++  (``setuptools/_distutils/_vendor/packaging-24.0.dist-info/``) contains only
++  LICENSE files — it has **no WHEEL file**.
++
++  ``AppPackagesMergeMixin.find_binary_packages`` uses:
++      ``install_path.glob("**/*.dist-info")``
++  (a recursive glob) which picks up these nested/vendored dist-info folders.
++  When it then tries to open the ``WHEEL`` file inside each found dist-info
++  folder, it gets a ``FileNotFoundError`` because the vendored one has no WHEEL.
++
++The fix:
++  Change ``install_path.glob("**/*.dist-info")`` to ``install_path.glob("*.dist-info")``
++  so that only top-level dist-info folders (the real installed packages) are
++  inspected, and vendored / nested ones are completely ignored.
++
++How to run:
++  cd /testbed && python reproduction.py
++"""
++
++from __future__ import annotations
++
++import sys
++import tempfile
++from pathlib import Path
++from unittest import mock
++
++# ---------------------------------------------------------------------------
++# Bootstrap: make sure the testbed source and test utilities are importable
++# ---------------------------------------------------------------------------
++sys.path.insert(0, str(Path(__file__).parent / "src"))
++sys.path.insert(0, str(Path(__file__).parent / "tests"))
++
++from briefcase.commands.base import BaseCommand
++from briefcase.console import Console, Log
++from briefcase.integrations.subprocess import Subprocess
++from briefcase.platforms.macOS.app import macOSAppMixin, macOSCreateMixin
++from utils import DummyConsole, create_file, create_installed_package
++
++
++# ---------------------------------------------------------------------------
++# Minimal command object that exposes find_binary_packages
++# (mirrors tests/platforms/macOS/conftest.py :: DummyInstallCommand)
++# ---------------------------------------------------------------------------
++
++class DummyCommand(macOSAppMixin, macOSCreateMixin, BaseCommand):
++    command = "install"
++
++    def __init__(self, base_path, **kwargs):
++        kwargs.setdefault("logger", Log())
++        kwargs.setdefault("console", Console())
++        super().__init__(base_path=base_path / "base_path", **kwargs)
++        self.tools.input = DummyConsole()
++
++
++def make_command(tmp_path: Path) -> DummyCommand:
++    cmd = DummyCommand(base_path=tmp_path)
++    cmd.tools.subprocess = mock.MagicMock(spec_set=Subprocess)
++    return cmd
++
++
++# ===========================================================================
++# TEST 1 – the exact setuptools>=73.0.0 crash scenario
++# ===========================================================================
++# setuptools>=73.0.0 ships with:
++#
++#   site-packages/
++#     setuptools-73.0.1.dist-info/        <- top-level, HAS WHEEL
++#     setuptools/
++#       _distutils/
++#         _vendor/
++#           packaging-24.0.dist-info/     <- NESTED, only LICENSE files, NO WHEEL
++#       _vendor/
++#         packaging-24.1.dist-info/       <- nested, HAS WHEEL
++#
++# The recursive glob ("**/*.dist-info") finds the nested packaging-24.0.dist-info,
++# then crashes when trying to open its missing WHEEL file.
++#
++# This is the primary bug described in the issue.
++
++def test_nested_distinfo_without_wheel_crashes_find_binary_packages():
++    """
++    The recursive glob "**/*.dist-info" finds vendored dist-info dirs that have
++    no WHEEL file. Attempting to open that missing file raises FileNotFoundError.
++    This reproduces the crash introduced by setuptools>=73.0.0.
++    """
++    with tempfile.TemporaryDirectory() as tmp:
++        tmp_path = Path(tmp)
++        app_packages = tmp_path / "app-packages"
++        app_packages.mkdir()
++
++        cmd = make_command(tmp_path)
++
++        # Simulate the installed setuptools-73.0.1 package (top-level, has WHEEL)
++        create_installed_package(
++            app_packages,
++            "setuptools",
++            version="73.0.1",
++            tag="macOS_11_arm64",
++        )
++
++        # Simulate setuptools/_distutils/_vendor/packaging-24.0.dist-info/
++        # This folder exists in real setuptools>=73.0.0 but has no WHEEL file.
++        vendored_distinfo = (
++            app_packages
++            / "setuptools"
++            / "_distutils"
++            / "_vendor"
++            / "packaging-24.0.dist-info"
++        )
++        vendored_distinfo.mkdir(parents=True, exist_ok=True)
++        for license_file in ("LICENSE", "LICENSE.APACHE", "LICENSE.BSD"):
++            (vendored_distinfo / license_file).write_text(
++                f"License text for {license_file}", encoding="utf-8"
++            )
++        # Deliberately NO WHEEL file — this is what triggers the crash.
++
++        try:
++            result = cmd.find_binary_packages(
++                app_packages,
++                universal_suffix="_universal2",
++            )
++        except FileNotFoundError as exc:
++            print(
++                f"FAIL test_nested_distinfo_without_wheel_crashes_find_binary_packages: "
++                f"FileNotFoundError raised for vendored dist-info with no WHEEL: {exc}"
++            )
++            return False
++
++        # After the fix, only the real setuptools top-level entry is returned.
++        expected = {("setuptools", "73.0.1")}
++        if set(result) != expected:
++            print(
++                f"FAIL test_nested_distinfo_without_wheel_crashes_find_binary_packages: "
++                f"expected {expected}, got {set(result)}"
++            )
++            return False
++
++        print("PASS test_nested_distinfo_without_wheel_crashes_find_binary_packages")
++        return True
++
++
++# ===========================================================================
++# TEST 2 – incomplete dist-info nested inside *any* package (generic case)
++# ===========================================================================
++# Any package that vendors a sub-package and ships its dist-info without a WHEEL
++# should not crash find_binary_packages.
++
++def test_nested_incomplete_distinfo_in_any_package():
++    """
++    A binary package that vendors an incomplete dist-info (no WHEEL) somewhere
++    inside its directory tree must not crash find_binary_packages.
++    """
++    with tempfile.TemporaryDirectory() as tmp:
++        tmp_path = Path(tmp)
++        app_packages = tmp_path / "app-packages"
++        app_packages.mkdir()
++
++        cmd = make_command(tmp_path)
++
++        # A binary package that ships a vendored, incomplete .dist-info.
++        # Uses the extra_content parameter exactly as the upstream fix's test does.
++        create_installed_package(
++            app_packages,
++            "binary-package-2",
++            version="3.4.6",
++            tag="macOS_13_arm64",
++            extra_content=[
++                # Vendored, but incomplete .dist-info folder (mirrors PR #1970 test)
++                ("vendored/nested-incomplete.dist-info/LICENSE", "Nested License"),
++            ],
++        )
++
++        try:
++            result = cmd.find_binary_packages(
++                app_packages,
++                universal_suffix="_universal2",
++            )
++        except FileNotFoundError as exc:
++            print(
++                f"FAIL test_nested_incomplete_distinfo_in_any_package: "
++                f"FileNotFoundError raised: {exc}"
++            )
++            return False
++
++        expected = {("binary-package-2", "3.4.6")}
++        if set(result) != expected:
++            print(
++                f"FAIL test_nested_incomplete_distinfo_in_any_package: "
++                f"expected {expected}, got {set(result)}"
++            )
++            return False
++
++        print("PASS test_nested_incomplete_distinfo_in_any_package")
++        return True
++
++
++# ===========================================================================
++# TEST 3 – nested complete dist-info (with WHEEL) must still be ignored
++# ===========================================================================
++# Even when a vendored dist-info inside a package directory is complete
++# (has WHEEL, METADATA, etc.), it must NOT be counted as a top-level installed
++# package because it belongs to the containing package's wheel manifest.
++
++def test_nested_complete_distinfo_is_not_counted_as_installed_package():
++    """
++    A vendored dist-info that is complete (has WHEEL) but is nested inside
++    another package's directory must not be treated as a separate installed package.
++    This ensures that only real, top-level installs are inspected.
++    """
++    with tempfile.TemporaryDirectory() as tmp:
++        tmp_path = Path(tmp)
++        app_packages = tmp_path / "app-packages"
++        app_packages.mkdir()
++
++        cmd = make_command(tmp_path)
++
++        # One real top-level binary package
++        create_installed_package(
++            app_packages,
++            "real-binary",
++            version="1.0.0",
++            tag="macOS_11_arm64",
++        )
++
++        # A fully-populated but nested dist-info (complete with WHEEL)
++        # installed as a vendored sub-package inside real-binary.
++        # This is also found by "**/*.dist-info" — but it should be ignored.
++        create_installed_package(
++            app_packages / "real-binary" / "_vendor",
++            "vendored-binary",
++            version="2.0.0",
++            tag="macOS_11_arm64",
++        )
++
++        try:
++            result = cmd.find_binary_packages(
++                app_packages,
++                universal_suffix="_universal2",
++            )
++        except FileNotFoundError as exc:
++            print(
++                f"FAIL test_nested_complete_distinfo_is_not_counted_as_installed_package: "
++                f"FileNotFoundError: {exc}"
++            )
++            return False
++
++        # Only the real top-level binary should appear
++        expected = {("real-binary", "1.0.0")}
++        if set(result) != expected:
++            print(
++                f"FAIL test_nested_complete_distinfo_is_not_counted_as_installed_package: "
++                f"expected {expected}, got {set(result)}"
++            )
++            return False
++
++        print("PASS test_nested_complete_distinfo_is_not_counted_as_installed_package")
++        return True
++
++
++# ===========================================================================
++# TEST 4 – the full setuptools >=73.0.0 realistic scenario (multiple packages)
++# ===========================================================================
++# Mirrors the upstream test added in commit 9970f165 exactly, plus adds the
++# real-world setuptools structure.
++
++def test_full_realistic_setuptools_73_scenario():
++    """
++    Full realistic scenario: a mix of pure, universal, and binary packages is
++    installed alongside a setuptools>=73.0.0 build that has vendored dist-info
++    directories (some without WHEEL).  Only the non-universal, non-pure,
++    top-level binary packages should be returned.
++    """
++    with tempfile.TemporaryDirectory() as tmp:
++        tmp_path = Path(tmp)
++        app_packages = tmp_path / "app-packages"
++        app_packages.mkdir()
++
++        cmd = make_command(tmp_path)
++
++        # Pure packages (should NOT appear in results)
++        create_installed_package(app_packages, "pure-package1", version="1.2.3")
++        create_installed_package(app_packages, "pure-package2", version="1.2.4")
++
++        # Universal binary packages (should NOT appear when universal_suffix given)
++        create_installed_package(
++            app_packages, "universal-package-1", version="2.3.4",
++            tag="macOS_11_universal2",
++        )
++        create_installed_package(
++            app_packages, "universal-package-2", version="2.3.5",
++            tag="macOS_13_universal2",
++        )
++
++        # Arch-specific binary packages — SHOULD appear in results
++        create_installed_package(
++            app_packages, "binary-package-1", version="3.4.5",
++            tag="macOS_11_arm64",
++        )
++
++        # binary-package-2 ships with a vendored, incomplete .dist-info
++        # (no WHEEL file) — exactly like setuptools>=73.0.0.
++        create_installed_package(
++            app_packages,
++            "binary-package-2",
++            version="3.4.6",
++            tag="macOS_13_arm64",
++            extra_content=[
++                ("vendored/nested-incomplete.dist-info/LICENSE", "Nested License"),
++            ],
++        )
++
++        # Also place a fully-populated nested dist-info inside binary-package-2
++        # (a complete sub-package install that should be ignored).
++        create_installed_package(
++            app_packages / "binary-package-2" / "vendored",
++            "nested-package",
++            version="9.9.9",
++            tag="macOS_13_arm64",
++        )
++
++        # Simulate setuptools itself: top-level dist-info (has WHEEL) plus
++        # a deeply nested vendored dist-info without WHEEL.
++        create_installed_package(
++            app_packages, "setuptools", version="73.0.1",
++            tag="macOS_11_arm64",
++        )
++        # The problematic packaging dist-info nested inside setuptools
++        nested_pkg_distinfo = (
++            app_packages
++            / "setuptools"
++            / "_distutils"
++            / "_vendor"
++            / "packaging-24.0.dist-info"
++        )
++        nested_pkg_distinfo.mkdir(parents=True, exist_ok=True)
++        (nested_pkg_distinfo / "LICENSE").write_text("License text", encoding="utf-8")
++        # No WHEEL — this is the crash trigger
++
++        try:
++            result = cmd.find_binary_packages(
++                app_packages,
++                universal_suffix="_universal2",
++            )
++        except FileNotFoundError as exc:
++            print(
++                f"FAIL test_full_realistic_setuptools_73_scenario: "
++                f"FileNotFoundError raised: {exc}"
++            )
++            return False
++
++        expected = {
++            ("binary-package-1", "3.4.5"),
++            ("binary-package-2", "3.4.6"),
++            ("setuptools", "73.0.1"),
++        }
++        if set(result) != expected:
++            print(
++                f"FAIL test_full_realistic_setuptools_73_scenario: "
++                f"expected {expected}, got {set(result)}"
++            )
++            return False
++
++        print("PASS test_full_realistic_setuptools_73_scenario")
++        return True
++
++
++# ===========================================================================
++# TEST 5 – normal operation still works (no regression check)
++# ===========================================================================
++
++def test_find_binary_packages_normal_case_no_regression():
++    """
++    Without any vendored/nested dist-info dirs, find_binary_packages must still
++    correctly identify binary packages and ignore pure / universal ones.
++    """
++    with tempfile.TemporaryDirectory() as tmp:
++        tmp_path = Path(tmp)
++        app_packages = tmp_path / "app-packages"
++        app_packages.mkdir()
++
++        cmd = make_command(tmp_path)
++
++        create_installed_package(app_packages, "pure-package1", version="1.2.3")
++        create_installed_package(app_packages, "pure-package2", version="1.2.4")
++        create_installed_package(
++            app_packages, "universal-package-1", version="2.3.4",
++            tag="macOS_11_universal2",
++        )
++        create_installed_package(
++            app_packages, "universal-package-2", version="2.3.5",
++            tag="macOS_13_universal2",
++        )
++        create_installed_package(
++            app_packages, "binary-package-1", version="3.4.5",
++            tag="macOS_11_arm64",
++        )
++        create_installed_package(
++            app_packages, "binary-package-2", version="3.4.6",
++            tag="macOS_13_arm64",
++        )
++
++        try:
++            result = cmd.find_binary_packages(
++                app_packages,
++                universal_suffix="_universal2",
++            )
++        except Exception as exc:
++            print(f"FAIL test_find_binary_packages_normal_case_no_regression: {exc}")
++            return False
++
++        expected = {("binary-package-1", "3.4.5"), ("binary-package-2", "3.4.6")}
++        if set(result) != expected:
++            print(
++                f"FAIL test_find_binary_packages_normal_case_no_regression: "
++                f"expected {expected}, got {set(result)}"
++            )
++            return False
++
++        print("PASS test_find_binary_packages_normal_case_no_regression")
++        return True
++
++
++# ===========================================================================
++# Main runner
++# ===========================================================================
++
++if __name__ == "__main__":
++    tests = [
++        test_nested_distinfo_without_wheel_crashes_find_binary_packages,
++        test_nested_incomplete_distinfo_in_any_package,
++        test_nested_complete_distinfo_is_not_counted_as_installed_package,
++        test_full_realistic_setuptools_73_scenario,
++        test_find_binary_packages_normal_case_no_regression,
++    ]
++
++    results = []
++    for test_fn in tests:
++        results.append(test_fn())
++
++    print()
++    passed = sum(1 for r in results if r)
++    total = len(results)
++    print(f"{passed}/{total} tests passed")
++
++    if not all(results):
++        sys.exit(1)
++    else:
++        sys.exit(0)
+
+

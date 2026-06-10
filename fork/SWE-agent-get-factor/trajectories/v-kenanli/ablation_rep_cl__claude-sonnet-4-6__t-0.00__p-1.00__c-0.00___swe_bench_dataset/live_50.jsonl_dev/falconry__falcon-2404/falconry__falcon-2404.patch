@@ -1,0 +1,376 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000..826556d
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,367 @@
++"""
++Reproduction tests for the PR: Update request-id recipe to use
++`contextvars` instead of `threading.local()`.
++
++The issue is that `request_id_context.py` currently uses `threading.local()`.
++In ASGI/async scenarios, multiple coroutines run in the same thread, so they
++all share the same `threading.local()` storage.  When two concurrent requests
++interleave, the request-id set by the first request's middleware can be
++overwritten by a second request before the first one's response phase, causing
++wrong IDs to be returned.
++
++`contextvars.ContextVar` is the correct solution because each async Task gets
++its own context copy.
++
++These tests:
++  1. Verify that `request_id_context.py` no longer uses `threading.local`.
++  2. Verify it uses `contextvars.ContextVar` instead.
++  3. Verify that concurrent ASGI requests each see their own request ID
++     (this was the core breakage with `threading.local()`).
++  4. Verify that basic WSGI usage still works after the change.
++  5. Verify that the X-Request-ID header in the response matches what was
++     stored in context during the resource handler.
++"""
++
++import asyncio
++import importlib.util
++import pathlib
++import sys
++import threading
++
++import falcon
++import falcon.asgi
++import falcon.testing
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++RECIPE_DIR = pathlib.Path(__file__).parent / 'examples' / 'recipes'
++
++
++def _fresh_load(filename, module_name, deps=None):
++    """Load a recipe module from disk under the given sys.modules name.
++
++    Re-loads the module every call so that separate test cases start fresh.
++    """
++    if deps:
++        for dep_name, dep_mod in deps.items():
++            sys.modules[dep_name] = dep_mod
++
++    path = RECIPE_DIR / filename
++    spec = importlib.util.spec_from_file_location(module_name, str(path))
++    assert spec is not None, f'Could not build spec for {path}'
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[module_name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++# ---------------------------------------------------------------------------
++# Test 1: request_id_context.py must NOT use threading.local any more.
++# ---------------------------------------------------------------------------
++
++def test_context_does_not_use_threading_local():
++    """The recipe must not import or use threading.local after the fix."""
++    ctx_mod = _fresh_load('request_id_context.py', '_ctx_no_thread_local')
++
++    # After the fix there should be no threading.local instance on the ctx obj.
++    ctx_obj = ctx_mod.ctx
++    assert not hasattr(ctx_obj, '_thread_local'), (
++        'request_id_context.py still uses threading.local; '
++        'it should be replaced with contextvars.ContextVar'
++    )
++
++    # The module itself should not import threading either.
++    assert 'threading' not in dir(ctx_mod), (
++        'request_id_context.py still imports the threading module'
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 2: request_id_context.py MUST use contextvars.ContextVar.
++# ---------------------------------------------------------------------------
++
++def test_context_uses_contextvars():
++    """The recipe must use contextvars after the fix."""
++    import contextvars
++
++    ctx_mod = _fresh_load('request_id_context.py', '_ctx_uses_contextvars')
++
++    # At least one ContextVar should be present at module level.
++    context_vars = [
++        v
++        for v in vars(ctx_mod).values()
++        if isinstance(v, contextvars.ContextVar)
++    ]
++    assert context_vars, (
++        'request_id_context.py does not define any contextvars.ContextVar; '
++        'please replace threading.local with a ContextVar'
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 3: basic read/write works via the ctx wrapper.
++# ---------------------------------------------------------------------------
++
++def test_context_read_write():
++    """The ctx wrapper must allow getting and setting request_id."""
++    ctx_mod = _fresh_load('request_id_context.py', '_ctx_rw')
++
++    # Default value should be None before any request.
++    assert ctx_mod.ctx.request_id is None
++
++    ctx_mod.ctx.request_id = 'test-id-123'
++    assert ctx_mod.ctx.request_id == 'test-id-123'
++
++
++# ---------------------------------------------------------------------------
++# Test 4: WSGI — basic request with the middleware.
++# ---------------------------------------------------------------------------
++
++def test_wsgi_request_id_middleware():
++    """WSGI requests must be assigned a unique UUID and returned as a header."""
++    ctx_mod = _fresh_load('request_id_context.py', '_ctx_wsgi')
++    mw_mod = _fresh_load(
++        'request_id_middleware.py', '_mw_wsgi', deps={'context': ctx_mod}
++    )
++
++    class SimpleResource:
++        def on_get(self, req, resp):
++            resp.media = {'request_id': ctx_mod.ctx.request_id}
++
++    app = falcon.App(middleware=[mw_mod.RequestIDMiddleware()])
++    app.add_route('/test', SimpleResource())
++
++    result = falcon.testing.simulate_get(app, '/test')
++
++    assert result.status_code == 200
++
++    rid_in_body = result.json['request_id']
++    rid_in_header = result.headers.get('X-Request-ID')
++
++    assert rid_in_body is not None, 'request_id should not be None inside a request'
++    assert rid_in_header is not None, 'X-Request-ID header must be present in response'
++    assert rid_in_body == rid_in_header, (
++        f'Body request_id ({rid_in_body}) must equal X-Request-ID header ({rid_in_header})'
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 5: WSGI — each request gets a DIFFERENT request ID.
++# ---------------------------------------------------------------------------
++
++def test_wsgi_unique_ids_per_request():
++    """Each WSGI request must receive its own unique request ID."""
++    ctx_mod = _fresh_load('request_id_context.py', '_ctx_wsgi_unique')
++    mw_mod = _fresh_load(
++        'request_id_middleware.py', '_mw_wsgi_unique', deps={'context': ctx_mod}
++    )
++
++    class SimpleResource:
++        def on_get(self, req, resp):
++            resp.media = {'request_id': ctx_mod.ctx.request_id}
++
++    app = falcon.App(middleware=[mw_mod.RequestIDMiddleware()])
++    app.add_route('/test', SimpleResource())
++
++    ids = [falcon.testing.simulate_get(app, '/test').json['request_id'] for _ in range(5)]
++
++    assert len(set(ids)) == 5, (
++        f'Expected 5 unique request IDs, but got: {ids}'
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 6 (KEY): ASGI — concurrent requests MUST NOT share request IDs.
++#
++# This is the main regression test.  With threading.local() all async
++# coroutines in the same thread share the same storage, so when a
++# coroutine yields (await asyncio.sleep) another coroutine's middleware
++# can overwrite the stored request_id.  contextvars gives every asyncio
++# Task its own isolated context copy.
++# ---------------------------------------------------------------------------
++
++def test_asgi_concurrent_requests_have_isolated_ids():
++    """Concurrent ASGI requests must each keep their own request ID."""
++
++    ctx_mod = _fresh_load('request_id_context.py', '_ctx_asgi_concurrent')
++
++    # Build an async version of the middleware that uses the (possibly fixed)
++    # context module.
++    class AsyncRequestIDMiddleware:
++        async def process_request(self, req, resp):
++            from uuid import uuid4
++            ctx_mod.ctx.request_id = str(uuid4())
++
++        async def process_response(self, req, resp, resource, req_succeeded):
++            rid = ctx_mod.ctx.request_id
++            if rid:
++                resp.set_header('X-Request-ID', rid)
++
++    class SlowResource:
++        """Yields control mid-request to expose concurrency bugs."""
++
++        async def on_get(self, req, resp):
++            initial_id = ctx_mod.ctx.request_id
++            # Yield the event loop so that other coroutines can run.
++            await asyncio.sleep(0)
++            final_id = ctx_mod.ctx.request_id
++            resp.media = {
++                'initial_id': initial_id,
++                'final_id': final_id,
++                'consistent': initial_id == final_id,
++            }
++
++    app = falcon.asgi.App(middleware=[AsyncRequestIDMiddleware()])
++    app.add_route('/test', SlowResource())
++
++    async def run():
++        async with falcon.testing.ASGIConductor(app) as conductor:
++            results = await asyncio.gather(
++                conductor.simulate_get('/test'),
++                conductor.simulate_get('/test'),
++                conductor.simulate_get('/test'),
++            )
++        return results
++
++    results = asyncio.run(run())
++
++    for i, result in enumerate(results):
++        data = result.json
++        assert data['consistent'], (
++            f'Request {i}: request_id changed mid-request from '
++            f'{data["initial_id"]} to {data["final_id"]}. '
++            'This indicates threading.local() is still being used; '
++            'use contextvars.ContextVar instead.'
++        )
++
++    # Also verify that all three requests got *different* IDs.
++    ids = [r.json['initial_id'] for r in results]
++    assert len(set(ids)) == 3, (
++        f'Expected 3 unique request IDs across concurrent ASGI requests, got: {ids}'
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 7: ASGI — X-Request-ID header matches the ctx value set in middleware.
++# ---------------------------------------------------------------------------
++
++def test_asgi_response_header_matches_context():
++    """The X-Request-ID response header must match what is in context."""
++
++    ctx_mod = _fresh_load('request_id_context.py', '_ctx_asgi_header')
++
++    class AsyncRequestIDMiddleware:
++        async def process_request(self, req, resp):
++            from uuid import uuid4
++            ctx_mod.ctx.request_id = str(uuid4())
++
++        async def process_response(self, req, resp, resource, req_succeeded):
++            rid = ctx_mod.ctx.request_id
++            if rid:
++                resp.set_header('X-Request-ID', rid)
++
++    class CapturingResource:
++        async def on_get(self, req, resp):
++            resp.media = {'request_id': ctx_mod.ctx.request_id}
++
++    app = falcon.asgi.App(middleware=[AsyncRequestIDMiddleware()])
++    app.add_route('/test', CapturingResource())
++
++    async def run():
++        async with falcon.testing.ASGIConductor(app) as conductor:
++            return await conductor.simulate_get('/test')
++
++    result = asyncio.run(run())
++
++    assert result.status_code == 200
++    rid_in_body = result.json['request_id']
++    rid_in_header = result.headers.get('X-Request-ID')
++
++    assert rid_in_body is not None
++    assert rid_in_header is not None
++    assert rid_in_body == rid_in_header, (
++        f'Body request_id ({rid_in_body}) != X-Request-ID header ({rid_in_header})'
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 8: contextvars isolate values between independent asyncio Tasks
++#         (unit-level check, no Falcon involved).
++# ---------------------------------------------------------------------------
++
++def test_contextvars_isolation_in_asyncio():
++    """contextvars.ContextVar must give each asyncio Task its own copy."""
++    import contextvars
++
++    ctx_mod = _fresh_load('request_id_context.py', '_ctx_task_isolation')
++
++    # Skip if still using threading.local (test 1/2 will already fail).
++    context_vars = [
++        v for v in vars(ctx_mod).values()
++        if isinstance(v, contextvars.ContextVar)
++    ]
++    if not context_vars:
++        # If no ContextVar found, we rely on the earlier tests to report the failure.
++        return
++
++    request_id_var = context_vars[0]
++
++    recorded = {}
++
++    async def worker(name, value):
++        request_id_var.set(value)
++        await asyncio.sleep(0)          # yield so other tasks can run
++        recorded[name] = request_id_var.get()
++
++    async def run():
++        await asyncio.gather(
++            worker('task-A', 'id-A'),
++            worker('task-B', 'id-B'),
++            worker('task-C', 'id-C'),
++        )
++
++    asyncio.run(run())
++
++    assert recorded.get('task-A') == 'id-A', (
++        f"task-A expected 'id-A', got {recorded.get('task-A')}"
++    )
++    assert recorded.get('task-B') == 'id-B', (
++        f"task-B expected 'id-B', got {recorded.get('task-B')}"
++    )
++    assert recorded.get('task-C') == 'id-C', (
++        f"task-C expected 'id-C', got {recorded.get('task-C')}"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Runner
++# ---------------------------------------------------------------------------
++
++if __name__ == '__main__':
++    tests = [
++        test_context_does_not_use_threading_local,
++        test_context_uses_contextvars,
++        test_context_read_write,
++        test_wsgi_request_id_middleware,
++        test_wsgi_unique_ids_per_request,
++        test_asgi_concurrent_requests_have_isolated_ids,
++        test_asgi_response_header_matches_context,
++        test_contextvars_isolation_in_asyncio,
++    ]
++
++    passed = 0
++    failed = 0
++    for test in tests:
++        try:
++            test()
++            print(f'PASS  {test.__name__}')
++            passed += 1
++        except Exception as exc:
++            print(f'FAIL  {test.__name__}: {exc}')
++            failed += 1
++
++    print(f'\n{passed} passed, {failed} failed')
++    if failed:
++        sys.exit(1)
+
+

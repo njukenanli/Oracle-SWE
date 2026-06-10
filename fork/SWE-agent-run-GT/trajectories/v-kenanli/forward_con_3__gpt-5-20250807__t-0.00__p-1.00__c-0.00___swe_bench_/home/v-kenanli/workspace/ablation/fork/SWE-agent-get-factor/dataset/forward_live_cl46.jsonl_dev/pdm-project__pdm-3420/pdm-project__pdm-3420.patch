@@ -1,0 +1,179 @@
+diff --git a/_tmp_proj/pdm.lock b/_tmp_proj/pdm.lock
+new file mode 100644
+index 00000000..af126ed7
+--- /dev/null
++++ b/_tmp_proj/pdm.lock
+@@ -0,0 +1,5 @@
++
++[metadata]
++lock_version = "4.5.0"
++groups = ["default"]
++content_hash = "sha256:dummy"
+diff --git a/_tmp_proj/pyproject.toml b/_tmp_proj/pyproject.toml
+new file mode 100644
+index 00000000..14e1e9b9
+--- /dev/null
++++ b/_tmp_proj/pyproject.toml
+@@ -0,0 +1,11 @@
++
++[project]
++name = "demo-proj"
++version = "0.0.0"
++dependencies = ["click"]
++
++[tool.pdm.dev-dependencies]
++# define some dev groups that are split into another lockfile normally
++lint = ["ruff"]
++doc = ["mkdocs"]
++test = ["pytest"]
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..cbc81a20
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,104 @@
++import os
++from pathlib import Path
++
++import sys
++sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
++from pdm.core import Core
++from pdm.cli.actions import do_sync
++from pdm.cli.filters import GroupSelection
++from pdm.cli.commands.remove import Command as RemoveCommand
++import pdm.cli.commands.remove as remove_mod
++from pdm.exceptions import PdmUsageError
++
++PYPROJECT = """
++[project]
++name = "demo-proj"
++version = "0.0.0"
++dependencies = ["click"]
++
++[tool.pdm.dev-dependencies]
++# define some dev groups that are split into another lockfile normally
++lint = ["ruff"]
++doc = ["mkdocs"]
++test = ["pytest"]
++"""
++
++LOCK = """
++[metadata]
++lock_version = "4.5.0"
++groups = ["default"]
++content_hash = "sha256:dummy"
++"""
++
++
++def setup_project(tmp: Path) -> Core:
++    tmp.mkdir(parents=True, exist_ok=True)
++    (tmp / "pyproject.toml").write_text(PYPROJECT)
++    (tmp / "pdm.lock").write_text(LOCK)
++    core = Core()
++    project = core.create_project(tmp)
++    # ensure lockfile points to our file
++    project.set_lockfile(tmp / "pdm.lock")
++    return core
++
++
++def main() -> None:
++    root = Path("./_tmp_proj").resolve()
++    if root.exists():
++        # clean up remnants from previous runs
++        for p in root.rglob("*"):
++            try:
++                if p.is_file():
++                    p.unlink()
++            except Exception:
++                pass
++        try:
++            for p in sorted(root.glob("**/*"), reverse=True):
++                if p.is_dir():
++                    p.rmdir()
++        except Exception:
++            pass
++        try:
++            root.rmdir()
++        except Exception:
++            pass
++    core = setup_project(root)
++    project = core.create_project(root)
++
++    print("-- Reproducing original failing behavior using do_sync with dev=None --")
++    sel = GroupSelection(project, default=False, groups=["default"])  # dev=None implies include dev groups
++    try:
++        do_sync(project, selection=sel, dry_run=True)
++        print("Unexpected: no error raised")
++    except Exception as e:
++        print("Caught expected error:", repr(e))
++
++    print("-- Now syncing only default group with dev=False (should pass) --")
++    sel2 = GroupSelection(project, default=False, groups=["default"], dev=False)
++    try:
++        print("Translated groups for sel2:", sel2._translated_groups)
++        print("Lockfile groups:", project.lockfile.groups)
++        sel2.validate()
++        do_sync(project, selection=sel2, dry_run=True)
++        print("Sync with dev=False passed without error")
++    except Exception as e:
++        print("Sync with dev=False raised:", repr(e))
++
++    print("\n-- Running remove command which should not error after fix --")
++    try:
++        print("remove module file:", remove_mod.__file__)
++        print("Remove sync selection dev pre-calc:", GroupSelection(project, default=False, groups=["default"]).dev)
++        RemoveCommand.do_remove(
++            project,
++            selection=GroupSelection(project, default=True, dev=False, groups=[]),
++            sync=True,
++            packages=["click"],
++            dry_run=True,
++        )
++        print("Remove completed without error")
++    except Exception as e:
++        print("Remove raised:", repr(e))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/pdm/cli/commands/remove.py b/src/pdm/cli/commands/remove.py
+index 8785a334..1e31f4c8 100644
+--- a/src/pdm/cli/commands/remove.py
++++ b/src/pdm/cli/commands/remove.py
+@@ -123,9 +123,16 @@ class Command(BaseCommand):
+             lock_groups = [g for g in lock_groups if g in project_groups]
+         do_lock(project, "reuse", dry_run=dry_run, tracked_names=tracked_names, hooks=hooks, groups=lock_groups)
+         if sync:
++            # When syncing after removal, ensure we don't implicitly include all dev groups
++            # if the target group is not a dev group. Otherwise, validation will fail when
++            # the lockfile doesn't contain dev groups (e.g., split prod/dev lockfiles).
++            dev_groups = set(project.pyproject.dev_dependencies)
++            is_dev_group = normalize_name(group) in dev_groups
++            sel = GroupSelection(project, default=False, groups=[group], dev=is_dev_group)
++
+             do_sync(
+                 project,
+-                selection=GroupSelection(project, default=False, groups=[group]),
++                selection=sel,
+                 clean=True,
+                 no_editable=no_editable,
+                 no_self=no_self,
+diff --git a/src/pdm/cli/filters.py b/src/pdm/cli/filters.py
+index 97893d1b..14487a08 100644
+--- a/src/pdm/cli/filters.py
++++ b/src/pdm/cli/filters.py
+@@ -77,7 +77,13 @@ class GroupSelection:
+                 return [g for g in locked_groups if g in project_groups]
+         default, dev, groups = self.default, self.dev, self.groups
+         if dev is None:  # --prod is not set, include dev-dependencies
+-            dev = True
++            # Only include dev dependencies by default when not targeting specific
++            # groups, or when ':all' is explicitly requested. If a specific group
++            # is selected, default to not including dev groups unless explicitly requested.
++            if groups and ":all" not in groups:
++                dev = False
++            else:
++                dev = True
+         project = self.project
+         optional_groups = {normalize_name(g) for g in project.pyproject.metadata.get("optional-dependencies", {})}
+         dev_groups = set(project.pyproject.dev_dependencies)

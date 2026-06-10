@@ -1,0 +1,151 @@
+diff --git a/falcon/routing/static.py b/falcon/routing/static.py
+index 57e327ab..6fd8ab3c 100644
+--- a/falcon/routing/static.py
++++ b/falcon/routing/static.py
+@@ -11,12 +11,29 @@ from typing import Any, ClassVar, IO, Optional, Pattern, Tuple, TYPE_CHECKING, U
+ import falcon
+ from falcon.typing import ReadableIO
+ 
++from datetime import datetime, timezone
+ if TYPE_CHECKING:
+     from falcon import asgi
+     from falcon import Request
+     from falcon import Response
+ 
+ 
++
++def _open_file(file_path: Union[str, Path]) -> Tuple[io.BufferedReader, os.stat_result]:
++    """Open a file and return its handle and stat info.
++
++    Args:
++        file_path (Union[str, Path]): Path to the file to open.
++
++    Returns:
++        (BufferedReader, stat_result): A tuple of the open buffered file handle
++        and the result of fstat() on that file handle.
++    """
++    fh = io.open(file_path, 'rb')
++    st = os.fstat(fh.fileno())
++    return fh, st
++
++
+ def _open_range(
+     file_path: Union[str, Path], req_range: Optional[Tuple[int, int]]
+ ) -> Tuple[ReadableIO, int, Optional[Tuple[int, int, int]]]:
+@@ -96,6 +113,66 @@ class _BoundedFile:
+         return data
+ 
+ 
++def _set_range(
++    fh: io.BufferedReader, st: os.stat_result, req_range: Optional[Tuple[int, int]]
++) -> Tuple[ReadableIO, int, Optional[Tuple[int, int, int]]]:
++    """Set up range for a pre-opened file handle.
++
++    Mirrors _open_range, but uses an existing file handle and stat result.
++    """
++    size = st.st_size
++    if req_range is None:
++        return fh, size, None
++
++    start, end = req_range
++    if size == 0:
++        # Ignore ranges for zero-byte files
++        return fh, 0, None
++
++    if start < 0 and end == -1:
++        # Only want the last N bytes
++        start = max(start, -size)
++        fh.seek(start, os.SEEK_END)
++        return _BoundedFile(fh, -start), -start, (size + start, size - 1, size)
++
++    if start >= size:
++        fh.close()
++        raise falcon.HTTPRangeNotSatisfiable(size)
++
++    fh.seek(start)
++    if end == -1:
++        length = size - start
++        return _BoundedFile(fh, length), length, (start, size - 1, size)
++
++    end = min(end, size - 1)
++    length = end - start + 1
++    return _BoundedFile(fh, length), length, (start, end, size)
++
++    """Wrap a file to only allow part of it to be read.
++
++    Args:
++        fh: The file object to wrap. Should be opened in binary mode,
++            and already seeked to an appropriate position. The object must
++            expose a ``.close()`` method.
++        length (int): Number of bytes that may be read.
++    """
++
++    def __init__(self, fh: IO[bytes], length: int) -> None:
++        self.fh = fh
++        self.close = fh.close
++        self.remaining = length
++
++    def read(self, size: Optional[int] = -1) -> bytes:
++        """Read the underlying file object, within the specified bounds."""
++        if size is None or size < 0:
++            size = self.remaining
++        else:
++            size = min(size, self.remaining)
++        data = self.fh.read(size)
++        self.remaining -= len(data)
++        return data
++
++
+ class StaticRoute:
+     """Represents a static route.
+ 
+@@ -218,23 +295,43 @@ class StaticRoute:
+             raise falcon.HTTPNotFound()
+ 
+         req_range = req.range
++
+         if req.range_unit != 'bytes':
+             req_range = None
++
++        # Open the file and obtain its stat info using the open file handle
+         try:
+-            stream, length, content_range = _open_range(file_path, req_range)
+-            resp.set_stream(stream, length)
++            fh, st = _open_file(file_path)
+         except IOError:
+             if self._fallback_filename is None:
+                 raise falcon.HTTPNotFound()
+             try:
+-                stream, length, content_range = _open_range(
+-                    self._fallback_filename, req_range
+-                )
+-                resp.set_stream(stream, length)
++                fh, st = _open_file(self._fallback_filename)
+                 file_path = self._fallback_filename
+             except IOError:
+                 raise falcon.HTTPNotFound()
+ 
++        # Compute Last-Modified from the open file's stat info and set the header
++        mtime = getattr(st, 'st_mtime', None)
++        if mtime is not None:
++            last_modified = datetime.fromtimestamp(st.st_mtime, timezone.utc)
++            # NOTE(vytas): HTTP-date has a second resolution; ignore subsecond precision
++            last_modified = last_modified.replace(microsecond=0)
++            resp.last_modified = last_modified
++
++            # If the client sent If-Modified-Since and the resource has not changed,
++            # return 304 Not Modified with an empty body.
++            ims = req.if_modified_since
++            if ims is not None and last_modified <= ims:
++                fh.close()
++                resp.status = falcon.HTTP_304
++                resp.set_header('Content-Length', '0')
++                return
++
++        # Serve the file, supporting Range requests.
++        stream, length, content_range = _set_range(fh, st, req_range)
++        resp.set_stream(stream, length)
++
+         suffix = os.path.splitext(file_path)[1]
+         resp.content_type = resp.options.static_media_types.get(
+             suffix, 'application/octet-stream'

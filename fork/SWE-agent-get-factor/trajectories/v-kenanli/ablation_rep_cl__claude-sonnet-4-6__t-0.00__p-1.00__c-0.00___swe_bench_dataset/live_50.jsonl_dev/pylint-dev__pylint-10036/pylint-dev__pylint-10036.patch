@@ -1,0 +1,415 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..38f16dc16
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,406 @@
++"""
++Reproduction test for the pyreverse source-root bug.
++
++Bug: When using `pyreverse --source-roots ./src mymodule` (where mymodule exists
++under ./src/ but not in the current directory), pyreverse raises:
++    ImportError: No module named mymodule
++
++Root cause: `discover_package_path` is called with a module name (not a file path).
++Since the module name does not exist as a directory on the filesystem, the function
++falls through to legacy __init__.py discovery and returns os.getcwd() instead of the
++source root. As a result, `augmented_sys_path` only adds cwd to sys.path, not the
++source root, so the module cannot be found.
++
++Expected: When --source-roots is given, pyreverse should add those paths to sys.path
++so that modules located under those roots can be found.
++
++Test structure mirrors the PR description:
++    ex/
++    └── src/
++        ├── __init__.py
++        └── mymodule/
++            ├── __init__.py
++            └── testmodule.py
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import shutil
++import tempfile
++import unittest
++from unittest import mock
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++def _make_src_layout(base_dir: str) -> None:
++    """Create the directory structure from the PR description inside base_dir."""
++    src = os.path.join(base_dir, "src")
++    mymodule = os.path.join(src, "mymodule")
++    os.makedirs(mymodule, exist_ok=True)
++    # src/__init__.py  (as in PR description)
++    open(os.path.join(src, "__init__.py"), "w").close()
++    # src/mymodule/__init__.py
++    open(os.path.join(mymodule, "__init__.py"), "w").close()
++    # src/mymodule/testmodule.py
++    with open(os.path.join(mymodule, "testmodule.py"), "w") as fh:
++        fh.write("class TestClass:\n    pass\n")
++
++
++def _make_src_layout_no_src_init(base_dir: str) -> None:
++    """Like _make_src_layout but WITHOUT src/__init__.py (namespace-package src)."""
++    src = os.path.join(base_dir, "src")
++    mymodule = os.path.join(src, "mymodule")
++    os.makedirs(mymodule, exist_ok=True)
++    # No src/__init__.py
++    open(os.path.join(mymodule, "__init__.py"), "w").close()
++    with open(os.path.join(mymodule, "testmodule.py"), "w") as fh:
++        fh.write("class MyClass:\n    pass\n")
++
++
++# ---------------------------------------------------------------------------
++# Test cases
++# ---------------------------------------------------------------------------
++
++class TestDiscoverPackagePath(unittest.TestCase):
++    """Tests for discover_package_path with source_roots."""
++
++    def setUp(self) -> None:
++        self.base_dir = tempfile.mkdtemp(prefix="pyreverse_repro_")
++        self.orig_dir = os.getcwd()
++
++    def tearDown(self) -> None:
++        os.chdir(self.orig_dir)
++        shutil.rmtree(self.base_dir, ignore_errors=True)
++
++    # ------------------------------------------------------------------
++    # Case 1 (main bug): module given by name, relative source root
++    # pyreverse --source-roots ./src mymodule
++    # ------------------------------------------------------------------
++    def test_module_name_with_relative_source_root(self) -> None:
++        """discover_package_path must return the source root when a bare module
++        name is passed together with a relative --source-roots entry."""
++        _make_src_layout(self.base_dir)
++        os.chdir(self.base_dir)
++
++        from pylint.lint.expand_modules import discover_package_path
++
++        expected = os.path.realpath(os.path.join(self.base_dir, "src"))
++        result = discover_package_path("mymodule", ["./src"])
++
++        self.assertEqual(
++            result,
++            expected,
++            msg=(
++                f"discover_package_path('mymodule', ['./src']) returned {result!r} "
++                f"but expected the source root {expected!r}. "
++                "This means source-roots are not being used when the module is "
++                "passed by name rather than by file path."
++            ),
++        )
++
++    # ------------------------------------------------------------------
++    # Case 2: module given by name, absolute source root
++    # ------------------------------------------------------------------
++    def test_module_name_with_absolute_source_root(self) -> None:
++        """discover_package_path must return the source root when a bare module
++        name is passed with an absolute source root path."""
++        _make_src_layout(self.base_dir)
++        os.chdir(self.base_dir)
++
++        from pylint.lint.expand_modules import discover_package_path
++
++        abs_src = os.path.join(self.base_dir, "src")
++        expected = os.path.realpath(abs_src)
++        result = discover_package_path("mymodule", [abs_src])
++
++        self.assertEqual(
++            result,
++            expected,
++            msg=(
++                f"discover_package_path('mymodule', ['{abs_src}']) returned "
++                f"{result!r} but expected {expected!r}."
++            ),
++        )
++
++    # ------------------------------------------------------------------
++    # Case 3: module given by name, no src/__init__.py (namespace pkg style)
++    # ------------------------------------------------------------------
++    def test_module_name_with_source_root_no_src_init(self) -> None:
++        """discover_package_path should still return the source root even when
++        src/ does not contain an __init__.py (namespace-package style)."""
++        _make_src_layout_no_src_init(self.base_dir)
++        os.chdir(self.base_dir)
++
++        from pylint.lint.expand_modules import discover_package_path
++
++        expected = os.path.realpath(os.path.join(self.base_dir, "src"))
++        result = discover_package_path("mymodule", ["./src"])
++
++        self.assertEqual(
++            result,
++            expected,
++            msg=(
++                f"discover_package_path('mymodule', ['./src']) returned {result!r} "
++                f"but expected {expected!r} (no src/__init__.py case)."
++            ),
++        )
++
++    # ------------------------------------------------------------------
++    # Case 4: single source root, module not yet on disk but source root
++    # is a sibling dir of cwd (i.e., cwd is the PARENT of the source root)
++    # ------------------------------------------------------------------
++    def test_module_name_source_root_is_child_of_cwd(self) -> None:
++        """discover_package_path must return the source root when the source
++        root is a child of cwd (e.g. cwd=/base, source_root=/base/src).
++
++        This is the core pattern in the PR description:
++          cwd = ex/
++          source_root = ex/src
++          module = mymodule  (exists under ex/src/mymodule)
++
++        After discover_package_path('mymodule', ['./src']):
++          dirname('mymodule') resolves to cwd (since 'mymodule' is not on disk)
++          commonpath(['cwd/src', 'cwd']) == 'cwd' == dirname  => source root returned
++        """
++        _make_src_layout(self.base_dir)
++        os.chdir(self.base_dir)
++
++        from pylint.lint.expand_modules import discover_package_path
++
++        # Only one source root – should return it
++        expected = os.path.realpath(os.path.join(self.base_dir, "src"))
++        result = discover_package_path("mymodule", ["./src"])
++
++        self.assertEqual(
++            result,
++            expected,
++            msg=(
++                f"discover_package_path('mymodule', ['./src']) returned {result!r} "
++                f"but expected {expected!r}. "
++                "The source root (child of cwd) was not returned for a bare "
++                "module name."
++            ),
++        )
++
++
++class TestPyreverseRunWithSourceRoot(unittest.TestCase):
++    """End-to-end tests: ensure pyreverse's Run.run() succeeds when
++    --source-roots points to the directory containing the module."""
++
++    def setUp(self) -> None:
++        self.base_dir = tempfile.mkdtemp(prefix="pyreverse_e2e_")
++        self.orig_dir = os.getcwd()
++        self.orig_sys_path = list(sys.path)
++
++    def tearDown(self) -> None:
++        os.chdir(self.orig_dir)
++        sys.path[:] = self.orig_sys_path
++        shutil.rmtree(self.base_dir, ignore_errors=True)
++
++    def _run_pyreverse(self, args: list[str]) -> int:
++        """Run pyreverse.Run.run() (not __init__) and return exit code."""
++        from pylint.pyreverse.main import Run
++
++        # Build a Run instance without triggering sys.exit
++        with mock.patch.object(Run, "__init__", lambda self_inner, _args: None):
++            runner = Run.__new__(Run)
++
++        # We need to parse options – the cleanest way is to let __init__ run
++        # but suppress the final sys.exit.  We do that by patching sys.exit
++        # before creating the Run instance properly.
++        with mock.patch("pylint.pyreverse.main.sys.exit"):
++            try:
++                with mock.patch("pylint.pyreverse.main.writer"):
++                    runner_obj = Run(args)  # type: ignore[arg-type]
++            except SystemExit:
++                pass
++
++        # Return the actual run() result without creating a new Run
++        return 0  # if we got here, no ImportError was raised
++
++    def test_run_with_relative_source_root(self) -> None:
++        """pyreverse Run.run() must NOT raise ImportError when the module is
++        found only under the specified --source-roots path (relative)."""
++        _make_src_layout(self.base_dir)
++        os.chdir(self.base_dir)
++
++        from pylint.pyreverse.main import Run
++        from pylint.pyreverse import inspector as insp
++
++        # Intercept project_from_files to detect ImportError
++        original = insp.project_from_files
++        caught_errors: list[Exception] = []
++
++        def _wrapper(files, *a, **kw):
++            try:
++                return original(files, *a, **kw)
++            except ImportError as exc:
++                caught_errors.append(exc)
++                raise
++
++        with mock.patch("pylint.pyreverse.main.project_from_files", side_effect=_wrapper):
++            with mock.patch("pylint.pyreverse.main.writer"):
++                try:
++                    Run(["-o", "html", "--source-roots", "./src", "mymodule"])
++                except SystemExit as se:
++                    # Exit code 0 means success; anything else is a failure
++                    if se.code != 0:
++                        self.fail(
++                            f"pyreverse exited with code {se.code}. "
++                            f"Caught errors: {caught_errors}"
++                        )
++                except ImportError as exc:
++                    self.fail(
++                        f"pyreverse raised ImportError: {exc}\n"
++                        "Source root was not added to sys.path."
++                    )
++
++        if caught_errors:
++            self.fail(
++                f"project_from_files raised ImportError: {caught_errors[0]}\n"
++                "The source root './src' was not used to find 'mymodule'."
++            )
++
++    def test_run_with_absolute_source_root(self) -> None:
++        """pyreverse Run.run() must NOT raise ImportError when an absolute
++        source root is provided."""
++        _make_src_layout(self.base_dir)
++        os.chdir(self.base_dir)
++
++        abs_src = os.path.join(self.base_dir, "src")
++
++        from pylint.pyreverse.main import Run
++        from pylint.pyreverse import inspector as insp
++
++        original = insp.project_from_files
++        caught_errors: list[Exception] = []
++
++        def _wrapper(files, *a, **kw):
++            try:
++                return original(files, *a, **kw)
++            except ImportError as exc:
++                caught_errors.append(exc)
++                raise
++
++        with mock.patch("pylint.pyreverse.main.project_from_files", side_effect=_wrapper):
++            with mock.patch("pylint.pyreverse.main.writer"):
++                try:
++                    Run(["-o", "html", "--source-roots", abs_src, "mymodule"])
++                except SystemExit as se:
++                    if se.code != 0:
++                        self.fail(
++                            f"pyreverse exited with code {se.code}. "
++                            f"Caught errors: {caught_errors}"
++                        )
++                except ImportError as exc:
++                    self.fail(
++                        f"pyreverse raised ImportError: {exc}\n"
++                        "Absolute source root was not added to sys.path."
++                    )
++
++        if caught_errors:
++            self.fail(
++                f"project_from_files raised ImportError: {caught_errors[0]}\n"
++                f"The source root '{abs_src}' was not used to find 'mymodule'."
++            )
++
++    def test_augmented_sys_path_includes_source_root(self) -> None:
++        """sys.path inside the augmented_sys_path context must include the
++        source root when it is explicitly provided via --source-roots."""
++        _make_src_layout(self.base_dir)
++        os.chdir(self.base_dir)
++
++        abs_src = os.path.realpath(os.path.join(self.base_dir, "src"))
++
++        from pylint.lint.expand_modules import discover_package_path
++        from pylint.lint.utils import augmented_sys_path
++
++        args = ["mymodule"]
++        source_roots = ["./src"]
++
++        extra_packages_paths = list(
++            {discover_package_path(arg, source_roots) for arg in args}
++        )
++
++        sys_path_during: list[str] = []
++        with augmented_sys_path(extra_packages_paths):
++            sys_path_during = list(sys.path)
++
++        self.assertIn(
++            abs_src,
++            sys_path_during,
++            msg=(
++                f"sys.path during execution {sys_path_during!r} does not contain "
++                f"the source root {abs_src!r}. "
++                "discover_package_path did not return the source root for a bare "
++                "module name, so the source root was never added to sys.path."
++            ),
++        )
++
++
++class TestDiscoverPackagePathRegression(unittest.TestCase):
++    """Regression tests: existing behaviour (module given as a file path) must
++    still work after the fix."""
++
++    def setUp(self) -> None:
++        self.base_dir = tempfile.mkdtemp(prefix="pyreverse_regression_")
++        self.orig_dir = os.getcwd()
++
++    def tearDown(self) -> None:
++        os.chdir(self.orig_dir)
++        shutil.rmtree(self.base_dir, ignore_errors=True)
++
++    def test_file_path_without_source_roots_still_works(self) -> None:
++        """When a module is given as a file path and no source roots are
++        provided, legacy behaviour (walk up past __init__.py) is unchanged."""
++        from pylint.lint.expand_modules import discover_package_path
++
++        pkg = os.path.join(self.base_dir, "mypackage")
++        os.makedirs(pkg, exist_ok=True)
++        open(os.path.join(pkg, "__init__.py"), "w").close()
++
++        os.chdir(self.base_dir)
++
++        # No source roots – should fall back to legacy discovery and return
++        # the parent of mypackage (i.e. base_dir).
++        result = discover_package_path(pkg, [])
++        expected = os.path.realpath(self.base_dir)
++        self.assertEqual(result, expected)
++
++    def test_file_path_with_matching_source_root(self) -> None:
++        """When a module is given as a file path that is inside the source root,
++        the source root should be returned."""
++        from pylint.lint.expand_modules import discover_package_path
++
++        src = os.path.join(self.base_dir, "src")
++        pkg = os.path.join(src, "mypkg")
++        os.makedirs(pkg, exist_ok=True)
++        open(os.path.join(pkg, "__init__.py"), "w").close()
++
++        os.chdir(self.base_dir)
++
++        # The file path IS inside ./src, so source root should be returned.
++        result = discover_package_path(pkg, ["./src"])
++        expected = os.path.realpath(src)
++        self.assertEqual(result, expected)
++
++
++if __name__ == "__main__":
++    # Run with verbose output so failures clearly show which case failed.
++    loader = unittest.TestLoader()
++    suite = unittest.TestSuite()
++    for cls in [
++        TestDiscoverPackagePath,
++        TestPyreverseRunWithSourceRoot,
++        TestDiscoverPackagePathRegression,
++    ]:
++        suite.addTests(loader.loadTestsFromTestCase(cls))
++
++    runner = unittest.TextTestRunner(verbosity=2)
++    result = runner.run(suite)
++    sys.exit(0 if result.wasSuccessful() else 1)
+
+

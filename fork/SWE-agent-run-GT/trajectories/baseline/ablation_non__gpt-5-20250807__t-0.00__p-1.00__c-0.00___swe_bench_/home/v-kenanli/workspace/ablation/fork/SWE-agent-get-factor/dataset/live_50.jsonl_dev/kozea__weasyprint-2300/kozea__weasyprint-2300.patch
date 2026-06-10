@@ -1,0 +1,171 @@
+diff --git a/datamodel_code_generator/model/pydantic_v2/base_model.py b/datamodel_code_generator/model/pydantic_v2/base_model.py
+index 9ab0018d..e7cc2753 100644
+--- a/datamodel_code_generator/model/pydantic_v2/base_model.py
++++ b/datamodel_code_generator/model/pydantic_v2/base_model.py
+@@ -150,6 +150,27 @@ class DataModelField(DataModelFieldV1):
+         self,
+         field_arguments: List[str],
+     ) -> List[str]:
++        # Inject inner Annotated for item constraints captured during collapse_root_models
++        extras = getattr(self, 'extras', {}) or {}
++        item_constraints = extras.get('__item_constraints')
++        if item_constraints and self.data_type.is_list and self.use_annotated:
++            try:
++                # Build Field(...) kwargs for inner annotated
++                # Translate keys as pydantic v2 expects pattern key
++                inner_kwargs = item_constraints.copy()
++                # Normalize possible alias
++                if 'regex' in inner_kwargs and 'pattern' not in inner_kwargs:
++                    inner_kwargs['pattern'] = inner_kwargs.pop('regex')
++                inner_field_args = ', '.join(
++                    f"{k}={repr(v)}" for k, v in inner_kwargs.items() if v is not None
++                )
++                inner = f"Annotated[{self.data_type.data_types[0].type_hint}, Field({inner_field_args})]"
++                # Replace outer list's inner type with annotated inner
++                # Handle both list[T] and Sequence[T] etc. We reconstruct using Python repr strings
++                if self.data_type.data_types:
++                    self.data_type.data_types[0].alias = inner
++            except Exception:
++                pass
+         return field_arguments
+ 
+ 
+diff --git a/datamodel_code_generator/parser/base.py b/datamodel_code_generator/parser/base.py
+index 874b64c0..e281f66e 100644
+--- a/datamodel_code_generator/parser/base.py
++++ b/datamodel_code_generator/parser/base.py
+@@ -1059,6 +1059,39 @@ class Parser(ABC):
+                                 root_type_field.constraints, model_field.constraints
+                             )
+ 
++
++                        # In pydantic v2, constraints like 'pattern' cannot be applied to list[str].
++                        # When collapsing root models, if the referenced root model defines string constraints
++                        # (e.g., pattern) for the list items, carry them as item-level constraints instead of
++                        # leaving them on the outer list field.
++                        if self.field_constraints and isinstance(
++                            root_type_field.constraints, ConstraintsBase
++                        ):
++
++                        
++
++                            item_constraints = root_type_field.constraints.dict(
++                                exclude_unset=True
++                            )
++                            if item_constraints:
++                                # Store under a private key to be handled later when rendering Annotated types
++                                model_field.extras['__item_constraints'] = item_constraints
++                                # Additionally, remove string-specific constraints from the outer constraints
++                                # to avoid applying them to list[...] as that is invalid in pydantic v2.
++                                for k in ('pattern', 'regex', 'minLength', 'maxLength'):
++                                    if k in model_field.constraints or k in (model_field.constraints or {}):
++                                        try:
++                                            # model_field.constraints can be a pydantic model; use dict update
++                                            current = model_field.constraints.dict(exclude_unset=True)
++                                            if k in current:
++                                                del current[k]
++                                                model_field.constraints = ConstraintsBase.parse_obj(current)
++                                        except Exception:
++                                            # Fallback if not pydantic model
++                                            if isinstance(model_field.constraints, dict) and k in model_field.constraints:
++                                                del model_field.constraints[k]
++
++
+                         data_type.parent.data_type = copied_data_type
+ 
+                     elif data_type.parent.is_list:
+@@ -1066,6 +1099,22 @@ class Parser(ABC):
+                             model_field.constraints = ConstraintsBase.merge_constraints(
+                                 root_type_field.constraints, model_field.constraints
+                             )
++                        # Prevent propagating string-specific item constraints to list level in v2
++                        try:
++                            current = model_field.constraints.dict(exclude_unset=True)
++                        except Exception:
++                            current = dict(model_field.constraints or {}) if isinstance(model_field.constraints, dict) else {}
++                        for k in ('pattern', 'regex', 'minLength', 'maxLength'):
++                            if k in current:
++                                del current[k]
++                        if current:
++                            try:
++                                model_field.constraints = ConstraintsBase.parse_obj(current)
++                            except Exception:
++                                model_field.constraints = current
++                        else:
++                            model_field.constraints = None
++
+                         if isinstance(
+                             root_type_field,
+                             pydantic_model.DataModelField,
+diff --git a/repro_collapse_pattern.py b/repro_collapse_pattern.py
+new file mode 100644
+index 00000000..149eb9e8
+--- /dev/null
++++ b/repro_collapse_pattern.py
+@@ -0,0 +1,66 @@
++from datamodel_code_generator import generate, InputFileType, DataModelType
++from pathlib import Path
++import tempfile, textwrap, sys, importlib.util
++
++schema = textwrap.dedent(
++    """
++openapi: 3.0.0
++info:
++  title: Test
++  version: 1.0.0
++paths: {}
++components:
++  schemas:
++    PetOpts:
++      type: string
++      pattern: ^[a-zA-Z]+$
++    Pet:
++      type: object
++      properties:
++        id:
++          type: integer
++          format: int64
++        name:
++          type: string
++        tag:
++          type: string
++        opts:
++          type: array
++          items:
++            $ref: "#/components/schemas/PetOpts"
++      required:
++        - id
++        - name
++        - opts
++"""
++)
++
++def main():
++    with tempfile.TemporaryDirectory() as tmpdir:
++        input_path = Path(tmpdir) / "api.yaml"
++        output_path = Path(tmpdir) / "model.py"
++        input_path.write_text(schema)
++        generate(
++            input_=input_path,
++            input_file_type=InputFileType.OpenAPI,
++            output=output_path,
++            target_python_version="3.8",
++            use_annotated=True,
++            field_constraints=True,
++            collapse_root_models=True,
++            use_standard_collections=True,
++            output_model_type=DataModelType.PydanticV2BaseModel,
++        )
++        print("Generated model.py:\n", output_path.read_text())
++
++        spec = importlib.util.spec_from_file_location("model", str(output_path))
++        mod = importlib.util.module_from_spec(spec)
++        try:
++            spec.loader.exec_module(mod)  # type: ignore
++            print("Import succeeded")
++        except Exception as e:
++            print("Import failed:", type(e).__name__, e)
++            raise
++
++if __name__ == "__main__":
++    main()

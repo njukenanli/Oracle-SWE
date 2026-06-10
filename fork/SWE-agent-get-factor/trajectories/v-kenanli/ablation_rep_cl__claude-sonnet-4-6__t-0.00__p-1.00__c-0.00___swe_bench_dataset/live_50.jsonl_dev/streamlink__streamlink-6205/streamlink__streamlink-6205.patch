@@ -1,0 +1,308 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..7f0d4701
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,299 @@
++"""
++Reproduction test for:
++  HTTP NO SSL Verify broken
++
++Issue description:
++  When using `--http-no-ssl-verify` (i.e. setting `http-ssl-verify=False`) together with
++  `--http-disable-dh` (which mounts a custom `SSLContextAdapter` / `TLSNoDHAdapter`),
++  making HTTPS requests fails with:
++    "Cannot set verify_mode to CERT_NONE when check_hostname is enabled."
++
++Root cause:
++  `SSLContextAdapter.get_ssl_context()` creates an `ssl.SSLContext` via
++  `create_urllib3_context()`.  That context has `check_hostname=True` and
++  `verify_mode=CERT_REQUIRED` by default.
++
++  When `verify=False` is passed to requests, it sets `cert_reqs="CERT_NONE"` on the
++  connection.  Later, inside `urllib3.connection._ssl_wrap_socket_and_match_hostname()`
++  the line:
++      context.verify_mode = resolve_cert_reqs(cert_reqs)   # → CERT_NONE
++  raises `ValueError: Cannot set verify_mode to CERT_NONE when check_hostname is enabled.`
++  because Python's ssl module does not allow `CERT_NONE` while `check_hostname` is True.
++
++Fix (expected):
++  `SSLContextAdapter.send()` should be overridden to update the custom `SSLContext`'s
++  `check_hostname` and `verify_mode` attributes *before* delegating to the parent
++  `HTTPAdapter.send()`, so that the context is already in the correct state when
++  urllib3 tries to use it.
++
++These tests:
++  - FAIL before the fix (ssl_context attributes are not updated by send())
++  - PASS  after the fix (ssl_context attributes are correctly updated by send())
++"""
++
++import ssl
++import sys
++from unittest.mock import patch
++
++import requests
++from requests.adapters import HTTPAdapter
++from urllib3.response import HTTPResponse
++
++from streamlink.session import Streamlink
++from streamlink.session.http import SSLContextAdapter, TLSNoDHAdapter
++
++
++# ---------------------------------------------------------------------------
++# helpers
++# ---------------------------------------------------------------------------
++
++def _build_fake_response(adapter):
++    """Return a fake requests.Response that does not touch the network."""
++    class _FakeHTTPResponse(HTTPResponse):
++        def stream(self, *_, **__):
++            yield b"mocked"
++
++    req = requests.PreparedRequest()
++    resp = _FakeHTTPResponse(status=200)
++    return adapter.build_response(req, resp)
++
++
++def _make_prepared_request(url="https://example.com/"):
++    req = requests.PreparedRequest()
++    req.method = "GET"
++    req.url = url
++    req.headers = {}
++    req.body = None
++    return req
++
++
++# ---------------------------------------------------------------------------
++# Test 1 – SSLContextAdapter: ssl_context must have check_hostname=False
++#           and verify_mode=CERT_NONE after send(verify=False)
++# ---------------------------------------------------------------------------
++def test_sslcontextadapter_verify_false_updates_ssl_context():
++    """
++    When SSLContextAdapter.send() is called with verify=False it must update
++    the custom SSLContext so that check_hostname=False and verify_mode=CERT_NONE.
++
++    Without the fix, check_hostname stays True and verify_mode stays CERT_REQUIRED,
++    which later causes urllib3 to raise:
++        ValueError: Cannot set verify_mode to CERT_NONE when check_hostname is enabled.
++    """
++    adapter = SSLContextAdapter()
++    ssl_context = adapter.poolmanager.connection_pool_kw["ssl_context"]
++
++    # Sanity: initial state has hostname checking enabled
++    assert ssl_context.check_hostname is True
++    assert ssl_context.verify_mode is ssl.CERT_REQUIRED
++
++    fake_response = _build_fake_response(adapter)
++    req = _make_prepared_request()
++
++    with patch.object(HTTPAdapter, "send", return_value=fake_response):
++        adapter.send(req, verify=False)
++
++    # After the fix these must have been updated:
++    assert ssl_context.check_hostname is False, (
++        "BUG: check_hostname was not set to False before urllib3 tries to use the "
++        "ssl_context with cert_reqs=CERT_NONE"
++    )
++    assert ssl_context.verify_mode is ssl.CERT_NONE, (
++        "BUG: verify_mode was not set to CERT_NONE; urllib3 will raise "
++        "'Cannot set verify_mode to CERT_NONE when check_hostname is enabled.'"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 2 – SSLContextAdapter: ssl_context must keep check_hostname=True
++#           and verify_mode=CERT_REQUIRED after send(verify=True)
++# ---------------------------------------------------------------------------
++def test_sslcontextadapter_verify_true_keeps_ssl_context():
++    """
++    When verify=True (the default), the ssl_context must retain the secure defaults.
++    """
++    adapter = SSLContextAdapter()
++    ssl_context = adapter.poolmanager.connection_pool_kw["ssl_context"]
++
++    fake_response = _build_fake_response(adapter)
++    req = _make_prepared_request()
++
++    with patch.object(HTTPAdapter, "send", return_value=fake_response):
++        adapter.send(req, verify=True)
++
++    assert ssl_context.check_hostname is True, (
++        "check_hostname should remain True when verify=True"
++    )
++    assert ssl_context.verify_mode is ssl.CERT_REQUIRED, (
++        "verify_mode should remain CERT_REQUIRED when verify=True"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 3 – TLSNoDHAdapter: same behaviour as SSLContextAdapter (verify=False)
++# ---------------------------------------------------------------------------
++def test_tlsnodhadapter_verify_false_updates_ssl_context():
++    """
++    TLSNoDHAdapter inherits from SSLContextAdapter; it must exhibit the same
++    fix: send(verify=False) must update the ssl_context.
++    """
++    adapter = TLSNoDHAdapter()
++    ssl_context = adapter.poolmanager.connection_pool_kw["ssl_context"]
++
++    assert ssl_context.check_hostname is True
++    assert ssl_context.verify_mode is ssl.CERT_REQUIRED
++
++    fake_response = _build_fake_response(adapter)
++    req = _make_prepared_request()
++
++    with patch.object(HTTPAdapter, "send", return_value=fake_response):
++        adapter.send(req, verify=False)
++
++    assert ssl_context.check_hostname is False, (
++        "BUG: TLSNoDHAdapter – check_hostname not set to False for verify=False"
++    )
++    assert ssl_context.verify_mode is ssl.CERT_NONE, (
++        "BUG: TLSNoDHAdapter – verify_mode not set to CERT_NONE for verify=False"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 4 – TLSNoDHAdapter: verify=True keeps secure defaults
++# ---------------------------------------------------------------------------
++def test_tlsnodhadapter_verify_true_keeps_ssl_context():
++    adapter = TLSNoDHAdapter()
++    ssl_context = adapter.poolmanager.connection_pool_kw["ssl_context"]
++
++    fake_response = _build_fake_response(adapter)
++    req = _make_prepared_request()
++
++    with patch.object(HTTPAdapter, "send", return_value=fake_response):
++        adapter.send(req, verify=True)
++
++    assert ssl_context.check_hostname is True
++    assert ssl_context.verify_mode is ssl.CERT_REQUIRED
++
++
++# ---------------------------------------------------------------------------
++# Test 5 – Session-level integration: http-disable-dh + http-ssl-verify=False
++#           must NOT raise "Cannot set verify_mode to CERT_NONE …"
++# ---------------------------------------------------------------------------
++def test_session_http_disable_dh_and_no_ssl_verify():
++    """
++    Reproduces the exact user-facing scenario from the bug report:
++    --http-disable-dh combined with --http-no-ssl-verify (http-ssl-verify=False).
++
++    Without the fix, session.http.get(...) raises:
++        PluginError: Unable to open URL: ... (Cannot set verify_mode to CERT_NONE
++        when check_hostname is enabled.)
++    """
++    session = Streamlink()
++    session.set_option("http-disable-dh", True)
++    session.set_option("http-ssl-verify", False)
++
++    adapter = session.http.adapters["https://"]
++    assert isinstance(adapter, TLSNoDHAdapter), "https:// adapter must be TLSNoDHAdapter"
++
++    ssl_context = adapter.poolmanager.connection_pool_kw["ssl_context"]
++
++    # Build a fake response for the mocked request
++    class _FakeHTTPResponse(HTTPResponse):
++        def stream(self, *_, **__):
++            yield b"mocked"
++
++    req = requests.PreparedRequest()
++    resp = _FakeHTTPResponse(status=200)
++    fake_response = adapter.build_response(req, resp)
++
++    # Patch the real network call; only the adapter-level send() logic is tested here.
++    with patch.object(HTTPAdapter, "send", return_value=fake_response):
++        try:
++            result = session.http.get("https://mocked/")
++        except Exception as exc:
++            raise AssertionError(
++                f"BUG: http-disable-dh + http-ssl-verify=False raised an unexpected error: {exc}"
++            ) from exc
++
++    assert result is not None
++
++    # After the fix the ssl_context must reflect the no-verify state:
++    assert ssl_context.check_hostname is False, (
++        "BUG: ssl_context.check_hostname should be False after a request with verify=False"
++    )
++    assert ssl_context.verify_mode is ssl.CERT_NONE, (
++        "BUG: ssl_context.verify_mode should be CERT_NONE after a request with verify=False"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 6 – Direct ssl_context incompatibility demonstration
++#           (core of the bug: check_hostname=True blocks CERT_NONE)
++# ---------------------------------------------------------------------------
++def test_ssl_context_check_hostname_blocks_cert_none():
++    """
++    Demonstrates the root cause: an SSLContext with check_hostname=True raises
++    ValueError when verify_mode is set to CERT_NONE.
++
++    This test captures the exact exception that users saw.
++    The fix ensures check_hostname is set to False *before* urllib3 tries to set
++    verify_mode = CERT_NONE.
++    """
++    try:
++        from urllib3.util import create_urllib3_context
++    except ImportError:
++        from urllib3.util.ssl_ import create_urllib3_context
++
++    ctx = create_urllib3_context()
++    assert ctx.check_hostname is True
++
++    # Without fix: urllib3 tries to do `ctx.verify_mode = CERT_NONE` while
++    # check_hostname is still True → raises ValueError.
++    try:
++        ctx.verify_mode = ssl.CERT_NONE
++        # If we get here, something changed in ssl/urllib3 behaviour.
++        # The bug would not manifest, but we still want the test to pass.
++    except (ValueError, ssl.SSLError) as exc:
++        assert "check_hostname" in str(exc), f"Unexpected error: {exc}"
++        # Verify that the fix (setting check_hostname=False first) resolves it:
++        ctx2 = create_urllib3_context()
++        ctx2.check_hostname = False           # fix: must come first
++        ctx2.verify_mode = ssl.CERT_NONE      # now this must not raise
++        assert ctx2.check_hostname is False
++        assert ctx2.verify_mode is ssl.CERT_NONE
++
++
++# ---------------------------------------------------------------------------
++# runner
++# ---------------------------------------------------------------------------
++if __name__ == "__main__":
++    tests = [
++        test_sslcontextadapter_verify_false_updates_ssl_context,
++        test_sslcontextadapter_verify_true_keeps_ssl_context,
++        test_tlsnodhadapter_verify_false_updates_ssl_context,
++        test_tlsnodhadapter_verify_true_keeps_ssl_context,
++        test_session_http_disable_dh_and_no_ssl_verify,
++        test_ssl_context_check_hostname_blocks_cert_none,
++    ]
++
++    failed = []
++    for test_fn in tests:
++        name = test_fn.__name__
++        try:
++            test_fn()
++            print(f"PASS  {name}")
++        except AssertionError as exc:
++            print(f"FAIL  {name}: {exc}")
++            failed.append(name)
++        except Exception as exc:
++            print(f"ERROR {name}: {type(exc).__name__}: {exc}")
++            failed.append(name)
++
++    print()
++    if failed:
++        print(f"{len(failed)}/{len(tests)} test(s) FAILED:")
++        for name in failed:
++            print(f"  - {name}")
++        sys.exit(1)
++    else:
++        print(f"All {len(tests)} tests PASSED.")
++        sys.exit(0)
+
+

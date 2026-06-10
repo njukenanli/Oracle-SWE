@@ -1,0 +1,186 @@
+diff --git a/conan/internal/model/cpp_info.py b/conan/internal/model/cpp_info.py
+index 1a702ba6e..010fbbc06 100644
+--- a/conan/internal/model/cpp_info.py
++++ b/conan/internal/model/cpp_info.py
+@@ -511,19 +511,49 @@ class _Component:
+             for file_name in files:
+                 full_path = os.path.join(dir_, file_name)
+                 if os.path.isfile(full_path) and pattern.match(file_name):
+-                    # File name could be a symlink, e.g., mylib.1.0.0.so -> mylib.so
+-                    if os.path.islink(full_path):
+-                        # Important! os.path.realpath returns the final path of the symlink even if it points
+-                        # to another symlink, i.e., libmylib.dylib -> libmylib.1.dylib -> libmylib.1.0.0.dylib
+-                        # then os.path.realpath("libmylib.1.0.0.dylib") == "libmylib.dylib"
+-                        # Note: os.readlink() returns the path which the symbolic link points to.
+-                        real_path = os.path.realpath(full_path)
+-                        ret.add(real_path)
+-                    else:
+-                        ret.add(full_path)
++                    # Keep the matching path as-is. Do NOT resolve symlinks to their real paths,
++                    # because we want to preserve SONAME symlink names like libmylib.so.1 or
++                    # libmylib.1.dylib if they exist. The runtime loader relies on those names.
++                    ret.add(full_path)
+             return list(ret)
+ 
+         def _find_matching(dirs, pattern):
++            def _score_shared_candidate(path):
++                base = os.path.basename(path)
++                # Prefer SONAME symlinks like libmylib.so.1 or libmylib.so.4.12 over plain libmylib.so
++                # and over deep-versioned leaf files like libmylib.so.4.12.4.0.
++                if base.endswith('.so'):
++                    return (1, 0, base)
++                if base.endswith('.dylib'):
++                    # macOS: version appears before extension: libmylib.1.dylib or libmylib.1.0.0.dylib
++                    parts = base[:-len('.dylib')].split('.')
++                    # Count numeric segments at the end (after the library name which can contain dots)
++                    numeric = 0
++                    for p in reversed(parts[1:]):
++                        if p.isdigit():
++                            numeric += 1
++                        else:
++                            break
++                    if numeric > 0:
++                        return (0, numeric, base)
++                    return (1, 0, base)
++                # Linux: libmylib.so.X[.Y[.Z...]]
++                m = re.match(r"^(.*)\.so(\..+)$", base)
++                if m:
++                    ver = m.group(2).strip('.')
++                    # Count numeric segments
++                    segs = [s for s in ver.split('.') if s]
++                    numeric = 0
++                    for s in segs:
++                        if s.isdigit():
++                            numeric += 1
++                        else:
++                            # If any non-numeric segment, treat as plain .so
++                            return (1, 0, base)
++                    if numeric > 0:
++                        return (0, numeric, base)
++                return (1, 0, base)
++
+             for d in dirs:
+                 if not os.path.exists(d):
+                     continue
+@@ -535,7 +565,8 @@ class _Component:
+                     lib_found = _lib_match_by_regex(d, pattern)
+                 if lib_found:
+                     if len(lib_found) > 1:
+-                        lib_found.sort()
++                        # Prefer SONAME over plain .so and over deeply versioned leaf files
++                        lib_found.sort(key=_score_shared_candidate)
+                         found, _ = os.path.splitext(os.path.basename(lib_found[0]))
+                         if found != libname and found != f"lib{libname}":
+                             out.warning(f"There were several matches for Lib {libname}: {lib_found}")
+diff --git a/conan/tools/google/bazeldeps.py b/conan/tools/google/bazeldeps.py
+index fa73a9fbc..dab58e8c3 100644
+--- a/conan/tools/google/bazeldeps.py
++++ b/conan/tools/google/bazeldeps.py
+@@ -277,6 +277,7 @@ class _BazelBUILDGenerator:
+         {% if lib_info.import_lib_path %}
+         interface_library = "{{ lib_info.import_lib_path }}",
+         {% endif %}
++        visibility = ["//visibility:public"],
+     )
+     {% endfor %}
+     {% endmacro %}
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..5cde44e4b
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,94 @@
++import os
++import shutil
++import tempfile
++from conan.internal.model.cpp_info import CppInfo
++from conan.internal.model.pkg_type import PackageType
++
++class DummyRef:
++    def __init__(self, name):
++        self.name = name
++
++class DummyConanfile:
++    def __init__(self, name, package_type=PackageType.SHARED):
++        self.ref = DummyRef(name)
++        self.package_type = package_type
++    def __str__(self):
++        return f"Conanfile<{self.ref.name}>"
++
++
++def setup_lib_tree(base):
++    libdir = os.path.join(base, "lib")
++    os.makedirs(libdir, exist_ok=True)
++    leaf = os.path.join(libdir, "libz3.so.4.12.4.0")
++    with open(leaf, "wb") as f:
++        f.write(b"\x00")
++    # symlink chain typical on Linux
++    so_412 = os.path.join(libdir, "libz3.so.4.12")
++    so = os.path.join(libdir, "libz3.so")
++    # Create symlinks pointing to the leaf, and libz3.so -> libz3.so.4.12
++    try:
++        os.symlink(os.path.basename(leaf), so_412)
++    except FileExistsError:
++        pass
++    try:
++        os.symlink(os.path.basename(so_412), so)
++    except FileExistsError:
++        pass
++    return libdir, leaf, so_412, so
++
++
++def reproduce_before_fix():
++    tempdir = tempfile.mkdtemp(prefix="conan_bazel_symlink_test_")
++    try:
++        libdir, leaf, so_412, so = setup_lib_tree(tempdir)
++        cpp = CppInfo(set_defaults=True)
++        cpp.libdirs = [libdir]
++        cpp.bindirs = [libdir]
++        cpp.libs = ["z3"]
++        conanfile = DummyConanfile("z3", package_type=PackageType.SHARED)
++        # Deduce locations
++        try:
++            cpp._package.deduce_locations(conanfile)
++        except Exception as e:
++            print("FAIL: deduce_locations raised exception:", e)
++            return False
++        loc = cpp._package.location
++        print("Deduced location:", loc)
++        # We expect the SONAME symlink (libz3.so.4.12), not the leaf (libz3.so.4.12.4.0)
++        if os.path.basename(loc) == os.path.basename(leaf):
++            print("Reproduction observed problem: chose leaf instead of SONAME symlink.")
++            return True
++        else:
++            print("Reproduction did not observe problem. Location basename:", os.path.basename(loc))
++            return False
++    finally:
++        shutil.rmtree(tempdir)
++
++
++def reproduce_after_fix():
++    tempdir = tempfile.mkdtemp(prefix="conan_bazel_symlink_test_")
++    try:
++        libdir, leaf, so_412, so = setup_lib_tree(tempdir)
++        cpp = CppInfo(set_defaults=True)
++        cpp.libdirs = [libdir]
++        cpp.bindirs = [libdir]
++        cpp.libs = ["z3"]
++        conanfile = DummyConanfile("z3", package_type=PackageType.SHARED)
++        cpp._package.deduce_locations(conanfile)
++        loc = cpp._package.location
++        print("Deduced location after fix:", loc)
++        if os.path.basename(loc) == os.path.basename(so_412):
++            print("PASS: chose SONAME symlink.")
++            return True
++        else:
++            print("FAIL: still not choosing SONAME symlink. Got:", os.path.basename(loc))
++            return False
++    finally:
++        shutil.rmtree(tempdir)
++
++if __name__ == "__main__":
++    print("Running reproduction and validation...")
++    ok = reproduce_after_fix()
++    if not ok:
++        raise SystemExit(2)
++    print("Reproduction succeeded and fix validated.")

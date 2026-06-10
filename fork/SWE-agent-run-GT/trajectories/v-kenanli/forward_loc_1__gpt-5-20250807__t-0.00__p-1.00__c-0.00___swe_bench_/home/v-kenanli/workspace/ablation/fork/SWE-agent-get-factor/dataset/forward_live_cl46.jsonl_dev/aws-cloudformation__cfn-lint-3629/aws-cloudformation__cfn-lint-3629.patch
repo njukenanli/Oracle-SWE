@@ -1,0 +1,198 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..1b1804213
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,139 @@
++from cfnlint.decode import convert_dict
++from cfnlint.template import Template
++from cfnlint.template.transforms._language_extensions import language_extension
++
++
++def build_template():
++    # Based on the PR description template
++    template = {
++        "AWSTemplateFormatVersion": "2010-09-09",
++        "Transform": "AWS::LanguageExtensions",
++        "Mappings": {
++            "111111111111": {
++                "A": {"AppName": "appa-dev"},
++                "B": {"AppName": "appb-dev"},
++            },
++            "222222222222": {
++                "A": {"AppName": "appa-qa"},
++                "B": {"AppName": "appb-qa"},
++            },
++        },
++        "Resources": {
++            "Fn::ForEach::Regions": [
++                "Region",
++                ["A"],
++                {
++                    "${Region}Role": {
++                        "Type": "AWS::IAM::Role",
++                        "Properties": {
++                            "RoleName": {
++                                "Fn::Sub": [
++                                    "${appname}",
++                                    {
++                                        "appname": {
++                                            "Fn::FindInMap": [
++                                                {"Ref": "AWS::AccountId"},
++                                                {"Ref": "Region"},
++                                                "AppName",
++                                            ]
++                                        }
++                                    },
++                                ]
++                            },
++                            "AssumeRolePolicyDocument": {
++                                "Version": "2012-10-17",
++                                "Statement": [
++                                    {
++                                        "Effect": "Allow",
++                                        "Principal": {"Service": ["ec2.amazonaws.com"]},
++                                        "Action": ["sts:AssumeRole"],
++                                    }
++                                ],
++                            },
++                            "Path": "/",
++                        },
++                    }
++                },
++            ],
++            "Fn::ForEach::NewRegions": [
++                "NewRegion",
++                ["B"],
++                {
++                    "${NewRegion}Role": {
++                        "Type": "AWS::IAM::Role",
++                        "Properties": {
++                            "RoleName": {
++                                "Fn::Sub": [
++                                    "${appname}",
++                                    {
++                                        "appname": {
++                                            "Fn::FindInMap": [
++                                                {"Ref": "AWS::AccountId"},
++                                                {"Ref": "NewRegion"},
++                                                "AppName",
++                                            ]
++                                        }
++                                    },
++                                ]
++                            },
++                            "AssumeRolePolicyDocument": {
++                                "Version": "2012-10-17",
++                                "Statement": [
++                                    {
++                                        "Effect": "Allow",
++                                        "Principal": {"Service": ["ec2.amazonaws.com"]},
++                                        "Action": ["sts:AssumeRole"],
++                                    }
++                                ],
++                            },
++                            "Path": "/",
++                        },
++                    }
++                },
++            ],
++        },
++    }
++    return convert_dict(template)
++
++
++def main():
++    tpl = build_template()
++    cfn = Template(filename="", template=tpl, regions=["us-east-1"])  # region arbitrary
++    matches, transformed = language_extension(cfn)
++    print("Transform matches:", matches)
++    print("Transformed template:")
++    import json
++    print(json.dumps(transformed, indent=2))
++
++    # Fetch ARole and BRole RoleName appname values
++    resources = transformed.get("Resources", {})
++    a_role = resources.get("ARole", {})
++    b_role = resources.get("BRole", {})
++
++    def get_appname(res):
++        rn = res.get("Properties", {}).get("RoleName")
++        if isinstance(rn, dict) and "Fn::Sub" in rn and isinstance(rn["Fn::Sub"], list):
++            mapping = rn["Fn::Sub"][1]
++            return mapping.get("appname")
++        return None
++
++    a_appname = get_appname(a_role)
++    b_appname = get_appname(b_role)
++
++    # We expect these not to both be resolved to the same plain string.
++    # Ideally they should be still Fn::FindInMap structures.
++    def is_plain_string(x):
++        return isinstance(x, str)
++
++    if is_plain_string(a_appname) and is_plain_string(b_appname):
++        # Before fix, this would typically be True and both equal 'appa-qa'
++        # We want to fail in that case.
++        raise SystemExit(
++            f"Reproduction failure: both appname values resolved to plain strings: {a_appname} and {b_appname}"
++        )
++
++    print("Reproduction passed: appname values not both plain strings.")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/cfnlint/template/transforms/_language_extensions.py b/src/cfnlint/template/transforms/_language_extensions.py
+index 373354262..2f826803a 100644
+--- a/src/cfnlint/template/transforms/_language_extensions.py
++++ b/src/cfnlint/template/transforms/_language_extensions.py
+@@ -334,12 +334,24 @@ class _ForEachValueFnFindInMap(_ForEachValue):
+                 )
+ 
+         try:
+-            if mapping is None and isinstance(
+-                t_map[1].value(cfn, params, only_params), str
++            # Only attempt to infer the mapping by scanning keys when the map name
++            # can be resolved using only the provided params. This prevents
++            # prematurely selecting a mapping when the map name is a Pseudo parameter
++            # like AWS::AccountId which should remain unresolved at transform time.
++            can_resolve_mapname = True
++            try:
++                t_map[0].value(cfn, params, only_params)
++            except _ResolveError:
++                can_resolve_mapname = False
++
++            if (
++                mapping is None
++                and can_resolve_mapname
++                and isinstance(t_map[1].value(cfn, params, only_params), str)
+             ):
+                 for k, v in cfn.template.get("Mappings", {}).items():
+                     if isinstance(v, dict):
+-                        if t_map[1].value(cfn) in v:
++                        if t_map[1].value(cfn, params, only_params) in v:
+                             t_map[0] = _ForEachValue.create(k)
+                             mapping = v
+                             break
+@@ -347,8 +359,18 @@ class _ForEachValueFnFindInMap(_ForEachValue):
+             pass
+ 
+         try:
+-            if mapping is None and isinstance(
+-                t_map[2].value(cfn, params, only_params), str
++            # Similarly, avoid inferring the mapping from the third key when the map
++            # name is not resolvable using only params.
++            can_resolve_mapname = True
++            try:
++                t_map[0].value(cfn, params, only_params)
++            except _ResolveError:
++                can_resolve_mapname = False
++
++            if (
++                mapping is None
++                and can_resolve_mapname
++                and isinstance(t_map[2].value(cfn, params, only_params), str)
+             ):
+                 for m1, mv1 in cfn.template.get("Mappings", {}).items():
+                     if isinstance(mv1, dict):

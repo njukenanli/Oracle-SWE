@@ -1,0 +1,153 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..0a6a3738
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,144 @@
++import unittest
++from unittest.mock import Mock, patch, PropertyMock
++
++from patroni import global_config
++from patroni.collections import CaseInsensitiveSet
++from patroni.dcs import Cluster, SyncState, Leader
++from patroni.dcs import Member as DcsMember
++from patroni.dcs import Status
++from patroni.postgresql import Postgresql
++
++# Reuse test harness utilities from the existing test suite
++from tests import BaseTestPostgresql, psycopg_connect, mock_available_gucs
++
++
++@patch('subprocess.call', Mock(return_value=0))
++@patch('patroni.psycopg.connect', psycopg_connect)
++@patch.object(Postgresql, 'available_gucs', mock_available_gucs)
++@patch.object(global_config.__class__, 'is_synchronous_mode', PropertyMock(return_value=True))
++class TestReproduction(BaseTestPostgresql):
++
++    @patch('subprocess.call', Mock(return_value=0))
++    @patch('os.rename', Mock())
++    @patch('patroni.postgresql.CallbackExecutor', Mock())
++    @patch.object(Postgresql, 'get_major_version', Mock(return_value=140000))
++    @patch.object(Postgresql, 'is_running', Mock(return_value=True))
++    @patch.object(Postgresql, 'available_gucs', mock_available_gucs)
++    def setUp(self):
++        super(TestReproduction, self).setUp()
++        # Ensure a baseline postgresql.conf exists for sync handler interactions
++        self.p.config.write_postgresql_conf()
++        self.s = self.p.sync_handler
++
++    def _build_cluster(self):
++        """
++        Build a Cluster object with:
++        - leader member named self.leadermem.name
++        - two replica members: self.me and self.other
++        We provide a realistic Status object as required by current Cluster signature.
++        """
++        # Minimal status: last_lsn 0, no slots
++        status = Status.empty()
++        # Order of members does not matter, but include leader for mapping application_name -> Member
++        members = [self.me, self.other, self.leadermem]
++        # SyncState(version, leader, sync_standby)
++        # Use current leader name as leader. No sync members initially.
++        sync_state = SyncState(0, self.leadermem.name, None)
++        cluster = Cluster(True, None, self.leader, status, members, None, sync_state, None, None, {})
++        return cluster
++
++    @patch.object(Postgresql, 'last_operation', Mock(return_value=1))
++    def test_current_state_should_not_include_leader_from_pg_stat_replication(self):
++        """
++        Reproduce the issue:
++        pg_stat_replication contains a row with application_name equal to the leader name.
++        Expected: SyncHandler.current_state must NEVER pick the leader as a synchronous candidate
++        or a ready sync node. It should consider only actual replicas.
++
++        This test must fail on buggy behavior (leader included), and pass after the fix (leader excluded).
++        """
++        cluster = self._build_cluster()
++
++        # Simulate pg_stat_replication containing leader itself as a row (bug symptom)
++        pg_stat_replication = [
++            {'pid': 100, 'application_name': self.leadermem.name, 'sync_state': 'sync', 'flush_lsn': 1},
++            {'pid': 101, 'application_name': self.me.name,        'sync_state': 'async', 'flush_lsn': 5},
++            {'pid': 102, 'application_name': self.other.name,     'sync_state': 'async', 'flush_lsn': 4},
++        ]
++
++        # synchronous_commit = 'on'; synchronous_standby_names (initial) can be anything, not relevant here
++        with patch.object(Postgresql, "_cluster_info_state_get", side_effect=['', 'on', pg_stat_replication]):
++            candidates, sync_nodes = self.s.current_state(cluster)
++
++        # The regression: leader name must not appear in either set
++        self.assertNotIn(self.leadermem.name, candidates,
++                         msg="Bug: leader was included in synchronous candidates")
++        self.assertNotIn(self.leadermem.name, sync_nodes,
++                         msg="Bug: leader was included in ready sync nodes")
++
++        # And we should still have a valid candidate among real replicas (prefer the one with higher LSN)
++        self.assertIn(self.me.name, candidates,
++                      msg="Expected a real replica to be picked as candidate")
++
++    @patch.object(Postgresql, 'last_operation', Mock(return_value=1))
++    def test_replica_list_internal_should_exclude_leader(self):
++        """
++        Validate that the internal replica list used for picking sync standbys does not include the leader,
++        even if pg_stat_replication erroneously reports it.
++        """
++        from patroni.postgresql.sync import _ReplicaList
++
++        cluster = self._build_cluster()
++
++        pg_stat_replication = [
++            {'pid': 200, 'application_name': self.leadermem.name, 'sync_state': 'sync',  'flush_lsn': 10},
++            {'pid': 201, 'application_name': self.me.name,        'sync_state': 'async', 'flush_lsn': 12},
++            {'pid': 202, 'application_name': self.other.name,     'sync_state': 'async', 'flush_lsn': 11},
++        ]
++
++        with patch.object(Postgresql, "_cluster_info_state_get", side_effect=['on', pg_stat_replication]):
++            replicas = _ReplicaList(self.p, cluster)
++
++        # Ensure leader entry is not present in the constructed replica list
++        self.assertFalse(any(r.application_name == self.leadermem.name for r in replicas),
++                         msg="Bug: leader present in internal replica list used for sync selection")
++
++    def test_setting_sync_param_via_selection_should_not_write_leader(self):
++        """
++        Emulate typical path: pick sync candidates from current_state() and then apply them via
++        set_synchronous_standby_names(). If the selection erroneously includes the leader, the resulting
++        postgresql.conf will contain leader which is a bug. After the fix, leader must be excluded and
++        the file should contain only replica names.
++        """
++        cluster = self._build_cluster()
++
++        def value_in_conf():
++            import os
++            with open(os.path.join(self.p.data_dir, 'postgresql.conf')) as f:
++                for line in f:
++                    if line.startswith('synchronous_standby_names'):
++                        return line.strip()
++
++        # Selection step returns leader incorrectly today (bug), after fix it should not.
++        pg_stat_replication = [
++            {'pid': 300, 'application_name': self.leadermem.name, 'sync_state': 'sync',  'flush_lsn': 2},
++            {'pid': 301, 'application_name': self.me.name,        'sync_state': 'async', 'flush_lsn': 1},
++            {'pid': 302, 'application_name': self.other.name,     'sync_state': 'async', 'flush_lsn': 1},
++        ]
++
++        with patch.object(Postgresql, "_cluster_info_state_get", side_effect=['', 'on', pg_stat_replication]):
++            picked, _ = self.s.current_state(cluster)
++
++        # Apply the picked set to Postgres config
++        self.s.set_synchronous_standby_names(picked)
++        # Read what got written
++        ssn_line = value_in_conf()
++
++        # Before fix, leader name will be written; after fix, it must not be
++        self.assertNotEqual(ssn_line, f"synchronous_standby_names = '{self.leadermem.name}'",
++                            msg="Bug: leader was written into synchronous_standby_names")
++
++
++if __name__ == '__main__':
++    # Run the reproduction tests
++    unittest.main(verbosity=2)
+
+

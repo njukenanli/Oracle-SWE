@@ -1,0 +1,165 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000..64eee8c
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,31 @@
++import asyncio
++from gitingest.query_parser import _parse_repo_source, parse_query
++
++async def main():
++    cases = [
++        # Typical copied URL from gitingest page that wraps a real repo URL
++        "https://gitingest.com/github.com/user/repo",
++        # Without scheme
++        "gitingest.com/github.com/user/repo",
++        # Path that might omit host, still a copied gitingest URL
++        "https://gitingest.com/user/repo",
++        # With subpaths
++        "https://gitingest.com/github.com/user/repo/tree/main/subdir/file",
++    ]
++    for src in cases:
++        try:
++            print(f"Trying _parse_repo_source on: {src}")
++            res = await _parse_repo_source(src)
++            print("Parsed:", {k: res[k] for k in ["user_name", "repo_name", "url", "type", "branch", "subpath"]})
++        except Exception as e:
++            print("_parse_repo_source failed:", type(e).__name__, e)
++        try:
++            print(f"Trying parse_query on: {src}")
++            res = await parse_query(src, max_file_size=50, from_web=True)
++            print("Parsed query:", {k: res[k] for k in ["user_name", "repo_name", "url"]})
++        except Exception as e:
++            print("parse_query failed:", type(e).__name__, e)
++        print("-"*60)
++
++if __name__ == "__main__":
++    asyncio.run(main())
+diff --git a/src/gitingest/query_parser.py b/src/gitingest/query_parser.py
+index 78dd6cf..cb1c875 100644
+--- a/src/gitingest/query_parser.py
++++ b/src/gitingest/query_parser.py
+@@ -4,6 +4,7 @@ import os
+ import re
+ import string
+ import uuid
++import asyncio
+ from pathlib import Path
+ from typing import Any
+ from urllib.parse import unquote, urlparse
+@@ -15,6 +16,9 @@ from gitingest.repository_clone import _check_repo_exists
+ 
+ HEX_DIGITS: set[str] = set(string.hexdigits)
+ 
++# Cache mapping 'user/repo' -> host inferred from earlier fully-qualified URLs
++HOST_CACHE: dict[str, str] = {}
++
+ KNOWN_GIT_HOSTS: list[str] = [
+     "github.com",
+     "gitlab.com",
+@@ -23,6 +27,13 @@ KNOWN_GIT_HOSTS: list[str] = [
+     "codeberg.org",
+ ]
+ 
++# Domains that are not actual git hosts but may wrap a repo URL
++WRAPPER_DOMAINS: list[str] = [
++    "gitingest.com",
++    "www.gitingest.com",
++]
++
++
+ 
+ async def parse_query(
+     source: str,
+@@ -115,15 +126,33 @@ async def _parse_repo_source(source: str) -> dict[str, Any]:
+ 
+     if parsed_url.scheme:
+         _validate_scheme(parsed_url.scheme)
+-        _validate_host(parsed_url.netloc.lower())
++        host_lower = parsed_url.netloc.lower()
++        if host_lower in WRAPPER_DOMAINS:
++            # Unwrap URLs like https://gitingest.com/<actual-host>/user/repo or /user/repo
++            inner = parsed_url.path.lstrip("/")
++            return await _parse_repo_source(inner)
++        if host_lower in KNOWN_GIT_HOSTS:
++            # Cache mapping for later bare slugs resolution
++            path_parts = parsed_url.path.strip("/").split("/")
++            if len(path_parts) >= 2:
++                HOST_CACHE[f"{path_parts[0]}/{path_parts[1]}"] = host_lower
++        _validate_host(host_lower)
+ 
+     else:  # Will be of the form 'host/user/repo' or 'user/repo'
+         tmp_host = source.split("/")[0].lower()
+         if "." in tmp_host:
++            if tmp_host in WRAPPER_DOMAINS:
++                # Unwrap domains like gitingest.com/<actual-host>/user/repo or /user/repo
++                inner = "/".join(source.split("/")[1:])
++                return await _parse_repo_source(inner)
+             _validate_host(tmp_host)
+         else:
+-            # No scheme, no domain => user typed "user/repo", so we'll guess the domain.
+-            host = await try_domains_for_user_and_repo(*_get_user_and_repo_from_path(source))
++            # No scheme, no domain => user typed "user/repo".
++            user_repo = "/".join(source.split("/")[:2]).lower()
++            if user_repo in HOST_CACHE:
++                host = HOST_CACHE[user_repo]
++            else:
++                host = await try_domains_for_user_and_repo(*_get_user_and_repo_from_path(source))
+             source = f"{host}/{source}"
+ 
+         source = "https://" + source
+@@ -174,6 +203,7 @@ async def _parse_repo_source(source: str) -> dict[str, Any]:
+     else:
+         parsed["branch"] = commit_or_branch
+ 
++
+     # Subpath if anything left
+     if remaining_parts:
+         parsed["subpath"] += "/".join(remaining_parts)
+@@ -333,6 +363,37 @@ def _is_valid_pattern(pattern: str) -> bool:
+     """
+     return all(c.isalnum() or c in "-_./+*" for c in pattern)
+ 
++async def _check_repo_exists_detection(url: str) -> bool:
++    """
++    Host detection checker with host-specific acceptance rules.
++    - bitbucket.org: accepts 200, 301, 302 (often redirects to sign-in)
++    - others (github.com, gitlab.com, gitea.com, codeberg.org): accept 200, 301
++    """
++    from urllib.parse import urlparse as _urlparse
++
++    host = _urlparse(url).netloc.lower()
++    acceptable = {200, 301}
++    if host == "bitbucket.org":
++        acceptable = {200, 301, 302}
++
++    proc = await asyncio.create_subprocess_exec(
++        "curl",
++        "-I",
++        url,
++        stdout=asyncio.subprocess.PIPE,
++        stderr=asyncio.subprocess.PIPE,
++    )
++    stdout, _ = await proc.communicate()
++    if proc.returncode != 0:
++        return False
++    try:
++        status_line = stdout.decode().splitlines()[0].strip()
++        status_code = int(status_line.split(" ", 2)[1])
++    except Exception:
++        return False
++    return status_code in acceptable
++
++
+ 
+ async def try_domains_for_user_and_repo(user_name: str, repo_name: str) -> str:
+     """
+@@ -357,7 +418,7 @@ async def try_domains_for_user_and_repo(user_name: str, repo_name: str) -> str:
+     """
+     for domain in KNOWN_GIT_HOSTS:
+         candidate = f"https://{domain}/{user_name}/{repo_name}"
+-        if await _check_repo_exists(candidate):
++        if await _check_repo_exists_detection(candidate):
+             return domain
+     raise ValueError(f"Could not find a valid repository host for '{user_name}/{repo_name}'.")
+ 

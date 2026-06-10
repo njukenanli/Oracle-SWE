@@ -1,0 +1,213 @@
+diff --git a/keras/src/trainers/data_adapters/py_dataset_adapter.py b/keras/src/trainers/data_adapters/py_dataset_adapter.py
+index 212e9823e..a4c69d8f6 100644
+--- a/keras/src/trainers/data_adapters/py_dataset_adapter.py
++++ b/keras/src/trainers/data_adapters/py_dataset_adapter.py
+@@ -223,54 +223,79 @@ class PyDatasetAdapter(DataAdapter):
+                 batch = batch + (sw,)
+         return batch
+ 
++    def _infinite_generator(self):
++        """Generator for infinite datasets without enqueuer."""
++        indices = itertools.count()
++        for i in indices:
++            yield self.py_dataset[i]
++
++    def _finite_generator(self):
++        """Generator for finite datasets without enqueuer."""
++        num_batches = self.py_dataset.num_batches
++        indices = range(num_batches)
++        if self.shuffle:
++            indices = list(indices)
++            random.shuffle(indices)
++        for i in indices:
++            yield self.py_dataset[i]
++
++    def _infinite_enqueuer_generator(self):
++        """Generator for infinite datasets with enqueuer."""
++        workers = self.py_dataset.workers
++        if not self.enqueuer or not self.enqueuer.is_running():
++            # Create and start enqueuer if it doesn't exist or is not running
++            self.enqueuer.start(
++                workers=workers,
++                max_queue_size=self.py_dataset.max_queue_size,
++            )
++        yield from self.enqueuer.get()
++
++    def _finite_enqueuer_generator(self):
++        """Generator for finite datasets with enqueuer."""
++        workers = self.py_dataset.workers
++        if not self.enqueuer or not self.enqueuer.is_running():
++            # Create and start enqueuer if it doesn't exist or is not running
++            self.enqueuer.start(
++                workers=workers,
++                max_queue_size=self.py_dataset.max_queue_size,
++            )
++        # For finite datasets, yield exactly num_batches batches per epoch.
++        # The enqueuer will manage epochs internally, so when we finish
++        # yielding num_batches, the enqueuer will have already started
++        # preparing the next epoch's batches.
++        for i, batch in enumerate(self.enqueuer.get()):
++            yield batch
++            if i >= self.py_dataset.num_batches - 1:
++                break
++
+     def _make_multiprocessed_generator_fn(self):
+         workers = self.py_dataset.workers
+         use_multiprocessing = self.py_dataset.use_multiprocessing
++        # Use enqueuer for multithreading (workers > 1) or multiprocessing (workers > 0 and use_multiprocessing)
+         if workers > 1 or (workers > 0 and use_multiprocessing):
+-
+-            def generator_fn():
++            # Create the enqueuer once
++            if not self.enqueuer:
+                 self.enqueuer = OrderedEnqueuer(
+                     self.py_dataset,
+                     use_multiprocessing=use_multiprocessing,
+                     shuffle=self.shuffle,
+                 )
+-                self.enqueuer.start(
+-                    workers=workers,
+-                    max_queue_size=self.py_dataset.max_queue_size,
+-                )
+-                return self.enqueuer.get()
+-
++            
++            if self.py_dataset.num_batches is None:
++                return self._infinite_enqueuer_generator
++            else:
++                return self._finite_enqueuer_generator
+         else:
+-
+-            def generator_fn():
+-                num_batches = self.py_dataset.num_batches
+-                indices = (
+-                    range(num_batches)
+-                    if num_batches is not None
+-                    else itertools.count()
+-                )
+-                if self.shuffle and num_batches is not None:
+-                    # Match the shuffle convention in OrderedEnqueuer.
+-                    indices = list(indices)
+-                    random.shuffle(indices)
+-
+-                for i in indices:
+-                    yield self.py_dataset[i]
+-
+-        return generator_fn
++            if self.py_dataset.num_batches is None:
++                return self._infinite_generator
++            else:
++                return self._finite_generator
+ 
+     def _get_iterator(self):
+-        num_batches = self.py_dataset.num_batches
+         gen_fn = self._make_multiprocessed_generator_fn()
+-        for i, batch in enumerate(gen_fn()):
++        for batch in gen_fn():
+             batch = self._standardize_batch(batch)
+             yield batch
+-            if (
+-                self.enqueuer
+-                and num_batches is not None
+-                and i >= num_batches - 1
+-            ):
+-                self.enqueuer.stop()
+ 
+     def get_numpy_iterator(self):
+         return data_adapter_utils.get_numpy_iterator(self._get_iterator())
+@@ -298,6 +323,11 @@ class PyDatasetAdapter(DataAdapter):
+         )
+         if self.shuffle and num_batches is not None:
+             ds = ds.shuffle(8)
++        options = tf.data.Options()
++        options.experimental_distribute.auto_shard_policy = (
++            tf.data.experimental.AutoShardPolicy.DATA
++        )
++        ds = ds.with_options(options)
+         ds = ds.prefetch(tf.data.AUTOTUNE)
+         return ds
+ 
+@@ -308,8 +338,9 @@ class PyDatasetAdapter(DataAdapter):
+         self.py_dataset.on_epoch_begin()
+ 
+     def on_epoch_end(self):
+-        if self.enqueuer:
+-            self.enqueuer.stop()
++        # Don't stop the enqueuer - it should keep running across epochs.
++        # The enqueuer will be stopped when the adapter is destroyed or
++        # training is complete.
+         self.py_dataset.on_epoch_end()
+ 
+     @property
+@@ -539,39 +570,50 @@ class OrderedEnqueuer(PyDatasetEnqueuer):
+         """Submits request to the executor and queue the `Future` objects."""
+         try:
+             num_batches = self.py_dataset.num_batches
+-            indices = (
+-                range(num_batches)
+-                if num_batches is not None
+-                else itertools.count()
+-            )
+-            if self.shuffle and num_batches is not None:
+-                indices = list(indices)
+-                random.shuffle(indices)
+             self._send_py_dataset()  # Share the initial py_dataset
+-            while True:
++            
++            if num_batches is None:
++                # Infinite dataset: just keep yielding batches indefinitely
++                # Don't try to manage epochs internally
++                indices = itertools.count()
+                 with closing(self.executor_fn(_SHARED_SEQUENCES)) as executor:
+                     for i in indices:
+                         if self.stop_signal.is_set():
+                             return
+-
+                         self.queue.put(
+                             executor.apply_async(get_index, (self.uid, i)),
+                             block=True,
+                         )
++            else:
++                # Finite dataset: manage epochs internally
++                indices = range(num_batches)
++                if self.shuffle:
++                    indices = list(indices)
++                    random.shuffle(indices)
++                while True:
++                    with closing(self.executor_fn(_SHARED_SEQUENCES)) as executor:
++                        for i in indices:
++                            if self.stop_signal.is_set():
++                                return
+ 
+-                    # Done with the current epoch, waiting for the final batches
+-                    self._wait_queue()
++                            self.queue.put(
++                                executor.apply_async(get_index, (self.uid, i)),
++                                block=True,
++                            )
+ 
+-                    if self.stop_signal.is_set():
+-                        # We're done
+-                        return
++                        # Done with the current epoch, waiting for the final batches
++                        self._wait_queue()
++
++                        if self.stop_signal.is_set():
++                            # We're done
++                            return
+ 
+-                # Call the internal on epoch end and epoch begin.
+-                self.py_dataset.on_epoch_end()
+-                # The first on_epoch_begin call was already made,
+-                # prior to the start of the Enqueuer.
+-                self.py_dataset.on_epoch_begin()
+-                self._send_py_dataset()  # Update the pool
++                    # Call the internal on epoch end and epoch begin.
++                    self.py_dataset.on_epoch_end()
++                    # The first on_epoch_begin call was already made,
++                    # prior to the start of the Enqueuer.
++                    self.py_dataset.on_epoch_begin()
++                    self._send_py_dataset()  # Update the pool
+         except Exception as e:
+             self.queue.put(e)  # Report exception
+ 

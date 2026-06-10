@@ -1,0 +1,132 @@
+diff --git a/aiogram/fsm/scene.py b/aiogram/fsm/scene.py
+index 1344b4d0..b239a4f1 100644
+--- a/aiogram/fsm/scene.py
++++ b/aiogram/fsm/scene.py
+@@ -421,8 +421,11 @@ class Scene:
+         >>> router.message.register(MyScene.as_handler(), Command("start"))
+         """
+ 
+-        async def enter_to_scene_handler(event: TelegramObject, scenes: ScenesManager) -> None:
+-            await scenes.enter(cls, **kwargs)
++        async def enter_to_scene_handler(
++            event: TelegramObject, scenes: ScenesManager, **middleware_kwargs: Any
++        ) -> None:
++            # Merge explicitly provided handler kwargs with middleware-injected kwargs
++            await scenes.enter(cls, **{**kwargs, **middleware_kwargs})
+ 
+         return enter_to_scene_handler
+ 
+@@ -572,7 +575,37 @@ class SceneWizard:
+             )
+             return False
+ 
+-        await action_config[event_type].call(self.scene, self.event, **{**self.data, **kwargs})
++        # Prepare merged kwargs from existing data and provided kwargs
++        merged_kwargs = {**self.data, **kwargs}
++
++        # Try to pass action handler through the same observer middleware pipeline
++        observer = None
++        try:
++            router = getattr(self.manager, "registry", None).router  # type: ignore[attr-defined]
++            observer = router.observers.get(event_type) if router else None
++        except Exception:
++            observer = None
++
++        # If we can't properly resolve observer or required context is missing, fallback
++        if not observer or not hasattr(observer, "wrap_outer_middleware") or not hasattr(
++            observer, "outer_middleware"
++        ) or not hasattr(observer, "_resolve_middlewares") or "event_update" not in merged_kwargs:
++            await action_config[event_type].call(self.scene, self.event, **merged_kwargs)
++            return True
++
++        async def _inner(event: TelegramObject, **data_kwargs: Any) -> Any:
++            # Apply inner middlewares chain around action handler
++            async def _action(event_: TelegramObject, **inner_kwargs: Any) -> Any:
++                return await action_config[event_type].call(self.scene, event_, **inner_kwargs)
++
++            wrapped_inner = observer.outer_middleware.wrap_middlewares(
++                observer._resolve_middlewares(),
++                _action,
++            )
++            return await wrapped_inner(event, data_kwargs)
++
++        # Wrap with outer middlewares as regular handlers do
++        await observer.wrap_outer_middleware(_inner, event=self.event, data=merged_kwargs)
+         return True
+ 
+     async def set_data(self, data: Dict[str, Any]) -> None:
+diff --git a/repro_scene_middleware.py b/repro_scene_middleware.py
+new file mode 100644
+index 00000000..60d79ad1
+--- /dev/null
++++ b/repro_scene_middleware.py
+@@ -0,0 +1,69 @@
++import asyncio
++from datetime import datetime
++from aiogram.fsm.scene import Scene, on, SceneRegistry, ScenesManager, SceneAction
++from aiogram.types import Message, Chat
++from aiogram.fsm.context import FSMContext
++from aiogram.fsm.storage.memory import MemoryStorage
++from aiogram.fsm.storage.base import StorageKey
++from aiogram.dispatcher.router import Router
++from aiogram.dispatcher.event.bases import NextMiddlewareType
++from aiogram.types import Update
++
++
++class TestScene(Scene, state='test_state'):
++    @on.message.enter()
++    async def greetings(self, message: Message, test_context: str):
++        # Should receive test_context from middleware (but we won't inject it here)
++        pass
++
++async def main():
++    # Setup FSM context
++    storage = MemoryStorage()
++    key = StorageKey(bot_id=42, chat_id=1, user_id=1)
++    state = FSMContext(storage=storage, key=key)
++
++    # Create router and registry
++    router = Router()
++    registry = SceneRegistry(router)
++    registry.register(TestScene)
++
++    # Register outer middleware to inject context
++    async def inject_middleware(
++        handler: NextMiddlewareType[Message], event: Message, data: dict
++    ):
++        data["test_context"] = "Custom context here"
++        return await handler(event, data)
++
++    router.message.outer_middleware(inject_middleware)
++
++    # Prepare message event
++    msg = Message(
++        message_id=1,
++        text="/start",
++        date=datetime.now(),
++        chat=Chat(id=1, type="private"),
++    )
++
++    # Create scenes manager with no middleware-injected data
++    # Build Update to populate event_update in data via registry._middleware
++    upd = Update(update_id=1, message=msg)
++
++    # Let middleware populate scenes manager in data path as it happens normally
++    data = {"state": state, "event_update": upd}
++    async def final_handler(update: Update, data_: dict):
++        return None
++    await registry._middleware(final_handler, msg, data)
++    scenes: ScenesManager = data["scenes"]
++
++    # Enter scene (should pass through observer middlewares and get test_context)
++    got_context = {}
++    async def patched_greetings(self, message: Message, test_context: str):
++        got_context["value"] = test_context
++    # Monkey patch the handler to capture context
++    TestScene.__scene_config__.actions[SceneAction.enter]["message"].callback = patched_greetings
++
++    await scenes.enter(TestScene)
++    print("Scene enter got context:", got_context.get("value"))
++
++if __name__ == "__main__":
++    asyncio.run(main())

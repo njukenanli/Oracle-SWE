@@ -1,0 +1,203 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..ffe27cac
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,194 @@
++"""
++Reproduction tests for AzureOpenAIDocumentEmbedder failing the entire run when one document causes an embedding error.
++
++Run with: python reproduction.py
++
++This script intentionally injects a fake `openai.lib.azure.AzureOpenAI` client into sys.modules
++so the AzureOpenAIDocumentEmbedder can be imported and exercised without real network calls.
++
++Desired behavior (after fix): if any document in a batch causes the embeddings client to raise an error
++(e.g. because the document is too long), the embedder.run() should NOT raise for the whole batch. It
++should try to produce embeddings for the documents that can be embedded and isolate/skip the failing
++documents. The exact policy (e.g. marking the failing document embedding as None) may vary, but the key
++point is that other documents are still embedded and returned.
++
++The tests below assert the desired behavior. They will fail on the current buggy implementation (which
++aborts the entire run when a single document causes an error) and will pass once the embedder is fixed.
++"""
++
++import sys
++import types
++
++# ----- Inject a fake openai package with the AzureOpenAI client -----
++# This avoids importing the real openai package and lets us simulate errors.
++MAX_CHARS_BEFORE_ERROR = 2000
++
++# Create the openai module
++openai = types.ModuleType("openai")
++
++# Define a fake BadRequestError similar to the one thrown by the real openai library
++class BadRequestError(Exception):
++    pass
++
++openai.BadRequestError = BadRequestError
++
++# Create submodules openai.lib and openai.lib.azure
++lib = types.ModuleType("openai.lib")
++azure_mod = types.ModuleType("openai.lib.azure")
++
++# Helper classes for fake responses
++class Usage:
++    def __init__(self, prompt_tokens: int, total_tokens: int):
++        self.prompt_tokens = prompt_tokens
++        self.total_tokens = total_tokens
++    def items(self):
++        return [("prompt_tokens", self.prompt_tokens), ("total_tokens", self.total_tokens)]
++    def __iter__(self):
++        return iter(self.items())
++
++class DataElem:
++    def __init__(self, embedding):
++        self.embedding = embedding
++
++class FakeResponse:
++    def __init__(self, model: str, usage: Usage, data):
++        self.model = model
++        self.usage = usage
++        self.data = data
++
++class EmbeddingsClient:
++    def __init__(self, deployment_name: str):
++        self._deployment_name = deployment_name
++
++    def create(self, *args, **kwargs):
++        # Accept both signatures: create(model=..., input=...) or create(model=..., dimensions=..., input=...)
++        input_texts = kwargs.get("input") if "input" in kwargs else (args[1] if len(args) > 1 else None)
++        model = kwargs.get("model") if "model" in kwargs else (args[0] if len(args) > 0 else "unknown-model")
++
++        # For single string inputs, make it a list to simplify logic
++        if isinstance(input_texts, str):
++            input_texts = [input_texts]
++
++        # Simulate a token/context-length error if any text is too long
++        for t in input_texts:
++            if t is None:
++                continue
++            if len(t) > MAX_CHARS_BEFORE_ERROR:
++                # mimic the openai.BadRequestError raised by the real client
++                raise openai.BadRequestError(
++                    "Error code: 400 - {'error': {'message': \"This model's maximum context length is exceeded.\"}}"
++                )
++
++        # Otherwise return a fake response with simple embeddings
++        data = [DataElem([float(len(t) % 5), 0.1, 0.2]) for t in input_texts]
++        # usage: set prompt_tokens proportional to total characters modded to small numbers
++        usage = Usage(prompt_tokens=sum(len(t) for t in input_texts) % 100, total_tokens=sum(len(t) for t in input_texts) % 100)
++        return FakeResponse(model=model, usage=usage, data=data)
++
++class AzureOpenAI:
++    def __init__(self, *args, **kwargs):
++        # The real AzureOpenAI client exposes an `embeddings` attribute
++        # that has a `.create(...)` method. We simulate that.
++        deployment = kwargs.get("azure_deployment") or kwargs.get("azure_deployment")
++        self.embeddings = EmbeddingsClient(deployment_name=deployment)
++
++# Insert fake modules into sys.modules before importing the embedder
++sys.modules["openai"] = openai
++sys.modules["openai.lib"] = lib
++sys.modules["openai.lib.azure"] = azure_mod
++azure_mod.AzureOpenAI = AzureOpenAI
++
++# Now import the AzureOpenAIDocumentEmbedder from the local haystack package
++from haystack import Document
++from haystack.components.embedders.azure_document_embedder import AzureOpenAIDocumentEmbedder
++
++# ----- Helper to run tests and report results -----
++
++def make_doc(text: str, meta=None):
++    return Document(content=text, meta=meta or {})
++
++
++# Testcases: These tests assert the desired (fixed) behavior: no full-run aborts when one doc is bad
++
++def test_all_short_docs_success():
++    print("Running test_all_short_docs_success...", end=" ")
++    embedder = AzureOpenAIDocumentEmbedder(azure_endpoint="https://example.azure.openai/")
++    docs = [make_doc("short text 1"), make_doc("another short text")]
++    result = embedder.run(documents=docs)
++    docs_out = result["documents"]
++    assert len(docs_out) == len(docs), "Number of returned documents must match"
++    for d in docs_out:
++        assert d.embedding is not None and isinstance(d.embedding, list), "Embedding must be assigned for short docs"
++    assert "meta" in result and result["meta"]["model"] == embedder.azure_deployment
++    print("PASSED")
++
++
++def test_batch_with_one_long_document_does_not_abort():
++    print("Running test_batch_with_one_long_document_does_not_abort...", end=" ")
++    # Create an embedder with batch size 2 so the short+long doc are sent together
++    embedder = AzureOpenAIDocumentEmbedder(azure_endpoint="https://example.azure.openai/", batch_size=2)
++    long_text = "L" * (MAX_CHARS_BEFORE_ERROR + 10)
++    docs = [make_doc("short_ok"), make_doc(long_text)]
++
++    # Desired: run() should not raise; it should embed the short doc and handle the long one gracefully
++    result = embedder.run(documents=docs)
++    docs_out = result["documents"]
++    assert len(docs_out) == 2, "Should return both documents even if one failed to embed"
++    # At least one document should have embedding (the short one)
++    assert any(d.embedding is not None for d in docs_out), "At least one document must have an embedding"
++    print("PASSED")
++
++
++def test_multiple_docs_with_one_long_doc_does_not_abort():
++    print("Running test_multiple_docs_with_one_long_doc_does_not_abort...", end=" ")
++    embedder = AzureOpenAIDocumentEmbedder(azure_endpoint="https://example.azure.openai/", batch_size=2)
++    long_text = "X" * (MAX_CHARS_BEFORE_ERROR + 1)
++    docs = [make_doc("short1"), make_doc(long_text), make_doc("short2")]
++
++    result = embedder.run(documents=docs)
++    docs_out = result["documents"]
++    assert len(docs_out) == 3, "Should return all documents"
++    # Expect at least the two short docs to have embeddings
++    short_embeddings = [d for d in docs_out if d.content and len(d.content) < MAX_CHARS_BEFORE_ERROR]
++    assert len([d for d in short_embeddings if d.embedding is not None]) >= 2, "Short docs should be embedded"
++    print("PASSED")
++
++
++def test_single_long_document_is_handled():
++    print("Running test_single_long_document_is_handled...", end=" ")
++    embedder = AzureOpenAIDocumentEmbedder(azure_endpoint="https://example.azure.openai/", batch_size=1)
++    long_text = "Y" * (MAX_CHARS_BEFORE_ERROR + 50)
++    docs = [make_doc(long_text)]
++
++    # Desired behavior: no exception, return the document (embedding may be None or omitted)
++    result = embedder.run(documents=docs)
++    docs_out = result["documents"]
++    assert len(docs_out) == 1, "Should return the document even if it couldn't be embedded"
++    # Embedding can be None; we just ensure it didn't crash
++    print("PASSED")
++
++
++# Run all tests
++if __name__ == "__main__":
++    tests = [
++        test_all_short_docs_success,
++        test_batch_with_one_long_document_does_not_abort,
++        test_multiple_docs_with_one_long_doc_does_not_abort,
++        test_single_long_document_is_handled,
++    ]
++
++    failed = 0
++    for t in tests:
++        try:
++            t()
++        except AssertionError as ae:
++            failed += 1
++            print(f"\nAssertionError in {t.__name__}: {ae}")
++        except Exception as e:
++            failed += 1
++            print(f"\nUnexpected exception in {t.__name__}: {type(e)}: {e}")
++
++    if failed:
++        print(f"\n{failed} test(s) failed (this reproduces the current bug). Exiting with non-zero status.")
++        sys.exit(1)
++    print("\nAll tests passed (the embedder behaves as expected after the fix).")
+
+

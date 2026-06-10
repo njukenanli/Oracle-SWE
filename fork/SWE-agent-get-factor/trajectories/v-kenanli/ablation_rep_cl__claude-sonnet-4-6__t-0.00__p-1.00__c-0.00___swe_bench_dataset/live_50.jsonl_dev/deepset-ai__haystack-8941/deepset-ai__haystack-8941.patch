@@ -1,0 +1,410 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..64a7969c
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,401 @@
++# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
++#
++# SPDX-License-Identifier: Apache-2.0
++
++"""
++Reproduction script for the issue:
++  AzureOpenAIDocumentEmbedder fails entire run when one document throws error
++
++The AzureOpenAIDocumentEmbedder._embed_batch method does not catch APIError
++exceptions, so a single document that triggers a 400 error (e.g. too many tokens)
++aborts the entire run instead of gracefully skipping the offending batch and
++continuing.
++
++These tests mirror the equivalent tests that already exist for OpenAIDocumentEmbedder
++(test_embed_batch_handles_exceptions_gracefully) but target AzureOpenAIDocumentEmbedder.
++
++Expected behaviour after the fix:
++  - An APIError inside _embed_batch is caught and logged; it does NOT propagate.
++  - Batches that succeed still produce embeddings.
++  - Batches that fail are skipped with a log message containing the document IDs.
++  - _prepare_texts_to_embed returns a dict keyed by document ID (so IDs are
++    available when logging errors).
++
++Run with:
++    cd /testbed && python reproduction.py
++"""
++
++import logging
++import sys
++from unittest.mock import Mock, patch
++
++from openai import APIError
++from openai.types.create_embedding_response import CreateEmbeddingResponse, Usage
++from openai.types.embedding import Embedding
++
++from haystack import Document
++from haystack.components.embedders import AzureOpenAIDocumentEmbedder
++from haystack.utils.auth import Secret
++
++PASS_COUNT = 0
++FAIL_COUNT = 0
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++def make_embedder(batch_size=32):
++    """Return an AzureOpenAIDocumentEmbedder with dummy credentials."""
++    return AzureOpenAIDocumentEmbedder(
++        azure_endpoint="https://test.openai.azure.com",
++        api_key=Secret.from_token("fake-api-key"),
++        azure_deployment="text-embedding-ada-002",
++        progress_bar=False,
++        batch_size=batch_size,
++    )
++
++
++def make_api_error():
++    return APIError(message="Mocked API error", request=Mock(), body=None)
++
++
++def _fake_embedding_response(input_texts, model="text-embedding-ada-002"):
++    """Return a proper CreateEmbeddingResponse for the given input texts."""
++    return CreateEmbeddingResponse(
++        object="list",
++        data=[
++            Embedding(embedding=[0.1 * (i + 1)] * 4, index=i, object="embedding")
++            for i in range(len(input_texts))
++        ],
++        model=model,
++        usage=Usage(prompt_tokens=len(input_texts), total_tokens=len(input_texts)),
++    )
++
++
++def report(name, passed, detail=""):
++    global PASS_COUNT, FAIL_COUNT
++    if passed:
++        PASS_COUNT += 1
++        print(f"PASS  {name}")
++    else:
++        FAIL_COUNT += 1
++        msg = f"FAIL  {name}"
++        if detail:
++            msg += f": {detail}"
++        print(msg, file=sys.stderr)
++
++
++# ---------------------------------------------------------------------------
++# Test 1 – run() does NOT raise when an APIError occurs
++# ---------------------------------------------------------------------------
++
++def test_run_does_not_raise_on_api_error():
++    """
++    Before the fix: the APIError propagates and the calling thread crashes.
++    After  the fix: the error is caught, logged, and run() returns normally.
++    """
++    embedder = make_embedder()
++    docs = [
++        Document(content="This document is fine."),
++        Document(content="X" * 10000),  # simulates an oversized document
++    ]
++
++    with patch.object(
++        embedder._client.embeddings,
++        "create",
++        side_effect=make_api_error(),
++    ):
++        raised = None
++        try:
++            embedder.run(documents=docs)
++        except APIError as exc:
++            raised = exc
++
++    report(
++        "test_run_does_not_raise_on_api_error",
++        raised is None,
++        detail=f"APIError propagated from run() – {raised}",
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 2 – _embed_batch / run() logs the failed document IDs
++# ---------------------------------------------------------------------------
++
++def test_embed_batch_logs_failed_document_ids():
++    """
++    After the fix the log record must mention 'Failed embedding' for the failing
++    batch.  This also implicitly validates that _prepare_texts_to_embed returns
++    a dict (otherwise there are no IDs to log).
++    """
++    embedder = make_embedder()
++
++    log_records = []
++
++    class ListHandler(logging.Handler):
++        def emit(self, record):
++            log_records.append(self.format(record))
++
++    list_handler = ListHandler()
++    root_logger = logging.getLogger()
++    root_logger.addHandler(list_handler)
++    root_logger.setLevel(logging.DEBUG)
++
++    docs = [
++        Document(content="hello world"),
++        Document(content="short text"),
++    ]
++
++    try:
++        with patch.object(
++            embedder._client.embeddings,
++            "create",
++            side_effect=make_api_error(),
++        ):
++            raised = None
++            try:
++                embedder.run(documents=docs)
++            except APIError as exc:
++                raised = exc
++    finally:
++        root_logger.removeHandler(list_handler)
++
++    combined = "\n".join(log_records)
++    has_failure_log = any("Failed embedding" in r for r in log_records)
++
++    if raised is not None:
++        report(
++            "test_embed_batch_logs_failed_document_ids",
++            False,
++            detail=f"APIError was NOT caught – {raised}",
++        )
++    elif not has_failure_log:
++        report(
++            "test_embed_batch_logs_failed_document_ids",
++            False,
++            detail=(
++                "Expected a 'Failed embedding' log message but none found.\n"
++                f"Captured logs:\n{combined}"
++            ),
++        )
++    else:
++        report("test_embed_batch_logs_failed_document_ids", True)
++
++
++# ---------------------------------------------------------------------------
++# Test 3 – partial success: good batch gets embeddings, bad batch is skipped
++# ---------------------------------------------------------------------------
++
++def test_partial_success_when_one_batch_fails():
++    """
++    With batch_size=1 the two documents are embedded in two separate API calls.
++    The first call succeeds, the second raises APIError.
++    After the fix: the first document gets an embedding; run() returns normally.
++    Before the fix: the second call raises and the whole method crashes.
++    """
++    embedder = make_embedder(batch_size=1)
++    doc_good = Document(content="short text")
++    doc_bad = Document(content="X" * 10000)
++    docs = [doc_good, doc_bad]
++
++    call_count = 0
++
++    def side_effect(**kwargs):
++        nonlocal call_count
++        call_count += 1
++        if call_count == 1:
++            return _fake_embedding_response(input_texts=kwargs["input"])
++        raise make_api_error()
++
++    with patch.object(
++        embedder._client.embeddings, "create", side_effect=side_effect
++    ):
++        raised = None
++        result = None
++        try:
++            result = embedder.run(documents=docs)
++        except APIError as exc:
++            raised = exc
++
++    if raised is not None:
++        report(
++            "test_partial_success_when_one_batch_fails",
++            False,
++            detail=f"APIError propagated – {raised}",
++        )
++        return
++
++    returned_docs = result["documents"]
++    good_doc = next(
++        (d for d in returned_docs if d.content == "short text"), None
++    )
++    if good_doc is None or good_doc.embedding is None:
++        report(
++            "test_partial_success_when_one_batch_fails",
++            False,
++            detail="Good document did not receive an embedding.",
++        )
++    else:
++        report("test_partial_success_when_one_batch_fails", True)
++
++
++# ---------------------------------------------------------------------------
++# Test 4 – _prepare_texts_to_embed returns a dict keyed by document ID
++# ---------------------------------------------------------------------------
++
++def test_prepare_texts_to_embed_returns_dict():
++    """
++    After the fix _prepare_texts_to_embed must return a dict whose keys are
++    document IDs, not a plain list.  This is required so that _embed_batch
++    can include the IDs in the error log.
++    """
++    embedder = make_embedder()
++    docs = [
++        Document(id="aaa", content="hello"),
++        Document(id="bbb", content="world"),
++    ]
++    result = embedder._prepare_texts_to_embed(docs)
++
++    if not isinstance(result, dict):
++        report(
++            "test_prepare_texts_to_embed_returns_dict",
++            False,
++            detail=f"Expected dict, got {type(result).__name__}",
++        )
++        return
++
++    if set(result.keys()) != {"aaa", "bbb"}:
++        report(
++            "test_prepare_texts_to_embed_returns_dict",
++            False,
++            detail=f"Expected keys {{'aaa', 'bbb'}}, got {set(result.keys())}",
++        )
++    else:
++        report("test_prepare_texts_to_embed_returns_dict", True)
++
++
++# ---------------------------------------------------------------------------
++# Test 5 – multiple failing batches are all skipped without crashing
++# ---------------------------------------------------------------------------
++
++def test_multiple_failing_batches_all_skipped():
++    """
++    All API calls fail.  run() must still return normally (no exception).
++    Documents that had no successful embedding should have embedding=None.
++    """
++    embedder = make_embedder()
++    docs = [Document(content=f"doc {i}") for i in range(3)]
++
++    with patch.object(
++        embedder._client.embeddings,
++        "create",
++        side_effect=make_api_error(),
++    ):
++        raised = None
++        result = None
++        try:
++            result = embedder.run(documents=docs)
++        except APIError as exc:
++            raised = exc
++
++    if raised is not None:
++        report(
++            "test_multiple_failing_batches_all_skipped",
++            False,
++            detail=f"APIError propagated – {raised}",
++        )
++        return
++
++    unexpected = [d for d in result["documents"] if d.embedding is not None]
++    if unexpected:
++        report(
++            "test_multiple_failing_batches_all_skipped",
++            False,
++            detail=f"{len(unexpected)} document(s) unexpectedly got embeddings.",
++        )
++    else:
++        report("test_multiple_failing_batches_all_skipped", True)
++
++
++# ---------------------------------------------------------------------------
++# Test 6 – embed_batch_handles_exceptions_gracefully (mirrors OpenAI test)
++#          This is the direct _embed_batch unit test equivalent to the one
++#          in test_openai_document_embedder.py
++# ---------------------------------------------------------------------------
++
++def test_embed_batch_handles_exceptions_gracefully():
++    """
++    Directly test that _embed_batch does not re-raise APIError.
++    After the fix _prepare_texts_to_embed returns a dict, so _embed_batch
++    receives a dict.  Before the fix it returns a list, and _embed_batch
++    takes a list.  We use run() as the entry point to avoid dealing with
++    the signature difference, but we check the core behaviour: no exception
++    escapes.
++    """
++    embedder = make_embedder()
++    docs = [Document(id="1", content="text1"), Document(id="2", content="text2")]
++
++    log_records = []
++
++    class ListHandler(logging.Handler):
++        def emit(self, record):
++            log_records.append(self.format(record))
++
++    list_handler = ListHandler()
++    root_logger = logging.getLogger()
++    root_logger.addHandler(list_handler)
++    root_logger.setLevel(logging.DEBUG)
++
++    try:
++        with patch.object(
++            embedder._client.embeddings,
++            "create",
++            side_effect=APIError(
++                message="Mocked error", request=Mock(), body=None
++            ),
++        ):
++            raised = None
++            try:
++                embedder.run(documents=docs)
++            except APIError as exc:
++                raised = exc
++    finally:
++        root_logger.removeHandler(list_handler)
++
++    combined = "\n".join(log_records)
++
++    if raised is not None:
++        report(
++            "test_embed_batch_handles_exceptions_gracefully",
++            False,
++            detail=f"APIError was NOT caught – {raised}",
++        )
++    elif not any("Failed embedding" in r for r in log_records):
++        report(
++            "test_embed_batch_handles_exceptions_gracefully",
++            False,
++            detail=(
++                "Expected log message 'Failed embedding of documents 1, 2 ...' "
++                f"not found.\nCaptured logs:\n{combined}"
++            ),
++        )
++    else:
++        report("test_embed_batch_handles_exceptions_gracefully", True)
++
++
++# ---------------------------------------------------------------------------
++# Main
++# ---------------------------------------------------------------------------
++
++if __name__ == "__main__":
++    test_run_does_not_raise_on_api_error()
++    test_embed_batch_logs_failed_document_ids()
++    test_partial_success_when_one_batch_fails()
++    test_prepare_texts_to_embed_returns_dict()
++    test_multiple_failing_batches_all_skipped()
++    test_embed_batch_handles_exceptions_gracefully()
++
++    print(f"\nResults: {PASS_COUNT} passed, {FAIL_COUNT} failed.")
++    if FAIL_COUNT > 0:
++        sys.exit(1)
+
+

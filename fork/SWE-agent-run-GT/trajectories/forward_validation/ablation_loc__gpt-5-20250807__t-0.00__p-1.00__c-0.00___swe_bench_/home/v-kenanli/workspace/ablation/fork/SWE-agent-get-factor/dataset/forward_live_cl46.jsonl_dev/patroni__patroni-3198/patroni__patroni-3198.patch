@@ -1,0 +1,142 @@
+diff --git a/patroni/postgresql/__init__.py b/patroni/postgresql/__init__.py
+index 33a6cc4b..e2e3010d 100644
+--- a/patroni/postgresql/__init__.py
++++ b/patroni/postgresql/__init__.py
+@@ -1151,20 +1151,27 @@ class Postgresql(object):
+             self.__cb_pending = CallbackAction.NOOP
+ 
+         ret = True
+-        if self.is_running():
+-            if do_reload:
+-                self.config.write_postgresql_conf()
+-                ret = self.reload(block_callbacks=change_role)
+-                if ret and change_role:
+-                    self.set_role(role)
++        try:
++            if self.is_running():
++                if do_reload:
++                    self.config.write_postgresql_conf()
++                    ret = self.reload(block_callbacks=change_role)
++                    if ret and change_role:
++                        self.set_role(role)
++                else:
++                    ret = self.restart(block_callbacks=change_role, role=role)
+             else:
+-                ret = self.restart(block_callbacks=change_role, role=role)
+-        else:
+-            ret = self.start(timeout=timeout, block_callbacks=change_role, role=role) or None
+-
+-        if change_role:
+-            # TODO: postpone this until start completes, or maybe do even earlier
+-            self.call_nowait(CallbackAction.ON_ROLE_CHANGE)
++                ret = self.start(timeout=timeout, block_callbacks=change_role, role=role) or None
++        except Exception:
++            # Ensure that unexpected errors (e.g. I/O errors due to full disk) do not prevent
++            # execution of the on_role_change callback when the role is changing.
++            logger.exception('Exception during follow()')
++            ret = False
++        finally:
++            if change_role:
++                # Execute the callback even if start/restart/reload failed. At this point
++                # the role might have already been changed (e.g. start() sets it early).
++                self.call_nowait(CallbackAction.ON_ROLE_CHANGE)
+         return ret
+ 
+     def _wait_promote(self, wait_seconds: int) -> Optional[bool]:
+diff --git a/repro_callback_disk_full.py b/repro_callback_disk_full.py
+new file mode 100644
+index 00000000..d4aaae4e
+--- /dev/null
++++ b/repro_callback_disk_full.py
+@@ -0,0 +1,91 @@
++import os
++import sys
++
++# Adjust path if needed
++sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
++
++from patroni.postgresql import Postgresql
++from patroni.postgresql.callback_executor import CallbackAction
++from patroni.postgresql.mpp import get_mpp
++
++
++def main():
++    data_dir = '/tmp/patroni_test_data'
++    os.makedirs(data_dir, exist_ok=True)
++
++    config = {
++        'name': 'node1',
++        'scope': 'testscope',
++        'data_dir': data_dir,
++        'config_dir': data_dir,
++        'retry_timeout': 10,
++        'listen': '127.0.0.1:5432',
++        'connect_address': '127.0.0.1:5432',
++        'authentication': {'superuser': {}, 'replication': {}},
++        'parameters': {
++            'wal_level': 'replica',
++            'hot_standby': 'on',
++            'max_wal_senders': 5,
++            'max_replication_slots': 5,
++            'wal_keep_segments': 8,
++        },
++        'callbacks': {
++            'on_role_change': 'echo',
++        },
++    }
++
++    p = Postgresql(config, get_mpp(config))
++
++    # Force major version known so follow() continues
++    p._major_version = 170000
++
++    # Force initial role to primary and mark that callbacks have been called before
++    p.set_role('primary')
++    # set private flag to simulate that callbacks already called previously
++    setattr(p, '_Postgresql__cb_called', True)
++
++    # Simplify recovery config handling in follow()
++    p.config.build_recovery_params = lambda member: {}
++    p.config.write_recovery_conf = lambda params: None
++
++    # Emulate that postgres is not running and start() fails with disk full after changing role
++    def fake_start(timeout=None, task=None, block_callbacks=False, role=None, after_start=None):
++        p.set_role(role or 'replica')
++        raise OSError(28, 'No space left on device')
++
++    p.is_running = lambda: False
++    p.start = fake_start
++
++    # Capture callback execution
++    calls = []
++
++    class DummyExec:
++        def call(self, cmd):
++            calls.append(cmd)
++            print('CALLBACK:', ' '.join(cmd))
++
++    p._callback_executor = DummyExec()
++
++    # Run follow which should execute callback even though start fails
++    try:
++        ret = p.follow(member=None, role='replica', timeout=5, do_reload=False)
++    except Exception as e:
++        print('Unexpected exception from follow:', e)
++        ret = None
++
++    print('follow ret:', ret)
++    print('role now:', p.role)
++    print('callbacks:', len(calls))
++    if not calls:
++        print('ERROR: on_role_change callback was NOT executed')
++        sys.exit(1)
++    # Validate callback contents (action and new role)
++    action, role, scope = calls[0][-3:]
++    if action != CallbackAction.ON_ROLE_CHANGE or role != 'replica':
++        print('ERROR: callback arguments incorrect:', action, role, scope)
++        sys.exit(2)
++    print('OK')
++
++
++if __name__ == '__main__':
++    main()

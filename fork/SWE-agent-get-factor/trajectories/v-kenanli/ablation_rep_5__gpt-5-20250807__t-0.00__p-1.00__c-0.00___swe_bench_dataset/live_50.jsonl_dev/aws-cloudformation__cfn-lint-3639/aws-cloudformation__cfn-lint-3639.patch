@@ -1,0 +1,276 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..a9a40632a
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,267 @@
++import json
++import os
++import subprocess
++import sys
++import tempfile
++from textwrap import dedent
++
++
++CFN_LINT_VERSION = os.environ.get("CFN_LINT_VERSION", "1.11.0")
++
++
++def ensure_cfn_lint_installed():
++    # Ensure we are running the requested version exactly, uninstall mismatched version first, then install
++    def get_installed_version():
++        try:
++            import importlib.metadata as importlib_metadata  # Py3.8+
++        except Exception:
++            import importlib_metadata  # type: ignore
++        try:
++            return importlib_metadata.version("cfn-lint")
++        except Exception:
++            return None
++
++    installed = get_installed_version()
++    if installed == CFN_LINT_VERSION:
++        print(f"[setup] Using existing cfn-lint=={installed}")
++        return True
++
++    if installed is not None:
++        print(f"[setup] Uninstalling existing cfn-lint=={installed} ...")
++        r_un = subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "cfn-lint"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
++        print(r_un.stdout)
++
++    print(f"[setup] Installing cfn-lint=={CFN_LINT_VERSION} ...", flush=True)
++    cmd = [sys.executable, "-m", "pip", "install", "--no-cache-dir", f"cfn-lint=={CFN_LINT_VERSION}"]
++    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
++    if r.returncode != 0:
++        print("[setup] Failed to install specified version of cfn-lint. Output:")
++        print(r.stdout)
++        # Try fallback to latest only if a specific version wasn't set by env
++        if os.environ.get("CFN_LINT_VERSION") is None:
++            print("[setup] Falling back to latest cfn-lint ...")
++            r2 = subprocess.run([sys.executable, "-m", "pip", "install", "--no-cache-dir", "cfn-lint"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
++            if r2.returncode != 0:
++                print("[setup] Unable to install cfn-lint:")
++                print(r2.stdout)
++                return False
++        else:
++            return False
++    return True
++
++
++def run_cfn_lint(template_body):
++    # Prefer using cfnlint API to avoid CLI/formatting differences between versions
++    try:
++        from cfnlint.api import lint as api_lint
++        from cfnlint.core import get_rules
++        rules = get_rules(append_rules=[], ignore_rules=[], include_rules=[], include_experimental=False)
++        # Only include the E1017 rule by filtering results post-run; API doesn't directly filter by id
++        matches = api_lint(template_body, rules=rules)
++        # Convert to JSON-like for uniform handling
++        data = [
++            {
++                "Rule": {"Id": m.rule.id if hasattr(m, 'rule') else getattr(m, 'rule', None)},
++                "Message": m.message,
++                "Location": {
++                    "Start": {"LineNumber": getattr(m, 'linenumber', None)},
++                },
++            }
++            for m in matches
++        ]
++        return 0 if not data else 1, data, "", ""
++    except Exception:
++        # Fallback to CLI if API usage fails for this version
++        # Write template to a temporary file
++        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as tf:
++            tf.write(template_body)
++            tf.flush()
++            template_path = tf.name
++        cmd_variants = [
++            [sys.executable, "-m", "cfnlint", "-f", "json", "--include-checks", "E1017", template_path],
++            ["cfn-lint", "-f", "json", "--include-checks", "E1017", template_path],
++        ]
++        last_exc = None
++        for cmd in cmd_variants:
++            try:
++                proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++                stdout = proc.stdout.strip()
++                stderr = proc.stderr.strip()
++                try:
++                    data = json.loads(stdout) if stdout else []
++                except json.JSONDecodeError:
++                    data = []
++                    for line in stdout.splitlines():
++                        line = line.strip()
++                        if line.startswith("[") and line.endswith("]"):
++                            try:
++                                data = json.loads(line)
++                                break
++                            except Exception:
++                                pass
++                os.unlink(template_path)
++                return proc.returncode, data, stdout, stderr
++            except FileNotFoundError as e:
++                last_exc = e
++                continue
++        try:
++            os.unlink(template_path)
++        except Exception:
++            pass
++        raise RuntimeError(f"Unable to execute cfn-lint: {last_exc}")
++
++
++def make_template_with_value(value_yaml_block):
++    # Compose a minimal template. We include only E1017 rule during linting to focus on the issue.
++    tpl = f"""
++    AWSTemplateFormatVersion: '2010-09-09'
++    Description: Reproduction template for cfn-lint E1017 with ElastiCache ReadEndPoint.Addresses
++    Resources:
++      ElasticacheRedis:
++        Type: AWS::ElastiCache::ReplicationGroup
++        Properties:
++          ReplicationGroupDescription: example replication group
++          Engine: redis
++          CacheNodeType: cache.t3.micro
++          NumNodeGroups: 1
++          ReplicasPerNodeGroup: 1
++          AutomaticFailoverEnabled: true
++      Alarm:
++        Type: AWS::CloudWatch::Alarm
++        DependsOn: ElasticacheRedis
++        Properties:
++          ComparisonOperator: GreaterThanOrEqualToThreshold
++          EvaluationPeriods: 1
++          MetricName: CPUUtilization
++          Namespace: AWS/ElastiCache
++          Period: 60
++          Statistic: Average
++          Threshold: 80
++          Dimensions:
++            - Name: CacheClusterId
++              Value:
++{value_yaml_block}
++    """
++    # Dedent and return
++    return dedent(tpl)
++
++
++def indent(level, s):
++    pad = "  " * level
++    return "\n".join(pad + line if line else pad for line in s.splitlines())
++
++
++# Problematic value from the issue description (using GetAtt ReadEndPoint.Addresses directly in Split)
++VALUE_PROBLEM = indent(8, dedent(
++    """
++    !Select 
++      - 0
++      - !Split 
++        - "."
++        - !Select 
++          - 1
++          - !Split 
++            - "["
++            - !Select 
++              - 0
++              - !Split 
++                - " "
++                - !GetAtt ElasticacheRedis.ReadEndPoint.Addresses
++    """
++))
++
++# A value that selects the first reader address from the list before splitting (expected to pass)
++VALUE_SELECT_FIRST_THEN_SPLIT = indent(8, dedent(
++    """
++    !Select 
++      - 0
++      - !Split 
++        - "."
++        - !Select 
++          - 1
++          - !Split 
++            - "["
++            - !Select 
++              - 0
++              - !Split 
++                - " "
++                - !Select 
++                  - 0
++                  - !GetAtt ElasticacheRedis.ReadEndPoint.Addresses
++    """
++))
++
++# A value using the primary endpoint address (string) which should be acceptable for Split
++VALUE_PRIMARY_ENDPOINT = indent(8, dedent(
++    """
++    !Select 
++      - 0
++      - !Split 
++        - "."
++        - !Select 
++          - 1
++          - !Split 
++            - "["
++            - !Select 
++              - 0
++              - !Split 
++                - " "
++                - !GetAtt ElasticacheRedis.PrimaryEndPoint.Address
++    """
++))
++
++
++def assert_no_E1017(template_body, context):
++    code, data, stdout, stderr = run_cfn_lint(template_body)
++    # Filter to E1017 findings
++    findings = [f for f in data if f.get("Rule", {}).get("Id") == "E1017"]
++    if findings:
++        # Provide helpful debug info
++        print(f"[FAIL] {context}: Expected no E1017 findings but found {len(findings)}.")
++        try:
++            print(json.dumps(findings, indent=2))
++        except Exception:
++            print(stdout)
++            if stderr:
++                print("stderr:\n" + stderr)
++        return False
++    else:
++        print(f"[PASS] {context}: No E1017 findings.")
++        return True
++
++
++def main():
++    if not ensure_cfn_lint_installed():
++        print("[FATAL] Could not install cfn-lint. Exiting with failure to reflect reproduction.")
++        sys.exit(1)
++
++    # Build templates
++    tpl_problem = make_template_with_value(VALUE_PROBLEM)
++    tpl_select_first = make_template_with_value(VALUE_SELECT_FIRST_THEN_SPLIT)
++    tpl_primary = make_template_with_value(VALUE_PRIMARY_ENDPOINT)
++
++    # Run assertions
++    print("Running cfn-lint E1017 reproduction tests...\n")
++    print(f"Using cfn-lint version requested: {CFN_LINT_VERSION}")
++
++    results = []
++    # This is the core reproduction: currently fails with E1017; expected behavior is no error
++    results.append(assert_no_E1017(tpl_problem, "Problem case: ReadEndPoint.Addresses used directly in Split (should be accepted)"))
++
++    # Control tests that should pass both before and after the fix
++    results.append(assert_no_E1017(tpl_select_first, "Control: Select first ReadEndPoint address then Split"))
++    results.append(assert_no_E1017(tpl_primary, "Control: PrimaryEndPoint.Address used in Split"))
++
++    # Determine overall status: We expect at least one failure prior to fix (the problem case)
++    all_passed = all(results)
++    if all_passed:
++        print("\nAll reproduction tests passed. If you expected a failure, the issue may have been fixed.")
++        sys.exit(0)
++    else:
++        print("\nSome reproduction tests failed (expected prior to fix). See details above.")
++        # Exit non-zero to indicate reproduction of the issue
++        sys.exit(1)
++
++
++if __name__ == "__main__":
++    main()
+
+

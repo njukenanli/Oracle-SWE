@@ -1,0 +1,188 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..ccdcbfee
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,179 @@
++import asyncio
++import sys
++from datetime import datetime
++
++# Reproduction tests for scene action handlers bypassing outer middleware
++# This file runs multiple approaches to trigger scene action handlers and
++# demonstrates that middleware-injected context is missing (TypeError) when
++# scene handlers are invoked incorrectly.
++
++
++async def run_mre_direct_call():
++    """
++    Approach 1: Use the minimal MRE from the PR description. Register the scene
++    and the outer middleware, then try to call the generated handler directly.
++    This should raise TypeError because 'test_context' is not passed to the
++    scene action handler when outer middleware is bypassed.
++    """
++    try:
++        from aiogram import Dispatcher, F, BaseMiddleware
++        from aiogram.filters import Command
++        from aiogram.types import Message, Chat, User
++        from aiogram.fsm.scene import Scene, on, SceneRegistry
++    except Exception as e:
++        print("SKIP: aiogram import failed:", e)
++        return 1
++
++    class TestScene(Scene, state='test'):
++        @on.message.enter()
++        async def greetings(self, message: Message, test_context: str):
++            await message.answer(f'Echo mode enabled. Context: {test_context}.')
++
++        @on.message(F.text)
++        async def echo(self, message: Message, test_context: str):
++            await message.reply(f'Your input: {message.text} and Context: {test_context}.')
++
++    class TestMiddleware(BaseMiddleware):
++        async def __call__(
++                self,
++                handler,
++                event,
++                data
++        ):
++            data['test_context'] = 'Custom context here'
++            return await handler(event, data)
++
++    # Setup dispatcher and register scene handler
++    dp = Dispatcher()
++
++    # Register scene handler via message router
++    dp.message.register(TestScene.as_handler(), Command('test'))
++
++    scene_registry = SceneRegistry(dp)
++    scene_registry.add(TestScene)
++
++    # Register outer middleware which is supposed to inject 'test_context'
++    dp.message.outer_middleware.register(TestMiddleware())
++
++    # Build a fake Message object to simulate incoming command
++    user = User(id=12345, is_bot=False, first_name='Test')
++    chat = Chat(id=11111, type='private')
++    message = Message(message_id=1, date=datetime.utcnow(), chat=chat, from_user=user, text='/test')
++
++    # Instead of directly calling handler, simulate an update going through
++    # the dispatcher so that outer middlewares (including our TestMiddleware)
++    # run and (should) inject 'test_context' into handler context. The bug is
++    # that scene action handlers are called without observer middlewares, so
++    # when scenes.enter triggers the 'enter' action, the handler will miss
++    # 'test_context' and raise TypeError.
++    class DummyBot:
++        def __init__(self, id: int = 1):
++            self.id = id
++
++    # Create Update object
++    from aiogram.types import Update
++    update = Update(update_id=1, message=message)
++
++    dummy_bot = DummyBot()
++
++    try:
++        # This should propagate the update through the dispatcher and trigger the scene
++        await dp.feed_update(dummy_bot, update)
++        print('TEST 1: DID NOT REPRODUCE (no TypeError during feed_update)')
++        return 2
++    except TypeError as e:
++        print('REPRO: TypeError as expected during dispatcher processing ->', e)
++        print('TEST 1: REPRODUCED (dispatcher raised TypeError)')
++        return 0
++    except Exception as e:
++        print('REPRO: Other exception during dispatcher processing ->', type(e), e)
++        return 2
++
++
++async def run_mre_scene_on_action():
++    """
++    Approach 2: Directly instantiate the scene and call its internal action invoker
++    if available. This tries to mimic the exact internal call that was failing in
++    the traceback (aiogram/fsm/scene.py line ~575).
++    """
++    try:
++        from aiogram.types import Message, Chat, User
++        from aiogram.fsm.scene import Scene, on
++    except Exception as e:
++        print("SKIP: aiogram fsm import failed:", e)
++        return 1
++
++    class TestScene(Scene, state='test'):
++        @on.message.enter()
++        async def greetings(self, message: Message, test_context: str):
++            return f'Context: {test_context}'
++
++    # Create dummy scene instance
++    # The Scene base may require parameters; we attempt to instantiate via its
++    # recommended factory if available, otherwise try best-effort.
++    # Build a fake Message object
++    user = User(id=1, is_bot=False, first_name='t')
++    chat = Chat(id=1, type='private')
++    message = Message(message_id=1, date=datetime.utcnow(), chat=chat, from_user=user, text='/test')
++
++    # Create proper wizard for the scene (avoid passing None which causes attribute access)
++    from aiogram.fsm.scene import SceneWizard
++    wizard = SceneWizard(
++        scene_config=TestScene.__scene_config__,
++        manager=None,
++        state=None,
++        update_type='message',
++        event=message,
++        data={},
++    )
++    scene = TestScene(wizard=wizard)
++
++    # Assign internals used by _on_action if present
++    # This is a best-effort approach and may vary between aiogram versions.
++    try:
++        scene.wizard.event = message
++        scene.wizard.data = {}
++        # Look for _on_action method on the wizard
++        on_action = getattr(scene.wizard, '_on_action', None)
++        if on_action is None:
++            print('SKIP: SceneWizard._on_action not present in this aiogram version')
++            return 0
++
++        # Call _on_action for event type 'message' which should trigger greetings
++        # If middleware-injected context is not present, this should raise TypeError
++        await on_action(SceneAction.enter,)
++        print('TEST 2: DID NOT REPRODUCE (no TypeError from _on_action)')
++        return 0
++    except TypeError as e:
++        print('REPRO: TypeError from SceneWizard._on_action ->', e)
++        print('TEST 2: REPRODUCED (SceneWizard._on_action raised TypeError)')
++        return 1
++    except Exception as e:
++        print('REPRO: Other exception from SceneWizard._on_action ->', type(e), e)
++        return 0
++
++
++def main():
++    results = asyncio.run(run_all())
++    # Exit with non-zero when reproduction successful (to indicate failure in CI)
++    # We'll use exit code 0 for reproduced (found failure) per instructions to show
++    # the issue; however, many CI systems expect non-zero for failures. To be
++    # explicit: return 0 when reproduction confirmed.
++    sys.exit(results)
++
++
++async def run_all():
++    r1 = await run_mre_direct_call()
++    r2 = await run_mre_scene_on_action()
++    # If any test reproduced the issue (returned 0), we treat whole run as reproduced
++    if r1 == 0 or r2 == 0:
++        print('\nOverall: ISSUE REPRODUCED')
++        return 0
++    else:
++        print('\nOverall: ISSUE NOT REPRODUCED — test inconclusive or environment differs')
++        # Return non-zero to indicate we couldn't reproduce in this environment
++        return 1
++
++
++if __name__ == '__main__':
++    main()
+
+

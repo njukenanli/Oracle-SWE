@@ -1,0 +1,210 @@
+diff --git a/dspy/functional/functional.py b/dspy/functional/functional.py
+index a45e302c..4352c75a 100644
+--- a/dspy/functional/functional.py
++++ b/dspy/functional/functional.py
+@@ -413,4 +413,110 @@ def _unwrap_json(output, from_json: Callable[[str], Union[pydantic.BaseModel, st
+             if not output.endswith("```"):
+                 raise ValueError("Don't write anything after the final json ```") from None
+             output = output[7:-3].strip()
+-        return ujson.dumps(ujson.loads(output))  # ujson is a bit more robust than the standard json
+\ No newline at end of file
++        return ujson.dumps(ujson.loads(output))  # ujson is a bit more robust than the standard json
++
++
++# Override: make JSON unwrapping robust to ChatAdapter list formatting.
++# ChatAdapter formats lists as human-readable bullets like:
++# [1] «item1»\n[2] «item2»\n or with multiline blocks using ««« ... »»».
++# This function normalizes such outputs into strict JSON before validation.
++def _unwrap_json(output, from_json: Callable[[str], Union[pydantic.BaseModel, str, None]]):
++    try:
++        parsing_result = from_json(output)
++        if isinstance(parsing_result, pydantic.BaseModel):
++            return parsing_result.model_dump_json()
++        else:
++            return output
++    except (ValueError, pydantic.ValidationError, AttributeError):
++        s = (output or "").strip()
++
++        # Handle empty list marker used by ChatAdapter.format_list
++        if s == "N/A":
++            return ujson.dumps([])
++
++        # Single-item blob formatted as «item»
++        if s.startswith("«") and s.endswith("»") and "\n" not in s:
++            inner = s[1:-1]
++            # Try to interpret inner as JSON, else keep as string
++            try:
++                parsed_inner = ujson.loads(inner)
++            except Exception:
++                parsed_inner = inner
++            return ujson.dumps([parsed_inner])
++
++        # Parse enumerated/multiline human-readable list format.
++        def _parse_formatted_list(text: str):
++            lines = text.splitlines()
++            items = []
++            i = 0
++            while i < len(lines):
++                line = lines[i].strip()
++                if not line:
++                    i += 1
++                    continue
++
++                # Multiline block item starts with: [n] «««
++                if line.startswith("[") and "]" in line and "«««" in line:
++                    i += 1
++                    buf = []
++                    while i < len(lines):
++                        l2 = lines[i]
++                        if l2.strip() == "»»»":
++                            break
++                        # Remove leading indentation if present.
++                        buf.append(l2.lstrip())
++                        i += 1
++                    block = "\n".join(buf).strip()
++                    # Try to interpret block as JSON, else keep as string
++                    try:
++                        parsed_block = ujson.loads(block)
++                    except Exception:
++                        parsed_block = block
++                    items.append(parsed_block)
++                    # Skip the closing line
++                    i += 1
++                    continue
++
++                # Single-line enumerated item: [n] «item»
++                if line.startswith("[") and "]" in line and "«" in line and "»" in line:
++                    start = line.find("«")
++                    end = line.rfind("»")
++                    if start != -1 and end != -1 and end > start:
++                        inner = line[start + 1 : end]
++                        try:
++                            parsed_inner = ujson.loads(inner)
++                        except Exception:
++                            parsed_inner = inner
++                        items.append(parsed_inner)
++                    i += 1
++                    continue
++
++                # Non-enumerated single-line blob: «item»
++                if line.startswith("«") and line.endswith("»"):
++                    inner = line[1:-1]
++                    try:
++                        parsed_inner = ujson.loads(inner)
++                    except Exception:
++                        parsed_inner = inner
++                    items.append(parsed_inner)
++                    i += 1
++                    continue
++
++                i += 1
++
++            return items if items else None
++
++        maybe_items = _parse_formatted_list(s)
++        if maybe_items is not None:
++            return ujson.dumps(maybe_items)
++
++        # Handle JSON fenced blocks: ```json ... ```
++        if s.startswith("```"):
++            if not s.startswith("```json"):
++                raise ValueError("json output should start with ```json") from None
++            if not s.endswith("```"):
++                raise ValueError("Don't write anything after the final json ```") from None
++            s = s[7:-3].strip()
++
++        # Fall back to strict JSON parsing.
++        return ujson.dumps(ujson.loads(s))
+diff --git a/repro_bootstrap_list_tokens.py b/repro_bootstrap_list_tokens.py
+new file mode 100644
+index 00000000..843c8b48
+--- /dev/null
++++ b/repro_bootstrap_list_tokens.py
+@@ -0,0 +1,40 @@
++import dspy
++from dspy.functional import TypedPredictor
++from dspy.teleprompt.bootstrap import BootstrapFewShot
++from dspy.utils.dummies import DummyLM
++
++# Define a signature with list[str] output
++class TokenizerSignature(dspy.Signature):
++    text: str = dspy.InputField(desc="Text")
++    tokens: list[str] = dspy.OutputField(desc="Tokens list")
++
++# Build a TypedPredictor
++tokenizer = TypedPredictor(TokenizerSignature)
++
++# Prepare a small trainset of labeled examples
++trainset = [
++    dspy.Example(text="EU rejects German", tokens=["EU", "rejects", "German"]).with_inputs("text"),
++    dspy.Example(text="Peter Blackburn", tokens=["Peter", "Blackburn"]).with_inputs("text"),
++]
++
++# DummyLM will return the labeled outputs based on input text found in the final message
++answers = {ex.inputs()["text"]: {"tokens": ex.labels()["tokens"]} for ex in trainset}
++lm = DummyLM(answers)
++dspy.settings.configure(lm=lm)
++
++# Metric: exact match of tokens
++
++def validate_tokens(example, prediction, trace=None):
++    return example.labels()["tokens"] == prediction.tokens
++
++# Run BootstrapFewShot optimization
++optimizer = BootstrapFewShot(metric=validate_tokens, max_labeled_demos=2)
++optimized_tokenizer = optimizer.compile(tokenizer, trainset=trainset)
++
++# Test optimized tokenizer inference
++for ex in trainset:
++    out = optimized_tokenizer(text=ex.inputs()["text"]).tokens
++    print("IN:", ex.inputs()["text"], "OUT:", out)
++    assert out == ex.labels()["tokens"], (out, ex.labels()["tokens"])
++
++print("Bootstrap optimization and inference succeeded.")
+diff --git a/repro_typedpredictor_list_parse.py b/repro_typedpredictor_list_parse.py
+new file mode 100644
+index 00000000..4f67097b
+--- /dev/null
++++ b/repro_typedpredictor_list_parse.py
+@@ -0,0 +1,41 @@
++import dspy
++from dspy.functional import TypedPredictor
++from dspy.adapters.chat_adapter import format_list
++
++# Create a signature with a list[str] output
++class Sig(dspy.Signature):
++    text: str = dspy.InputField()
++    tokens: list[str] = dspy.OutputField()
++
++# Instantiate TypedPredictor and prepare signature (sets parser)
++module = TypedPredictor(Sig)
++signature = module._prepare_signature()
++field = signature.output_fields["tokens"]
++parser = field.json_schema_extra["parser"]
++
++# Simulate ChatAdapter formatted list outputs
++
++enumerated = format_list(["EU", "rejects", "German"])  # produces [1] «EU» ...
++
++try:
++    parsed = parser(enumerated)
++    print("PARSED:", parsed)
++    assert parsed == ["EU", "rejects", "German"], parsed
++    print("OK: enumerated list parsed correctly.")
++except Exception as e:
++    print("ERROR:", e)
++    raise
++
++# Test empty list formatting (N/A)
++empty = format_list([])  # N/A
++parsed_empty = parser(empty)
++print("PARSED EMPTY:", parsed_empty)
++assert parsed_empty == [], parsed_empty
++
++# Test single-item formatting «item»
++single = format_list(["EU"])  # «EU»
++parsed_single = parser(single)
++print("PARSED SINGLE:", parsed_single)
++assert parsed_single == ["EU"], parsed_single
++
++print("All tests passed.")

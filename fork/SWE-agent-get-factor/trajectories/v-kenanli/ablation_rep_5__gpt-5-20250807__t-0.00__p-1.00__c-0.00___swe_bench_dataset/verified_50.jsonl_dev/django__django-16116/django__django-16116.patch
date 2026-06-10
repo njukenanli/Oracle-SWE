@@ -1,0 +1,175 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..3cc58d1e7b
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,169 @@
++import os
++import sys
++
++
++def setup_django():
++    # Configure a minimal Django environment without real apps. We'll define
++    # models in this module with an explicit app_label.
++    from django.conf import settings
++
++    if not settings.configured:
++        settings.configure(
++            DEBUG=True,
++            SECRET_KEY="repro",
++            INSTALLED_APPS=[],  # No real apps needed for this reproduction.
++            DATABASES={
++                "default": {
++                    "ENGINE": "django.db.backends.sqlite3",
++                    "NAME": ":memory:",
++                }
++            },
++            DEFAULT_AUTO_FIELD="django.db.models.AutoField",
++        )
++
++    import django
++    django.setup()
++
++    # Define model after setup so Model base classes are ready.
++    from django.db import models
++
++    class MyModel(models.Model):
++        name = models.CharField(max_length=50)
++
++        class Meta:
++            app_label = "reproapp"
++
++        def __str__(self):
++            return f"MyModel(name={self.name!r})"
++
++    return MyModel
++
++
++def create_schema(model):
++    from django.db import connection
++    with connection.schema_editor() as editor:
++        editor.create_model(model)
++
++
++def seed_data(model):
++    model.objects.bulk_create([
++        model(name="test"),
++        model(name="other"),
++    ])
++
++
++def assert_true(expr, msg="Assertion failed"):
++    if not expr:
++        raise AssertionError(msg)
++
++
++def run_test(name, fn):
++    try:
++        fn()
++        print(f"[PASS EXPECTED AFTER FIX] {name}")
++        return True
++    except AssertionError as e:
++        # Print assertion errors with more context; this indicates current buggy behavior.
++        print(f"[FAIL (EXPECTED BEFORE FIX)] {name}: {e}")
++        return False
++    except Exception as e:
++        print(f"[ERROR] {name}: {e}")
++        raise
++
++
++def tests(model):
++    from django.db.models import Exists
++
++    def show_query(qs):
++        from django.core.exceptions import EmptyResultSet
++        try:
++            return str(qs.query)
++        except EmptyResultSet:
++            return "EmptyResultSet"
++        except Exception as e:
++            return f"<error getting query: {e}>"
++
++    def test_not_exists_empty_matches_all_rows():
++        # ~Exists(empty queryset) should be a SQL constant TRUE, i.e., match all rows.
++        qs = model.objects.filter(~Exists(model.objects.none()))
++        expected_count = model.objects.count()
++        # Before fix, some Django versions reduce this to EmptyResultSet (0 rows), which is wrong.
++        assert_true(qs.count() == expected_count,
++                    msg=(
++                        "~Exists(empty queryset) should match all rows but did not.\n"
++                        f"Rendered query: {show_query(qs)}\n"
++                        f"Expected count={expected_count}, got count={qs.count()}"
++                    ))
++        # Additionally, the compiled query should not be represented as EmptyResultSet.
++        assert_true("EmptyResultSet" not in show_query(qs),
++                    msg=f"Query unexpectedly compiled to EmptyResultSet: {show_query(qs)}")
++
++    def test_not_exists_empty_with_additional_filter():
++        # When combined with another condition, ~Exists(empty) should not remove the WHERE clause.
++        qs = model.objects.filter(~Exists(model.objects.none()), name="test")
++        names = list(qs.values_list("name", flat=True))
++        assert_true(names == ["test"],
++                    msg=(
++                        "Filtering with ~Exists(empty) and another predicate should behave like the other predicate alone.\n"
++                        f"Rendered query: {show_query(qs)}\n"
++                        f"Got rows: {names}"
++                    ))
++        assert_true("EmptyResultSet" not in show_query(qs),
++                    msg=f"Query unexpectedly compiled to EmptyResultSet: {show_query(qs)}")
++
++    def test_exists_empty_matches_no_rows():
++        # Control test: Exists(empty queryset) should be SQL constant FALSE, i.e., match no rows.
++        qs = model.objects.filter(Exists(model.objects.none()))
++        assert_true(qs.count() == 0,
++                    msg=(
++                        "Exists(empty queryset) should yield no rows.\n"
++                        f"Rendered query: {show_query(qs)}\n"
++                        f"Got count: {qs.count()}"
++                    ))
++
++    def test_symmetry_with_all_vs_none():
++        # Another control: Exists(all()) is TRUE if any row exists in table.
++        from django.db.models import Exists
++        qs_all = model.objects.filter(Exists(model.objects.all()))
++        any_rows = model.objects.exists()
++        assert_true(qs_all.exists() == any_rows,
++                    msg=(
++                        "Exists(all()) should be TRUE iff there are rows in the subquery.\n"
++                        f"Rendered query: {show_query(qs_all)}\n"
++                        f"model.objects.exists()={any_rows}, qs_all.exists()={qs_all.exists()}"
++                    ))
++
++    def test_exclude_with_not_exists_empty():
++        # exclude() with ~Exists(empty) should be a no-op (exclude where TRUE matches all, so excluding TRUE removes all rows)
++        # Wait, careful: exclude(condition) is equivalent to filter(~condition). So exclude(~Exists(empty)) == filter(~~Exists(empty)) == filter(Exists(empty)).
++        # The intended edge case: ensure exclude behaves consistently with filter on the negation.
++        qs = model.objects.exclude(Exists(model.objects.none()))
++        # exclude(Exists(empty)) == exclude(FALSE) == no-op, so it should return all rows.
++        expected_count = model.objects.count()
++        assert_true(qs.count() == expected_count,
++                    msg=(
++                        "exclude(Exists(empty)) should be a no-op (exclude FALSE).\n"
++                        f"Rendered query: {show_query(qs)}\n"
++                        f"Expected count={expected_count}, got count={qs.count()}"
++                    ))
++
++    return [
++        ("~Exists(empty) matches all rows", test_not_exists_empty_matches_all_rows),
++        ("~Exists(empty) with additional predicate", test_not_exists_empty_with_additional_filter),
++        ("Exists(empty) matches no rows (control)", test_exists_empty_matches_no_rows),
++        ("Exists(all()) truthiness (control)", test_symmetry_with_all_vs_none),
++        ("exclude() interplay with Exists(empty)", test_exclude_with_not_exists_empty),
++    ]
++
++
++if __name__ == "__main__":
++    MyModel = setup_django()
++    create_schema(MyModel)
++    seed_data(MyModel)
++
++    for name, fn in tests(MyModel):
++        run_test(name, fn)
++
++
++    # Summary hint for developers running this reproduction.
++    print("\nNote: Tests marked '[FAIL (EXPECTED BEFORE FIX)]' indicate the bug is present. After applying a fix, these should turn into '[PASS EXPECTED AFTER FIX]'.")

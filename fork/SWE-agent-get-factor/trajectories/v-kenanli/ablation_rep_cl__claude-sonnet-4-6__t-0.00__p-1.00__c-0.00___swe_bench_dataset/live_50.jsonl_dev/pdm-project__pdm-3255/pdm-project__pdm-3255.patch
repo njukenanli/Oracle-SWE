@@ -1,0 +1,369 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..88df2600
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,360 @@
++"""
++Reproduction test for: PDM ignores no_proxy when all_proxy is set.
++
++Issue: When `all_proxy` is set along with `no_proxy`, PDM's PDMPyPIClient builds
++its _proxy_map by sorting proxy keys alphabetically. This means `all://` (wildcard
++proxy from all_proxy) sorts before `all://*pypi.org` (no-proxy entry from no_proxy),
++so the wildcard proxy is matched first and no_proxy entries are effectively ignored.
++
++The fix should sort the _proxy_map by URLPattern priority (most specific first) rather
++than by alphabetical string key order.
++"""
++
++import os
++import sys
++
++# Ensure we use the local source
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
++
++
++def make_proxy_map(env_vars: dict) -> dict:
++    """
++    Simulate the construction of PDMPyPIClient._proxy_map given environment variables.
++    Returns a dict of {URLPattern: proxy} sorted the same way PDMPyPIClient does it.
++    """
++    # Save and set environment variables
++    old_env = {}
++    for key in ("all_proxy", "ALL_PROXY", "http_proxy", "HTTP_PROXY",
++                "https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY"):
++        old_env[key] = os.environ.pop(key, None)
++
++    for key, value in env_vars.items():
++        os.environ[key] = value
++
++    try:
++        # We need to import fresh since httpx caches environment lookups
++        import importlib
++        import httpx
++        import httpx._client
++        # Reload to clear any caches
++        importlib.reload(httpx._client)
++        from httpx._client import Client
++        from httpx._utils import URLPattern
++
++        c = Client()
++        raw_proxy_map = c._get_proxy_map(None, allow_env_proxies=True)
++
++        # This is what PDMPyPIClient does currently (BUG: sorts by string key)
++        proxy_map_buggy = {
++            URLPattern(key): proxy
++            for key, proxy in sorted(raw_proxy_map.items())  # <-- alphabetical sort by string key
++        }
++
++        return proxy_map_buggy, raw_proxy_map
++    finally:
++        # Restore environment
++        for key, value in old_env.items():
++            if value is None:
++                os.environ.pop(key, None)
++            else:
++                os.environ[key] = value
++
++
++def get_proxy_for_url(proxy_map: dict, url_str: str):
++    """Simulate _transport_for's proxy selection using next()."""
++    import httpx
++    source_url = httpx.URL(url_str)
++    return next(
++        (proxy for pattern, proxy in proxy_map.items() if pattern.matches(source_url)),
++        None,
++    )
++
++
++def test_no_proxy_ignored_when_all_proxy_set():
++    """
++    Core regression test: when all_proxy=http://localhost:8888 and no_proxy=pypi.org,
++    pypi.org should NOT be proxied (proxy should be None).
++
++    This is the exact scenario from the bug report.
++    """
++    import httpx
++    from httpx._utils import URLPattern
++
++    env_vars = {
++        "all_proxy": "http://localhost:8888",
++        "no_proxy": "pypi.org",
++    }
++
++    proxy_map_buggy, raw_proxy_map = make_proxy_map(env_vars)
++
++    # Verify that the raw proxy map from httpx is correct
++    assert "all://" in raw_proxy_map, "all:// should be in the raw proxy map"
++    assert "all://*pypi.org" in raw_proxy_map, "all://*pypi.org should be in the raw proxy map from no_proxy"
++    assert raw_proxy_map["all://*pypi.org"] is None, "no_proxy entry should map to None"
++    assert raw_proxy_map["all://"] is not None, "all_proxy entry should be a Proxy"
++
++    # The bug: alphabetical sort puts 'all://' before 'all://*pypi.org'
++    keys = list(proxy_map_buggy.keys())
++    key_patterns = [k.pattern for k in keys]
++
++    # With the bug, 'all://' sorts before 'all://*pypi.org'
++    # This means the wildcard proxy is matched first, ignoring no_proxy
++    proxy_for_pypi = get_proxy_for_url(proxy_map_buggy, "https://pypi.org/simple/")
++
++    # This SHOULD be None (no proxy for pypi.org) but the bug causes it to be the proxy
++    # The test FAILS before the fix (proxy_for_pypi is not None)
++    # The test PASSES after the fix (proxy_for_pypi is None)
++    assert proxy_for_pypi is None, (
++        f"Expected no proxy for pypi.org (it's in no_proxy), "
++        f"but got {proxy_for_pypi}. "
++        f"Proxy map key order: {key_patterns}. "
++        f"This indicates no_proxy is being ignored because 'all://' pattern "
++        f"appears before 'all://*pypi.org' in the proxy map."
++    )
++
++
++def test_proxy_map_sort_order_with_all_proxy():
++    """
++    Test that when all_proxy is set, no_proxy entries (which have more specific
++    URLPatterns like 'all://*pypi.org') should appear before the wildcard
++    'all://' entry in the proxy map.
++
++    The bug is that `sorted()` is called on string keys, causing 'all://'
++    (less specific) to appear before 'all://*pypi.org' (more specific).
++    """
++    from httpx._utils import URLPattern
++
++    env_vars = {
++        "all_proxy": "http://localhost:8888",
++        "no_proxy": "pypi.org",
++    }
++
++    proxy_map_buggy, raw_proxy_map = make_proxy_map(env_vars)
++
++    keys = list(proxy_map_buggy.keys())
++    key_patterns = [k.pattern for k in keys]
++
++    # Find indices of the two patterns
++    all_wildcard_idx = next(
++        (i for i, k in enumerate(keys) if k.pattern == "all://"), None
++    )
++    no_proxy_idx = next(
++        (i for i, k in enumerate(keys) if k.pattern == "all://*pypi.org"), None
++    )
++
++    assert all_wildcard_idx is not None, "'all://' pattern not found in proxy map"
++    assert no_proxy_idx is not None, "'all://*pypi.org' pattern not found in proxy map"
++
++    # After the fix, the more specific 'all://*pypi.org' should come BEFORE 'all://'
++    # Before the fix, 'all://' comes first (alphabetically 'all://' < 'all://*pypi.org')
++    assert no_proxy_idx < all_wildcard_idx, (
++        f"Expected 'all://*pypi.org' (more specific) to appear before 'all://' (wildcard) "
++        f"in the proxy map, but got order: {key_patterns}. "
++        f"no_proxy_idx={no_proxy_idx}, all_wildcard_idx={all_wildcard_idx}. "
++        f"The proxy map should be sorted by URLPattern priority, not alphabetically."
++    )
++
++
++def test_multiple_no_proxy_entries_with_all_proxy():
++    """
++    Test that multiple no_proxy entries are all respected when all_proxy is set.
++    """
++    env_vars = {
++        "all_proxy": "http://localhost:8888",
++        "no_proxy": "pypi.org,files.pythonhosted.org",
++    }
++
++    proxy_map_buggy, raw_proxy_map = make_proxy_map(env_vars)
++
++    # Both pypi.org and files.pythonhosted.org should not be proxied
++    proxy_for_pypi = get_proxy_for_url(proxy_map_buggy, "https://pypi.org/simple/")
++    proxy_for_files = get_proxy_for_url(proxy_map_buggy, "https://files.pythonhosted.org/packages/some-pkg.tar.gz")
++    # Other domains should still be proxied
++    proxy_for_other = get_proxy_for_url(proxy_map_buggy, "https://other-registry.example.com/")
++
++    assert proxy_for_pypi is None, (
++        f"Expected no proxy for pypi.org (it's in no_proxy), but got {proxy_for_pypi}"
++    )
++    assert proxy_for_files is None, (
++        f"Expected no proxy for files.pythonhosted.org (it's in no_proxy), but got {proxy_for_files}"
++    )
++    assert proxy_for_other is not None, (
++        f"Expected proxy for other-registry.example.com (not in no_proxy), but got {proxy_for_other}"
++    )
++
++
++def test_transport_for_with_no_proxy_respected():
++    """
++    Test the PDMPyPIClient._transport_for method properly respects no_proxy.
++    When all_proxy is set but no_proxy includes pypi.org, _transport_for should
++    create a transport with proxy=None (direct connection).
++    """
++    import httpx
++    from httpx._utils import URLPattern
++
++    # Save env
++    old_env = {}
++    for key in ("all_proxy", "ALL_PROXY", "https_proxy", "HTTPS_PROXY",
++                "http_proxy", "HTTP_PROXY", "no_proxy", "NO_PROXY"):
++        old_env[key] = os.environ.pop(key, None)
++
++    try:
++        os.environ["all_proxy"] = "http://localhost:8888"
++        os.environ["no_proxy"] = "pypi.org"
++
++        from pdm._types import RepositoryConfig
++        from pdm.models.session import PDMPyPIClient
++
++        pypi_source = RepositoryConfig("pypi", "pypi", url="https://pypi.org/simple/")
++
++        client = PDMPyPIClient(sources=[pypi_source])
++
++        # Verify the proxy map keys
++        proxy_map = client._proxy_map
++        key_patterns = [k.pattern for k in proxy_map.keys()]
++
++        # Simulate what _transport_for does for pypi.org
++        source_url = httpx.URL("https://pypi.org/simple/")
++        proxy = next(
++            (proxy for pattern, proxy in proxy_map.items() if pattern.matches(source_url)),
++            None,
++        )
++
++        assert proxy is None, (
++            f"_transport_for should select proxy=None for pypi.org (it's in no_proxy), "
++            f"but selected {proxy}. Proxy map key order: {key_patterns}"
++        )
++
++    finally:
++        # Restore env
++        for key, value in old_env.items():
++            if value is None:
++                os.environ.pop(key, None)
++            else:
++                os.environ[key] = value
++
++
++def test_no_proxy_wildcard_star_bypasses_all():
++    """
++    Test that no_proxy=* (bypass everything) results in an empty proxy map
++    even when all_proxy is set. This is handled at the httpx level.
++    """
++    env_vars = {
++        "all_proxy": "http://localhost:8888",
++        "no_proxy": "*",
++    }
++
++    proxy_map_buggy, raw_proxy_map = make_proxy_map(env_vars)
++
++    # no_proxy=* causes httpx to return an empty proxy map
++    assert len(raw_proxy_map) == 0, (
++        f"no_proxy=* should result in an empty proxy map, but got: {raw_proxy_map}"
++    )
++
++    # With empty proxy map, no proxy should be selected for any URL
++    proxy_for_pypi = get_proxy_for_url(proxy_map_buggy, "https://pypi.org/simple/")
++    assert proxy_for_pypi is None, (
++        f"With no_proxy=*, no URL should be proxied, but pypi.org got {proxy_for_pypi}"
++    )
++
++
++def test_all_proxy_without_no_proxy():
++    """
++    Test that when all_proxy is set without no_proxy, proxy is used for all URLs.
++    (This is the expected behavior and should not be broken by any fix.)
++    """
++    env_vars = {
++        "all_proxy": "http://localhost:8888",
++    }
++
++    proxy_map_buggy, raw_proxy_map = make_proxy_map(env_vars)
++
++    # Without no_proxy, pypi.org should be proxied
++    proxy_for_pypi = get_proxy_for_url(proxy_map_buggy, "https://pypi.org/simple/")
++    assert proxy_for_pypi is not None, (
++        f"With all_proxy set and no no_proxy, pypi.org should be proxied, but got {proxy_for_pypi}"
++    )
++
++
++def test_https_proxy_with_no_proxy():
++    """
++    Test that https_proxy with no_proxy works correctly (this should work even
++    before the fix because 'all://*pypi.org' < 'https://' alphabetically).
++    After the fix, it should still work.
++    """
++    env_vars = {
++        "https_proxy": "http://localhost:8888",
++        "no_proxy": "pypi.org",
++    }
++
++    proxy_map_buggy, raw_proxy_map = make_proxy_map(env_vars)
++
++    proxy_for_pypi = get_proxy_for_url(proxy_map_buggy, "https://pypi.org/simple/")
++    assert proxy_for_pypi is None, (
++        f"Expected no proxy for pypi.org (it's in no_proxy), but got {proxy_for_pypi}"
++    )
++
++
++def test_all_proxy_with_no_proxy_subdomain():
++    """
++    Test that no_proxy with a subdomain is respected when all_proxy is set.
++    e.g. no_proxy=.pypi.org should block proxying for any *.pypi.org host.
++    """
++    env_vars = {
++        "all_proxy": "http://localhost:8888",
++        "no_proxy": ".pypi.org",  # subdomain matching
++    }
++
++    proxy_map_buggy, raw_proxy_map = make_proxy_map(env_vars)
++
++    # Check what pattern was created for .pypi.org
++    # httpx converts .pypi.org to all://*.pypi.org
++    proxy_for_files = get_proxy_for_url(proxy_map_buggy, "https://files.pypi.org/packages/")
++    proxy_for_api = get_proxy_for_url(proxy_map_buggy, "https://api.pypi.org/")
++
++    # These should not be proxied since they match *.pypi.org
++    assert proxy_for_files is None, (
++        f"Expected no proxy for files.pypi.org (matches .pypi.org in no_proxy), "
++        f"but got {proxy_for_files}"
++    )
++    assert proxy_for_api is None, (
++        f"Expected no proxy for api.pypi.org (matches .pypi.org in no_proxy), "
++        f"but got {proxy_for_api}"
++    )
++
++
++if __name__ == "__main__":
++    tests = [
++        test_no_proxy_ignored_when_all_proxy_set,
++        test_proxy_map_sort_order_with_all_proxy,
++        test_multiple_no_proxy_entries_with_all_proxy,
++        test_transport_for_with_no_proxy_respected,
++        test_no_proxy_wildcard_star_bypasses_all,
++        test_all_proxy_without_no_proxy,
++        test_https_proxy_with_no_proxy,
++        test_all_proxy_with_no_proxy_subdomain,
++    ]
++
++    passed = 0
++    failed = 0
++
++    for test in tests:
++        test_name = test.__name__
++        try:
++            test()
++            print(f"  PASS: {test_name}")
++            passed += 1
++        except AssertionError as e:
++            print(f"  FAIL: {test_name}")
++            print(f"        {e}")
++            failed += 1
++        except Exception as e:
++            print(f"  ERROR: {test_name}: {type(e).__name__}: {e}")
++            failed += 1
++
++    print(f"\nResults: {passed} passed, {failed} failed out of {len(tests)} tests")
++
++    if failed > 0:
++        sys.exit(1)
++    else:
++        sys.exit(0)
+
+

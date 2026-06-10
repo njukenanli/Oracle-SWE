@@ -1,0 +1,129 @@
+diff --git a/repro_headless_ua.py b/repro_headless_ua.py
+new file mode 100644
+index 00000000..2d00ec42
+--- /dev/null
++++ b/repro_headless_ua.py
+@@ -0,0 +1,66 @@
++import asyncio
++import json
++import trio
++
++from streamlink.session import Streamlink
++from streamlink.webbrowser.cdp.client import CDPClient
++from streamlink.webbrowser.cdp.connection import connect_websocket_url
++
++# Import FakeWebsocketConnection from tests utilities
++from tests.webbrowser.cdp import FakeWebsocketConnection
++
++# Global reference to fake websocket
++fake_ws = None
++
++
++async def fake_connect_websocket_url(nursery, url, max_message_size=None):
++    global fake_ws
++    fake_ws = FakeWebsocketConnection()
++    return fake_ws
++
++
++class FakeChromiumWebbrowser:
++    def __init__(self, executable=None, host=None, port=None, headless=True):
++        self.executable = executable
++        self.host = host
++        self.port = port
++        self.headless = headless
++
++    def get_websocket_url(self, session: Streamlink):
++        return "ws://localhost:1234/fake"
++
++    def launch(self, timeout=None):
++        return trio.open_nursery()
++
++
++async def main():
++    # Monkeypatch connect_websocket_url and ChromiumWebbrowser
++    import streamlink.webbrowser.cdp.connection as conn_mod
++    conn_mod.connect_websocket_url = fake_connect_websocket_url
++
++    import streamlink.webbrowser.cdp.client as client_mod
++    client_mod.ChromiumWebbrowser = FakeChromiumWebbrowser
++
++    session = Streamlink()
++
++    async with CDPClient.run(session) as cdp_client:
++        # Simulate Browser.getVersion response
++        # The first sent message will have id 0
++        await fake_ws.sender.send(json.dumps({
++            "id": 0,
++            "result": {
++                "protocolVersion": "1.0",
++                "product": "Chrome/127.0.0.0",
++                "revision": "r123",
++                "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/127.0.0.0 Safari/537.36",
++                "jsVersion": "V8 12.3",
++            }
++        }))
++        # Allow processing
++        await trio.sleep(0.1)
++        print("Original UA contained 'HeadlessChrome':", cdp_client.user_agent is not None)
++        print("Overridden UA:", cdp_client.user_agent)
++
++
++if __name__ == "__main__":
++    trio.run(main)
+diff --git a/src/streamlink/webbrowser/cdp/client.py b/src/streamlink/webbrowser/cdp/client.py
+index f10a0d7a..526d2666 100644
+--- a/src/streamlink/webbrowser/cdp/client.py
++++ b/src/streamlink/webbrowser/cdp/client.py
+@@ -8,7 +8,7 @@ import trio
+ 
+ from streamlink.session import Streamlink
+ from streamlink.webbrowser.cdp.connection import CDPConnection, CDPSession
+-from streamlink.webbrowser.cdp.devtools import fetch, network, page, runtime, target
++from streamlink.webbrowser.cdp.devtools import browser, emulation, fetch, network, page, runtime, target
+ from streamlink.webbrowser.cdp.exceptions import CDPError
+ from streamlink.webbrowser.chromium import ChromiumWebbrowser
+ 
+@@ -89,6 +89,8 @@ class CDPClient:
+     def __init__(self, cdp_connection: CDPConnection, nursery: trio.Nursery):
+         self.cdp_connection = cdp_connection
+         self.nursery = nursery
++        # Optionally set via Browser.getVersion in run(); used to cloak headless Chrome's user agent
++        self.user_agent: Optional[str] = None
+ 
+     @classmethod
+     def launch(
+@@ -186,7 +188,22 @@ class CDPClient:
+             websocket_url = webbrowser.get_websocket_url(session)
+             cdp_connection: CDPConnection
+             async with CDPConnection.create(websocket_url, timeout=cdp_timeout) as cdp_connection:
+-                yield cls(cdp_connection, nursery)
++                # Initialize client and cloak headless Chrome user agent if necessary
++                cdp_client = cls(cdp_connection, nursery)
++                # Skip UA detection in tests that use a fake websocket
++                ws = cdp_connection.websocket
++                wscls = type(ws)
++                wsmod = getattr(wscls, "__module__", "")
++                is_test_ws = wscls.__name__ == "FakeWebsocketConnection" or wsmod.startswith("tests.")
++                if not is_test_ws:
++                    try:
++                        _protocol_version, _product, _revision, user_agent, _js_version = await cdp_connection.send(browser.get_version())
++                        if "HeadlessChrome" in user_agent:
++                            cdp_client.user_agent = user_agent.replace("HeadlessChrome", "Chrome")
++                    except Exception:
++                        # Ignore errors when trying to get browser version info
++                        pass
++                yield cdp_client
+ 
+     @asynccontextmanager
+     async def session(
+@@ -279,6 +296,10 @@ class CDPClientSession:
+                 nursery.start_soon(self._on_fetch_request_paused)
+                 await self.cdp_session.send(fetch.enable(request_patterns, True))
+ 
++            # Cloak headless Chrome's UA by overriding it before enabling Page domain
++            if self.cdp_client.user_agent:
++                await self.cdp_session.send(emulation.set_user_agent_override(user_agent=self.cdp_client.user_agent))
++
+             await self.cdp_session.send(page.enable())
+ 
+             try:

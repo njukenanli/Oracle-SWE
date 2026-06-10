@@ -1,0 +1,204 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..e764d937c
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,195 @@
++#!/usr/bin/env python3
++"""
++Reproduction tests for shared-library soname vs filename mismatch.
++
++This script builds a small shared library with SONAME set to
++"librepro_z3.so.4.12" but named on-disk as
++"librepro_z3.so.4.12.4.0" (the leaf filename). It then builds
++a tiny executable that links against that leaf file.
++
++It runs multiple scenarios to reproduce the issue described in the PR:
++
++- When only the leaf file is present (no libname -> version symlink),
++  the loader should fail at runtime because the DT_NEEDED entry
++  references the SONAME (librepro_z3.so.4.12) which is not found.
++
++- When the versioned symlink (librepro_z3.so.4.12) pointing to the
++  leaf is present, the executable should run successfully.
++
++- When only an unversioned symlink (librepro_z3.so) pointing to the leaf
++  is present but the versioned symlink is missing, it should still fail.
++
++- When both versioned and unversioned symlinks are present it should pass.
++
++Run with: cd /testbed && python reproduction.py
++
++The tests are failing on purpose (matching the bug) and should pass
++only after the underlying packaging/conan/bazel issue is fixed.
++"""
++
++import os
++import sys
++import subprocess
++import tempfile
++import shutil
++
++ROOT = os.path.abspath(os.path.dirname(__file__))
++
++LIB_BASENAME = "librepro_z3"
++SONAME = LIB_BASENAME + ".so.4.12"
++LEAF_NAME = SONAME + ".4.0"
++UNVERSIONED = LIB_BASENAME + ".so"
++
++
++def run(cmd, env=None, check=True):
++    print("+ ", " ".join(cmd))
++    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True)
++    print(res.stdout, end="")
++    if res.stderr:
++        print(res.stderr, end="", file=sys.stderr)
++    if check and res.returncode != 0:
++        raise RuntimeError(f"Command failed (rc={res.returncode}): {' '.join(cmd)}")
++    return res
++
++
++def compile_shared_lib(build_dir):
++    cpath = os.path.join(build_dir, "libsrc.c")
++    with open(cpath, "w") as f:
++        f.write(r'''#include <stdio.h>
++int lib_value(void) { return 12345; }
++''')
++    libpath = os.path.join(build_dir, LEAF_NAME)
++    # Compile shared lib with SONAME set to SONAME but output file named LEAF_NAME.
++    cmd = [
++        "gcc", "-shared", "-fPIC", cpath,
++        "-Wl,-soname,%s" % SONAME,
++        "-o", libpath,
++    ]
++    run(cmd)
++    return libpath
++
++
++def compile_app(app_path, libfile_path):
++    cpath = app_path + ".c"
++    with open(cpath, "w") as f:
++        f.write(r'''#include <stdio.h>
++extern int lib_value(void);
++int main(void) { printf("%d\n", lib_value()); return 0; }
++''')
++    # Link by specifying the leaf library path explicitly (this mirrors
++    # conan/bazel cc_import referring to the leaf file).
++    cmd = ["gcc", cpath, "-o", app_path, libfile_path]
++    run(cmd)
++
++
++def run_with_ld_library_path(app_path, lib_dir):
++    # Run the app with LD_LIBRARY_PATH set to only lib_dir to ensure loader
++    # searches that location for the SONAME.
++    env = os.environ.copy()
++    env["LD_LIBRARY_PATH"] = lib_dir
++    res = subprocess.run([app_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True)
++    return res
++
++
++def ldd_shows_not_found(app_path, needle, lib_dir=None):
++    # Run 'ldd' on the binary and check for 'needle => not found'
++    env = None
++    if lib_dir is not None:
++        env = os.environ.copy()
++        env["LD_LIBRARY_PATH"] = lib_dir
++    res = subprocess.run(["ldd", app_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True)
++    out = res.stdout + res.stderr
++    print("ldd output:\n", out)
++    return (needle + " => not found") in out
++
++
++def test_scenarios():
++    failures = []
++    with tempfile.TemporaryDirectory() as tmp:
++        build_dir = os.path.join(tmp, "build")
++        os.makedirs(build_dir, exist_ok=True)
++        leaf = compile_shared_lib(build_dir)
++
++        # Prepare various packing scenarios
++        scenarios = []
++
++        # 1) Only leaf file present (broken packaging)
++        bad_dir = os.path.join(tmp, "bad_only_leaf")
++        os.makedirs(bad_dir, exist_ok=True)
++        shutil.copy(leaf, os.path.join(bad_dir, LEAF_NAME))
++        # EXPECTATION: packaging should provide correct SONAME symlink; test expects success.
++        scenarios.append(("only_leaf", bad_dir, True))
++
++        # 2) Only unversioned symlink present (e.g., libz3.so -> leaf)
++        unver_dir = os.path.join(tmp, "unver_symlink")
++        os.makedirs(unver_dir, exist_ok=True)
++        shutil.copy(leaf, os.path.join(unver_dir, LEAF_NAME))
++        os.symlink(LEAF_NAME, os.path.join(unver_dir, UNVERSIONED))
++        # EXPECTATION: conan/bazel should ensure this packaging works; mark as expected success
++        scenarios.append(("unversioned_symlink_only", unver_dir, True))
++
++        # 3) Versioned symlink present (librepro_z3.so.4.12 -> leaf)
++        ver_dir = os.path.join(tmp, "versioned_symlink")
++        os.makedirs(ver_dir, exist_ok=True)
++        shutil.copy(leaf, os.path.join(ver_dir, LEAF_NAME))
++        os.symlink(LEAF_NAME, os.path.join(ver_dir, SONAME))
++        scenarios.append(("versioned_symlink", ver_dir, True))
++
++        # 4) Both symlinks present
++        both_dir = os.path.join(tmp, "both_symlinks")
++        os.makedirs(both_dir, exist_ok=True)
++        shutil.copy(leaf, os.path.join(both_dir, LEAF_NAME))
++        os.symlink(LEAF_NAME, os.path.join(both_dir, SONAME))
++        os.symlink(SONAME, os.path.join(both_dir, UNVERSIONED))
++        scenarios.append(("both_symlinks", both_dir, True))
++
++        # For each scenario, compile an app that links against the leaf path
++        for name, libdir, should_pass in scenarios:
++            print("\n=== Scenario:", name, "libdir=", libdir, "expected_pass=", should_pass)
++            app_path = os.path.join(tmp, f"app_{name}")
++            # Use the absolute path to the leaf inside the package dir to mimic cc_import shared_library pointing
++            libfile_path = os.path.join(libdir, LEAF_NAME)
++            compile_app(app_path, libfile_path)
++
++            # Check ldd first (use LD_LIBRARY_PATH so ldd looks in our libdir)
++            not_found = ldd_shows_not_found(app_path, SONAME, libdir)
++            print(f"ldd shows missing soname {SONAME}: {not_found}")
++
++            # Run the app with LD_LIBRARY_PATH set to our libdir
++            res = run_with_ld_library_path(app_path, libdir)
++            ran_ok = (res.returncode == 0)
++            print("run rc=", res.returncode)
++            if res.stdout:
++                print("stdout:\n", res.stdout)
++            if res.stderr:
++                print("stderr:\n", res.stderr)
++
++            # Expectations:
++            # - If the versioned symlink is missing, the loader should not find SONAME and the app should fail.
++            expected_not_found = not should_pass
++            if expected_not_found:
++                if not_found or (not ran_ok):
++                    print("EXPECTED FAILURE observed for", name)
++                else:
++                    failures.append((name, "Expected failure but app ran successfully"))
++            else:
++                if ran_ok and not not_found:
++                    print("EXPECTED SUCCESS observed for", name)
++                else:
++                    failures.append((name, f"Expected success but failed (ran_ok={ran_ok}, not_found={not_found})"))
++
++    if failures:
++        print("\nSome scenarios did not behave as expected:")
++        for name, msg in failures:
++            print(f" - {name}: {msg}")
++        raise SystemExit(1)
++    else:
++        print("\nAll scenarios behaved as expected for this reproduction test.")
++
++
++if __name__ == '__main__':
++    try:
++        test_scenarios()
++    except Exception as e:
++        print("ERROR:", e, file=sys.stderr)
++        raise
+
+

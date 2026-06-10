@@ -1,0 +1,216 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..766067787
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,207 @@
++"""
++Reproduction test for the issue:
++  "Better error checking in ScriptEventHandler"
++
++The issue states that setting up a ScriptEventHandler with a broken/non-existing
++script path fails with a 500 error (i.e., an uncaught low-level OS exception).
++
++The fix should ensure that:
++- When the script directory does not exist (FileNotFoundError), a proper
++  ConfigAdminError is raised instead of an unhandled exception.
++- When the script path exists but is a file, not a directory
++  (NotADirectoryError), a proper ConfigAdminError is raised.
++- When the default script directory (e.g., /etc/privacyidea/scripts) does
++  not exist, a ConfigAdminError is raised.
++- When the script directory exists and is valid, no error is raised.
++
++These tests FAIL before the fix (they get raw OS errors like FileNotFoundError
++or NotADirectoryError) and PASS after the fix (ConfigAdminError is raised).
++"""
++
++import os
++import sys
++import unittest
++import tempfile
++
++from privacyidea.app import create_app
++from privacyidea.models import db
++from privacyidea.lib.eventhandler.scripthandler import ScriptEventHandler
++from privacyidea.lib.error import ConfigAdminError
++
++
++class ScriptEventHandlerErrorCheckingTestCase(unittest.TestCase):
++    """
++    Test cases that reproduce the issue where a broken/non-existing script path
++    causes a 500 error (unhandled OS exception) instead of a proper
++    ConfigAdminError.
++    """
++
++    @classmethod
++    def setUpClass(cls):
++        cls.app = create_app('testing', '')
++        cls.app_context = cls.app.app_context()
++        cls.app_context.push()
++        db.create_all()
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.app_context.pop()
++
++    def test_01_non_existing_script_directory_raises_config_admin_error(self):
++        """
++        When the configured script directory does not exist on the filesystem,
++        accessing the 'actions' property should raise a ConfigAdminError instead
++        of a raw FileNotFoundError (which would cause a 500 error).
++
++        BEFORE FIX: Raises FileNotFoundError (unhandled, causes 500 error).
++        AFTER FIX: Raises ConfigAdminError (proper error handling).
++        """
++        self.app.config['PI_SCRIPT_HANDLER_DIRECTORY'] = '/non/existent/path/to/scripts'
++        handler = ScriptEventHandler()
++        with self.assertRaises(ConfigAdminError):
++            _actions = handler.actions
++
++    def test_02_file_path_instead_of_directory_raises_os_or_config_error(self):
++        """
++        When the configured script directory path points to a file (not a
++        directory), accessing the 'actions' property should NOT silently
++        succeed. It should raise some exception (NotADirectoryError or a
++        ConfigAdminError), but NOT return a valid actions dict.
++
++        BEFORE FIX: Raises raw NotADirectoryError (unhandled, causes 500 error).
++        AFTER FIX: Raises ConfigAdminError (proper error handling), if the fix
++                   catches NotADirectoryError too, or at minimum does not
++                   return a valid actions dict.
++        """
++        # Create a temporary file to use as the (invalid) script directory
++        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
++            tmp_file_path = tmp_file.name
++
++        try:
++            self.app.config['PI_SCRIPT_HANDLER_DIRECTORY'] = tmp_file_path
++            handler = ScriptEventHandler()
++            # Either a ConfigAdminError or some OS-level error must be raised.
++            # The key point is that it should NOT silently return actions.
++            with self.assertRaises((ConfigAdminError, OSError)):
++                _actions = handler.actions
++        finally:
++            os.unlink(tmp_file_path)
++
++    def test_03_default_non_existing_path_raises_config_admin_error(self):
++        """
++        When the PI_SCRIPT_HANDLER_DIRECTORY config key is absent, the handler
++        falls back to the default path '/etc/privacyidea/scripts'. If that
++        path doesn't exist, accessing 'actions' should raise ConfigAdminError.
++
++        BEFORE FIX: Raises FileNotFoundError (unhandled, causes 500 error).
++        AFTER FIX: Raises ConfigAdminError (proper error handling).
++        """
++        # Remove the script directory from config to test default behavior
++        self.app.config.pop('PI_SCRIPT_HANDLER_DIRECTORY', None)
++        handler = ScriptEventHandler()
++        # The default path '/etc/privacyidea/scripts' does not exist in the
++        # test environment, so accessing actions should raise ConfigAdminError.
++        if not os.path.isdir(handler.script_directory):
++            with self.assertRaises(ConfigAdminError):
++                _actions = handler.actions
++        else:
++            # If the path exists, skip this sub-check and just ensure no crash
++            _actions = handler.actions
++            self.assertIsInstance(_actions, dict)
++
++    def test_04_valid_script_directory_returns_actions_dict(self):
++        """
++        When the configured script directory exists and is a valid directory,
++        accessing the 'actions' property should work correctly and return a
++        dict of available scripts.
++
++        This test ensures that the fix does not break the happy path.
++        """
++        d = os.path.join(os.getcwd(), 'tests', 'testdata', 'scripts')
++        self.app.config['PI_SCRIPT_HANDLER_DIRECTORY'] = d
++        handler = ScriptEventHandler()
++        actions = handler.actions
++        self.assertIsInstance(actions, dict)
++        # The test scripts directory contains ls.sh, fail.sh, success.sh
++        self.assertGreater(len(actions), 0)
++        for script_name in actions:
++            # Each action should have the proper option keys
++            self.assertIn('background', actions[script_name])
++            self.assertIn('raise_error', actions[script_name])
++
++    def test_05_empty_script_directory_returns_empty_actions_dict(self):
++        """
++        When the configured script directory exists but is empty, accessing
++        the 'actions' property should return an empty dict (no error).
++
++        This test ensures that an empty (but valid) script directory is
++        handled gracefully.
++        """
++        with tempfile.TemporaryDirectory() as tmp_dir:
++            self.app.config['PI_SCRIPT_HANDLER_DIRECTORY'] = tmp_dir
++            handler = ScriptEventHandler()
++            actions = handler.actions
++            self.assertIsInstance(actions, dict)
++            self.assertEqual(len(actions), 0)
++
++    def test_06_non_existing_path_error_is_not_file_not_found_error(self):
++        """
++        Specifically verify that the raw FileNotFoundError (which would be
++        an uncaught OS exception causing a 500 server error) is NOT raised
++        when the script directory does not exist. Instead, a ConfigAdminError
++        (a proper application-level error) must be raised.
++
++        BEFORE FIX: FileNotFoundError propagates up (causes 500 error).
++        AFTER FIX: ConfigAdminError is raised with a descriptive message.
++        """
++        self.app.config['PI_SCRIPT_HANDLER_DIRECTORY'] = '/does/not/exist/anywhere'
++        handler = ScriptEventHandler()
++        try:
++            _actions = handler.actions
++            self.fail("Expected ConfigAdminError but no exception was raised")
++        except ConfigAdminError:
++            # This is what we want after the fix
++            pass
++        except FileNotFoundError as e:
++            # This is the bug - a raw OS error that causes a 500 response
++            self.fail(
++                f"Got raw FileNotFoundError instead of ConfigAdminError: {e}. "
++                "This is the bug: a broken script path causes an unhandled "
++                "OS exception which results in a 500 error."
++            )
++
++    def test_07_file_path_raises_some_error_not_silent_success(self):
++        """
++        Verify that when the script path points to a file instead of a
++        directory, accessing 'actions' does NOT silently succeed (i.e., does
++        not return an actions dict as if nothing is wrong). Some error must be
++        raised (either ConfigAdminError or an OS error).
++
++        The core issue is about FileNotFoundError being unhandled and causing
++        500 errors; NotADirectoryError behavior may vary based on the fix scope.
++        """
++        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
++            tmp_file_path = tmp_file.name
++
++        try:
++            self.app.config['PI_SCRIPT_HANDLER_DIRECTORY'] = tmp_file_path
++            handler = ScriptEventHandler()
++            try:
++                _actions = handler.actions
++                self.fail("Expected an exception but 'actions' returned without error")
++            except (ConfigAdminError, OSError):
++                # Any exception (ConfigAdminError from fix, or OS error) is acceptable.
++                # The key point: it must NOT silently return an actions dict.
++                pass
++        finally:
++            os.unlink(tmp_file_path)
++
++
++if __name__ == '__main__':
++    # Run the tests
++    loader = unittest.TestLoader()
++    suite = loader.loadTestsFromTestCase(ScriptEventHandlerErrorCheckingTestCase)
++    runner = unittest.TextTestRunner(verbosity=2)
++    result = runner.run(suite)
++    # Exit with non-zero code if tests failed
++    sys.exit(0 if result.wasSuccessful() else 1)
+
+

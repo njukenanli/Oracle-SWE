@@ -1,0 +1,244 @@
+diff --git a/libqtile/backend/base/window.py b/libqtile/backend/base/window.py
+index 1255fef1..2d44ccf7 100644
+--- a/libqtile/backend/base/window.py
++++ b/libqtile/backend/base/window.py
+@@ -35,6 +35,9 @@ class _Window(CommandObject, metaclass=ABCMeta):
+         # Window.static sets this in case it is hooked to client_new to stop the
+         # Window object from being managed, now that a Static is being used instead
+         self.defunct: bool = False
++        # Optional per-window override for whether a window may steal focus on map.
++        # If None, backend-specific logic applies; otherwise this value is used.
++        self._user_can_steal_focus: bool | None = None
+ 
+         self.base_x: int | None = None
+         self.base_y: int | None = None
+@@ -79,8 +82,16 @@ class _Window(CommandObject, metaclass=ABCMeta):
+     @property
+     def can_steal_focus(self):
+         """Is it OK for this window to steal focus?"""
++        # Allow explicit user override by setting an attribute (used by hooks).
++        if self._user_can_steal_focus is not None:
++            return self._user_can_steal_focus
+         return True
+ 
++    @can_steal_focus.setter
++    def can_steal_focus(self, value: bool):
++        # Setting the property allows user hooks like client_new to control focus.
++        self._user_can_steal_focus = bool(value)
++
+     def has_fixed_ratio(self) -> bool:
+         """Does this window want a fixed aspect ratio?"""
+         return False
+diff --git a/libqtile/backend/x11/window.py b/libqtile/backend/x11/window.py
+index 8cb32203..795757fc 100644
+--- a/libqtile/backend/x11/window.py
++++ b/libqtile/backend/x11/window.py
+@@ -1249,8 +1249,15 @@ class _Window:
+ 
+     @property
+     def can_steal_focus(self):
++        # Respect explicit user override if set on base class
++        if self._user_can_steal_focus is not None:
++            return self._user_can_steal_focus
+         return self.window.get_wm_type() != "notification"
+ 
++    @can_steal_focus.setter
++    def can_steal_focus(self, value: bool):
++        self._user_can_steal_focus = bool(value)
++
+     def _do_focus(self):
+         """
+         Focus the window if we can, and return whether or not it was successful.
+diff --git a/libqtile/core/manager.py b/libqtile/core/manager.py
+index 7d4bced0..51ef4f5f 100644
+--- a/libqtile/core/manager.py
++++ b/libqtile/core/manager.py
+@@ -736,7 +736,8 @@ class Qtile(CommandObject):
+         if self.current_screen and isinstance(win, base.Window):
+             # Window may have been bound to a group in the hook.
+             if not win.group and self.current_screen.group:
+-                self.current_screen.group.add(win, focus=win.can_steal_focus)
++                # Only allow focus to be taken automatically if the window can steal focus
++                self.current_screen.group.add(win, focus=bool(getattr(win, "can_steal_focus", True)))
+ 
+         hook.fire("client_managed", win)
+ 
+diff --git a/libqtile/group.py b/libqtile/group.py
+index a4a68136..27e8c152 100644
+--- a/libqtile/group.py
++++ b/libqtile/group.py
+@@ -267,6 +267,11 @@ class _Group(CommandObject):
+                 i.add_client(win)
+         if focus:
+             self.focus(win, warp=True, force=force)
++        else:
++            # Ensure newly added window is positioned by layouts even if it doesn't
++            # take focus (e.g. when can_steal_focus is False).
++            # Without this, new clients could appear at (0, 0) until manually focused.
++            self.layout_all(warp=False)
+ 
+     def remove(self, win, force=False):
+         hook.fire("group_window_remove", self, win)
+diff --git a/libqtile/widget/prompt.py b/libqtile/widget/prompt.py
+index 42ed6601..08c2cb3a 100644
+--- a/libqtile/widget/prompt.py
++++ b/libqtile/widget/prompt.py
+@@ -405,7 +405,14 @@ class Prompt(base._TextBox):
+         base._TextBox._configure(self, qtile, bar)
+ 
+         def f(win):
+-            if self.active and not win == self.bar.window:
++            # Only unfocus the prompt if the focused window is allowed to steal focus
++            # and it's not the bar's own window. This prevents new clients from
++            # interrupting input when focus_on_window_activation is disabled.
++            try:
++                can_steal = win.can_steal_focus
++            except Exception:
++                can_steal = True
++            if self.active and can_steal and not win == self.bar.window:
+                 self._unfocus()
+ 
+         hook.subscribe.client_focus(f)
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..d2a7e6be
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,137 @@
++# Reproduction script to validate that adding a window without focusing it
++# will still trigger a layout pass so the window is positioned appropriately.
++
++from libqtile.group import _Group
++from libqtile.backend.base.window import FloatStates
++
++
++class DummyLayout:
++    name = "dummy"
++
++    def __init__(self, group):
++        self._clients = []
++
++    def clone(self, group):
++        return DummyLayout(group)
++
++    def add_client(self, win):
++        self._clients.append(win)
++
++    def layout(self, windows, screen_rect):
++        # no-op for reproduction
++        pass
++
++    def show(self, screen_rect):
++        pass
++
++    def hide(self):
++        pass
++
++    def blur(self):
++        pass
++
++    def focus(self, win):
++        pass
++
++    def focus_first(self):
++        return None
++
++
++class DummyFloatingLayout:
++    def match(self, win):
++        return False
++
++    def add_client(self, win):
++        pass
++
++    def layout(self, windows, screen_rect):
++        pass
++
++    def show(self, screen_rect):
++        pass
++
++    def blur(self):
++        pass
++
++    def remove(self, win):
++        return None
++
++    def focus_first(self, group=None):
++        return None
++
++    def to_screen(self, group, screen):
++        pass
++
++
++class DummyQtile:
++    class Core:
++        def masked(self):
++            from contextlib import contextmanager
++
++            @contextmanager
++            def _cm():
++                yield
++            return _cm()
++
++    class Screen:
++        def __init__(self):
++            self._rect = (0, 0, 1920, 1080)
++
++        def get_rect(self):
++            # x, y, width, height
++            class Rect:
++                x = 0
++                y = 0
++                width = 800
++                height = 600
++            return Rect()
++
++    def __init__(self):
++        self.core = DummyQtile.Core()
++        self.current_screen = DummyQtile.Screen()
++        self.config = type("Cfg", (), {
++            "auto_fullscreen": False,
++            "floats_kept_above": False,
++            "cursor_warp": False,
++        })()
++
++
++class DummyWin:
++    floating = False
++    fullscreen = False
++    wants_to_fullscreen = False
++    _float_state = None
++    group = None
++    minimized = False
++
++    @property
++    def can_steal_focus(self):
++        return False
++
++    def __repr__(self):
++        return "<DummyWin>"
++
++
++class TestGroup(_Group):
++    def __init__(self):
++        super().__init__("a")
++        self._layout_calls = 0
++
++    def layout_all(self, warp=False):
++        self._layout_calls += 1
++        return super().layout_all(warp)
++
++
++if __name__ == "__main__":
++    g = TestGroup()
++    q = DummyQtile()
++    g._configure([DummyLayout(g)], DummyFloatingLayout(), q)
++    # attach a screen so layout_all performs
++    g.set_screen(q.current_screen, warp=False)
++
++    w = DummyWin()
++    # Simulate group.add with focus=False e.g. when window should not steal focus
++    g.add(w, focus=w.can_steal_focus)
++
++    # Expect that layout_all was called at least once, even though focus=False
++    print({"layout_calls": g._layout_calls, "tiled_count": len(g.tiled_windows)})

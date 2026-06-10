@@ -1,0 +1,313 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..ef9bffaf
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,304 @@
++"""
++Reproduction test for the issue:
++"Disabling focus change on new clients destroys layouts"
++
++When `can_steal_focus` returns False for a new client (either because it is a
++notification-type window or because the user sets it via a `client_new` hook),
++`group.add()` is called with `focus=False`.  In that code-path, `layout_all()`
++is **never** invoked which means the freshly-added tiled window never gets
++placed by the layout and stays at its original (often 0,0, 100×100) position.
++
++The fix is to ensure that `layout_all()` is still called in `group.add()` even
++when `focus=False`.
++
++Run with:
++    cd /testbed && python reproduction.py
++"""
++
++# ---------------------------------------------------------------------------
++# When executed as a script, re-invoke through pytest from the test directory
++# so that the conftest.py fixtures (Xephyr, backend, etc.) are available.
++# ---------------------------------------------------------------------------
++import sys
++import os
++
++if __name__ == "__main__":
++    import subprocess
++    # pytest must be invoked with --rootdir pointing to /testbed so that
++    # pyproject.toml is found and the conftest.py in test/ (which registers
++    # --backend) is loaded.
++    result = subprocess.run(
++        [
++            sys.executable, "-m", "pytest",
++            # Point pytest at this file so only our tests run
++            os.path.abspath(__file__),
++            "-v",
++            "--backend=x11",
++            "--tb=short",
++            # Override testpaths so pytest finds our file rather than test/
++            "--override-ini=testpaths=.",
++        ],
++        cwd="/testbed",
++    )
++    sys.exit(result.returncode)
++
++
++# ===========================================================================
++# Actual pytest test cases
++# ===========================================================================
++import pytest
++import sys
++import os
++
++# Make sure /testbed is on the path so test helpers can be imported
++sys.path.insert(0, "/testbed")
++
++import libqtile.config
++import libqtile.hook as hook
++import libqtile.layout
++import libqtile.resources
++
++from libqtile import layout
++from libqtile.confreader import Config
++from test.helpers import BareConfig, Retry
++from test.layouts.layout_utils import assert_focused
++
++# Screen dimensions used by the test Xephyr instance
++SCREEN_WIDTH = 800
++SCREEN_HEIGHT = 600
++
++
++# ---------------------------------------------------------------------------
++# Helper configs
++# ---------------------------------------------------------------------------
++
++class MonadTallConfig(BareConfig):
++    """MonadTall layout, mouse-focus disabled."""
++    layouts = [libqtile.layout.MonadTall()]
++    follow_mouse_focus = False
++
++
++class StackConfig(BareConfig):
++    """Stack layout (single stack), mouse-focus disabled."""
++    layouts = [libqtile.layout.Stack(num_stacks=1)]
++    follow_mouse_focus = False
++
++
++monadtall_config = pytest.mark.parametrize("manager", [MonadTallConfig], indirect=True)
++stack_config     = pytest.mark.parametrize("manager", [StackConfig],     indirect=True)
++
++
++# ---------------------------------------------------------------------------
++# Helper: code that installs a client_new hook inside the qtile process which
++# makes every subsequent new window return False from can_steal_focus.
++# ---------------------------------------------------------------------------
++_HOOK_INSTALL_CODE = """\
++from libqtile import hook as _h
++def _prevent_steal(c):
++    type(c).can_steal_focus = property(lambda self: False)
++_h.subscribe.client_new(_prevent_steal)
++"""
++
++
++# ---------------------------------------------------------------------------
++# Test 1 – tiled window added with can_steal_focus=False must be positioned
++# ---------------------------------------------------------------------------
++
++@monadtall_config
++def test_no_steal_focus_window_is_positioned_by_layout(manager):
++    """
++    Bug: when can_steal_focus=False the window is added with focus=False which
++    means layout_all() is never called.  The window stays at its initial
++    100×100 size at position 0,0 instead of being placed by MonadTall.
++
++    After the fix the layout must call place() on the window, giving it
++    dimensions that match the tiling layout (much larger than the initial
++    100×100).
++    """
++    # Spawn the first window normally; it gets focus and is tiled.
++    manager.test_window("one")
++    assert_focused(manager, "one")
++
++    # Install the hook that prevents focus stealing.
++    manager.c.eval(_HOOK_INSTALL_CODE)
++
++    # Spawn a second window; the hook makes it return False from can_steal_focus.
++    manager.test_window("two")
++
++    # ------------------------------------------------------------------
++    # Assertion A: focus must NOT have moved to "two"
++    # ------------------------------------------------------------------
++    assert manager.c.group.info()["focus"] == "one", (
++        "Focus moved to 'two' even though can_steal_focus=False"
++    )
++
++    # ------------------------------------------------------------------
++    # Assertion B: "two" must be in the windows list
++    # ------------------------------------------------------------------
++    names = [w["name"] for w in manager.c.windows()]
++    assert "two" in names, "'two' was not added to the group"
++
++    # ------------------------------------------------------------------
++    # Assertion C: "two" must have been positioned by MonadTall
++    #
++    # MonadTall on an 800×600 screen splits two tiled windows so each gets
++    # roughly half the width (~400 px) and the full client height (~580 px).
++    # The initial GTK test window requests 100×100.
++    # If layout_all() was never called, "two" stays at 100×100.
++    # ------------------------------------------------------------------
++    info_two = next(w for w in manager.c.windows() if w["name"] == "two")
++
++    assert info_two["width"] > 100, (
++        f"Window 'two' width={info_two['width']} – layout_all() was not called "
++        f"(window stuck at its initial size, meaning focus=False skipped layout)"
++    )
++    assert info_two["height"] > 100, (
++        f"Window 'two' height={info_two['height']} – layout_all() was not called"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 2 – focus stays on the previously focused window
++# ---------------------------------------------------------------------------
++
++@monadtall_config
++def test_no_steal_focus_preserves_existing_focus(manager):
++    """
++    Spawning a window with can_steal_focus=False must leave focus on the
++    previously focused window and must not add the new window to focus_history.
++    """
++    manager.test_window("one")
++    assert_focused(manager, "one")
++
++    manager.test_window("two")
++    assert_focused(manager, "two")
++
++    # Prevent the next window from stealing focus.
++    manager.c.eval(_HOOK_INSTALL_CODE)
++
++    manager.test_window("three")
++
++    # Focus must remain on "two"
++    assert manager.c.group.info()["focus"] == "two", (
++        "Focus changed away from 'two' when 'three' was spawned with "
++        "can_steal_focus=False"
++    )
++
++    # "three" must not appear in focus_history
++    focus_history = manager.c.group.info()["focus_history"]
++    assert "three" not in focus_history, (
++        f"'three' should not be in focus_history={focus_history}"
++    )
++
++    # "three" must still be in the windows list (it was added to the group)
++    names = [w["name"] for w in manager.c.windows()]
++    assert "three" in names, "'three' was not added to the group at all"
++
++    # "three" must be positioned (not stuck at 100×100)
++    info_three = next(w for w in manager.c.windows() if w["name"] == "three")
++    assert info_three["width"] > 100, (
++        f"'three' width={info_three['width']} – not positioned by layout"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 3 – multiple non-focusing windows are all positioned
++# ---------------------------------------------------------------------------
++
++@stack_config
++def test_multiple_no_steal_focus_windows_all_positioned(manager):
++    """
++    Spawning several windows with can_steal_focus=False must result in ALL of
++    them being positioned by the layout (not left at initial 100×100).
++    """
++    manager.test_window("one")
++    assert_focused(manager, "one")
++
++    # Install the hook.
++    manager.c.eval(_HOOK_INSTALL_CODE)
++
++    manager.test_window("two")
++    manager.test_window("three")
++
++    # Focus must remain on "one".
++    assert manager.c.group.info()["focus"] == "one", (
++        "Focus changed away from 'one'"
++    )
++
++    # All three windows must be present.
++    names = {w["name"] for w in manager.c.windows()}
++    for expected in ("one", "two", "three"):
++        assert expected in names, f"Window '{expected}' not found"
++
++    # "two" and "three" must have been positioned.
++    for w in manager.c.windows():
++        if w["name"] in ("two", "three"):
++            assert w["width"] > 100, (
++                f"Window '{w['name']}' was not positioned: width={w['width']}"
++            )
++
++
++# ---------------------------------------------------------------------------
++# Test 4 – notification windows (builtin can_steal_focus=False) must not
++#           disrupt an already-tiled layout
++# ---------------------------------------------------------------------------
++
++@monadtall_config
++def test_notification_does_not_disrupt_tiled_layout(manager):
++    """
++    Desktop notifications use wm_type='notification', which makes X11's
++    can_steal_focus property return False automatically.  After a notification
++    appears the existing tiled window must remain focused and keep its
++    layout-assigned dimensions.
++    """
++    manager.test_window("one")
++    assert_focused(manager, "one")
++
++    # Record the layout-assigned dimensions of "one".
++    info_one = manager.c.window.info()
++    w_before = info_one["width"]
++    h_before = info_one["height"]
++
++    # Spawn a notification; it must NOT steal focus.
++    notif = manager.test_notification("notif")
++
++    assert manager.c.group.info()["focus"] == "one", (
++        "Notification stole focus from 'one'"
++    )
++
++    # Layout dimensions of "one" must be unchanged after the notification.
++    info_one_after = manager.c.window.info()
++    assert info_one_after["width"] == w_before, (
++        "Tiled window 'one' changed width after notification spawned"
++    )
++    assert info_one_after["height"] == h_before, (
++        "Tiled window 'one' changed height after notification spawned"
++    )
++
++    manager.kill_window(notif)
++
++
++# ---------------------------------------------------------------------------
++# Test 5 – focus_history is not polluted by non-focusing windows
++# ---------------------------------------------------------------------------
++
++@monadtall_config
++def test_no_steal_focus_window_not_in_focus_history(manager):
++    """
++    A window that cannot steal focus must not appear in focus_history because
++    it was never actually focused.
++    """
++    manager.test_window("one")
++    assert_focused(manager, "one")
++
++    manager.c.eval(_HOOK_INSTALL_CODE)
++
++    manager.test_window("two")
++
++    focus_history = manager.c.group.info()["focus_history"]
++    assert "two" not in focus_history, (
++        f"'two' must not be in focus_history={focus_history}"
++    )
++    assert "one" in focus_history, (
++        f"'one' must still be in focus_history={focus_history}"
++    )
+
+

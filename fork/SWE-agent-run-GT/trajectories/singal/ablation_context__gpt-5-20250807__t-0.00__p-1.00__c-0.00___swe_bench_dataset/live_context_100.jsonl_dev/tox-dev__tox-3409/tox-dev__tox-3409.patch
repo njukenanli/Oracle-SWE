@@ -1,0 +1,151 @@
+diff --git a/src/tox/tox_env/python/runner.py b/src/tox/tox_env/python/runner.py
+index 336476ef..1157b91a 100644
+--- a/src/tox/tox_env/python/runner.py
++++ b/src/tox/tox_env/python/runner.py
+@@ -69,6 +69,7 @@ class PythonRun(Python, RunToxEnv, ABC):
+             return False
+ 
+         add_extras_to_env(self.conf)
++        add_dependency_groups_to_env(self.conf)
+         return True
+ 
+     @property
+@@ -134,8 +135,23 @@ def add_extras_to_env(conf: EnvConfigSet) -> None:
+     )
+ 
+ 
++def add_dependency_groups_to_env(conf: EnvConfigSet) -> None:
++    def _normalize_groups(values: set[str]) -> set[str]:
++        return {canonicalize_name(v) for v in values}
++
++    conf.add_config(
++        keys=["dependency_groups", "dependency-groups"],
++        of_type=Set[str],
++        default=set(),
++        desc="dependency groups to install of the target package as per PEP 735",
++        post_process=_normalize_groups,
++    )
++
++
++
+ __all__ = [
+     "PythonRun",
+     "add_extras_to_env",
++    "add_dependency_groups_to_env",
+     "add_skip_missing_interpreters_to_core",
+ ]
+diff --git a/src/tox/tox_env/python/virtual_env/package/pyproject.py b/src/tox/tox_env/python/virtual_env/package/pyproject.py
+index b70fc677..0b06ae88 100644
+--- a/src/tox/tox_env/python/virtual_env/package/pyproject.py
++++ b/src/tox/tox_env/python/virtual_env/package/pyproject.py
+@@ -12,6 +12,8 @@ from threading import RLock
+ from typing import TYPE_CHECKING, Any, Dict, Generator, Iterator, Literal, NoReturn, Optional, Sequence, cast
+ 
+ from cachetools import cached
++from packaging.utils import canonicalize_name
++
+ from packaging.requirements import Requirement
+ from pyproject_api import (
+     BackendFailed,
+@@ -304,8 +306,9 @@ class Pep517VenvPackager(PythonPackageToxEnv, ABC):
+             return None  # is not a PEP-621 pyproject
+         project = pyproject["project"]
+         extras: set[str] = for_env["extras"]
++        dependency_groups: set[str] = for_env["dependency_groups"]
+         for dynamic in project.get("dynamic", []):
+-            if dynamic == "dependencies" or (extras and dynamic == "optional-dependencies"):
++            if dynamic == "dependencies" or ((extras or dependency_groups) and dynamic == "optional-dependencies"):
+                 return None  # if any dependencies are dynamic we can just calculate all dynamically
+ 
+         deps_with_markers: list[tuple[Requirement, set[str | None]]] = [
+@@ -314,6 +317,37 @@ class Pep517VenvPackager(PythonPackageToxEnv, ABC):
+         optional_deps = project.get("optional-dependencies", {})
+         for extra, reqs in optional_deps.items():
+             deps_with_markers.extend((Requirement(req), {extra}) for req in (reqs or []))
++        # PEP 735 dependency groups
++        groups = project.get("dependency-groups", {})
++        # normalize group keys
++        norm_groups: dict[str, list[str]] = {canonicalize_name(k): (v or []) for k, v in groups.items()}
++        selected = {canonicalize_name(g) for g in dependency_groups}
++
++        # expand selected groups with support for recursive group references via entries like "group:<name>"
++        added: set[str] = set()
++        visiting: set[str] = set()
++
++        def add_group(g: str) -> None:
++            ng = canonicalize_name(g)
++            if ng in visiting:
++                cycle = " -> ".join(list(visiting) + [ng])
++                raise Fail(f"circular dependency groups detected: {cycle}")
++            visiting.add(ng)
++            try:
++                entries = norm_groups.get(ng, [])
++                for entry in entries:
++                    if entry.startswith("group:"):
++                        child = entry.split(":", 1)[1].strip()
++                        add_group(child)
++                    else:
++                        if entry not in added:
++                            added.add(entry)
++                            deps_with_markers.append((Requirement(entry), {None}))
++            finally:
++                visiting.remove(ng)
++
++        for group in selected:
++            add_group(group)
+         return dependencies_with_extras_from_markers(
+             deps_with_markers=deps_with_markers,
+             extras=extras,
+@@ -338,6 +372,40 @@ class Pep517VenvPackager(PythonPackageToxEnv, ABC):
+             reqs = self.get_package_dependencies(for_env)
+             name = self.get_package_name(for_env)
+         extras: set[str] = for_env["extras"]
++        dependency_groups: set[str] = for_env["dependency_groups"]
++        # Merge selected dependency groups from static pyproject configuration even when using built metadata
++        pyproject_file = self.core["package_root"] / "pyproject.toml"
++        if pyproject_file.exists():
++            with pyproject_file.open("rb") as fh:
++                pyproject = tomllib.load(fh)
++            if "project" in pyproject:
++                groups = pyproject["project"].get("dependency-groups", {})
++                norm_groups: dict[str, list[str]] = {canonicalize_name(k): (v or []) for k, v in groups.items()}
++                selected = {canonicalize_name(g) for g in dependency_groups}
++                added: set[str] = set()
++                visiting: set[str] = set()
++
++                def add_group(g: str) -> None:
++                    ng = canonicalize_name(g)
++                    if ng in visiting:
++                        cycle = " -> ".join(list(visiting) + [ng])
++                        raise Fail(f"circular dependency groups detected: {cycle}")
++                    visiting.add(ng)
++                    try:
++                        entries = norm_groups.get(ng, [])
++                        for entry in entries:
++                            if entry.startswith("group:"):
++                                child = entry.split(":", 1)[1].strip()
++                                add_group(child)
++                            else:
++                                if entry not in added:
++                                    added.add(entry)
++                                    reqs.append(Requirement(entry))
++                    finally:
++                        visiting.remove(ng)
++
++                for group in selected:
++                    add_group(group)
+         return dependencies_with_extras(reqs, extras, name)
+ 
+     def get_package_dependencies(self, for_env: EnvConfigSet) -> list[Requirement]:
+diff --git a/tmp_dep_groups/tox.ini b/tmp_dep_groups/tox.ini
+new file mode 100644
+index 00000000..01be8831
+--- /dev/null
++++ b/tmp_dep_groups/tox.ini
+@@ -0,0 +1,5 @@
++[tox]
++envlist = py
++[testenv]
++dependency-groups = test
++commands = python -c "print('hello')"
+\ No newline at end of file

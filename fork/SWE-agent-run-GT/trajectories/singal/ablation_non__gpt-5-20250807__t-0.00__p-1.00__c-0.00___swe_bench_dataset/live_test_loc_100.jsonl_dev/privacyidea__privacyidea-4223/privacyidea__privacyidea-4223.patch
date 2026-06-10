@@ -1,0 +1,171 @@
+diff --git a/privacyidea/lib/eventhandler/requestmangler.py b/privacyidea/lib/eventhandler/requestmangler.py
+index 9467939a8..ef49075dc 100644
+--- a/privacyidea/lib/eventhandler/requestmangler.py
++++ b/privacyidea/lib/eventhandler/requestmangler.py
+@@ -23,7 +23,8 @@ __doc__ = """This is the event handler module modifying request parameters.
+ from privacyidea.lib.eventhandler.base import BaseEventHandler
+ from privacyidea.lib.token import (get_token_types, set_validity_period_end,
+                                    set_validity_period_start)
+-from privacyidea.lib.realm import get_realms
++from privacyidea.lib.realm import get_realms, get_default_realm
++from privacyidea.lib.user import User, split_user
+ from privacyidea.lib.token import (set_realms, remove_token, enable_token,
+                                    unassign_token, init_token, set_description,
+                                    set_count_window, add_tokeninfo,
+@@ -169,4 +170,17 @@ class RequestManglerEventHandler(BaseEventHandler):
+                                 log.warning("The number of found tags ({0!r}) "
+                                             "do not match the required number ({1!r}).".format(m.groups(), value))
+ 
++                # If the RequestMangler modified the username or realm, update request.User accordingly
++                try:
++                    if parameter in ("username", "realm"):
++                        username_param = request.all_data.get("username")
++                        if username_param is not None:
++                            login_name, realm_from_username = split_user(username_param)
++                            new_realm = (request.all_data.get("realm") or realm_from_username or get_default_realm())
++                            request.User = User(login_name, new_realm)
++                except Exception as e:
++                    # Do not fail the request mangle if updating the user fails, just log a warning
++                    log.debug(f"RequestMangler: could not update request.User: {e!s}")
++
++
+         return ret
+diff --git a/repro_auth_user_realm.py b/repro_auth_user_realm.py
+new file mode 100644
+index 000000000..8bf704d3f
+--- /dev/null
++++ b/repro_auth_user_realm.py
+@@ -0,0 +1,52 @@
++# Reproducer for auth flow with RequestMangler modifying realm based on username
++
++def run():
++    from types import SimpleNamespace
++    from privacyidea.api import auth as auth_api
++    from privacyidea.lib.eventhandler import requestmangler as rm_module
++    from privacyidea.app import create_app
++
++    # Monkeypatch RequestMangler.User to a simple one to avoid DB lookups
++    class DummyUser:
++        def __init__(self, login="", realm=""):
++            self.login = login or ""
++            self.realm = (realm or "").lower()
++        def exist(self):
++            return True
++    rm_module.User = DummyUser
++
++    app = create_app(config_name="testing", silent=True)
++    with app.app_context():
++        # Build a fake request/g objects similar to Flask, but we're not hitting route
++        class DummyRequest:
++            def __init__(self):
++                self.all_data = {"username": "john.admin", "realm": "COMPANY_ad", "password": "secret"}
++                self.User = DummyUser("john.admin", "COMPANY_ad")
++        req = DummyRequest()
++
++        # Simulate that before_request did set g.event_config to contain a RequestMangler pre handler
++        # Instead of running the decorator chain, we directly execute the handler to modify request
++        handler_def = {
++            "options": {
++                "parameter": "realm",
++                "value": "COMPANY_ad_admin",
++                "match_parameter": "username",
++                "match_pattern": ".*admin.*"
++            }
++        }
++        handler = rm_module.RequestManglerEventHandler()
++        handler.do("set", options={"request": req, "handler_def": handler_def})
++
++        # Now mimic the auth code's user resolution block from our patched version
++        from privacyidea.lib.user import split_user, User
++        from privacyidea.lib.realm import get_default_realm
++
++        username = req.all_data.get("username")
++        realm_param = req.all_data.get("realm")
++        login_name, realm_from_username = split_user(username)
++        realm = (realm_param or realm_from_username or get_default_realm()).lower()
++        user = User(login_name, realm)
++        print("Resolved:", login_name, realm)
++
++if __name__ == "__main__":
++    run()
+diff --git a/repro_event_admin_realm.py b/repro_event_admin_realm.py
+new file mode 100644
+index 000000000..d4c03053d
+--- /dev/null
++++ b/repro_event_admin_realm.py
+@@ -0,0 +1,25 @@
++# Conceptual reproducer: demonstrate old vs new auth behavior when RequestMangler changes realm based on username
++
++class DummyUser:
++    def __init__(self, login="", realm=""):
++        self.login = login
++        self.realm = realm.lower() if realm else ""
++
++# Simulate initial request state set in before_request
++req_user = DummyUser("john.admin", "COMPANY_ad")
++all_data = {"username": "john.admin", "realm": "COMPANY_ad"}
++
++# Simulate RequestMangler rule: if username contains "admin", set realm to admin realm
++if "admin" in all_data["username"]:
++    all_data["realm"] = "COMPANY_ad_admin"
++
++# Old behavior (pre-3.9.2 upgrade or regression): code uses request.User if present
++old_realm_used = req_user.realm
++print("Old behavior realm used:", old_realm_used)
++
++# New fixed behavior: re-evaluate login_name and realm from parameters
++username = all_data["username"]
++realm_param = all_data.get("realm")
++login_name = username  # split_user would extract the same login without resolver part here
++new_realm_used = (realm_param or "").lower()
++print("New behavior realm used:", new_realm_used)
+diff --git a/repro_requestmangler.py b/repro_requestmangler.py
+new file mode 100644
+index 000000000..c5798fce9
+--- /dev/null
++++ b/repro_requestmangler.py
+@@ -0,0 +1,44 @@
++# Reproducer for issue: RequestMangler event handler should update request.User when modifying username/realm
++from types import SimpleNamespace
++
++# Import the module under test
++from privacyidea.lib.eventhandler import requestmangler as rm_module
++
++# Create a dummy User class to avoid accessing real resolvers/DB
++class DummyUser:
++    def __init__(self, login="", realm=""):
++        self.login = login or ""
++        self.realm = (realm or "").lower()
++    def __repr__(self):
++        return f"DummyUser(login={self.login!r}, realm={self.realm!r})"
++
++# Monkeypatch the User class used inside the requestmangler module
++rm_module.User = DummyUser
++
++# Prepare a dummy request object
++class DummyRequest:
++    def __init__(self, username, realm):
++        self.all_data = {"username": username, "realm": realm}
++        self.User = DummyUser(username.split("@")[0], realm)
++
++# Handler definition simulating setting the realm based on username containing 'admin'
++handler_def = {
++    "options": {
++        "parameter": "realm",
++        "value": "COMPANY_ad_admin",
++        "match_parameter": "username",
++        "match_pattern": ".*admin.*"
++    }
++}
++
++# Create request with a username that contains 'admin' and initial (wrong) realm
++req = DummyRequest(username="john.admin", realm="COMPANY_ad")
++print("Before do():", req.User)
++
++# Run the RequestMangler
++handler = rm_module.RequestManglerEventHandler()
++handler.do("set", options={"request": req, "handler_def": handler_def})
++
++print("After do():", req.User)
++# Expectation: req.User.realm == "company_ad_admin" (lowercased by DummyUser)
++print("New realm:", req.all_data.get("realm"))

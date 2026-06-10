@@ -1,0 +1,215 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 00000000..b3732730
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,206 @@
++import os
++import sys
++import threading
++import time
++from http.server import HTTPServer, BaseHTTPRequestHandler
++from contextlib import contextmanager
++
++# Ensure we can import pdm from the local repository source
++ROOT = os.path.dirname(__file__)
++sys.path.insert(0, os.path.join(ROOT, "src"))
++
++from typing import Optional, List, Tuple
++
++# Imports from the repository under test
++from pdm.models.session import PDMPyPIClient  # type: ignore
++from pdm._types import RepositoryConfig  # type: ignore
++
++
++class SimpleHandler(BaseHTTPRequestHandler):
++    def do_GET(self):  # noqa: N802
++        # Emulate a minimal simple index endpoint
++        if self.path == "/" or self.path.startswith("/simple"):
++            content = b"<html><body>OK</body></html>"
++            self.send_response(200)
++            self.send_header("Content-Type", "text/html")
++            self.send_header("Content-Length", str(len(content)))
++            self.end_headers()
++            self.wfile.write(content)
++        else:
++            self.send_response(404)
++            self.end_headers()
++
++    def log_message(self, format, *args):  # noqa: A003 - suppress server logs in test output
++        pass
++
++
++class TestHTTPServer:
++    def __init__(self, host: str = "127.0.0.1", port: int = 0):
++        self.server = HTTPServer((host, port), SimpleHandler)
++        sa = self.server.socket.getsockname()
++        self.host: str = sa[0]
++        self.port: int = sa[1]
++        self._thread: Optional[threading.Thread] = None
++
++    def start(self):
++        def _serve():
++            try:
++                self.server.serve_forever()
++            except Exception:
++                pass
++        self._thread = threading.Thread(target=_serve, daemon=True)
++        self._thread.start()
++        # Small delay to ensure the server is ready
++        time.sleep(0.05)
++
++    def stop(self):
++        try:
++            self.server.shutdown()
++        except Exception:
++            pass
++        if self._thread is not None:
++            self._thread.join(timeout=1.0)
++
++
++@contextmanager
++def patched_env(overrides: dict):
++    # Save and restore relevant proxy environment variables to avoid interference
++    keys = {
++        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
++        "http_proxy", "https_proxy", "no_proxy", "all_proxy",
++    }
++    backup = {k: os.environ.get(k) for k in keys}
++    try:
++        # Clear all proxy variables first
++        for k in keys:
++            if k in os.environ:
++                del os.environ[k]
++        # Apply overrides
++        for k, v in overrides.items():
++            if v is None and k in os.environ:
++                del os.environ[k]
++            elif v is not None:
++                os.environ[k] = v
++        yield
++    finally:
++        # Restore
++        for k in keys:
++            if backup[k] is None:
++                if k in os.environ:
++                    del os.environ[k]
++            else:
++                os.environ[k] = backup[k]  # type: ignore
++
++
++def make_client(source_url: str) -> PDMPyPIClient:
++    # Build a RepositoryConfig for our local source. Use name "pypi" to match default source behavior.
++    src = RepositoryConfig(config_prefix="source", name="pypi", url=source_url, verify_ssl=False)
++    client = PDMPyPIClient(sources=[src], cache_dir=None)
++    return client
++
++
++def try_request(url: str) -> Tuple[bool, Optional[str]]:
++    client = make_client(url)
++    try:
++        resp = client.get(url, timeout=1.0)
++        ok = resp.status_code == 200
++        return ok, f"status={resp.status_code}"
++    except Exception as e:
++        return False, f"exception={repr(e)}"
++
++
++def run_tests(server_host: str, server_port: int) -> int:
++    base_url = f"http://{server_host}:{server_port}"
++    simple_url = f"{base_url}/simple/"
++
++    results: List[Tuple[str, bool, str]] = []
++
++    # 1) Reproduce user scenario with lowercase env vars: all_proxy set, no_proxy includes host; expect success after fix
++    with patched_env({
++        "all_proxy": "http://127.0.0.1:1",  # non-existent proxy to force failure if used
++        "no_proxy": f"{server_host},localhost",
++    }):
++        ok, info = try_request(simple_url)
++        results.append(("lowercase envs bypass host", ok, info or ""))
++
++    # 2) Uppercase env vars: expect success after fix
++    with patched_env({
++        "ALL_PROXY": "http://127.0.0.1:1",
++        "NO_PROXY": f"{server_host},localhost",
++    }):
++        ok, info = try_request(simple_url)
++        results.append(("uppercase envs bypass host", ok, info or ""))
++
++    # 3) Bypass by hostname 'localhost'
++    with patched_env({
++        "ALL_PROXY": "http://127.0.0.1:1",
++        "NO_PROXY": "localhost",
++    }):
++        ok, info = try_request(f"http://localhost:{server_port}/simple/")
++        results.append(("bypass by localhost hostname", ok, info or ""))
++
++    # 4) Port-specific NO_PROXY entry
++    with patched_env({
++        "ALL_PROXY": "http://127.0.0.1:1",
++        "NO_PROXY": f"{server_host}:{server_port}",
++    }):
++        ok, info = try_request(simple_url)
++        results.append(("bypass by host:port entry", ok, info or ""))
++
++    # 5) No bypass: should fail because proxy is used
++    with patched_env({
++        "ALL_PROXY": "http://127.0.0.1:1",
++        # no NO_PROXY
++    }):
++        ok, info = try_request(simple_url)
++        results.append(("no bypass (should fail via proxy)", not ok, info or ""))
++
++    # Evaluate and report
++    failed = []
++    print("Reproduction for: PDM ignores no_proxy when all_proxy is set")
++    print(f"Using local server at {simple_url}\n")
++    for name, ok, info in results:
++        status = "PASS" if ok else "FAIL"
++        print(f"{status}: {name} -> {info}")
++        if not ok:
++            failed.append((name, info))
++
++    # The reproduction should fail on current buggy code: specifically, the first four cases should FAIL currently,
++    # because PDM incorrectly uses the proxy even when NO_PROXY includes the host/port.
++    # After the issue is fixed, those will PASS, and the last case should PASS (since it expects failure via proxy).
++
++    # Determine exit code: if any of the first four cases failed, that's expected for buggy code, but our reproduction
++    # script should signal failure to reflect the bug presence.
++    # We implement this as: the script fails (exit code 1) if any of the intended-to-succeed cases did not succeed.
++
++    intended_success_cases = results[:4]
++    intended_failure_case = results[4]
++
++    success_failures = [r for r in intended_success_cases if not r[1]]
++    failure_case_ok = intended_failure_case[1]  # this is boolean after NOT applied above
++
++    exit_code = 0
++    if success_failures or not failure_case_ok:
++        # If any intended success failed OR intended failure did not fail, mark as failure
++        exit_code = 1
++
++    # Additional summary hint for collaborators
++    if exit_code != 0:
++        print("\nSummary: One or more requests attempted to use ALL_PROXY despite NO_PROXY including the target host.")
++        print("This indicates the bug is present. After fixing, rerun this script: all bypass cases should PASS.")
++    else:
++        print("\nAll bypass cases succeeded and the non-bypass case failed via proxy as expected. The issue appears fixed.")
++
++    return exit_code
++
++
++if __name__ == "__main__":
++    server = TestHTTPServer()
++    server.start()
++    try:
++        code = run_tests(server.host, server.port)
++        # Ensure exit code reflects success/failure
++        if code != 0:
++            sys.exit(1)
++    finally:
++        server.stop()
+
+

@@ -1,0 +1,181 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..6684a63e7a
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,175 @@
++import os
++import sys
++import unittest
++
++from django.conf import settings
++
++# Configure minimal Django settings for an in-memory SQLite database.
++if not settings.configured:
++    settings.configure(
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++    )
++
++import django
++from django.db import models, connection
++from django.db import NotSupportedError
++
++django.setup()
++
++# Models closely resembling the ones in the PR description.
++class ProductMetaDataType(models.Model):
++    label = models.CharField(max_length=255, unique=True, blank=False, null=False)
++    # The problematic field name: instances have an attribute named 'filterable'.
++    filterable = models.BooleanField(default=False)
++
++    class Meta:
++        app_label = 'repro'
++
++    def __str__(self):
++        return self.label
++
++
++class ProductMetaData(models.Model):
++    value = models.TextField(null=False, blank=False)
++    metadata_type = models.ForeignKey(ProductMetaDataType, null=False, blank=False, on_delete=models.CASCADE)
++
++    class Meta:
++        app_label = 'repro'
++
++
++# Control model without the problematic attribute name to show the rename workaround.
++class ProductMetaDataTypeNoFilterable(models.Model):
++    label = models.CharField(max_length=255, unique=True, blank=False, null=False)
++    filterable_test = models.BooleanField(default=False)
++
++    class Meta:
++        app_label = 'repro'
++
++
++class ProductMetaDataB(models.Model):
++    value = models.TextField(null=False, blank=False)
++    metadata_type = models.ForeignKey(ProductMetaDataTypeNoFilterable, null=False, blank=False, on_delete=models.CASCADE)
++
++    class Meta:
++        app_label = 'repro'
++
++
++class FilterableRHSReproTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        super().setUpClass()
++        # Create tables for the test models.
++        with connection.schema_editor() as editor:
++            editor.create_model(ProductMetaDataType)
++            editor.create_model(ProductMetaData)
++            editor.create_model(ProductMetaDataTypeNoFilterable)
++            editor.create_model(ProductMetaDataB)
++        # Seed data
++        cls.brand_metadata_false = ProductMetaDataType.objects.create(label='Brand', filterable=False)
++        cls.brand_metadata_true = ProductMetaDataType.objects.create(label='BrandTrue', filterable=True)
++        cls.meta_false = ProductMetaData.objects.create(value='Dark Vador', metadata_type=cls.brand_metadata_false)
++        cls.meta_true = ProductMetaData.objects.create(value='Dark Vador', metadata_type=cls.brand_metadata_true)
++        cls.brand_metadata_nf = ProductMetaDataTypeNoFilterable.objects.create(label='BrandNF', filterable_test=False)
++        cls.meta_nf = ProductMetaDataB.objects.create(value='Dark Vador', metadata_type=cls.brand_metadata_nf)
++
++    @classmethod
++    def tearDownClass(cls):
++        # Drop tables after tests.
++        with connection.schema_editor() as editor:
++            editor.delete_model(ProductMetaDataB)
++            editor.delete_model(ProductMetaDataTypeNoFilterable)
++            editor.delete_model(ProductMetaData)
++            editor.delete_model(ProductMetaDataType)
++        super().tearDownClass()
++
++    def test_filter_rhs_instance_with_filterable_false_should_work(self):
++        """
++        Reproduction of the bug: filtering by a FK instance that has a
++        field named 'filterable' with value False should work.
++
++        Current buggy behavior (Django 3.0.7): raises NotSupportedError:
++        "ProductMetaDataType is disallowed in the filter clause."
++        """
++        try:
++            qs = ProductMetaData.objects.filter(value='Dark Vador', metadata_type=self.brand_metadata_false)
++            # Expect no exception and exactly the matching row.
++            rows = list(qs)
++            self.assertEqual(len(rows), 1)
++            self.assertEqual(rows[0].id, self.meta_false.id)
++        except NotSupportedError as e:
++            self.fail(
++                f"Bug reproduced: Unexpected NotSupportedError was raised: {e}.\n"
++                f"Expected no error when filtering with a FK instance regardless of any \n"
++                f"attribute named 'filterable' on the instance."
++            )
++
++    def test_filter_rhs_instance_with_filterable_true(self):
++        """Control: when 'filterable' attribute on the instance is True, the query works."""
++        qs = ProductMetaData.objects.filter(value='Dark Vador', metadata_type=self.brand_metadata_true)
++        rows = list(qs)
++        self.assertEqual(len(rows), 1)
++        self.assertEqual(rows[0].id, self.meta_true.id)
++
++    def test_filter_rhs_pk_value_works_even_with_filterable_false(self):
++        """
++        Using the FK id on RHS shouldn't trigger the bug and should work.
++        """
++        qs = ProductMetaData.objects.filter(value='Dark Vador', metadata_type_id=self.brand_metadata_false.id)
++        rows = list(qs)
++        self.assertEqual(len(rows), 1)
++        self.assertEqual(rows[0].id, self.meta_false.id)
++
++    def test_filter_rhs_instance_in_lookup_works_even_with_filterable_false(self):
++        """
++        Using __in with a list of instances appears to bypass the buggy check
++        and should work.
++        """
++        qs = ProductMetaData.objects.filter(metadata_type__in=[self.brand_metadata_false])
++        rows = list(qs)
++        self.assertTrue(any(row.id == self.meta_false.id for row in rows))
++
++    def test_filter_rhs_instance_on_model_without_filterable_attribute_name(self):
++        """
++        Control: renaming the field to something other than 'filterable' avoids the issue.
++        """
++        qs = ProductMetaDataB.objects.filter(value='Dark Vador', metadata_type=self.brand_metadata_nf)
++        rows = list(qs)
++        self.assertEqual(len(rows), 1)
++        self.assertEqual(rows[0].id, self.meta_nf.id)
++
++    def test_error_message_currently_raised_by_bug(self):
++        """
++        Demonstrate the exact error message raised today to aid diagnosis.
++        This test expects NO error after the bug is fixed; however, if the bug persists,
++        it will raise NotSupportedError with a specific message.
++        """
++        try:
++            # This triggers the buggy path where check_filterable(value) inspects the instance.
++            list(ProductMetaData.objects.filter(metadata_type=self.brand_metadata_false))
++        except NotSupportedError as e:
++            # Provide a clear assertion failure message that includes the current buggy behavior.
++            self.fail(
++                f"Bug reproduced: Unexpected NotSupportedError was raised: {e}.\n"
++                f"Expected no error when filtering with a FK instance regardless of any \n"
++                f"attribute named 'filterable' on the instance."
++            )
++
++
++if __name__ == '__main__':
++    # Run the tests when executing this file directly.
++    suite = unittest.defaultTestLoader.loadTestsFromTestCase(FilterableRHSReproTests)
++    runner = unittest.TextTestRunner(verbosity=2)
++    result = runner.run(suite)
++    # Exit with a non-zero code if tests failed.
++    sys.exit(0 if result.wasSuccessful() else 1)

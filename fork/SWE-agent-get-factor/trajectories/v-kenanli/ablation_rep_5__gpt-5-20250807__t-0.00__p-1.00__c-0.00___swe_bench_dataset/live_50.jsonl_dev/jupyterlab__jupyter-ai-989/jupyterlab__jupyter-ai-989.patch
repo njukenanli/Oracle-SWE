@@ -1,0 +1,282 @@
+
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000..b739d33
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,273 @@
++import os
++import sys
++import asyncio
++import tempfile
++import shutil
++import time
++from types import SimpleNamespace
++
++# Ensure repository packages are importable
++REPO_ROOT = os.path.dirname(__file__)
++PKG_PATH = os.path.join(REPO_ROOT, "packages", "jupyter-ai")
++if PKG_PATH not in sys.path:
++    sys.path.insert(0, PKG_PATH)
++
++# Import the classes we need from the repository
++from jupyter_ai.chat_handlers.learn import LearnChatHandler
++from jupyter_ai.models import HumanChatMessage, ChatClient
++
++
++class DummyLogger:
++    def info(self, *args, **kwargs):
++        pass
++
++    def error(self, *args, **kwargs):
++        pass
++
++
++def make_handler(root_dir: str):
++    """
++    Construct a LearnChatHandler instance with minimal viable dependencies.
++    We monkeypatch methods that would otherwise require external services.
++    """
++    log = DummyLogger()
++
++    # Minimal config manager stub; we won't use it since we monkeypatch provider getters and reply
++    config_manager = SimpleNamespace(persona=SimpleNamespace(name="Test", avatar_route=""))
++
++    # Root chat handlers; reply() iterates over its values to broadcast. We'll monkeypatch reply anyway.
++    root_chat_handlers = {}
++
++    model_parameters = {}
++    chat_history = []
++    llm_chat_memory = None
++
++    preferred_dir = None
++
++    # A resolved future for dask client; learn_dir is monkeypatched during tests to avoid awaiting it.
++    loop = asyncio.get_event_loop()
++    fut = loop.create_future()
++    fut.set_result(None)
++
++    help_message_template = ""
++    chat_handlers = {}
++
++    handler = LearnChatHandler(
++        log=log,
++        config_manager=config_manager,
++        root_chat_handlers=root_chat_handlers,
++        model_parameters=model_parameters,
++        chat_history=chat_history,
++        llm_chat_memory=llm_chat_memory,
++        root_dir=root_dir,
++        preferred_dir=preferred_dir,
++        dask_client_future=fut,
++        help_message_template=help_message_template,
++        chat_handlers=chat_handlers,
++    )
++
++    # Monkeypatch: pretend an embedding provider is selected so process_message can proceed past that check
++    class DummyEmbeddingsProvider:
++        id = "dummy-emb"
++
++        def __init__(self, **kwargs):
++            pass
++
++        def embed_query(self, content: str):
++            # very dummy embedding
++            return [0.0]
++
++    handler.get_embedding_provider = lambda: (DummyEmbeddingsProvider, {"model_id": "dummy"})  # type: ignore
++
++    # Prevent any heavy relearning logic from triggering
++    async def _noop(*args, **kwargs):
++        return None
++
++    handler.delete_and_relearn = _noop  # type: ignore
++
++    return handler
++
++
++def make_message(body: str) -> HumanChatMessage:
++    client = ChatClient(
++        id="client-1",
++        username="user",
++        initials="U",
++        name="User",
++        display_name="User",
++        color=None,
++        avatar_url=None,
++    )
++    msg = HumanChatMessage(
++        type="human",
++        id="msg-1",
++        time=time.time(),
++        body=body,
++        prompt=body,
++        selection=None,
++        client=client,
++    )
++    return msg
++
++
++async def test_glob_ipynb_calls_learn_dir(tmpdir: str):
++    # Create nested structure with ipynb files
++    os.makedirs(os.path.join(tmpdir, "alpha"), exist_ok=True)
++    os.makedirs(os.path.join(tmpdir, "beta", "nested"), exist_ok=True)
++    for p in [
++        os.path.join(tmpdir, "alpha", "a1.ipynb"),
++        os.path.join(tmpdir, "beta", "nested", "b1.ipynb"),
++    ]:
++        with open(p, "w", encoding="utf-8") as f:
++            f.write("{}")
++
++    handler = make_handler(tmpdir)
++
++    learn_calls = []
++
++    async def fake_learn_dir(path, chunk_size, chunk_overlap, all_files=False):
++        learn_calls.append(path)
++        return None
++
++    handler.learn_dir = fake_learn_dir  # type: ignore
++
++    # Capture replies to inspect errors if any
++    replies = []
++    handler.reply = lambda response, message=None: replies.append(response)  # type: ignore
++
++    # Using glob pattern for ipynb files (recursive)
++    msg = make_message("/learn **/*.ipynb")
++    await handler.process_message(msg)
++
++    # EXPECTATION (after fix): learn_dir should be invoked for matching files/dirs.
++    # CURRENT BEHAVIOR (before fix): it replies that the path doesn't exist and learn_dir is never called.
++    assert (
++        len(learn_calls) >= 1
++    ), f"Expected learn_dir to be called for glob pattern, but it was not. Replies: {replies}"
++
++
++async def test_dirname_wildcard_calls_learn_dir(tmpdir: str):
++    # Create directories that should match pattern
++    os.makedirs(os.path.join(tmpdir, "testdata"), exist_ok=True)
++    os.makedirs(os.path.join(tmpdir, "testdocs", "sub"), exist_ok=True)
++    with open(os.path.join(tmpdir, "testdocs", "sub", "note.md"), "w", encoding="utf-8") as f:
++        f.write("hello")
++
++    handler = make_handler(tmpdir)
++
++    learn_calls = []
++
++    async def fake_learn_dir(path, chunk_size, chunk_overlap, all_files=False):
++        learn_calls.append(path)
++        return None
++
++    handler.learn_dir = fake_learn_dir  # type: ignore
++    handler.reply = lambda response, message=None: None  # type: ignore
++
++    # Pattern matching multiple directories
++    msg = make_message("/learn test*")
++    await handler.process_message(msg)
++
++    assert (
++        len(learn_calls) >= 1
++    ), "Expected learn_dir to be called for directory wildcard pattern, but it was not."
++
++
++async def test_exact_dir_still_works(tmpdir: str):
++    # Non-glob path should continue to work
++    target = os.path.join(tmpdir, "alpha")
++    os.makedirs(target, exist_ok=True)
++    with open(os.path.join(target, "file.txt"), "w", encoding="utf-8") as f:
++        f.write("text")
++
++    handler = make_handler(tmpdir)
++
++    learn_calls = []
++
++    async def fake_learn_dir(path, chunk_size, chunk_overlap, all_files=False):
++        learn_calls.append(path)
++        return None
++
++    handler.learn_dir = fake_learn_dir  # type: ignore
++    handler.reply = lambda response, message=None: None  # type: ignore
++
++    msg = make_message("/learn alpha")
++    await handler.process_message(msg)
++
++    assert len(learn_calls) == 1 and learn_calls[0].endswith("alpha"), (
++        f"Expected learn_dir to be called once with exact directory path, got {learn_calls}"
++    )
++
++
++async def test_no_match_pattern_does_not_call_learn(tmpdir: str):
++    handler = make_handler(tmpdir)
++
++    learn_calls = []
++
++    async def fake_learn_dir(path, chunk_size, chunk_overlap, all_files=False):
++        learn_calls.append(path)
++        return None
++
++    handler.learn_dir = fake_learn_dir  # type: ignore
++    replies = []
++    handler.reply = lambda response, message=None: replies.append(response)  # type: ignore
++
++    msg = make_message("/learn doesnotmatch*")
++    await handler.process_message(msg)
++
++    assert (
++        len(learn_calls) == 0
++    ), f"Expected no learn_dir calls for non-matching pattern, but got {learn_calls}"
++
++
++def run_tests():
++    tmpdir = tempfile.mkdtemp(prefix="jai-repro-")
++    try:
++        loop = asyncio.get_event_loop()
++        failures = []
++
++        async def _run():
++            # Order matters: the first two should fail before fix and pass after fix.
++            try:
++                await test_glob_ipynb_calls_learn_dir(tmpdir)
++                print("PASS: glob ipynb pattern triggers learn_dir")
++            except AssertionError as e:
++                print("FAIL: glob ipynb pattern triggers learn_dir ->", e)
++                failures.append("glob_ipynb")
++
++            try:
++                await test_dirname_wildcard_calls_learn_dir(tmpdir)
++                print("PASS: dirname wildcard triggers learn_dir")
++            except AssertionError as e:
++                print("FAIL: dirname wildcard triggers learn_dir ->", e)
++                failures.append("dirname_wildcard")
++
++            try:
++                await test_exact_dir_still_works(tmpdir)
++                print("PASS: exact directory still works")
++            except AssertionError as e:
++                print("FAIL: exact directory still works ->", e)
++                failures.append("exact_dir")
++
++            try:
++                await test_no_match_pattern_does_not_call_learn(tmpdir)
++                print("PASS: non-matching pattern does not call learn_dir")
++            except AssertionError as e:
++                print("FAIL: non-matching pattern does not call learn_dir ->", e)
++                failures.append("no_match")
++
++            return failures
++
++        failures = loop.run_until_complete(_run())
++        if failures:
++            print("\nReproduction complete: tests failing due to missing glob support:", failures)
++            sys.exit(1)
++        else:
++            print("\nAll reproduction tests passed.")
++            sys.exit(0)
++    finally:
++        shutil.rmtree(tmpdir, ignore_errors=True)
++
++
++if __name__ == "__main__":
++    run_tests()
+
+

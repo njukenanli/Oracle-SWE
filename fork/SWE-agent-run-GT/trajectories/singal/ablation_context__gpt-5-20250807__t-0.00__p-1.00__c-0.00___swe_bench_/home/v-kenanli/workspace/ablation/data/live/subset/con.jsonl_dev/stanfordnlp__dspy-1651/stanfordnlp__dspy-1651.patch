@@ -1,0 +1,147 @@
+diff --git a/dspy/clients/lm.py b/dspy/clients/lm.py
+index f2949372..f793cb0c 100644
+--- a/dspy/clients/lm.py
++++ b/dspy/clients/lm.py
+@@ -14,16 +14,40 @@ from dspy.clients.lm_finetune_utils import (
+     execute_finetune_job,
+ )
+ 
+-import litellm
+-from litellm.caching import Cache
+-
++# NOTE: Avoid importing heavy third-party modules (like litellm) at import time to
++# prevent side-effects during test collection/import. We'll lazy-load and configure
++# them when actually needed.
+ 
+ DISK_CACHE_DIR = os.environ.get("DSPY_CACHEDIR") or os.path.join(Path.home(), ".dspy_cache")
+-litellm.cache = Cache(disk_cache_dir=DISK_CACHE_DIR, type="disk")
+-litellm.telemetry = False
+ 
+-if "LITELLM_LOCAL_MODEL_COST_MAP" not in os.environ:
+-    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
++
++def _get_litellm():
++    """Lazily import and configure litellm and its cache.
++
++    Returns the litellm module, configured for disk caching and with telemetry disabled.
++    """
++    # Local import to avoid import-time side effects during test discovery
++    import litellm  # type: ignore
++    try:
++        from litellm.caching import Cache  # type: ignore
++    except Exception:  # pragma: no cover - very defensive, caching API may change
++        Cache = None  # type: ignore
++
++    # Configure caching and telemetry once
++    try:
++        if Cache is not None and getattr(litellm, "cache", None) is None:
++            litellm.cache = Cache(disk_cache_dir=DISK_CACHE_DIR, type="disk")  # type: ignore[attr-defined]
++        # Always disable telemetry in DSPy
++        litellm.telemetry = False  # type: ignore[attr-defined]
++    except Exception:
++        # If anything goes wrong configuring cache/telemetry, proceed without failing import
++        pass
++
++    # Ensure local model cost map is set to avoid network calls
++    if "LITELLM_LOCAL_MODEL_COST_MAP" not in os.environ:
++        os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
++
++    return litellm
+ 
+ 
+ class LM:
+@@ -155,6 +179,8 @@ def cached_litellm_completion(request):
+ 
+ 
+ def litellm_completion(request, cache={"no-cache": True, "no-store": True}):
++    # Lazily import litellm and configure
++    litellm = _get_litellm()
+     kwargs = ujson.loads(request)
+     return litellm.completion(cache=cache, **kwargs)
+ 
+@@ -165,6 +191,8 @@ def cached_litellm_text_completion(request):
+ 
+ 
+ def litellm_text_completion(request, cache={"no-cache": True, "no-store": True}):
++    # Lazily import litellm and configure
++    litellm = _get_litellm()
+     kwargs = ujson.loads(request)
+ 
+     # Extract the provider and model from the model string.
+diff --git a/dspy/functional/functional.py b/dspy/functional/functional.py
+index a45e302c..19c43484 100644
+--- a/dspy/functional/functional.py
++++ b/dspy/functional/functional.py
+@@ -199,11 +199,26 @@ class TypedPredictor(dspy.Module):
+         ).advice
+ 
+     def _prepare_signature(self) -> dspy.Signature:
+-        """Add formats and parsers to the signature fields, based on the type annotations of the fields."""
+-        signature = self.signature
+-        for name, field in self.signature.fields.items():
+-            is_output = field.json_schema_extra["__dspy_field_type"] == "output"
+-            type_ = field.annotation
++        """Add formats and parsers to the signature fields, based on the type annotations of the fields.
++
++        If an underlying dspy.Predict has an optimized signature (e.g., from MIPROv2),
++        we start from that signature so optimized instructions/prefixes are preserved.
++        We then layer the TypedPredictor type annotations and formatting/parsing rules
++        on top of that base.
++        """
++        # Prefer the inner predictor's signature if available (e.g., after optimization/load)
++        base_signature = getattr(self, "predictor", None)
++        base_signature = getattr(base_signature, "signature", None) or self.signature
++
++        signature = base_signature
++        # Iterate over the typed signature's fields to derive types/parsers, but apply them to the base.
++        for name, typed_field in self.signature.fields.items():
++            # If the base signature doesn't have this field (e.g., mismatch), fall back to typed signature entirely.
++            if name not in signature.fields:
++                signature = self.signature
++                typed_field = self.signature.fields[name]
++            is_output = typed_field.json_schema_extra["__dspy_field_type"] == "output"
++            type_ = typed_field.annotation
+             if is_output:
+                 if type_ is bool:
+ 
+@@ -215,18 +230,20 @@ class TypedPredictor(dspy.Module):
+ 
+                     signature = signature.with_updated_fields(
+                         name,
+-                        desc=field.json_schema_extra.get("desc", "")
++                        desc=typed_field.json_schema_extra.get("desc", "")
+                         + (" (Respond with true or false)" if type_ != str else ""),
+                         format=lambda x: x if isinstance(x, str) else str(x),
+                         parser=parse,
++                        type_=type_,
+                     )
+                 elif type_ in (str, int, float):
+                     signature = signature.with_updated_fields(
+                         name,
+-                        desc=field.json_schema_extra.get("desc", "")
++                        desc=typed_field.json_schema_extra.get("desc", "")
+                         + (f" (Respond with a single {type_.__name__} value)" if type_ != str else ""),
+                         format=lambda x: x if isinstance(x, str) else str(x),
+                         parser=type_,
++                        type_=type_,
+                     )
+                 else:
+                     # Anything else we wrap in a pydantic object
+@@ -248,7 +265,7 @@ class TypedPredictor(dspy.Module):
+                         schema = "```json\n" + schema + "\n```"
+                     signature = signature.with_updated_fields(
+                         name,
+-                        desc=field.json_schema_extra.get("desc", "")
++                        desc=typed_field.json_schema_extra.get("desc", "")
+                         + (". Respond with a single JSON object. JSON Schema: " + schema),
+                         format=lambda x, to_json=to_json: (x if isinstance(x, str) else to_json(x)),
+                         parser=lambda x, from_json=from_json: from_json(_unwrap_json(x, from_json)),
+@@ -275,7 +292,7 @@ class TypedPredictor(dspy.Module):
+                     is_json = True
+                 if self.wrap_json and is_json:
+                     format_ = lambda x, inner=format_: x if isinstance(x, str) else "```json\n" + inner(x) + "\n```\n"
+-                signature = signature.with_updated_fields(name, format=format_)
++                signature = signature.with_updated_fields(name, format=format_, type_=type_)
+ 
+         return signature
+ 

